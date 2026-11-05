@@ -62,17 +62,30 @@ class VisualPerception {
 
   List<TrackedObject> get tracks => List.unmodifiable(_tracks.values);
 
+  /// Tracks not seen for longer than [staleAfter]. Callers must not
+  /// use stale tracks to generate new step instructions.
+  int staleTrackCount(DateTime now,
+      {Duration staleAfter = const Duration(seconds: 3)}) {
+    return _tracks.values
+        .where((t) => now.difference(t.lastSeen) > staleAfter)
+        .length;
+  }
+
   /// Process one frame. Returns ONLY new tracks and tracks whose centre
   /// moved by more than [moveThreshold] since the last frame. Repeated
   /// detections of the same stationary object return an empty list.
+  /// v0.4: low-confidence detections (< 0.3 by default) never create
+  /// a track. A faint detection must not become a spoken obstacle.
   List<PerceptionEvent> processFrame(
     List<Detection> detections,
     DateTime now, {
     double moveThreshold = 0.15,
     Duration staleAfter = const Duration(seconds: 3),
+    double minConfidence = 0.3,
   }) {
     final events = <PerceptionEvent>[];
     for (final d in detections) {
+      if (d.confidence < minConfidence) continue;
       TrackedObject? match;
       for (final t in _tracks.values) {
         if (t.label != d.label) continue;

@@ -15,6 +15,13 @@ enum TaskState {
   listening,
   understanding,
   planning,
+  // Refactor phase 1 (spec section 2): PREPARING checks resources
+  // before execution, EXECUTING is the generic execution state that
+  // NAVIGATING / AVOIDING / FINDING / INDOOR refine. Older transitions
+  // planning -> navigating are kept for compatibility, so existing
+  // flows do not break when these states are added.
+  preparing,
+  executing,
   navigating,
   avoidingObstacle,
   findingEntrance,
@@ -50,8 +57,30 @@ const Map<TaskState, Set<TaskState>> _legal = {
     TaskState.emergency,
   },
   TaskState.planning: {
+    TaskState.preparing,
     TaskState.navigating,
     TaskState.waitingConfirmation,
+    TaskState.failed,
+    TaskState.cancelled,
+    TaskState.emergency,
+  },
+  TaskState.preparing: {
+    TaskState.executing,
+    TaskState.navigating,
+    TaskState.waitingConfirmation,
+    TaskState.failed,
+    TaskState.cancelled,
+    TaskState.emergency,
+  },
+  TaskState.executing: {
+    TaskState.navigating,
+    TaskState.avoidingObstacle,
+    TaskState.findingEntrance,
+    TaskState.indoorGuidance,
+    TaskState.paused,
+    TaskState.degraded,
+    TaskState.waitingConfirmation,
+    TaskState.completed,
     TaskState.failed,
     TaskState.cancelled,
     TaskState.emergency,
@@ -94,6 +123,8 @@ const Map<TaskState, Set<TaskState>> _legal = {
   },
   TaskState.waitingConfirmation: {
     TaskState.planning,
+    TaskState.preparing,
+    TaskState.executing,
     TaskState.navigating,
     TaskState.avoidingObstacle,
     TaskState.findingEntrance,
@@ -104,6 +135,7 @@ const Map<TaskState, Set<TaskState>> _legal = {
     TaskState.emergency,
   },
   TaskState.paused: {
+    TaskState.executing,
     TaskState.navigating,
     TaskState.avoidingObstacle,
     TaskState.findingEntrance,
@@ -112,6 +144,7 @@ const Map<TaskState, Set<TaskState>> _legal = {
     TaskState.emergency,
   },
   TaskState.degraded: {
+    TaskState.executing,
     TaskState.navigating,
     TaskState.paused,
     TaskState.failed,

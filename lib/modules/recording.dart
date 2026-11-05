@@ -22,6 +22,13 @@ class RecordingManager {
 
   RecordingSession? get current => _current;
 
+  /// v0.4 explicit deletion of the album-export claim: saving to the
+  /// phone album needs a gallery plugin and a real phone, neither of
+  /// which is wired in. "Saved" here means only the managed local
+  /// session, never a gallery copy.
+  static const String albumExportStatus =
+      'NOT_CONFIGURED（未接入手机相册导出，本地保存不等于已存入相册）';
+
   RecordingSession start(String id, DateTime now) {
     _current = RecordingSession(id: id, startedAt: now);
     return _current!;

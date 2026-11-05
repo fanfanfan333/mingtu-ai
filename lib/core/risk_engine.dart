@@ -90,6 +90,21 @@ class RiskEngine {
         valid: false,
       );
     }
+    // v0.4: traffic and location-uncertainty events can NEVER produce
+    // a step instruction, even if a caller supplies "confirmed" side
+    // evidence. A traffic light is not a crossing permission, and an
+    // uncertain location cannot anchor a precise step.
+    if (event.type == 'traffic_uncertain' ||
+        event.type == 'traffic' ||
+        event.type == 'location_uncertain') {
+      return const RiskAssessment(
+        level: RiskLevel.r2,
+        action: RiskAction.stop,
+        speechText: '路口或位置情况无法确认，请停下，不要凭信号灯判断过马路，必要时寻求帮助。',
+        reason: 'traffic-or-location-never-a-step',
+        stepDirection: StepDirection.none,
+      );
+    }
     final ev = event.evidence;
     if (ev == null) {
       // Rule 2: missed detection is NEVER safe.

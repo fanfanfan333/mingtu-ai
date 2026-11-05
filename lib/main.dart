@@ -4,7 +4,10 @@ import 'package:flutter/material.dart';
 
 import 'adapters/bailian_client.dart';
 import 'config/app_config.dart';
+import 'core/event_bus.dart';
+import 'core/health_monitor.dart';
 import 'core/llm_gateway.dart';
+import 'core/contracts.dart';
 import 'core/voice_commands.dart';
 import 'core/risk_engine.dart';
 import 'core/speech_scheduler.dart';
@@ -15,10 +18,13 @@ import 'modules/hospital_task.dart';
 import 'modules/entrance_finding.dart';
 import 'modules/indoor_task.dart';
 import 'modules/map_navigation.dart';
+import 'modules/learning_backlog.dart';
 import 'modules/recording.dart';
+import 'modules/traffic_scene.dart';
 import 'modules/visual_perception.dart';
 import 'skills/destination_finding.dart';
 import 'skills/environment_analysis.dart';
+import 'skills/registry.dart';
 import 'skills/route_planning.dart';
 
 /// Mingtu AI v0.2 Flutter demo entry point.
@@ -73,6 +79,17 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   RecordingManager _recording = RecordingManager();
   VisualPerception _perception = VisualPerception();
   LlmGateway? _gateway;
+  // Refactor phase 1 unified core: one event bus and one health
+  // monitor for the whole demo. Modules must publish here instead of
+  // keeping private state that can contradict the task manager.
+  final EventBus _events = EventBus();
+  final HealthMonitor _health = HealthMonitor();
+  // v0.4: the demo now goes through the Skill registry, the
+  // traffic-info replacement and the record-only learning backlog.
+  final SkillRegistry _registry = defaultSkillRegistry();
+  final TrafficSceneService _traffic = TrafficSceneService();
+  final LearningBacklog _backlog = LearningBacklog();
+  String _trafficText = '路口信息未提示（只提示，不放行）。';
 
   String _currentPrompt = '尚未开始。';
   final List<String> _log = <String>[];
@@ -141,9 +158,27 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   /// scheduler accepted it as active or queued. Speech completion is
   /// simulated after a short delay in this demo; completion of a spoken
   /// prompt is NEVER treated as completion of a physical action.
+  void _publishSpeech(SpeechRequest request) {
+    final DateTime now = DateTime.now();
+    _events.publish(
+      MingtuEvent(
+        eventId: 'speech-${request.id}',
+        type: MingtuEventType.speechRequested,
+        taskId: _tasks.taskId,
+        createdAt: now,
+        source: 'speech_scheduler',
+        dataVersion: 0,
+        expiresAt: request.expiresAt,
+        payload: <String, Object?>{'text': request.text, 'kind': request.kind.name},
+      ),
+      now,
+    );
+  }
+
   bool _say(SpeechRequest request) {
     final DateTime now = DateTime.now();
     final bool accepted = _scheduler.submit(request, now);
+    if (accepted) _publishSpeech(request);
     setState(() {
       if (accepted && _scheduler.active?.id == request.id) {
         _currentPrompt = request.text;
@@ -232,6 +267,13 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _logMsg('开始任务失败：任务状态机拒绝了开始。');
       return;
     }
+    // v0.4 health coverage, honest by construction: the demo map is a
+    // stub, the demo voice is text (not TTS), and there is no camera
+    // in this run. Reporting them here is why the health line below
+    // is not "everything is fine" in a demo.
+    _health.report('map_navigation', ServiceHealthStatus.degraded, '演示桩路线，非真实高德数据。');
+    _health.report('voice_output', ServiceHealthStatus.degraded, '演示文本播报，非真实系统 TTS。');
+    _health.report('camera', ServiceHealthStatus.unavailable, '演示中无真实摄像头。');
     _recording.start('demo-recording', DateTime.now());
     setState(() {
       _recordingText = '录像已开始（本地演示会话，等待任务结束后的保留/删除选择）。';
@@ -249,6 +291,19 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   void _planRoute() {
     if (_tasks.state != TaskState.understanding) {
       _logMsg('请先按“语音开始”，再规划路线。');
+      return;
+    }
+    // v0.4 Skill wiring: route planning now goes through the registry
+    // gate. If the Skill were disabled, planning would be refused here
+    // instead of silently running anyway.
+    final SkillExecutionResult gate = _registry.execute(
+      'route_planning',
+      preconditionsMet: true,
+      riskOk: false,
+      runner: () => {'skill': 'route_planning'},
+    );
+    if (gate.status != SkillExecutionStatus.ok) {
+      _logMsg('路线规划被 Skill 注册表拒绝：${gate.reason}，未规划。');
       return;
     }
     _tasks.transitionTo(TaskState.planning, trigger: 'plan-route');
@@ -421,6 +476,12 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     );
     final RiskAssessment assessment =
         _envSkill.analyse(event, now).assessment;
+    _backlog.record(
+      'obstacle-uncertain-demo',
+      'uncertain-side-space',
+      '演示障碍：侧方未确认，只停下不给步数，离线复查用。',
+      now,
+    );
     setState(() {
       _perceptionText =
           '感知帧（演示）：新跟踪事件 ${events.length} 条，跟踪目标 ${_perception.tracks.length} 个。';
@@ -537,6 +598,38 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     _startStraightTimer();
     _logMsg('动作后重新感知（演示）：新事件 ${events.length} 条，'
         '原障碍帧不再出现，仍以本次重新感知为准恢复导航。');
+  }
+
+  // v0.4 traffic replacement demo: information only, never a
+  // crossing permission. The backlog records the uncertain scene for
+  // offline review; it never changes any production rule.
+  void _trafficInfo() {
+    if (_tasks.state != TaskState.navigating) {
+      _logMsg('请先开始导航，再看路口信息提示。');
+      return;
+    }
+    final TrafficSceneAssessment assessment = _traffic.assess(
+      lightDetected: true,
+      lightDirectionConfirmed: false,
+      locationAccuracyOk: true,
+      crossingConfirmed: false,
+    );
+    _backlog.record(
+      'traffic-demo-1',
+      'traffic-unconfirmed',
+      '演示路口：信号灯方向未确认，只提示不放行。',
+      DateTime.now(),
+    );
+    setState(() {
+      _trafficText = '${assessment.speechText}（允许过马路：${assessment.allowsCrossing}，学习记录 ${_backlog.count} 条，只记录不改规则。）';
+    });
+    _logMsg('路口信息（替代原过街决策）：只提示，不放行。');
+    _say(_request(
+      id: 'traffic-info-1',
+      eventId: 'traffic-info-1',
+      text: assessment.speechText,
+      kind: SpeechKind.obstacleAvoidance,
+    ));
   }
 
   void _destinationApproach() {
@@ -813,6 +906,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     switch (state) {
       case TaskState.idle:
         return '未开始';
+      case TaskState.preparing:
+        return '正在准备（检查任务所需资源）';
+      case TaskState.executing:
+        return '正在执行';
       case TaskState.navigating:
         return '正在导航';
       case TaskState.avoidingObstacle:
@@ -993,6 +1090,23 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   }
 
   void _triggerEmergency() {
+    final DateTime now = DateTime.now();
+    _events.publish(
+      MingtuEvent(
+        eventId: 'emergency-${now.millisecondsSinceEpoch}',
+        type: MingtuEventType.emergencyTriggered,
+        taskId: _tasks.taskId,
+        createdAt: now,
+        source: 'emergency',
+        expiresAt: now.add(const Duration(seconds: 30)),
+      ),
+      now,
+    );
+    _health.report(
+      'emergency',
+      ServiceHealthStatus.ok,
+      '本地紧急流程已启动，不依赖大模型。',
+    );
     final EmergencyResult result = _emergency.trigger(
       triggerType: 'voice-小途，我需要帮助（演示）',
       networkAvailable: false,
@@ -1058,6 +1172,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _recordingText = '未开始录像。';
       _llmText = '未申请云端调用。';
       _perceptionText = '尚未模拟感知帧。';
+      _trafficText = '路口信息未提示（只提示，不放行）。';
     });
     _logMsg('演示已重置（重新开始演示，非任务状态迁移）。');
   }
@@ -1112,6 +1227,13 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
                 '语音：演示文本播报，非真实 TTS；'
                 '云端模型：${AppConfig.llmStatus}；'
                 '百炼：${AppConfig.bailianStatus}。'),
+            const SizedBox(height: 8),
+            // Refactor phase 1 health display: only reports services
+            // that actually reported. Empty means "no degradation
+            // reported", never "everything is healthy".
+            Text(_health.announcementText().isEmpty
+                ? '系统健康：暂无已上报的降级（演示中仅紧急流程会主动上报本地服务状态，未上报的服务不伪造健康）。'
+                : '系统健康：${_health.announcementText()}'),
             const SizedBox(height: 12),
             Semantics(
               label: '当前任务状态',
@@ -1144,6 +1266,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             Text('感知：$_perceptionText'),
             const SizedBox(height: 8),
             Text('医院挂号：$_hospitalText'),
+            const SizedBox(height: 8),
+            Text('路口：$_trafficText'),
+            const SizedBox(height: 8),
+            Text('Skill 注册：${_registry.list().length} 个（车站、医院完整挂号未注册；路口只提示不放行；相册导出 NOT_CONFIGURED）。'),
             const SizedBox(height: 24),
             const Text('语音控制（盲人优先：不用看屏幕点步骤也能控制）',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
@@ -1276,6 +1402,12 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
               onPressed: state == TaskState.avoidingObstacle
                   ? _obstacleConfirmedVerified
                   : null,
+            ),
+            _demoButton(
+              label: '路口信息提示（只提示，不放行）',
+              semanticsLabel: '路口信息提示',
+              onPressed:
+                  state == TaskState.navigating ? _trafficInfo : null,
             ),
             _demoButton(
               label: '模拟行进至接近目的地',

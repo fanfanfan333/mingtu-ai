@@ -1,7 +1,7 @@
 name: mingtu_ai
 description: "明途 AI v0.2：面向视障人士的校园出行辅助演示原型（盲人优先，本地优先，云端按需）。"
 publish_to: "none"
-version: 0.2.2+3
+version: 0.4.0+5
 
 environment:
   sdk: ">=3.0.0 <4.0.0"

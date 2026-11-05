@@ -58,6 +58,9 @@ class SpeechScheduler {
   final List<String> interruptedLog = [];
   final List<String> droppedExpiredLog = [];
   final List<String> droppedDuplicateLog = [];
+  // v0.4: conflicting action instructions (a turn vs an avoidance
+  // step) are dropped, never played one after the other.
+  final List<String> droppedConflictLog = [];
   DateTime? _lastStraightPlayedAt;
 
   SpeechRequest? get active => _active;
@@ -80,6 +83,24 @@ class SpeechScheduler {
         );
     if (duplicate) {
       droppedDuplicateLog.add(request.id);
+      return false;
+    }
+    // Conflicting actions: a turn and an avoidance step must never be
+    // queued to play in sequence. Drop the new one and keep the active
+    // one; the caller must re-evaluate the environment and resubmit
+    // a single consistent instruction.
+    bool conflicts(SpeechRequest other) {
+      final kinds = {request.kind, other.kind};
+      return kinds.contains(SpeechKind.turn) &&
+          kinds.contains(SpeechKind.obstacleAvoidance);
+    }
+
+    if (_active != null && conflicts(_active!)) {
+      droppedConflictLog.add(request.id);
+      return false;
+    }
+    if (_queue.any((q) => conflicts(q))) {
+      droppedConflictLog.add(request.id);
       return false;
     }
     if (_active == null) {

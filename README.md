@@ -1,4 +1,22 @@
-# 明途 AI v0.2
+# 明途 AI v0.4
+
+## v0.4（2026-11-05）新增：按总规范整改——能做就修，不能做就删，不留假功能
+
+- 可行性评估见 `docs/FEASIBILITY.md`：15 个模块逐个判可做 / 可替代 / 删除。
+- 修：统一任务上下文快照、Skill 注册表接进演示（路线规划走门禁）、健康覆盖（演示开始上报地图桩/演示语音/无摄像头）、交通与位置不确定永不给步数、转弯与避障冲突指令丢弃不连播、偏航重规划需精度合格、低置信度检测不建轨迹。
+- 替代：路口过街决策删掉，换成只提示不放行的 `traffic_scene.dart`（`allowsCrossing` 恒 false）；持续学习自动改规则删掉，换成只记录的 `learning_backlog.dart`（无 `apply()`）。
+- 删除（本版不宣称、不留假入口）：持续唤醒词、云端视觉传图、车站 Skill、医院完整挂号、呼叫帮助站、保存到相册——其中后两者在代码里明写 NOT_CONFIGURED / 永不宣称已联系。
+- Skill 注册表从 12 个变 13 个：新增 `traffic_scene_info`，车站仍未注册。
+- 验证（VM 内，2026-11-05）：`flutter analyze` 无问题，`flutter test` 46/46（35 旧 + 11 个 v0.4 新测试），`flutter build web` 成功；网页产物未在浏览器中点按验证，真机/高德/YOLO/真实语音/实地验证仍未做。
+
+## v0.3（2026-11-05）新增：重构第一阶段——统一层，不扩场景
+
+- 统一合同 `lib/core/contracts.dart`、统一事件总线 `lib/core/event_bus.dart`、健康监控 `lib/core/health_monitor.dart`、Skill 注册表 `lib/skills/registry.dart`（只注册 12 个真实 Skill，车站/交通场景故意不注册）。
+- 任务状态机新增 `preparing`、`executing`，旧 `planning → navigating` 保留兼容，紧急不自动恢复不变。
+- 演示入口接线：语音播报发布 `speechRequested` 事件，紧急发布 `emergencyTriggered` 事件并上报本地紧急服务健康；界面新增系统健康显示（无上报时不伪造健康）。
+- 审计文档：`docs/CODE_AUDIT.md`、`EXISTING_MODULE_MAP.md`、`TECHNICAL_DEBT.md`、`REFACTOR_PLAN.md`、`BLIND_FIRST_DESIGN.md`；每项功能仍按 NOT_STARTED / IMPLEMENTED / TESTED / FIELD_VALIDATED 诚实标注，不自动升级。
+- 验证（VM 内，2026-11-05）：`flutter analyze` 无问题，`flutter test` 35/35（29 旧 + 6 统一核心新测试），`flutter build web` 成功；网页产物未在浏览器中点按验证，真机/高德/YOLO/真实语音/实地验证仍未做。
+- 本批本地已验证，未推送：需用户在场确认后推 main，核验远端头并回读新文件后才算推完。
 
 ## v0.2.2（2026-11-05）新增：盲人第一缺陷补齐
 

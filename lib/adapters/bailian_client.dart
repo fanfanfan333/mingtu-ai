@@ -89,6 +89,21 @@ class BailianClient {
 
   bool get isConfigured => apiKey.isNotEmpty;
 
+  /// v0.4 explicit deletion: cloud vision (uploading a camera frame
+  /// to the model) is NOT_IMPLEMENTED. There is no camera pipeline,
+  /// no image transport and no verified cost for it in this version,
+  /// so this method always returns NOT_CONFIGURED and never touches
+  /// the network, even with a key and an allowing gateway decision.
+  Future<BailianResult> callVision({
+    required LlmGateway gateway,
+    required LlmDecision decision,
+  }) async {
+    return const BailianResult(
+      status: 'NOT_CONFIGURED',
+      error: '云端视觉（传图）未实现：本版本只发文本，不上传摄像头画面。',
+    );
+  }
+
   String _redact(String value) =>
       apiKey.isEmpty ? value : value.replaceAll(apiKey, '[REDACTED]');
 

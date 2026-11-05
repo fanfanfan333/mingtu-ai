@@ -106,3 +106,35 @@ v0.2.2 blind-first defect batch (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
 - Still open and NOT claimed: real system TTS/ASR, camera, GPS,
   Amap SDK, on-device YOLO, traffic lights, hospital payment/identity,
   field validation, real-road safety.
+
+v0.3 refactor phase 1 (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
+- Added unified contracts, event bus, health monitor, skill registry (12 real skills),
+  task states preparing/executing, main.dart health display + state text.
+- Added docs: CODE_AUDIT.md, EXISTING_MODULE_MAP.md, TECHNICAL_DEBT.md,
+  REFACTOR_PLAN.md, BLIND_FIRST_DESIGN.md.
+- flutter analyze: No issues found! (after removing one unused import in unified_core_test.dart).
+- flutter test: 35/35 passed (29 previous + 6 new unified-core tests).
+- flutter build web: Built build/web (first attempt interrupted by service restart,
+  verified NOT landed as new build; second attempt succeeded, 64.0s).
+  Build output itself not committed and not run in a browser in this VM (no Chrome).
+- NOT pushed yet: local verification only. Push requires user present to approve,
+  then remote-head verification and read-back before claiming pushed.
+- NOT verified: phone run, real Amap/YOLO/ASR/TTS, real Bailian call/billing,
+  site-verified locations, real-road safety, blind-user field validation.
+
+v0.4 feasibility整改 (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
+- Added traffic_scene.dart (info-only, allowsCrossing always false),
+  learning_backlog.dart (record-only, no apply), TaskContext snapshot,
+  registry traffic_scene_info (13 skills), scheduler conflict drop,
+  risk traffic/location-never-step, map shouldReplan, perception
+  min-confidence filter, recording album NOT_CONFIGURED, wake-word
+  NOT_IMPLEMENTED, Bailian callVision NOT_CONFIGURED.
+- Docs: FEASIBILITY.md (deleted functions listed explicitly).
+- flutter analyze: No issues found!
+- flutter test: 46/46 passed (35 previous + 11 new v0.4 tests; one old
+  unified test updated from 12 to 13 skills, because traffic info was added).
+- flutter build web: Built build/web (65.3s); output not committed,
+  not run in a browser in this VM (no Chrome).
+- NOT verified: phone run, real Amap/YOLO/ASR/TTS, real Bailian call/billing,
+  site-verified locations, real-road safety, blind-user field validation.
+  Deleted functions are NOT claimed anywhere in this version.

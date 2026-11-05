@@ -15,6 +15,16 @@
 /// recognised text into parseVoiceCommand, never into a state setter.
 library;
 
+/// v0.4 explicit scope decision: continuous wake-word detection
+/// ("小途" always listening) is NOT_IMPLEMENTED in this competition
+/// version -- it needs a native always-on recogniser, background
+/// microphone permission, battery and vendor handling that cannot be
+/// verified here. Replacement, already implemented: app-internal voice
+/// control (voice button / command input feeding parseVoiceCommand),
+/// plus pause / resume / repeat / status / help / emergency commands.
+const String wakeWordStatus =
+    'NOT_IMPLEMENTED（持续唤醒词未实现，替代：应用内语音控制 + 指令解析）';
+
 abstract class VoiceOutput {
   bool get isAvailable;
   String get status;

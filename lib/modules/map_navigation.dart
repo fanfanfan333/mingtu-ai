@@ -98,6 +98,16 @@ class MapNavigationService {
   bool isDeviated({required double distanceFromRouteM}) =>
       distanceFromRouteM > 15.0;
 
+  /// Replan only when deviated AND location accuracy is good enough
+  /// for the deviation itself to be meaningful. A large deviation with
+  /// poor accuracy must not trigger a replan on a guessed position.
+  bool shouldReplan({
+    required double distanceFromRouteM,
+    required double locationAccuracyM,
+  }) =>
+      isDeviated(distanceFromRouteM: distanceFromRouteM) &&
+      locationAccuracyM <= 30.0;
+
   /// Switch to destination-approach / entrance-finding mode when close
   /// AND location accuracy is good enough to be meaningful. GPS near a
   /// building can be off by tens of metres, so a small remaining distance
