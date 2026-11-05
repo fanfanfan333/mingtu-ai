@@ -21,6 +21,13 @@ enum VoiceCommand {
   status,
   help,
   emergency,
+  // v0.5 blind-first additions: a blind user must be able to stop
+  // immediately, confirm a step, ask what is ahead, and keep/delete
+  // the recording -- all by voice, not by finding a button on screen.
+  confirmStep,
+  environment,
+  saveRecording,
+  deleteRecording,
   unknown,
 }
 
@@ -30,7 +37,12 @@ VoiceCommand parseVoiceCommand(String raw) {
   if (text.contains('需要帮助') || text.contains('救命') || text.contains('紧急')) {
     return VoiceCommand.emergency;
   }
-  if (text.contains('暂停') || text.contains('停一下') || text.contains('先停下')) {
+  if (text.contains('暂停') ||
+      text.contains('停一下') ||
+      text.contains('先停下') ||
+      text.contains('停下') ||
+      text.contains('别走') ||
+      text.contains('别走了')) {
     return VoiceCommand.pause;
   }
   if (text.contains('继续') || text.contains('恢复')) {
@@ -42,8 +54,30 @@ VoiceCommand parseVoiceCommand(String raw) {
   if (text.contains('再说一遍') || text.contains('重复') || text.contains('刚才说什么')) {
     return VoiceCommand.repeat;
   }
-  if (text.contains('到哪') || text.contains('现在在哪') || text.contains('什么状态') || text.contains('走到哪')) {
+  if (text.contains('到哪') ||
+      text.contains('现在在哪') ||
+      text.contains('我在哪') ||
+      text.contains('什么状态') ||
+      text.contains('走到哪')) {
     return VoiceCommand.status;
+  }
+  if (text.contains('保存录像') || text.contains('保留录像') || text.contains('留着录像')) {
+    return VoiceCommand.saveRecording;
+  }
+  if (text.contains('删除录像') || text.contains('删掉录像') || text.contains('不要录像')) {
+    return VoiceCommand.deleteRecording;
+  }
+  if (text.contains('确认') ||
+      text.contains('我到了') ||
+      text.contains('完成了') ||
+      text.contains('下一步')) {
+    return VoiceCommand.confirmStep;
+  }
+  if (text.contains('前面有什么') ||
+      text.contains('周围有什么') ||
+      text.contains('附近有什么') ||
+      text.contains('前面是什么')) {
+    return VoiceCommand.environment;
   }
   if (text.contains('去图书馆') || text.contains('图书馆')) {
     return VoiceCommand.startLibrary;
@@ -55,5 +89,5 @@ VoiceCommand parseVoiceCommand(String raw) {
 }
 
 String voiceCommandHelpText() =>
-    '你可以说：带我去图书馆、暂停、继续、取消、再说一遍、'
-    '现在到哪了、我需要帮助。';
+    '你可以说：带我去图书馆、停下、暂停、继续、取消、再说一遍、'
+    '现在到哪了、前面有什么、确认、保存录像、删除录像、我需要帮助。';

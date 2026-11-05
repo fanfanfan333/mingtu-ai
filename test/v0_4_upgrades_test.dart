@@ -67,6 +67,9 @@ void main() {
   });
 
   test('speech scheduler drops turn vs avoidance conflicts', () {
+    // v0.5 correction: this v0.4 test had the direction backwards.
+    // A turn must be dropped while avoidance is active; avoidance
+    // must never be dropped while a turn is active (see v0.5 test).
     final scheduler = SpeechScheduler();
     final now = DateTime(2026, 11, 5, 12, 0, 0);
     SpeechRequest req(String id, SpeechKind kind) => SpeechRequest(
@@ -78,10 +81,10 @@ void main() {
           expiresAt: now.add(const Duration(seconds: 10)),
           navigationStateVersion: 'nav-v0',
         );
-    expect(scheduler.submit(req('turn-1', SpeechKind.turn), now), isTrue);
     expect(scheduler.submit(req('avoid-1', SpeechKind.obstacleAvoidance), now),
-        isFalse);
-    expect(scheduler.droppedConflictLog, contains('avoid-1'));
+        isTrue);
+    expect(scheduler.submit(req('turn-1', SpeechKind.turn), now), isFalse);
+    expect(scheduler.droppedConflictLog, contains('turn-1'));
   });
 
   test('map replan needs deviation and good accuracy', () {

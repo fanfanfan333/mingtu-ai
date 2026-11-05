@@ -86,20 +86,25 @@ class SpeechScheduler {
       return false;
     }
     // Conflicting actions: a turn and an avoidance step must never be
-    // queued to play in sequence. Drop the new one and keep the active
-    // one; the caller must re-evaluate the environment and resubmit
-    // a single consistent instruction.
+    // queued to play in sequence. BUT a risk warning must never be
+    // silenced by a turn: if the new request is higher priority
+    // (avoidance over turn) it interrupts, as the priority rule below
+    // does. Only a LOWER-priority conflicting request is dropped here.
+    // v0.5 fix: v0.4 dropped avoidance whenever a turn was active,
+    // which could hide a danger warning from a blind user.
     bool conflicts(SpeechRequest other) {
       final kinds = {request.kind, other.kind};
       return kinds.contains(SpeechKind.turn) &&
           kinds.contains(SpeechKind.obstacleAvoidance);
     }
 
-    if (_active != null && conflicts(_active!)) {
+    bool lowerPriorityConflict(SpeechRequest other) =>
+        conflicts(other) && request.priority >= other.priority;
+    if (_active != null && lowerPriorityConflict(_active!)) {
       droppedConflictLog.add(request.id);
       return false;
     }
-    if (_queue.any((q) => conflicts(q))) {
+    if (_queue.any((q) => lowerPriorityConflict(q))) {
       droppedConflictLog.add(request.id);
       return false;
     }

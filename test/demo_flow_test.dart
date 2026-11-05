@@ -25,16 +25,16 @@ void main() {
     }
 
     await tester.pumpWidget(const MingtuApp());
-    expect(find.text('当前任务状态：idle'), findsOneWidget);
+    expect(find.text('当前任务状态：未开始'), findsOneWidget);
 
     await tapText('语音开始（演示输入：带我去图书馆）');
-    expect(find.text('当前任务状态：understanding'), findsOneWidget);
+    expect(find.text('当前任务状态：正在理解你的请求'), findsOneWidget);
 
     await tapText('理解并规划路线');
-    expect(find.text('当前任务状态：planning'), findsOneWidget);
+    expect(find.text('当前任务状态：正在规划路线'), findsOneWidget);
 
     await tapText('开始导航（直行节奏启动）');
-    expect(find.text('当前任务状态：navigating'), findsOneWidget);
+    expect(find.text('当前任务状态：正在导航'), findsOneWidget);
     expect(find.text('当前提示：直走'), findsOneWidget);
 
     await tapText('紧急求助（本地，不依赖网络和大模型）');
@@ -42,6 +42,6 @@ void main() {
     // completion delay, so no delayed timer is still pending at
     // test teardown. This does not advance the real demo clock.
     await tester.pump(const Duration(milliseconds: 1500));
-    expect(find.text('当前任务状态：emergency'), findsOneWidget);
+    expect(find.text('当前任务状态：紧急求助中'), findsOneWidget);
   });
 }

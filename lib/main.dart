@@ -52,7 +52,7 @@ class MingtuApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return const MaterialApp(
-      title: '明途 AI v0.2',
+      title: '明途 AI v0.5',
       home: MingtuHomePage(),
     );
   }
@@ -286,6 +286,17 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       text: '已听到：带我去图书馆。演示输入，不是真实语音识别。',
       kind: SpeechKind.info,
     ));
+    // v0.5: degraded services must be HEARD, not only shown as text.
+    // A blind user cannot see the health line on screen.
+    final String healthText = _health.announcementText();
+    if (healthText.isNotEmpty) {
+      _say(_request(
+        id: 'health-announce',
+        eventId: 'health-announce',
+        text: healthText,
+        kind: SpeechKind.info,
+      ));
+    }
   }
 
   void _planRoute() {
@@ -902,12 +913,20 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         '网关已用估算费用已记账，未记录 Key。');
   }
 
+  // v0.5: every state has a Chinese name. A blind user hearing the
+  // status must never hear an English enum name like "understanding".
   String _stateText(TaskState state) {
     switch (state) {
       case TaskState.idle:
         return '未开始';
+      case TaskState.listening:
+        return '正在听你说话';
+      case TaskState.understanding:
+        return '正在理解你的请求';
+      case TaskState.planning:
+        return '正在规划路线';
       case TaskState.preparing:
-        return '正在准备（检查任务所需资源）';
+        return '正在准备，检查任务所需资源';
       case TaskState.executing:
         return '正在执行';
       case TaskState.navigating:
@@ -918,8 +937,12 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         return '正在找入口';
       case TaskState.indoorGuidance:
         return '正在室内引导';
+      case TaskState.waitingConfirmation:
+        return '正在等待你确认';
       case TaskState.paused:
         return '已暂停';
+      case TaskState.degraded:
+        return '部分功能不可用，正在降级运行';
       case TaskState.emergency:
         return '紧急求助中';
       case TaskState.completed:
@@ -928,8 +951,6 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         return '已取消';
       case TaskState.failed:
         return '已失败';
-      default:
-        return state.name;
     }
   }
 
@@ -1038,12 +1059,82 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         }
         return;
       case VoiceCommand.status:
+        // v0.5: status must include the route, not only the state
+        // name, so a blind user knows where they are in the journey.
+        final String routePart = _routeText == '尚未规划路线。'
+            ? ''
+            : '路线：$_routeText';
         _say(_request(
           id: 'voice-status-${DateTime.now().millisecondsSinceEpoch}',
           eventId: 'voice-status-${DateTime.now().millisecondsSinceEpoch}',
-          text: '当前状态：${_stateText(_tasks.state)}。当前提示：$_currentPrompt。',
+          text: '当前状态：${_stateText(_tasks.state)}。当前提示：$_currentPrompt。$routePart',
           kind: SpeechKind.info,
         ));
+        return;
+      case VoiceCommand.confirmStep:
+        // v0.5: indoor steps are now voice-confirmable. Outside indoor
+        // guidance there is no step to confirm, and the answer says so
+        // instead of advancing an unrelated task.
+        if (_tasks.state == TaskState.indoorGuidance) {
+          _indoorStep();
+        } else {
+          _say(_request(
+            id: 'voice-confirm-no-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-confirm-no-${DateTime.now().millisecondsSinceEpoch}',
+            text: '当前没有室内步骤可以确认。',
+            kind: SpeechKind.info,
+          ));
+        }
+        return;
+      case VoiceCommand.environment:
+        _say(_request(
+          id: 'voice-env-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'voice-env-${DateTime.now().millisecondsSinceEpoch}',
+          text: _riskActive
+              ? '前方情况：$_obstacleText'
+              : '前方情况：$_perceptionText',
+          kind: SpeechKind.info,
+        ));
+        return;
+      case VoiceCommand.saveRecording:
+        if (_recording.saveWithConsent()) {
+          setState(() {
+            _recordingText = '录像已保留（本地演示会话）。';
+          });
+          _say(_request(
+            id: 'voice-save-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-save-${DateTime.now().millisecondsSinceEpoch}',
+            text: '录像已保留在本地演示会话中。注意：这不是已存入手机相册。',
+            kind: SpeechKind.info,
+          ));
+        } else {
+          _say(_request(
+            id: 'voice-save-no-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-save-no-${DateTime.now().millisecondsSinceEpoch}',
+            text: '现在没有可以保存的录像，请先完成任务到等待确认状态。',
+            kind: SpeechKind.info,
+          ));
+        }
+        return;
+      case VoiceCommand.deleteRecording:
+        if (_recording.deleteOnDecline()) {
+          setState(() {
+            _recordingText = '录像已删除（本地演示会话；不宣称已删除系统外的任何副本）。';
+          });
+          _say(_request(
+            id: 'voice-delete-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-delete-${DateTime.now().millisecondsSinceEpoch}',
+            text: '录像已删除本地演示会话，不宣称已删除系统外的任何副本。',
+            kind: SpeechKind.info,
+          ));
+        } else {
+          _say(_request(
+            id: 'voice-delete-no-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-delete-no-${DateTime.now().millisecondsSinceEpoch}',
+            text: '现在没有可以删除的录像，请先完成任务到等待确认状态。',
+            kind: SpeechKind.info,
+          ));
+        }
         return;
       case VoiceCommand.help:
         _say(_request(
@@ -1128,10 +1219,14 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _logMsg('紧急求助：本地流程已启动；当前任务状态无法迁移到紧急状态，'
           '请重置演示后重新开始。');
     }
+    // v0.5: the fallbacks must be SPOKEN, not only shown as text.
+    // A blind user in an emergency cannot read the screen for them,
+    // and must never be left waiting for a help station that was
+    // never actually contacted.
     _say(_request(
       id: 'emergency-1',
       eventId: 'emergency-1',
-      text: '已进入紧急求助流程，普通导航已暂停。',
+      text: '${result.statusText}备用办法：${result.fallbackOptions.join('；')}。',
       kind: SpeechKind.emergency,
     ));
   }
@@ -1202,7 +1297,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   Widget build(BuildContext context) {
     final TaskState state = _tasks.state;
     return Scaffold(
-      appBar: AppBar(title: const Text('明途 AI v0.2（演示原型）')),
+      appBar: AppBar(title: const Text('明途 AI v0.5（演示原型）')),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -1237,7 +1332,9 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             const SizedBox(height: 12),
             Semantics(
               label: '当前任务状态',
-              child: Text('当前任务状态：${state.name}'),
+              // v0.5: show the Chinese state name, never the English
+              // enum name, so a screen reader reads it correctly.
+              child: Text('当前任务状态：${_stateText(state)}'),
             ),
             const SizedBox(height: 8),
             Semantics(
