@@ -1,0 +1,20 @@
+00:00 +0: loading test/task_manager_test.dart
+00:00 +0: test/task_manager_test.dart: legal flow: idle -> listening -> understanding -> planning -> navigating
+00:00 +1: test/speech_scheduler_test.dart: high-priority obstacle interrupts straight prompt
+00:00 +2: test/speech_scheduler_test.dart: high-priority obstacle interrupts straight prompt
+00:00 +3: test/speech_scheduler_test.dart: high-priority obstacle interrupts straight prompt
+00:00 +4: test/speech_scheduler_test.dart: high-priority obstacle interrupts straight prompt
+00:00 +5: test/speech_scheduler_test.dart: resume after interrupt requires re-check and restarts timer
+00:00 +6: test/speech_scheduler_test.dart: expired prompts are dropped, never played
+00:00 +7: test/speech_scheduler_test.dart: duplicate event is deduped, not replayed
+00:00 +8: test/risk_engine_test.dart: uncertain side space never produces a left/right step
+00:00 +9: test/route_scoring_test.dart: unknown accessibility is penalised, never treated as safe
+00:00 +10: test/route_scoring_test.dart: unknown accessibility is penalised, never treated as safe
+00:00 +11: test/route_scoring_test.dart: unknown accessibility is penalised, never treated as safe
+00:00 +12: test/route_scoring_test.dart: unknown accessibility is penalised, never treated as safe
+00:00 +13: test/route_scoring_test.dart: unknown accessibility is penalised, never treated as safe
+00:00 +14: test/route_scoring_test.dart: weights are normalised and lower score wins
+00:00 +15: test/llm_gateway_test.dart: local-first: cloud denied if local not attempted
+00:00 +16: test/llm_gateway_test.dart: budget cap denies over-cap calls
+00:00 +17: test/llm_gateway_test.dart: expensive foreign model ids are blocked
+00:00 +18: All tests passed!

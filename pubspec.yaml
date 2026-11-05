@@ -1,0 +1,22 @@
+name: mingtu_ai
+description: "明途 AI v0.1：面向视障人士的校园出行辅助演示原型（盲人优先，本地优先，云端按需）。"
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  # Core tests are pure Dart and import package:test so they can also be
+  # verified with `dart test` in a standalone harness (see scripts/run_tests.sh).
+  test: ^1.24.0
+
+flutter:
+  uses-material-design: true
