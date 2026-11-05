@@ -98,3 +98,11 @@ v0.2.1 Bailian client (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
   That can only be verified by the user running on their own machine
   with their own --dart-define key; no real key was ever given to Muse
   or committed to the repo.
+
+v0.2.2 blind-first defect batch (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
+- Added voice command parser, voice IO contracts, hospital
+  pre-registration task, voice-control UI (pause/resume/cancel/repeat/
+  status/help/emergency) and docs/DEFECTS.md.
+- Still open and NOT claimed: real system TTS/ASR, camera, GPS,
+  Amap SDK, on-device YOLO, traffic lights, hospital payment/identity,
+  field validation, real-road safety.

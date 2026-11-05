@@ -5,11 +5,13 @@ import 'package:flutter/material.dart';
 import 'adapters/bailian_client.dart';
 import 'config/app_config.dart';
 import 'core/llm_gateway.dart';
+import 'core/voice_commands.dart';
 import 'core/risk_engine.dart';
 import 'core/speech_scheduler.dart';
 import 'core/task_manager.dart';
 import 'modules/blind_path.dart';
 import 'modules/emergency.dart';
+import 'modules/hospital_task.dart';
 import 'modules/entrance_finding.dart';
 import 'modules/indoor_task.dart';
 import 'modules/map_navigation.dart';
@@ -89,9 +91,19 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   String _llmText = '未申请云端调用。';
   String _perceptionText = '尚未模拟感知帧。';
 
+  // Blind-first voice control: the command text is a simulation of a
+  // real recogniser transcript until system ASR is integrated (see
+  // adapters/voice_io.dart). The last spoken prompt is kept so the
+  // user can ask to hear it again.
+  final TextEditingController _voiceController = TextEditingController();
+  String _lastSpokenText = '';
+  HospitalTask _hospital = HospitalTask();
+  String _hospitalText = '医院挂号未开始（逻辑步骤演示，非真实挂号）。';
+
   @override
   void dispose() {
     _straightTimer?.cancel();
+    _voiceController.dispose();
     super.dispose();
   }
 
@@ -135,6 +147,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     setState(() {
       if (accepted && _scheduler.active?.id == request.id) {
         _currentPrompt = request.text;
+        _lastSpokenText = request.text;
       } else if (accepted) {
         _currentPrompt = '已排队：${request.text}';
       } else {
@@ -796,6 +809,189 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         '网关已用估算费用已记账，未记录 Key。');
   }
 
+  String _stateText(TaskState state) {
+    switch (state) {
+      case TaskState.idle:
+        return '未开始';
+      case TaskState.navigating:
+        return '正在导航';
+      case TaskState.avoidingObstacle:
+        return '正在避障';
+      case TaskState.findingEntrance:
+        return '正在找入口';
+      case TaskState.indoorGuidance:
+        return '正在室内引导';
+      case TaskState.paused:
+        return '已暂停';
+      case TaskState.emergency:
+        return '紧急求助中';
+      case TaskState.completed:
+        return '已完成';
+      case TaskState.cancelled:
+        return '已取消';
+      case TaskState.failed:
+        return '已失败';
+      default:
+        return state.name;
+    }
+  }
+
+  /// Execute one recognised voice command. Illegal transitions are
+  /// answered, never silently applied, and emergency never auto-resumes.
+  void _handleVoiceCommand(String raw) {
+    final VoiceCommand command = parseVoiceCommand(raw);
+    switch (command) {
+      case VoiceCommand.emergency:
+        _triggerEmergency();
+        return;
+      case VoiceCommand.startLibrary:
+        if (_tasks.state == TaskState.idle) {
+          _startVoice();
+        } else {
+          _say(_request(
+            id: 'voice-busy-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-busy-${DateTime.now().millisecondsSinceEpoch}',
+            text: '已有任务在进行，请先取消或完成当前任务。',
+            kind: SpeechKind.info,
+          ));
+        }
+        return;
+      case VoiceCommand.pause:
+        if (_tasks.canTransitionTo(TaskState.paused)) {
+          _tasks.transitionTo(TaskState.paused, trigger: 'voice-pause');
+          _stopStraightTimer();
+          _scheduler.pauseStraight();
+          setState(() {
+            _straightConfirmed = false;
+          });
+          _say(_request(
+            id: 'voice-pause-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-pause-${DateTime.now().millisecondsSinceEpoch}',
+            text: '已暂停导航，直行提醒已停止。说继续可以恢复，但要重新确认直行路段。',
+            kind: SpeechKind.info,
+          ));
+        } else {
+          _say(_request(
+            id: 'voice-pause-no-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-pause-no-${DateTime.now().millisecondsSinceEpoch}',
+            text: '当前状态不能暂停。',
+            kind: SpeechKind.info,
+          ));
+        }
+        return;
+      case VoiceCommand.resume:
+        if (_tasks.state == TaskState.paused) {
+          // Resume to navigating, but do NOT restart the straight timer:
+          // the user must re-confirm the straight segment first. This is
+          // the blind-first safety rule, not a convenience shortcut.
+          _tasks.transitionTo(TaskState.navigating, trigger: 'voice-resume');
+          setState(() {
+            _straightConfirmed = false;
+          });
+          _say(_request(
+            id: 'voice-resume-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-resume-${DateTime.now().millisecondsSinceEpoch}',
+            text: '已恢复导航，但直行提醒还没有恢复，请先重新确认直行路段。',
+            kind: SpeechKind.info,
+          ));
+        } else {
+          _say(_request(
+            id: 'voice-resume-no-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-resume-no-${DateTime.now().millisecondsSinceEpoch}',
+            text: '当前没有暂停的任务可以恢复。',
+            kind: SpeechKind.info,
+          ));
+        }
+        return;
+      case VoiceCommand.cancel:
+        if (_tasks.canTransitionTo(TaskState.cancelled)) {
+          _tasks.transitionTo(TaskState.cancelled, trigger: 'voice-cancel');
+          _stopStraightTimer();
+          _scheduler.pauseStraight();
+          _say(_request(
+            id: 'voice-cancel-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-cancel-${DateTime.now().millisecondsSinceEpoch}',
+            text: '任务已取消，直行提醒已停止。',
+            kind: SpeechKind.info,
+          ));
+        } else {
+          _say(_request(
+            id: 'voice-cancel-no-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-cancel-no-${DateTime.now().millisecondsSinceEpoch}',
+            text: '当前状态不能取消，请先重置演示。',
+            kind: SpeechKind.info,
+          ));
+        }
+        return;
+      case VoiceCommand.repeat:
+        if (_lastSpokenText.isEmpty) {
+          _say(_request(
+            id: 'voice-repeat-no-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-repeat-no-${DateTime.now().millisecondsSinceEpoch}',
+            text: '还没有上一条提示。',
+            kind: SpeechKind.info,
+          ));
+        } else {
+          _say(_request(
+            id: 'voice-repeat-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'voice-repeat-${DateTime.now().millisecondsSinceEpoch}',
+            text: _lastSpokenText,
+            kind: SpeechKind.info,
+          ));
+        }
+        return;
+      case VoiceCommand.status:
+        _say(_request(
+          id: 'voice-status-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'voice-status-${DateTime.now().millisecondsSinceEpoch}',
+          text: '当前状态：${_stateText(_tasks.state)}。当前提示：$_currentPrompt。',
+          kind: SpeechKind.info,
+        ));
+        return;
+      case VoiceCommand.help:
+        _say(_request(
+          id: 'voice-help-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'voice-help-${DateTime.now().millisecondsSinceEpoch}',
+          text: voiceCommandHelpText(),
+          kind: SpeechKind.info,
+        ));
+        return;
+      case VoiceCommand.unknown:
+        _say(_request(
+          id: 'voice-unknown-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'voice-unknown-${DateTime.now().millisecondsSinceEpoch}',
+          text: '没听清。${voiceCommandHelpText()}',
+          kind: SpeechKind.info,
+        ));
+        return;
+    }
+  }
+
+  void _hospitalAdvance() {
+    if (_hospital.preRegistrationComplete) {
+      setState(() {
+        _hospitalText = _hospital.currentStepText;
+      });
+      _say(_request(
+        id: 'hospital-done-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'hospital-done-${DateTime.now().millisecondsSinceEpoch}',
+        text: _hospital.currentStepText,
+        kind: SpeechKind.info,
+      ));
+      return;
+    }
+    final bool ok = _hospital.tryAdvance(verified: true, evidence: 'demo');
+    setState(() {
+      _hospitalText = _hospital.currentStepText;
+    });
+    _say(_request(
+      id: 'hospital-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'hospital-${DateTime.now().millisecondsSinceEpoch}',
+      text: ok ? _hospital.currentStepText : '医院挂号步骤不能前进，需要先核验。',
+      kind: SpeechKind.info,
+    ));
+  }
+
   void _triggerEmergency() {
     final EmergencyResult result = _emergency.trigger(
       triggerType: 'voice-小途，我需要帮助（演示）',
@@ -841,6 +1037,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _mapService = MapNavigationService(StubMapProvider());
       _routeSkill = RoutePlanningSkill(_mapService);
       _indoor = IndoorTask();
+      _hospital = HospitalTask();
+      _hospitalText = '医院挂号未开始（逻辑步骤演示，非真实挂号）。';
+      _lastSpokenText = '';
+      _voiceController.clear();
       _recording = RecordingManager();
       _perception = VisualPerception();
       _gateway = null;
@@ -942,6 +1142,70 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             Text('云端网关：$_llmText'),
             const SizedBox(height: 8),
             Text('感知：$_perceptionText'),
+            const SizedBox(height: 8),
+            Text('医院挂号：$_hospitalText'),
+            const SizedBox(height: 24),
+            const Text('语音控制（盲人优先：不用看屏幕点步骤也能控制）',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            const Text(
+              '真实语音识别还没接入，下面这个输入框是演示代替：'
+              '输入一句话，点发送，就按语音指令解析执行。'
+              '也可以直接点下面的暂停、继续、再说一遍、现在到哪了。',
+            ),
+            const SizedBox(height: 8),
+            Semantics(
+              label: '语音指令输入，演示用，代替真实语音识别',
+              child: TextField(
+                controller: _voiceController,
+                decoration: const InputDecoration(
+                  hintText: '例如：暂停、继续、再说一遍、现在到哪了、我需要帮助',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            _demoButton(
+              label: '发送语音指令（演示）',
+              semanticsLabel: '发送语音指令',
+              onPressed: () => _handleVoiceCommand(_voiceController.text),
+            ),
+            _demoButton(
+              label: '暂停导航（语音）',
+              semanticsLabel: '暂停导航',
+              onPressed: _tasks.canTransitionTo(TaskState.paused)
+                  ? () => _handleVoiceCommand('暂停')
+                  : null,
+            ),
+            _demoButton(
+              label: '继续导航（语音，需重新确认直行）',
+              semanticsLabel: '继续导航',
+              onPressed: _tasks.state == TaskState.paused
+                  ? () => _handleVoiceCommand('继续')
+                  : null,
+            ),
+            _demoButton(
+              label: '再说一遍',
+              semanticsLabel: '再说一遍',
+              onPressed: () => _handleVoiceCommand('再说一遍'),
+            ),
+            _demoButton(
+              label: '现在到哪了',
+              semanticsLabel: '现在到哪了',
+              onPressed: () => _handleVoiceCommand('现在到哪了'),
+            ),
+            _demoButton(
+              label: '取消任务（语音）',
+              semanticsLabel: '取消任务',
+              onPressed: _tasks.canTransitionTo(TaskState.cancelled)
+                  ? () => _handleVoiceCommand('取消')
+                  : null,
+            ),
+            _demoButton(
+              label: '医院挂号下一步（逻辑步骤，非真实挂号）',
+              semanticsLabel: '医院挂号下一步',
+              onPressed: _hospitalAdvance,
+            ),
             const SizedBox(height: 24),
             const Text('演示步骤（按顺序点按）',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
