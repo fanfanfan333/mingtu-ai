@@ -5,6 +5,8 @@
 /// quota and walking-route behaviour must be verified against the official
 /// Amap documentation before any claim of "Amap integration" is made.
 /// The stub deliberately returns accessibility UNKNOWN for every route.
+library;
+
 import '../core/route_scoring.dart';
 
 class GeoPoint {

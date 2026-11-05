@@ -102,7 +102,7 @@ class RiskEngine {
     }
     // Rule 1: uncertain side space -> never a step instruction.
     if (!ev.sideSpaceConfirmed) {
-      return RiskAssessment(
+      return const RiskAssessment(
         level: RiskLevel.r2,
         action: RiskAction.stop,
         speechText: '前方可能存在障碍，暂时无法确认安全绕行方向，请先停下。',

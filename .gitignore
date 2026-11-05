@@ -1,0 +1,15 @@
+# Flutter / Dart build outputs - never commit these.
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+pubspec.lock
+# Local secrets - configuration comes from --dart-define only.
+.env
+*.key
+*.pem
+# OS / editor noise.
+.DS_Store
+.idea/
+.vscode/

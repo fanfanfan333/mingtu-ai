@@ -7,6 +7,8 @@
 /// The dedup rule is implemented here and is testable in pure Dart:
 /// the same object in consecutive frames is ONE tracked event, never a
 /// new broadcast per frame.
+library;
+
 import 'dart:math' as math;
 
 class Detection {

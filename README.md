@@ -1,4 +1,47 @@
-# 明途 AI v0.1
+# 明途 AI v0.2
+
+## v0.2.1（2026-11-05）新增：百炼客户端（Key 不发给 Muse）
+
+- 新增 `lib/adapters/bailian_client.dart`：阿里云百炼 DashScope OpenAI 兼容接口客户端，见 `docs/BAILIAN.md`。
+- Key 只从本机 `--dart-define=MINGTU_DASHSCOPE_API_KEY` 读，代码里不写、不打印、不提交；学生券是账号级的，挂在用户自己的百炼账号上，不经过 Muse。
+- 只有网关先批准（本地先试过且不够用、预算内）才发请求；没 Key、网关拒绝、预算不足时不发网络请求。报错时 Key 会被替换成 `[REDACTED]`。
+- 演示界面新增“百炼真实调用”按钮：只有用户主动点按、且本机已配置 Key 时才真正调用一次；原来的“云端网关演示”按钮仍只返回决策，永不产生费用。
+- 测试：新增 `test/bailian_client_test.dart`（4 个测试，假发送器，零真实费用），`flutter test` 24/24，`flutter analyze` 无问题。
+- 还没验证：真实百炼调用和真实计费，只能在用户本机带 Key 跑一次后才算验证；视觉传图还没做，现在只发文本。
+
+## v0.2（2026-11-05）新增：可运行的演示流程
+
+v0.2 把 v0.1 的静态状态展示升级为完整的语音优先演示流程
+（见 docs/DEMO_SCRIPT.md），只用已有核心逻辑实现：
+
+- 语音开始（演示输入）→ 理解并规划路线 → 开始导航
+  → 直行 3 秒节奏 → 转弯与直行恢复 → 侧方未确认障碍（停下，
+  不给步数）→ 侧方已确认障碍（仅演示数据给一步，播报完成
+  不等于动作完成）→ 接近目的地 → 入口寻找 → 室内服务台任务
+  → 任务验证 → 任务完成 → 本地录像保留/删除
+  → 云端网关演示（只返回决策，无真实调用）
+  → 本地紧急求助（不依赖网络和大模型，不宣称已联系帮助站）
+- 新增 lib/config/app_config.dart：高德密钥、YOLO 模型路径、
+  LLM 模型 ID 只来自 --dart-define，永不硬编码、永不提交；
+  未配置时对应能力显示 NOT_CONFIGURED，绝不伪造路线、检测或语音结果。
+- 新增 web 平台支持，`flutter build web` 已成功，输出在 build/web
+ （构建产物不提交，见 .gitignore）。
+- 新增两个 Widget 测试，覆盖演示主流程和完整流程。
+
+v0.2 实际运行结果（2026-11-05，VM 内）：
+
+- Flutter 3.47.9（stable），Dart 3.13.7，SDK 装在 VM 外的
+  ~/flutter-sdk（不在项目内，不提交）。
+- `flutter test`：20/20 通过（18 个核心测试 + 2 个 Widget 测试）。
+- `flutter analyze`：No issues found!（0 个问题）。
+- `flutter build web`：✓ Built build/web（build/web/index.html，
+  main.dart.js 约 2.0 MB，build/web 共约 40 MB）。
+- `flutter doctor`：Flutter 本身通过；VM 内缺少 Android SDK、
+  Chrome 和 Linux 桌面工具链（clang、ninja、GTK），
+  所以 Android 真机、Chrome 运行和 Linux 桌面构建未在本机验证。
+- 网页构建产物未在本机浏览器中实际打开运行（VM 内无 Chrome），
+  不能宣称为“已在浏览器中点按验证”；Widget 测试已验证主流程
+  的按钮驱动状态变化。
 
 ## 明途是什么
 
@@ -16,7 +59,7 @@
 - 紧急求助必须能在本地启动，不依赖云端大模型和网络。
 - 任务完成必须靠实际状态验证，地图显示到了不等于进了门，流程走完了不等于任务成功了。
 
-## v0.1 做什么（一个场景）
+## v0.2 做什么（一个场景）
 
 只做校园图书馆场景：起点、转弯点、图书馆入口、服务台标识。包含：
 
@@ -35,7 +78,8 @@
 |---|---|
 | 任务状态机、语音调度器、风险引擎、路线评分、云端网关、盲道决策、入口寻找、图书馆室内任务、紧急求助、录像管理、三个 Skill | IMPLEMENTED（代码已写，见测试运行结果） |
 | 上述核心逻辑的单元测试 | TESTED：2026-11-05 在 VM 内用 Dart SDK 3.13.7 独立包验证，18/18 通过（见 TEST_RUN_LOG.txt）；`flutter test` 未运行（本机无 Flutter SDK），Flutter UI 未编译验证 |
-| Flutter 真机运行、语音识别与合成接入、高德地图 SDK 真实接入、本地 YOLO 模型文件与手机端推理、摄像头与定位真机验证 | NOT_IMPLEMENTED |
+| Flutter 网页构建（build/web）与 Widget 演示流程 | TESTED：2026-11-05，flutter test 20/20，flutter analyze 0 问题，flutter build web 成功；网页产物未在本机浏览器中打开运行 |
+| Flutter 真机运行、语音识别与合成接入、高德地图 SDK 真实接入、本地 YOLO 模型文件与手机端推理、摄像头与定位真机验证 | NOT_IMPLEMENTED（仍需用户手机、高德密钥、YOLO 模型文件和现场核验地点） |
 | 医院挂号完整流程 | NOT_IMPLEMENTED（仅接口占位，见 lib/skills/hospital_registration.dart） |
 | 真实道路安全、精确迈步指令的空间验证、红绿灯过街许可 | NOT_IMPLEMENTED / NOT_VERIFIED，绝不能宣称 |
 | 真实视障用户参与的受控可用性验证 | NOT_IMPLEMENTED（未做，不虚构） |
@@ -44,6 +88,16 @@
 明途不能替代盲杖、导盲犬或专业定向行走训练。任何对外材料都必须保留这句话。
 
 ## 测试运行结果（已实际运行，非宣称）
+
+### v0.2（2026-11-05，最新）
+
+- `flutter test`：20/20 通过（见 TEST_RUN_LOG.txt v0.2 节）。
+- `flutter analyze`：No issues found!
+- `flutter build web`：✓ Built build/web。
+- 未验证：真机运行、高德/YOLO/语音/摄像头/定位真机验证、
+  网页产物浏览器内点按运行、真实道路安全、真实视障用户验证。
+
+### v0.1（2026-11-05，历史）
 
 - 时间与环境：2026-11-05，VM 内下载的 Dart SDK 3.13.7（stable），独立测试包（复制 lib/ 与 test/，仅依赖 package:test）。
 - 结果：**18/18 通过**，包括任务状态机 4 项、语音调度器 4 项、风险引擎 5 项、路线评分 2 项、云端网关 3 项。完整输出见 TEST_RUN_LOG.txt。
@@ -56,7 +110,24 @@
 
 ```sh
 flutter pub get
+flutter test
+flutter analyze
 flutter run
+```
+
+只构建网页演示产物（不提交 build/）：
+
+```sh
+flutter build web
+# 输出：build/web（用静态服务器托管，或在装有 Chrome 的机器上 flutter run -d chrome）
+```
+
+配置（只用 --dart-define，永不写进代码或提交）：
+
+```sh
+flutter run --dart-define=MINGTU_AMAP_KEY=... \
+  --dart-define=MINGTU_YOLO_MODEL_PATH=... \
+  --dart-define=MINGTU_LLM_MODEL_ID=...
 ```
 
 只验证核心逻辑（不需要 Flutter UI）：
@@ -89,3 +160,5 @@ bash scripts/run_tests.sh
 - docs/TEST_PLAN.md：测试计划
 - docs/BUDGET.md：预算
 - docs/SUBMISSION_CHECKLIST.md：提交清单
+- docs/DEMO_SCRIPT.md：3 分钟演示脚本（模拟与真实的对照表）
+- lib/config/app_config.dart：--dart-define 配置（无硬编码密钥）

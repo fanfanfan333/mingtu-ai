@@ -2,6 +2,8 @@
 ///
 /// Input: from / to labels. Output: best scored route + reason.
 /// Accessibility UNKNOWN is never reported as SAFE; see route_scoring.dart.
+library;
+
 import '../core/route_scoring.dart';
 import '../modules/map_navigation.dart';
 

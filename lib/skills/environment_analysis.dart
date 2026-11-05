@@ -3,6 +3,8 @@
 ///
 /// It never invents a step direction: if the risk engine says the side
 /// is uncertain, the skill returns the cautious prompt unchanged.
+library;
+
 import '../core/risk_engine.dart';
 
 class EnvironmentAnalysisResult {

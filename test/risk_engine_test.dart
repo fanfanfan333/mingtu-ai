@@ -60,14 +60,14 @@ void main() {
   });
 
   test('conflicting step directions resolve to stop, not both', () {
-    final left = RiskAssessment(
+    const left = RiskAssessment(
       level: RiskLevel.r3,
       action: RiskAction.caution,
       speechText: '向左',
       reason: 'test',
       stepDirection: StepDirection.left,
     );
-    final right = RiskAssessment(
+    const right = RiskAssessment(
       level: RiskLevel.r3,
       action: RiskAction.caution,
       speechText: '向右',

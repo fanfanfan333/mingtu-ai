@@ -18,3 +18,83 @@
 00:00 +16: test/llm_gateway_test.dart: budget cap denies over-cap calls
 00:00 +17: test/llm_gateway_test.dart: expensive foreign model ids are blocked
 00:00 +18: All tests passed!
+
+---
+## v0.2 (2026-11-05, VM, Flutter SDK installed outside the project at ~/flutter-sdk)
+
+Flutter version (flutter --version):
+Flutter 3.47.9 • channel stable • https://github.com/flutter/flutter.git
+Tools • Dart 3.13.7 • DevTools 2.60.0
+
+flutter doctor (summary, verbatim categories):
+[✓] Flutter (Channel stable, 3.47.9, on Ubuntu 24.04.5 LTS 7.0.0-39-generic, locale en_US)
+[✗] Android toolchain - develop for Android devices: Unable to locate Android SDK.
+[✗] Chrome - develop for the web (Cannot find Chrome executable at google-chrome)
+[✗] Linux toolchain - develop for Linux desktop: clang++, ninja, GTK 3.0 missing
+[✓] Proxy Configuration
+[✓] Connected device (1 available)
+[✓] Network resources
+Doctor found issues in 3 categories (Android SDK, Chrome, Linux toolchain).
+These are VM limitations, not project code failures. A container
+workaround was needed for Flutter's Gradle-wrapper tar extraction
+(uid/gid cannot be chowned in this user namespace): a local ~/bin/tar
+shim adds --no-same-owner for -xzf invocations only. No test, analyze
+or build result was faked by that shim.
+
+flutter test (final run, verbatim tail):
+00:02 +18: /home/hatch/workspace/mingtu-ai/test/demo_flow_test.dart: demo flow: voice start, plan, navigate, emergency
+00:04 +19: /home/hatch/workspace/mingtu-ai/test/demo_full_flow_test.dart: demo full flow: campus library scene
+00:06 +20: All tests passed!
+Total: 20/20 (18 core tests + demo_flow_test + demo_full_flow_test).
+
+flutter analyze (final run, verbatim):
+Analyzing mingtu-ai...
+No issues found! (ran in 13.4s)
+
+flutter build web (final run, verbatim tail):
+Compiling lib/main.dart for the Web... 47.6s
+✓ Built build/web
+build/web/index.html (1.5K), build/web/main.dart.js (2.0M), build/web total ~40M.
+Build output was NOT run in a browser in this VM (no Chrome here);
+do not claim browser click-through verification.
+
+Errors fixed during v0.2 (all found by flutter analyze, not hidden):
+- lib/main.dart method/field name collisions (_entrance, _emergency)
+  and unused fields (_risk, _bestRoute) - fixed by renaming methods to
+  _findEntrance / _triggerEmergency and removing the unused fields.
+- test/risk_engine_test.dart prefer_const_declarations - fixed.
+- First web build failed: "This project is not configured for the web."
+  Fixed by `flutter create . --platforms web`; the template's default
+  test/widget_test.dart (which referenced a non-existent MyApp) was
+  deleted and replaced by demo_flow_test.dart / demo_full_flow_test.dart.
+- First demo_flow widget test failed only because buttons scroll
+  off-screen in the 800x600 test window; fixed with ensureVisible.
+  A second failure was a pending delayed timer at teardown; fixed by
+  advancing fake time 1500 ms after the emergency tap in the test.
+
+What is now runnable:
+- flutter test, flutter analyze, flutter build web in the VM.
+- The demo flow in lib/main.dart via flutter run on a phone or via
+  serving build/web, following docs/DEMO_SCRIPT.md.
+
+What still needs the user (NOT done, NOT verified):
+- A phone with Flutter, an Amap API key, a YOLO model file, and
+  site-verified locations (verified_locations.json is still placeholders
+  only, coordinates null, status 待现场核验).
+- Real system ASR/TTS, camera, GPS/positioning, Amap SDK integration,
+  on-device YOLO inference, browser click-through of build/web,
+  real-road safety validation, and real blind-user field validation.
+- Hospital registration remains a NOT_IMPLEMENTED stub.
+Mingtu does not replace a cane, guide dog or professional training,
+and is not validated for real-road safety.
+
+v0.2.1 Bailian client (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
+- flutter test: 24/24 passed (20 previous + 4 new Bailian client tests,
+  fake sender only, zero real network calls, zero real cost).
+- flutter analyze: No issues found! (after adding `library;` to the new
+  adapter file to clear a dangling-doc-comment info).
+- flutter build web: Built build/web (build output itself not committed).
+- NOT verified: real Bailian call, real billing, real model output.
+  That can only be verified by the user running on their own machine
+  with their own --dart-define key; no real key was ever given to Muse
+  or committed to the repo.
