@@ -69,6 +69,16 @@ Android SDK、没有真机、没有 Chrome，所以下面三项在真机上的
   `minSdk` 设为 24（插件的 LiteRT 2.3 要求），
   `AndroidManifest.xml` 加了 INTERNET、RECORD_AUDIO、CAMERA、
   定位权限。
+- **重要（第一次在真机跑之前必做）**：推送工具只传文本文件，
+  所以 `android/` 里的二进制文件（启动图标 `ic_launcher.png`、
+  `gradle-wrapper.jar`）和本机路径文件 `local.properties` 没有
+  推上仓库。在你电脑上克隆后先跑一次（只生成缺的文件，
+  不动 `lib/` 代码）：
+  ```sh
+  flutter create --platforms=android .
+  ```
+  然后再 `flutter run`。不跑这一步，Android 构建会因为缺
+  图标和 Gradle 包装文件而失败。
 - 在手机上跑：`flutter run`（Android 真机，开发者选项开 USB
   调试）。先对着静态的人、自行车、电动车、椅子看检出和单帧
   毫秒数，再实时，最后才边走边测。算通过：能检出、报延迟，
