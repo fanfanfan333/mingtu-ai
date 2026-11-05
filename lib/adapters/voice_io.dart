@@ -20,11 +20,15 @@ library;
 /// ("小途" always listening) is NOT_IMPLEMENTED in this competition
 /// version -- it needs a native always-on recogniser, background
 /// microphone permission, battery and vendor handling that cannot be
-/// verified here. Replacement, already implemented: app-internal voice
-/// control (voice button / command input feeding parseVoiceCommand),
-/// plus pause / resume / repeat / status / help / emergency commands.
+/// verified here. Replacement, implemented in v0.7: turn-taking
+/// listening -- the app greets by voice at startup and then listens,
+/// and after every spoken prompt finishes it listens again while a
+/// task is running, so a blind user can say "停下" at any time without
+/// tapping. The microphone only opens after speech ends, never while
+/// TTS is speaking. Plus pause / resume / repeat / status / help /
+/// emergency commands via parseVoiceCommand.
 const String wakeWordStatus =
-    'NOT_IMPLEMENTED（持续唤醒词未实现，替代：应用内语音控制 + 指令解析）';
+    'NOT_IMPLEMENTED（持续唤醒词未实现，替代：启动问候 + 播报后自动再听的轮流对话）';
 
 abstract class VoiceOutput {
   bool get isAvailable;

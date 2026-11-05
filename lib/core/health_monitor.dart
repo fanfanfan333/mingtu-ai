@@ -46,6 +46,31 @@ class HealthMonitor {
   /// Voice announcement for degraded services. Empty when nothing is
   /// reported degraded/unavailable, so callers never announce a
   /// problem that does not exist.
+  ///
+  /// v0.7: service names are spoken in Chinese. Before this fix the
+  /// announcement read out the English identifiers
+  /// (map_navigation, voice_output, ...) to a blind user.
+  static String chineseServiceName(String service) {
+    switch (service) {
+      case 'map_navigation':
+        return '地图导航';
+      case 'voice_output':
+        return '语音播报';
+      case 'voice_input':
+        return '语音识别';
+      case 'camera':
+        return '摄像头';
+      case 'location':
+        return '定位';
+      case 'emergency':
+        return '紧急求助';
+      case 'llm':
+        return '云端模型';
+      default:
+        return '一项服务';
+    }
+  }
+
   String announcementText() {
     final problems = _services.values
         .where((s) =>
@@ -53,7 +78,8 @@ class HealthMonitor {
             s.status == ServiceHealthStatus.degraded)
         .toList();
     if (problems.isEmpty) return '';
-    final names = problems.map((s) => s.service).join('、');
+    final names =
+        problems.map((s) => chineseServiceName(s.service)).join('、');
     return '注意：$names 当前不可用或性能下降，相关提示可能不准确，'
         '请谨慎行动，必要时寻求帮助。';
   }

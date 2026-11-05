@@ -114,7 +114,9 @@ void main() {
 
   test('wake word is explicitly NOT_IMPLEMENTED with an alternative', () {
     expect(wakeWordStatus, contains('NOT_IMPLEMENTED'));
-    expect(wakeWordStatus, contains('应用内语音控制'));
+    // v0.7: the alternative is now the turn-taking loop (greeting +
+    // listen again after each prompt), not just in-app voice control.
+    expect(wakeWordStatus, contains('轮流对话'));
   });
 
   test('bailian vision sends nothing and returns NOT_CONFIGURED', () async {

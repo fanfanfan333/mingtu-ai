@@ -80,7 +80,10 @@ void main() {
     expect(monitor.announcementText(), '');
     monitor.report('location', ServiceHealthStatus.unavailable, 'GPS lost');
     expect(monitor.hasCriticalFailure, isTrue);
-    expect(monitor.announcementText(), contains('location'));
+    // v0.7: the announcement speaks Chinese service names, never the
+    // English identifier.
+    expect(monitor.announcementText(), contains('定位'));
+    expect(monitor.announcementText(), isNot(contains('location')));
   });
 
   test('skill registry denies disabled, unmet preconditions and high-risk without risk-ok', () {

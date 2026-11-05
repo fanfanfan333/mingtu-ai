@@ -125,6 +125,12 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   String _yoloText = 'YOLO：未接入。';
   bool _yoloLiveOpen = false;
   double? _yoloLatencyMs;
+  // v0.7 voice-first additions.
+  AmapStepSpeaker? _amapSpeaker;
+  bool _autoListenEnabled = false;
+  bool _welcomeListenPending = false;
+  bool _yoloRiskActive = false;
+  int _yoloEmptyFrames = 0;
 
   // Blind-first voice control: the command text is a simulation of a
   // real recogniser transcript until system ASR is integrated (see
@@ -179,6 +185,54 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _voiceText = '语音：TTS：${tts.status}；ASR：${asr.status}。';
       _yoloText = 'YOLO：${_yoloDetector.status}';
     });
+    // v0.7 hands-free entry: when the phone's recogniser is up, greet
+    // by voice and then listen -- a blind user must not have to find
+    // and tap a button on screen to start talking. Listening starts
+    // only after the greeting finishes (see _finishSpeech), so the
+    // microphone never hears the app's own voice as a command.
+    if (asrOk) {
+      _autoListenEnabled = true;
+      _welcomeListenPending = true;
+      _say(_request(
+        id: 'voice-welcome',
+        eventId: 'voice-welcome',
+        text: '明途已启动，语音识别已开启。请说一句话，例如带我去图书馆。',
+        kind: SpeechKind.info,
+      ));
+    }
+  }
+
+  /// Start one short ASR session, but only after speech has finished:
+  /// the turn-taking loop for a blind user. Called from
+  /// [_finishSpeech] (after the welcome greeting, and after every
+  /// prompt while a task is running) -- never while TTS is speaking.
+  void _maybeStartListeningAfterSpeech() {
+    if (!_autoListenEnabled || !_voiceInput.isAvailable) return;
+    if (_voiceInput is! SystemVoiceInput) return;
+    final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
+    if (input.isListening) return;
+    if (_welcomeListenPending) {
+      _welcomeListenPending = false;
+      _startListening();
+      return;
+    }
+    switch (_tasks.state) {
+      case TaskState.navigating:
+      case TaskState.paused:
+      case TaskState.avoidingObstacle:
+      case TaskState.findingEntrance:
+      case TaskState.indoorGuidance:
+      case TaskState.waitingConfirmation:
+      case TaskState.planning:
+      case TaskState.understanding:
+      case TaskState.preparing:
+      case TaskState.executing:
+      case TaskState.degraded:
+      case TaskState.listening:
+        _startListening();
+      default:
+        return;
+    }
   }
 
   @override
@@ -274,7 +328,12 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         straightSegmentConfirmed: _straightConfirmed,
         riskActive: _riskActive,
       );
-      if (next == null) return;
+      if (next == null) {
+        // Speech is done and nothing is queued: the turn-taking
+        // loop may open the microphone now (v0.7).
+        _maybeStartListeningAfterSpeech();
+        return;
+      }
       setState(() {
         _currentPrompt = next.text;
         _lastSpokenText = next.text;
@@ -477,6 +536,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     final RouteCandidate candidate = result.candidate!;
     final ScoredRoute scored =
         RouteScoring.scoreRoutes(<RouteCandidate>[candidate]).first;
+    // v0.7: keep the steps and speak the first one -- a blind user
+    // cannot read the step list from the screen.
+    _amapSpeaker = AmapStepSpeaker(result.steps);
+    final String? firstStep = _amapSpeaker!.nextStepText();
     setState(() {
       _amapText = '高德真实路线：距离 ${candidate.distanceM.toStringAsFixed(0)} 米，'
           '预计 ${candidate.durationS.toStringAsFixed(0)} 秒，'
@@ -492,7 +555,32 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       id: 'amap-route',
       eventId: 'amap-route',
       text: '高德已返回步行路线，距离 ${candidate.distanceM.toStringAsFixed(0)} 米。'
-          '注意：高德不提供盲道信息，这条路线不是安全路线。',
+          '注意：高德不提供盲道信息，这条路线不是安全路线。'
+          '${firstStep == null ? '' : '第一段：$firstStep'}',
+      kind: SpeechKind.info,
+    ));
+  }
+
+  /// v0.7: speak the next Amap walking step, in order. Saying
+  /// "下一步" while navigating speaks the next step; when the steps
+  /// run out it says so instead of inventing one.
+  void _speakNextAmapStep() {
+    final AmapStepSpeaker? speaker = _amapSpeaker;
+    if (speaker == null || speaker.isDone) {
+      _say(_request(
+        id: 'amap-step-done-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'amap-step-done-${DateTime.now().millisecondsSinceEpoch}',
+        text: '高德路段已播报完毕，没有下一段了。',
+        kind: SpeechKind.info,
+      ));
+      return;
+    }
+    final String? text = speaker.nextStepText();
+    if (text == null) return;
+    _say(_request(
+      id: 'amap-step-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'amap-step-${DateTime.now().millisecondsSinceEpoch}',
+      text: text,
       kind: SpeechKind.info,
     ));
   }
@@ -505,6 +593,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _logMsg('语音识别不可用：${_voiceInput.status}');
       return;
     }
+    _autoListenEnabled = true;
     final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
     final bool started = await input.startListening();
     if (!mounted) return;
@@ -517,6 +606,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   }
 
   Future<void> _stopListening() async {
+    // Manual stop also switches the turn-taking loop off, so the
+    // microphone does not reopen by itself after the next prompt.
+    _autoListenEnabled = false;
+    _welcomeListenPending = false;
     if (_voiceInput is SystemVoiceInput) {
       await (_voiceInput as SystemVoiceInput).stopListening();
     }
@@ -526,13 +619,81 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     });
   }
 
+  /// COCO classes that can be in a blind user's path, with their
+  /// Chinese names for speech. Any other class is tracked but never
+  /// treated as an obstacle.
+  static const Map<String, String> _yoloObstacleLabels = <String, String>{
+    'person': '行人',
+    'bicycle': '自行车',
+    'car': '汽车',
+    'motorcycle': '摩托车',
+    'bus': '公交车',
+    'truck': '卡车',
+  };
+
   /// v0.6: feed one YOLO frame's detections into the tracking /
-  /// dedup pipeline. New tracks are reported as perception text;
-  /// no step direction is ever derived here from a box's position.
+  /// dedup pipeline. v0.7: a NEW track of a person/vehicle class now
+  /// also enters the risk/speech loop -- it speaks a warning and
+  /// stops straight prompts. It still never yields a step direction:
+  /// a detection box has no distance, so no left/right step is ever
+  /// spoken from YOLO alone. The risk clears only after 3 consecutive
+  /// frames without such a detection, and straight never auto-resumes.
   void _onYoloDetections(List<Detection> detections) {
     final DateTime now = DateTime.now();
     final List<PerceptionEvent> events =
         _perception.processFrame(detections, now);
+    final bool hasObstacleNow = detections.any((Detection d) =>
+        _yoloObstacleLabels.containsKey(d.label) && d.confidence >= 0.3);
+    if (hasObstacleNow) {
+      _yoloEmptyFrames = 0;
+    } else {
+      _yoloEmptyFrames += 1;
+    }
+    final List<PerceptionEvent> newObstacles = events
+        .where((PerceptionEvent e) =>
+            e.isNewTrack && _yoloObstacleLabels.containsKey(e.label))
+        .toList();
+    if (newObstacles.isNotEmpty &&
+        !_yoloRiskActive &&
+        (_tasks.state == TaskState.navigating ||
+            _tasks.state == TaskState.avoidingObstacle)) {
+      _yoloRiskActive = true;
+      if (_tasks.state == TaskState.navigating) {
+        _tasks.transitionTo(TaskState.avoidingObstacle,
+            trigger: 'yolo-obstacle');
+        _stopStraightTimer();
+        _scheduler.pauseStraight();
+      }
+      setState(() {
+        _riskActive = true;
+        _straightConfirmed = false;
+      });
+      final String names = newObstacles
+          .map((PerceptionEvent e) =>
+              _yoloObstacleLabels[e.label] ?? e.label)
+          .join('、');
+      _say(_request(
+        id: 'yolo-obstacle-${now.millisecondsSinceEpoch}',
+        eventId: 'yolo-obstacle-${now.millisecondsSinceEpoch}',
+        text: '前方检测到$names，请注意。暂未确认距离，不给避让方向，请停下或寻求帮助。',
+        kind: SpeechKind.obstacleAvoidance,
+      ));
+    } else if (_yoloRiskActive && _yoloEmptyFrames >= 3) {
+      _yoloRiskActive = false;
+      if (_tasks.state == TaskState.avoidingObstacle) {
+        _tasks.transitionTo(TaskState.navigating, trigger: 'yolo-cleared');
+      }
+      setState(() {
+        _riskActive = false;
+        _straightConfirmed = false;
+      });
+      _say(_request(
+        id: 'yolo-cleared-${now.millisecondsSinceEpoch}',
+        eventId: 'yolo-cleared-${now.millisecondsSinceEpoch}',
+        text: '前方已无检测到的障碍。请说继续，重新确认直行路段后再走。',
+        kind: SpeechKind.info,
+      ));
+    }
     setState(() {
       _perceptionText = 'YOLO 实时：${detections.length} 个检测，'
           '新跟踪事件 ${events.length} 条，跟踪目标 ${_perception.tracks.length} 个。'
@@ -554,6 +715,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     setState(() {
       _straightConfirmed = true;
       _straightNavVersion = _navVersion;
+      // v0.7: navigation starts the camera too -- a blind user must
+      // not have to find and tap a button to turn perception on.
+      // On web this shows the phone-only stub text.
+      _yoloLiveOpen = true;
     });
     _startStraightTimer();
     _logMsg('开始导航：直行路段已确认，3 秒直行节奏已启动。');
@@ -652,6 +817,15 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _logMsg('直行恢复：导航版本已变化，已重新确认当前路段后重启计时器，'
           '旧直行指令未补播。');
     }
+    // v0.7: the re-confirmation must be HEARD, not only logged --
+    // a blind user cannot see the log line.
+    _say(_request(
+      id: 'straight-resumed-${now.millisecondsSinceEpoch}',
+      eventId: 'straight-resumed-${now.millisecondsSinceEpoch}',
+      text: '已重新确认直线路段，继续直走。',
+      kind: SpeechKind.straight,
+      requiresStraight: true,
+    ));
   }
 
   void _obstacleUncertain() {
@@ -998,6 +1172,9 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       return;
     }
     _tasks.transitionTo(TaskState.completed, trigger: 'confirm-complete');
+    setState(() {
+      _yoloLiveOpen = false;
+    });
     _logMsg('任务已完成。请选择保留或删除本地录像。');
     _say(_request(
       id: 'task-completed',
@@ -1203,7 +1380,15 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         }
         return;
       case VoiceCommand.resume:
-        if (_tasks.state == TaskState.paused) {
+        // v0.7: while navigating with straight unconfirmed and no
+        // risk, "继续" re-confirms the straight segment (e.g. after a
+        // YOLO obstacle cleared). It never resumes straight while a
+        // risk is active -- _reconfirmStraight refuses that.
+        if (_tasks.state == TaskState.navigating &&
+            !_straightConfirmed &&
+            !_riskActive) {
+          _reconfirmStraight();
+        } else if (_tasks.state == TaskState.paused) {
           // Resume to navigating, but do NOT restart the straight timer:
           // the user must re-confirm the straight segment first. This is
           // the blind-first safety rule, not a convenience shortcut.
@@ -1277,16 +1462,22 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         ));
         return;
       case VoiceCommand.confirmStep:
-        // v0.5: indoor steps are now voice-confirmable. Outside indoor
-        // guidance there is no step to confirm, and the answer says so
-        // instead of advancing an unrelated task.
+        // v0.5: indoor steps are now voice-confirmable. v0.7: while
+        // navigating, "下一步" speaks the next Amap step instead.
+        // Outside those states there is no step to confirm, and the
+        // answer says so instead of advancing an unrelated task.
         if (_tasks.state == TaskState.indoorGuidance) {
           _indoorStep();
+        } else if ((_tasks.state == TaskState.navigating ||
+                _tasks.state == TaskState.planning) &&
+            _amapSpeaker != null &&
+            !_amapSpeaker!.isDone) {
+          _speakNextAmapStep();
         } else {
           _say(_request(
             id: 'voice-confirm-no-${DateTime.now().millisecondsSinceEpoch}',
             eventId: 'voice-confirm-no-${DateTime.now().millisecondsSinceEpoch}',
-            text: '当前没有室内步骤可以确认。',
+            text: '当前没有室内步骤可以确认，也没有未播报的高德路段。',
             kind: SpeechKind.info,
           ));
         }
@@ -1413,6 +1604,8 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     setState(() {
       _riskActive = true;
       _straightConfirmed = false;
+      _yoloLiveOpen = false;
+      _yoloRiskActive = false;
       _emergencyText = '${result.statusText}'
           '已联系帮助站：${result.contactClaimed}（v0.2 永不宣称已联系）。'
           '备用：${result.fallbackOptions.join('；')}';
@@ -1473,8 +1666,11 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _llmText = '未申请云端调用。';
       _perceptionText = '尚未模拟感知帧。';
       _amapText = '高德真实路线：未请求。';
+      _amapSpeaker = null;
       _yoloLiveOpen = false;
       _yoloLatencyMs = null;
+      _yoloRiskActive = false;
+      _yoloEmptyFrames = 0;
       _trafficText = '路口信息未提示（只提示，不放行）。';
     });
     _logMsg('演示已重置（重新开始演示，非任务状态迁移）。');
@@ -1505,7 +1701,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   Widget build(BuildContext context) {
     final TaskState state = _tasks.state;
     return Scaffold(
-      appBar: AppBar(title: const Text('明途 AI v0.6（演示原型）')),
+      appBar: AppBar(title: const Text('明途 AI v0.7（演示原型）')),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -1633,6 +1829,30 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
                   _yoloLiveOpen = !_yoloLiveOpen;
                 });
               },
+            ),
+            _demoButton(
+              label: '模拟 YOLO 检测：前方行人（演示，无摄像头）',
+              semanticsLabel: '模拟 YOLO 检测前方行人',
+              onPressed: state == TaskState.navigating
+                  ? () => _onYoloDetections(const <Detection>[
+                        Detection(
+                            label: 'person',
+                            confidence: 0.9,
+                            cx: 0.5,
+                            cy: 0.5),
+                      ])
+                  : null,
+            ),
+            _demoButton(
+              label: '模拟 YOLO：连续 3 帧前方无障碍（演示）',
+              semanticsLabel: '模拟 YOLO 前方无障碍',
+              onPressed: state == TaskState.avoidingObstacle
+                  ? () {
+                      for (int i = 0; i < 3; i++) {
+                        _onYoloDetections(const <Detection>[]);
+                      }
+                    }
+                  : null,
             ),
             if (_yoloLiveOpen)
               SizedBox(

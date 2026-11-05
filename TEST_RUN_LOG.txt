@@ -181,3 +181,23 @@ v0.6 real integrations (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
   real Amap call/billing/quota, real YOLO model download/latency,
   GPS, site-verified locations, real-road safety, blind-user field
   validation, iOS (no iOS platform generated).
+
+v0.7 voice audit fixes (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
+- Health announcement now speaks Chinese service names (was English
+  identifiers); Amap steps speakable one at a time (AmapStepSpeaker);
+  hands-free turn-taking listen loop (welcome greeting, then listen
+  again after each prompt finishes, only while a task runs; manual
+  stop disables it); YOLO person/vehicle tracks warn by voice and
+  stop straight, clear after 3 empty frames without auto-resume;
+  "继续" re-confirms straight while navigating; camera auto-opens
+  on navigation start, closes on emergency/complete.
+- flutter analyze: No issues found!
+- flutter test: 62/62 passed (57 previous + 4 new v0.7 pure-Dart
+  audit tests + 1 new v0.7 widget test; two older tests updated to
+  the v0.7 wording: health announcement Chinese names, wake-word
+  alternative is now the turn-taking loop).
+- flutter build web: Built build/web; output not committed, not run
+  in a browser in this VM (no Chrome).
+- NOT verified: phone run, real TTS/ASR quality and noisy-environment
+  recognition, real YOLO latency/miss rate, real Amap call, GPS,
+  site-verified locations, real-road safety, blind-user field validation.

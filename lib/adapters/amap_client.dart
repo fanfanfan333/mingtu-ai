@@ -126,6 +126,37 @@ double _asDouble(Object? value) {
   return 0;
 }
 
+/// Speaks Amap walking steps one at a time, in order, for a blind
+/// user. v0.7: before this, a real Amap route only announced its
+/// total distance and left the step instructions as screen text.
+/// The speaker never invents a step: when the steps run out it says
+/// so and returns null.
+class AmapStepSpeaker {
+  final List<AmapStep> steps;
+  int _index = 0;
+
+  AmapStepSpeaker(this.steps);
+
+  int get remaining => steps.length - _index;
+  bool get isDone => _index >= steps.length;
+
+  /// The next step's spoken text, or null when all steps are spoken.
+  String? nextStepText() {
+    if (isDone) return null;
+    final AmapStep step = steps[_index];
+    _index += 1;
+    final String road = step.road.isEmpty ? '' : '，${step.road}';
+    final String instruction =
+        step.instruction.isEmpty ? '继续向前' : step.instruction;
+    return '$instruction$road，约 ${step.distanceM.toStringAsFixed(0)} 米。'
+        '（第 $_index 段，共 ${steps.length} 段）';
+  }
+
+  void reset() {
+    _index = 0;
+  }
+}
+
 class AmapWalkingClient {
   final String apiKey;
   final String baseUrl;
