@@ -41,7 +41,11 @@ void main() {
     // Advance fake time past the demo's simulated 1200 ms speech
     // completion delay, so no delayed timer is still pending at
     // test teardown. This does not advance the real demo clock.
-    await tester.pump(const Duration(milliseconds: 1500));
+    // v0.6 chains one 1200 ms completion timer per queued prompt,
+    // so drain the queue with several pumps before teardown.
+    for (int i = 0; i < 6; i++) {
+      await tester.pump(const Duration(milliseconds: 1500));
+    }
     expect(find.text('当前任务状态：紧急求助中'), findsOneWidget);
   });
 }

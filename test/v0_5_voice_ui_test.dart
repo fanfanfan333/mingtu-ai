@@ -39,7 +39,10 @@ void main() {
     expect(find.textContaining('understanding'), findsNothing);
     expect(find.textContaining('paused'), findsNothing);
     // Advance past the demo's simulated 1200 ms speech completion
-    // delay, so no timer is pending at teardown (as in demo_flow_test).
-    await tester.pump(const Duration(milliseconds: 1500));
+    // delays, so no timer is pending at teardown (v0.6 chains one
+    // timer per queued prompt).
+    for (int i = 0; i < 6; i++) {
+      await tester.pump(const Duration(milliseconds: 1500));
+    }
   });
 }

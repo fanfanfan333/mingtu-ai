@@ -1,4 +1,12 @@
-# 明途 AI v0.5
+# 明途 AI v0.6
+
+## v0.6（2026-11-05）新增：高德、YOLO、真实语音接成真代码（真机待验证）
+
+- 真实语音：`flutter_tts`（系统 TTS，zh-CN）+ `speech_to_text`（系统识别，单次最长 10 秒，非持续监听）；播报等 TTS 真正播完才算播完，引擎失败回退演示播报；无引擎时报 NOT_CONFIGURED。
+- 高德：Web 服务步行路线 REST 客户端，Key 与现场坐标只从 `--dart-define` 读；无 Key/无坐标不编路线；真实路线仍按无障碍 UNKNOWN 计分，不宣称“安全路线”。
+- YOLO：官方 `ultralytics_yolo` 插件，单图推理 + 实时摄像头视图（条件导入，网页用桩）；模型默认 `yolo11n`，结果进跟踪去重，只报告检测，不给行走方向。新增 `android/` 工程（minSdk 24，相机/录音/定位权限）。
+- 接入说明与真机跑法见 `docs/REAL_INTEGRATIONS_V06.md`；**真机调用、延迟、识别率都仍未验证**，只能在用户手机上跑一次才算数。
+- 验证（VM 内，2026-11-05）：`flutter analyze` 无问题，`flutter test` 57/57，`flutter build web` 成功；网页产物未在浏览器中点按验证，真机/Android 构建仍未做。
 
 ## v0.5（2026-11-05）新增：盲人优先再审计——看不见屏幕也能安全用
 

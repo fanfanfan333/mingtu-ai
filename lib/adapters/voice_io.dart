@@ -2,17 +2,18 @@
 ///
 /// Blind-first rule: every prompt the app produces must be speakable,
 /// and every control the app offers must be reachable by voice. These
-/// interfaces are that contract. They are NOT a real TTS/ASR
-/// integration: no system TTS or recogniser plugin is wired in yet,
-/// so on a real phone the app today still cannot actually speak or
-/// listen. The [UnavailableVoiceOutput] / [UnavailableVoiceInput]
-/// implementations exist precisely so that gap is reported as
-/// NOT_CONFIGURED instead of being faked.
+/// interfaces are that contract.
 ///
-/// A future phone implementation must implement these two interfaces
-/// with the platform system TTS/ASR (never a custom audio hack that
-/// bypasses the user's accessibility settings), and must feed
-/// recognised text into parseVoiceCommand, never into a state setter.
+/// v0.6: the real implementations now exist in
+/// `system_voice_io.dart` ([SystemVoiceOutput] via flutter_tts,
+/// [SystemVoiceInput] via speech_to_text), using the phone's own
+/// system engines -- never a custom audio hack that bypasses the
+/// user's accessibility settings. Recognised text is fed into
+/// parseVoiceCommand, never into a state setter. The
+/// [UnavailableVoiceOutput] / [UnavailableVoiceInput] implementations
+/// below are still the fallback: when no engine is reachable (web
+/// without a voice, VM, test harness, denied permission) the gap is
+/// reported as NOT_CONFIGURED instead of being faked.
 library;
 
 /// v0.4 explicit scope decision: continuous wake-word detection

@@ -2,10 +2,16 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'adapters/amap_client.dart';
 import 'adapters/bailian_client.dart';
+import 'adapters/system_voice_io.dart';
+import 'adapters/voice_io.dart';
+import 'adapters/yolo_detector.dart';
+import 'adapters/yolo_live_view.dart';
 import 'config/app_config.dart';
 import 'core/event_bus.dart';
 import 'core/health_monitor.dart';
+import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
 import 'core/voice_commands.dart';
@@ -107,6 +113,18 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   String _recordingText = '未开始录像。';
   String _llmText = '未申请云端调用。';
   String _perceptionText = '尚未模拟感知帧。';
+  // v0.6 real integrations. Defaults are the unavailable fallbacks;
+  // _initRealIntegrations replaces them only when the phone's own
+  // engine / model actually answers. Nothing here fakes a service.
+  VoiceOutput _voiceOutput = UnavailableVoiceOutput();
+  VoiceInput _voiceInput = UnavailableVoiceInput();
+  YoloDetector _yoloDetector = UnavailableYoloDetector();
+  StreamSubscription<String>? _transcriptSub;
+  String _voiceText = '语音：未初始化（演示文本播报）。';
+  String _amapText = '高德真实路线：未请求。';
+  String _yoloText = 'YOLO：未接入。';
+  bool _yoloLiveOpen = false;
+  double? _yoloLatencyMs;
 
   // Blind-first voice control: the command text is a simulation of a
   // real recogniser transcript until system ASR is integrated (see
@@ -118,8 +136,55 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   String _hospitalText = '医院挂号未开始（逻辑步骤演示，非真实挂号）。';
 
   @override
+  void initState() {
+    super.initState();
+    _initRealIntegrations();
+  }
+
+  /// Try the phone's own engines once at startup. Each adapter
+  /// reports unavailable instead of throwing, so a missing engine
+  /// (web, VM, test harness, denied permission) just leaves the
+  /// demo fallback in place.
+  Future<void> _initRealIntegrations() async {
+    // A dead engine must never hang startup: 3 s per engine, then
+    // the demo fallback stays in place.
+    final SystemVoiceOutput tts = SystemVoiceOutput();
+    final bool ttsOk = await tts
+        .initialize()
+        .timeout(const Duration(seconds: 3), onTimeout: () => false);
+    final SystemVoiceInput asr = SystemVoiceInput();
+    final bool asrOk = await asr
+        .initialize()
+        .timeout(const Duration(seconds: 3), onTimeout: () => false);
+    if (!mounted) return;
+    if (ttsOk) _voiceOutput = tts;
+    if (asrOk) {
+      _voiceInput = asr;
+      _transcriptSub = asr.transcripts.listen((String text) {
+        if (mounted) _handleVoiceCommand(text);
+      });
+    }
+    _yoloDetector = createYoloDetector(AppConfig.yoloModelPath);
+    _health.report(
+      'voice_output',
+      ttsOk ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
+      tts.status,
+    );
+    _health.report(
+      'voice_input',
+      asrOk ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
+      asr.status,
+    );
+    setState(() {
+      _voiceText = '语音：TTS：${tts.status}；ASR：${asr.status}。';
+      _yoloText = 'YOLO：${_yoloDetector.status}';
+    });
+  }
+
+  @override
   void dispose() {
     _straightTimer?.cancel();
+    _transcriptSub?.cancel();
     _voiceController.dispose();
     super.dispose();
   }
@@ -189,28 +254,61 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         _currentPrompt = '未播报（调度器已丢弃过期或重复提示）：${request.text}';
       }
     });
-    if (accepted) {
-      final String id = request.id;
-      Future<void>.delayed(const Duration(milliseconds: 1200), () {
-        if (!mounted) {
-          return;
-        }
-        if (_scheduler.active?.id == id) {
-          _scheduler.completeActive();
-          final SpeechRequest? next = _scheduler.promoteNext(
-            DateTime.now(),
-            straightSegmentConfirmed: _straightConfirmed,
-            riskActive: _riskActive,
-          );
-          setState(() {
-            if (next != null) {
-              _currentPrompt = next.text;
-            }
-          });
-        }
-      });
+    // v0.6: real TTS when the phone's engine is reachable; the
+    // prompt completes only when the engine reports completion.
+    // Otherwise the old simulated 1200 ms timing is used.
+    if (accepted && _scheduler.active?.id == request.id) {
+      _speakActive(request);
     }
     return accepted;
+  }
+
+  /// Shared completion step: mark the active prompt spoken, then
+  /// promote the next queued prompt if it is still valid -- and speak
+  /// it too, through the same real-or-simulated path.
+  void _finishSpeech(String id) {
+    if (_scheduler.active?.id == id) {
+      _scheduler.completeActive();
+      final SpeechRequest? next = _scheduler.promoteNext(
+        DateTime.now(),
+        straightSegmentConfirmed: _straightConfirmed,
+        riskActive: _riskActive,
+      );
+      if (next == null) return;
+      setState(() {
+        _currentPrompt = next.text;
+        _lastSpokenText = next.text;
+      });
+      _speakActive(next);
+    }
+  }
+
+  /// Speak the currently active prompt: real TTS when available,
+  /// simulated timing otherwise.
+  void _speakActive(SpeechRequest request) {
+    if (_voiceOutput.isAvailable) {
+      _voiceOutput.speak(request.text).then((_) {
+        if (mounted) _finishSpeech(request.id);
+      }).catchError((Object e) {
+        _logMsg('系统语音合成失败，已回退到演示文本播报：$e');
+        _voiceOutput = UnavailableVoiceOutput();
+        if (mounted) _simulateSpeechCompletion(request.id);
+        return null;
+      });
+    } else {
+      _simulateSpeechCompletion(request.id);
+    }
+  }
+
+  /// Demo fallback only: the old simulated 1200 ms completion, used
+  /// when no real TTS engine is reachable (web / VM / test).
+  void _simulateSpeechCompletion(String id) {
+    Future<void>.delayed(const Duration(milliseconds: 1200), () {
+      if (!mounted) {
+        return;
+      }
+      _finishSpeech(id);
+    });
   }
 
   void _startStraightTimer() {
@@ -268,11 +366,13 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       return;
     }
     // v0.4 health coverage, honest by construction: the demo map is a
-    // stub, the demo voice is text (not TTS), and there is no camera
-    // in this run. Reporting them here is why the health line below
-    // is not "everything is fine" in a demo.
+    // stub and there is no camera in this run. v0.6: voice_output is
+    // only degraded when no real TTS engine is reachable -- when the
+    // phone's engine is up, reporting it degraded would be a lie.
     _health.report('map_navigation', ServiceHealthStatus.degraded, '演示桩路线，非真实高德数据。');
-    _health.report('voice_output', ServiceHealthStatus.degraded, '演示文本播报，非真实系统 TTS。');
+    if (!_voiceOutput.isAvailable) {
+      _health.report('voice_output', ServiceHealthStatus.degraded, '演示文本播报，非真实系统 TTS。');
+    }
     _health.report('camera', ServiceHealthStatus.unavailable, '演示中无真实摄像头。');
     _recording.start('demo-recording', DateTime.now());
     setState(() {
@@ -338,6 +438,111 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       text: '已规划路线，正在开始导航。',
       kind: SpeechKind.info,
     ));
+  }
+
+  /// v0.6: fetch a REAL Amap walking route. Needs the Web Service key
+  /// plus on-site coordinates (AppConfig.amapFrom / amapTo, "lon,lat").
+  /// Without either, it reports NOT_CONFIGURED / missing coordinates
+  /// and never invents a route. The real candidate still scores with
+  /// accessibility UNKNOWN -- Amap gives no blind-path data.
+  Future<void> _fetchAmapRoute() async {
+    final GeoPoint? from = parseLonLat(AppConfig.amapFrom);
+    final GeoPoint? to = parseLonLat(AppConfig.amapTo);
+    final AmapWalkingClient client =
+        AmapWalkingClient(apiKey: AppConfig.amapApiKey);
+    if (!client.isConfigured) {
+      setState(() {
+        _amapText = '高德真实路线：NOT_CONFIGURED，未提供高德 Web 服务 Key。';
+      });
+      _logMsg('高德真实路线未请求：未提供 Key。');
+      return;
+    }
+    if (from == null || to == null) {
+      setState(() {
+        _amapText = '高德真实路线：未提供现场坐标（MINGTU_AMAP_FROM / MINGTU_AMAP_TO）。';
+      });
+      _logMsg('高德真实路线未请求：未提供现场坐标。');
+      return;
+    }
+    final AmapWalkingResult result =
+        await client.walkingRoute(from: from, to: to);
+    if (!mounted) return;
+    if (!result.ok || result.candidate == null) {
+      setState(() {
+        _amapText = '高德真实路线：${result.error ?? '调用失败'}';
+      });
+      _logMsg('高德真实路线调用失败：${result.error ?? '未知错误'}');
+      return;
+    }
+    final RouteCandidate candidate = result.candidate!;
+    final ScoredRoute scored =
+        RouteScoring.scoreRoutes(<RouteCandidate>[candidate]).first;
+    setState(() {
+      _amapText = '高德真实路线：距离 ${candidate.distanceM.toStringAsFixed(0)} 米，'
+          '预计 ${candidate.durationS.toStringAsFixed(0)} 秒，'
+          '${result.steps.length} 个路段，得分 ${scored.score.toStringAsFixed(3)}。'
+          '无障碍信息仍为 UNKNOWN，未按安全路线处理。';
+      _routeText = _amapText;
+    });
+    _health.report('map_navigation', ServiceHealthStatus.ok,
+        '高德步行路线已返回真实数据（无障碍信息仍未知）。');
+    _logMsg('高德真实路线已返回：${candidate.distanceM.toStringAsFixed(0)} 米，'
+        '${result.steps.length} 个路段。');
+    _say(_request(
+      id: 'amap-route',
+      eventId: 'amap-route',
+      text: '高德已返回步行路线，距离 ${candidate.distanceM.toStringAsFixed(0)} 米。'
+          '注意：高德不提供盲道信息，这条路线不是安全路线。',
+      kind: SpeechKind.info,
+    ));
+  }
+
+  /// v0.6: one short ASR session (max 10 s). Recognised text flows
+  /// through the transcript subscription into _handleVoiceCommand.
+  /// Not continuous listening: the session stops on silence.
+  Future<void> _startListening() async {
+    if (!_voiceInput.isAvailable) {
+      _logMsg('语音识别不可用：${_voiceInput.status}');
+      return;
+    }
+    final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
+    final bool started = await input.startListening();
+    if (!mounted) return;
+    setState(() {
+      _voiceText = started
+          ? '语音识别进行中：请说一句话（最长 10 秒，说完停顿即结束）。'
+          : '语音识别：开始失败，${_voiceInput.status}';
+    });
+    if (started) _logMsg('语音识别已开始：请说一句话。');
+  }
+
+  Future<void> _stopListening() async {
+    if (_voiceInput is SystemVoiceInput) {
+      await (_voiceInput as SystemVoiceInput).stopListening();
+    }
+    if (!mounted) return;
+    setState(() {
+      _voiceText = '语音：TTS：${_voiceOutput.status}；ASR：${_voiceInput.status}。';
+    });
+  }
+
+  /// v0.6: feed one YOLO frame's detections into the tracking /
+  /// dedup pipeline. New tracks are reported as perception text;
+  /// no step direction is ever derived here from a box's position.
+  void _onYoloDetections(List<Detection> detections) {
+    final DateTime now = DateTime.now();
+    final List<PerceptionEvent> events =
+        _perception.processFrame(detections, now);
+    setState(() {
+      _perceptionText = 'YOLO 实时：${detections.length} 个检测，'
+          '新跟踪事件 ${events.length} 条，跟踪目标 ${_perception.tracks.length} 个。'
+          '${_yoloLatencyMs == null ? '' : '单帧 ${_yoloLatencyMs!.toStringAsFixed(0)} 毫秒。'}';
+    });
+    if (events.isNotEmpty) {
+      final String labels =
+          events.map((PerceptionEvent e) => e.label).join('、');
+      _logMsg('YOLO 新跟踪：$labels（仅报告检测，不给行走方向）。');
+    }
   }
 
   void _startNavigating() {
@@ -1267,6 +1472,9 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _recordingText = '未开始录像。';
       _llmText = '未申请云端调用。';
       _perceptionText = '尚未模拟感知帧。';
+      _amapText = '高德真实路线：未请求。';
+      _yoloLiveOpen = false;
+      _yoloLatencyMs = null;
       _trafficText = '路口信息未提示（只提示，不放行）。';
     });
     _logMsg('演示已重置（重新开始演示，非任务状态迁移）。');
@@ -1297,7 +1505,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   Widget build(BuildContext context) {
     final TaskState state = _tasks.state;
     return Scaffold(
-      appBar: AppBar(title: const Text('明途 AI v0.5（演示原型）')),
+      appBar: AppBar(title: const Text('明途 AI v0.6（演示原型）')),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -1319,9 +1527,17 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             const SizedBox(height: 12),
             Text('配置状态：地图：${AppConfig.amapStatus}；'
                 'YOLO：${AppConfig.yoloStatus}；'
-                '语音：演示文本播报，非真实 TTS；'
                 '云端模型：${AppConfig.llmStatus}；'
                 '百炼：${AppConfig.bailianStatus}。'),
+            const SizedBox(height: 8),
+            // v0.6 real-integration status: TTS/ASR/YOLO/Amap report
+            // their own availability; "已接入" only appears when the
+            // phone's engine actually answered at startup.
+            Text(_voiceText),
+            const SizedBox(height: 8),
+            Text(_amapText),
+            const SizedBox(height: 8),
+            Text(_yoloText),
             const SizedBox(height: 8),
             // Refactor phase 1 health display: only reports services
             // that actually reported. Empty means "no degradation
@@ -1372,8 +1588,9 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             const Text(
-              '真实语音识别还没接入，下面这个输入框是演示代替：'
-              '输入一句话，点发送，就按语音指令解析执行。'
+              'v0.6：真机上点“开始语音识别”就是系统语音识别（单次最长 10 秒），'
+              '识别结果按语音指令解析执行；下面这个输入框是演示代替，'
+              '在网页 / 没有语音引擎时用。'
               '也可以直接点下面的暂停、继续、再说一遍、现在到哪了。',
             ),
             const SizedBox(height: 8),
@@ -1389,10 +1606,53 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             ),
             const SizedBox(height: 12),
             _demoButton(
+              label: '开始语音识别（真机，单次最长 10 秒）',
+              semanticsLabel: '开始语音识别',
+              onPressed: _voiceInput.isAvailable ? _startListening : null,
+            ),
+            _demoButton(
+              label: '停止语音识别',
+              semanticsLabel: '停止语音识别',
+              onPressed: _voiceInput.isAvailable ? _stopListening : null,
+            ),
+            _demoButton(
               label: '发送语音指令（演示）',
               semanticsLabel: '发送语音指令',
               onPressed: () => _handleVoiceCommand(_voiceController.text),
             ),
+            _demoButton(
+              label: '高德真实路线（需 Key 与现场坐标）',
+              semanticsLabel: '高德真实路线',
+              onPressed: _fetchAmapRoute,
+            ),
+            _demoButton(
+              label: _yoloLiveOpen ? '关闭 YOLO 实时摄像头' : '打开 YOLO 实时摄像头（真机）',
+              semanticsLabel: '打开或关闭 YOLO 实时摄像头',
+              onPressed: () {
+                setState(() {
+                  _yoloLiveOpen = !_yoloLiveOpen;
+                });
+              },
+            ),
+            if (_yoloLiveOpen)
+              SizedBox(
+                height: 320,
+                child: YoloLiveView(
+                  modelPath: AppConfig.yoloModelPath,
+                  onDetections: _onYoloDetections,
+                  onLatencyMs: (double ms) {
+                    setState(() {
+                      _yoloLatencyMs = ms;
+                    });
+                  },
+                  onError: (Object error) {
+                    _logMsg('YOLO 实时视图出错：$error');
+                    setState(() {
+                      _yoloText = 'YOLO：实时视图出错：$error';
+                    });
+                  },
+                ),
+              ),
             _demoButton(
               label: '暂停导航（语音）',
               semanticsLabel: '暂停导航',

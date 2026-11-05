@@ -1,7 +1,7 @@
 name: mingtu_ai
 description: "明途 AI v0.2：面向视障人士的校园出行辅助演示原型（盲人优先，本地优先，云端按需）。"
 publish_to: "none"
-version: 0.5.0+6
+version: 0.6.0+7
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
@@ -9,6 +9,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_tts: ^4.2.5
+  speech_to_text: ^7.5.0
+  ultralytics_yolo: ^0.7.1
 
 dev_dependencies:
   flutter_test:

@@ -5,9 +5,19 @@
 /// file committed to the repository. Run, for example:
 ///
 ///   flutter run --dart-define=MINGTU_AMAP_KEY=... \
-///     --dart-define=MINGTU_YOLO_MODEL_PATH=... \
+///     --dart-define=MINGTU_AMAP_FROM=116.4,39.9 \
+///     --dart-define=MINGTU_AMAP_TO=116.41,39.91 \
+///     --dart-define=MINGTU_YOLO_MODEL_PATH=yolo11n \
 ///     --dart-define=MINGTU_LLM_MODEL_ID=... \
 ///     --dart-define=MINGTU_DASHSCOPE_API_KEY=...
+///
+/// Amap coordinates are "lon,lat" (longitude first), read on site in
+/// the Amap app, never from memory. No GPS provider is wired yet, so a
+/// real Amap route needs MINGTU_AMAP_FROM / MINGTU_AMAP_TO supplied
+/// this way; without them the app reports NOT_CONFIGURED and never
+/// invents coordinates. YOLO model path defaults to the official
+/// model id 'yolo11n' (the plugin downloads it on the phone); an
+/// asset path such as 'assets/models/custom.tflite' also works.
 ///
 /// The DashScope key is only for the Bailian client
 /// (lib/adapters/bailian_client.dart). It is never committed, never
@@ -23,7 +33,11 @@ class AppConfig {
   static const String amapApiKey =
       String.fromEnvironment('MINGTU_AMAP_KEY');
   static const String yoloModelPath =
-      String.fromEnvironment('MINGTU_YOLO_MODEL_PATH');
+      String.fromEnvironment('MINGTU_YOLO_MODEL_PATH', defaultValue: 'yolo11n');
+  // Amap route endpoints, "lon,lat". Empty = not supplied.
+  static const String amapFrom =
+      String.fromEnvironment('MINGTU_AMAP_FROM');
+  static const String amapTo = String.fromEnvironment('MINGTU_AMAP_TO');
   static const String llmModelId =
       String.fromEnvironment('MINGTU_LLM_MODEL_ID');
   static const String dashscopeApiKey =

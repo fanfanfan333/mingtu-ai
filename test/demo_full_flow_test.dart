@@ -62,7 +62,12 @@ void main() {
 
     // Advance fake time past the demo's simulated speech-completion
     // delays so no delayed timer is pending at test teardown.
-    await tester.pump(const Duration(milliseconds: 1500));
+    // This flow queues ~15 prompts and v0.6 drains one per 1200 ms
+    // (each promoted prompt gets its own completion timer), so drain
+    // with enough pumps that no timer is pending at teardown.
+    for (int i = 0; i < 16; i++) {
+      await tester.pump(const Duration(milliseconds: 1500));
+    }
     expect(find.text('当前任务状态：已完成'), findsOneWidget);
   });
 }

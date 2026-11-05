@@ -155,3 +155,29 @@ v0.5 blind-first re-audit (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
 - flutter build web: Built build/web (69.9s); output not committed, not run in a browser in this VM (no Chrome).
 - NOT verified: phone run, real Amap/YOLO/ASR/TTS, real Bailian call/billing,
   site-verified locations, real-road safety, blind-user field validation.
+
+v0.6 real integrations (2026-11-05, VM, Flutter 3.47.9 / Dart 3.13.7):
+- flutter_tts 4.2.5 + speech_to_text 7.5.0 + ultralytics_yolo 0.7.1 added.
+  Android platform generated (flutter create --platforms=android),
+  minSdk 24 (LiteRT 2.3), permissions INTERNET/RECORD_AUDIO/CAMERA/
+  location in AndroidManifest.xml. Scaffold widget_test.dart deleted.
+- Voice: SystemVoiceOutput/Input with lazy plugin construction,
+  3 s init timeout each (a dead engine must not hang startup or
+  leave a misleading 'uninitialised' status); _say now completes
+  on real TTS completion and speaks the next queued prompt too.
+- Amap: Web Service walking REST client, injectable sender, key
+  redacted from errors, candidate stays UNKNOWN accessibility.
+- YOLO: conditional import (mobile plugin / web stub), single-image
+  detector + live YOLOView, results mapped to Detection centre and
+  fed to VisualPerception tracking/dedup.
+- flutter analyze: No issues found!
+- flutter test: 57/57 passed (49 previous + 7 new v0.6 pure-Dart
+  integration tests + 1 new v0.6 widget test; two v0.6 test issues
+  fixed along the way: engine-init timeout, chained completion
+  timers needing longer drains in widget tests).
+- flutter build web: Built build/web (80.1s); output not committed,
+  not run in a browser in this VM (no Chrome).
+- NOT verified: Android build, phone run, real TTS/ASR quality,
+  real Amap call/billing/quota, real YOLO model download/latency,
+  GPS, site-verified locations, real-road safety, blind-user field
+  validation, iOS (no iOS platform generated).
