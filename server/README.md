@@ -61,6 +61,17 @@ key's own provider, and numeric fields carry no other content.
 Operators must still use the providers' real keys -- never a
 short numeric string -- as the server secret.
 
+A malicious upstream could also encode information across
+several individually legitimate numeric or coordinate fields
+(a covert channel spread over many values). No per-field
+structural rule can close that either. This is likewise
+accepted, on an explicit trust basis: the upstream here IS
+Amap -- the issuer of the key itself -- so an upstream turned
+malicious would already hold the secret, and exfiltrating it
+to its own customer-facing responses would gain it nothing.
+The posture is "trust the upstream, accepted"; the proxy code
+is intentionally unchanged for this risk.
+
 ## Deploy (manual, not automated by this repo)
 
 Required environment on the server:

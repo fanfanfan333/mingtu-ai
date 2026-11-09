@@ -91,28 +91,133 @@ class CloudVisionCancellation {
   }
 }
 
+/// What the device camera is being used for right now.
+enum CameraUse { yoloLive, singleShot }
+
+/// The app's single camera arbiter: ONE owner for the whole app,
+/// shared by the YOLO live view and the one-shot still capture,
+/// so the two can never hold the camera at the same time.
+///
+/// Ownership rules:
+/// - [tryAcquire] succeeds only when the camera is free or
+///   already held for the SAME use; a different use is refused.
+/// - [release] only frees the camera for its current use.
+/// - Every in-flight cancellable camera request registers its
+///   token here; [cancelAllAndRelease] (app backgrounded /
+///   disposed) cancels ALL of them and frees the camera -- not
+///   just whichever token happens to be newest.
+class CameraOwnership {
+  CameraUse? _current;
+  final Set<CloudVisionCancellation> _cancellations =
+      <CloudVisionCancellation>{};
+
+  CameraUse? get current => _current;
+  bool get isHeld => _current != null;
+  bool isHeldBy(CameraUse use) => _current == use;
+  int get activeCancellations => _cancellations.length;
+
+  bool tryAcquire(CameraUse use) {
+    if (_current == use) {
+      // The live view is a persistent holder: acquiring it again
+      // (navigation start + manual toggle) is idempotent. A
+      // one-shot capture is an exclusive operation: a second
+      // acquire while one is in flight is REFUSED, so two
+      // captures can never overlap.
+      return use == CameraUse.yoloLive;
+    }
+    if (_current != null) return false;
+    _current = use;
+    return true;
+  }
+
+  void release(CameraUse use) {
+    if (_current == use) _current = null;
+  }
+
+  void registerCancellation(CloudVisionCancellation token) {
+    _cancellations.add(token);
+  }
+
+  void unregisterCancellation(CloudVisionCancellation token) {
+    _cancellations.remove(token);
+  }
+
+  /// Cancel every registered in-flight request and free the
+  /// camera. Called when the app goes to background or is
+  /// disposed: nothing camera-related may survive that.
+  void cancelAllAndRelease() {
+    for (final CloudVisionCancellation token in _cancellations) {
+      token.cancel();
+    }
+    _cancellations.clear();
+    _current = null;
+  }
+}
+
+/// Owns the cancellation token of the ONE cloud-vision run that
+/// may be active at a time. [begin] returns null when a run is
+/// already active: the caller must refuse the duplicate trigger
+/// WITHOUT creating a token -- the previous design overwrote a
+/// shared field with a fresh token on every call, orphaning the
+/// running run's token so background/dispose cancelled only the
+/// newest (idle) token and the real run could no longer be
+/// cancelled.
+class VisionRunManager {
+  CloudVisionCancellation? _active;
+
+  bool get isRunning => _active != null;
+  CloudVisionCancellation? get activeToken => _active;
+
+  CloudVisionCancellation? begin() {
+    if (_active != null) return null;
+    return _active = CloudVisionCancellation();
+  }
+
+  void end(CloudVisionCancellation token) {
+    if (identical(_active, token)) _active = null;
+  }
+
+  void cancelActive() {
+    _active?.cancel();
+  }
+}
+
 /// Routes frame capture so the camera is never double-opened:
-/// while the YOLO live view is running (it owns the camera), the
-/// frame comes from THAT view's capture (its most recent live
-/// frame) via [yoloSource]; otherwise a dedicated one-shot still
-/// is taken via [singleShotSource]. Exactly one source is used
-/// per trigger -- the two never run together.
+/// while the YOLO live view is running (it holds the camera via
+/// [CameraOwnership]), the frame comes from THAT view's capture
+/// (its most recent live frame) via [yoloSource]; otherwise a
+/// dedicated one-shot still is taken via [singleShotSource],
+/// which must first acquire [CameraUse.singleShot] ownership
+/// and releases it afterwards. Exactly one source is used per
+/// trigger -- the two never run together.
 class RoutedCameraFrameSource implements CameraFrameSource {
   final bool Function() yoloLiveActive;
   final CameraFrameSource yoloSource;
   final CameraFrameSource singleShotSource;
+  final CameraOwnership ownership;
 
   const RoutedCameraFrameSource({
     required this.yoloLiveActive,
     required this.yoloSource,
     required this.singleShotSource,
+    required this.ownership,
   });
 
   @override
-  Future<CameraFrameCapture> captureSingleFrame() {
+  Future<CameraFrameCapture> captureSingleFrame() async {
     if (yoloLiveActive()) {
       return yoloSource.captureSingleFrame();
     }
-    return singleShotSource.captureSingleFrame();
+    if (!ownership.tryAcquire(CameraUse.singleShot)) {
+      return CameraFrameCapture.failed(
+        CameraFrameFailure.unavailable,
+        detail: '摄像头正被其他功能占用。',
+      );
+    }
+    try {
+      return await singleShotSource.captureSingleFrame();
+    } finally {
+      ownership.release(CameraUse.singleShot);
+    }
   }
 }

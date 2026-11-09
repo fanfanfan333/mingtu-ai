@@ -135,9 +135,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // _yoloLiveOpen, which an initializer may not reference.
   late final CameraFrameSource _frameSource;
 
-  /// Cancellation token for the current cloud-vision run; a new
-  /// one is created per run, and lifecycle/dispose cancels it.
-  CloudVisionCancellation _visionCancellation = CloudVisionCancellation();
+  /// The app's single camera arbiter: the YOLO live view and
+  /// the one-shot still capture share it, so the camera can
+  /// never be double-opened, and background/dispose cancels
+  /// every registered in-flight request through it.
+  final CameraOwnership _cameraOwnership = CameraOwnership();
+
+  /// Owns the ONE active cloud-vision run's cancellation token.
+  /// A duplicate trigger is refused via begin() == null and
+  /// creates NO token (the old per-call field overwrite orphaned
+  /// the running run's token).
+  final VisionRunManager _visionRuns = VisionRunManager();
   // The sequenced flow: configured/rate-limit checks BEFORE the
   // camera opens, "正在识别" announced first, then one frame, then
   // one rate-limited describe call. Every step is spoken.
@@ -189,6 +197,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       yoloLiveActive: () => _yoloLiveOpen,
       yoloSource: createYoloFrameSource(),
       singleShotSource: createCameraFrameSource(),
+      ownership: _cameraOwnership,
     );
     _initRealIntegrations();
   }
@@ -203,10 +212,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached) {
-      _visionCancellation.cancel();
+      _visionRuns.cancelActive();
+      _cameraOwnership.cancelAllAndRelease();
       if (_yoloLiveOpen && mounted) {
         setState(() {
-          _yoloLiveOpen = false;
+          _closeYoloLiveView();
         });
         _logMsg('应用进入后台：已关闭 YOLO 实时摄像头并取消进行中的云端视觉识别。');
       }
@@ -368,7 +378,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _visionCancellation.cancel();
+    _visionRuns.cancelActive();
+    _cameraOwnership.cancelAllAndRelease();
     _straightTimer?.cancel();
     _transcriptSub?.cancel();
     _asrErrorSub?.cancel();
@@ -1007,6 +1018,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  /// Close the YOLO live view and hand the camera back to the
+  /// shared arbiter. Safe to call when the view is not open.
+  void _closeYoloLiveView() {
+    _yoloLiveOpen = false;
+    _cameraOwnership.release(CameraUse.yoloLive);
+  }
+
   void _startNavigating() {
     if (_tasks.state != TaskState.planning) {
       _logMsg('请先规划路线，再开始导航。');
@@ -1018,8 +1036,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _straightNavVersion = _navVersion;
       // v0.7: navigation starts the camera too -- a blind user must
       // not have to find and tap a button to turn perception on.
-      // On web this shows the phone-only stub text.
-      _yoloLiveOpen = true;
+      // On web this shows the phone-only stub text. The shared
+      // arbiter is acquired first: if a one-shot capture holds
+      // the camera, the live view does NOT open (no double-open)
+      // and navigation proceeds without it.
+      if (_cameraOwnership.tryAcquire(CameraUse.yoloLive)) {
+        _yoloLiveOpen = true;
+      } else {
+        _logMsg('开始导航：摄像头正被占用，YOLO 实时视图未打开（不双开摄像头）。');
+      }
     });
     _startStraightTimer();
     _logMsg('开始导航：直行路段已确认，3 秒直行节奏已启动。');
@@ -1471,7 +1496,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     _tasks.transitionTo(TaskState.completed, trigger: 'confirm-complete');
     setState(() {
-      _yoloLiveOpen = false;
+      _closeYoloLiveView();
     });
     _logMsg('任务已完成。请选择保留或删除本地录像。');
     _say(_request(
@@ -1604,39 +1629,62 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// only in the proxy's server environment; this device sends
   /// one downsampled frame to the proxy and nothing else.
   Future<void> _runCloudVisionAssist() async {
-    _visionCancellation = CloudVisionCancellation();
-    final CloudVisionCancellation token = _visionCancellation;
-    int seq = 0;
-    final CloudVisionFlowOutcome outcome = await _cloudVisionFlow.run(
-      cancellation: token,
-      announce: (String text) {
-        if (!mounted) return;
-        seq += 1;
-        setState(() {
-          _cloudVisionText = '云端视觉辅助：$text';
-        });
-        _say(_request(
-          id: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}-$seq',
-          eventId: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}-$seq',
-          text: text,
-          kind: SpeechKind.info,
-        ));
-      },
-    );
-    if (!mounted) return;
-    if (outcome.cancelled) {
-      _logMsg('云端视觉辅助：应用进入后台/销毁，识别已取消，结果已丢弃。');
+    // Duplicate trigger: refuse WITHOUT creating a token. The
+    // run in flight keeps its token, so background/dispose can
+    // still cancel it (the old code overwrote the shared token
+    // field on every call and orphaned the running run).
+    final CloudVisionCancellation? token = _visionRuns.begin();
+    if (token == null) {
+      _say(_request(
+        id: 'cloud-vision-busy-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'cloud-vision-busy-${DateTime.now().millisecondsSinceEpoch}',
+        text: CloudVisionResult.failed(CloudVisionFailure.busy).speechText,
+        kind: SpeechKind.alert,
+      ));
       return;
     }
-    final CloudVisionResult result = outcome.visionResult;
-    _health.report(
-      'cloud_vision',
-      result.ok ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
-      outcome.announcements.isEmpty
-          ? result.speechText
-          : outcome.announcements.last,
-    );
-    _logMsg('云端视觉辅助：ok=${result.ok}，failure=${result.failure}。');
+    _cameraOwnership.registerCancellation(token);
+    int seq = 0;
+    try {
+      final CloudVisionFlowOutcome outcome = await _cloudVisionFlow.run(
+        cancellation: token,
+        announce: (String text) {
+          if (!mounted) return;
+          seq += 1;
+          setState(() {
+            _cloudVisionText = '云端视觉辅助：$text';
+          });
+          _say(_request(
+            id: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}-$seq',
+            eventId:
+                'cloud-vision-${DateTime.now().millisecondsSinceEpoch}-$seq',
+            text: text,
+            // Critical delivery: recognition results, failures
+            // and camera-permission denials are high-priority
+            // (alert) and never expire -- they must not be
+            // dropped or interrupted by ordinary prompts.
+            kind: SpeechKind.alert,
+          ));
+        },
+      );
+      if (!mounted) return;
+      if (outcome.cancelled) {
+        _logMsg('云端视觉辅助：应用进入后台/销毁，识别已取消，结果已丢弃。');
+        return;
+      }
+      final CloudVisionResult result = outcome.visionResult;
+      _health.report(
+        'cloud_vision',
+        result.ok ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
+        outcome.announcements.isEmpty
+            ? result.speechText
+            : outcome.announcements.last,
+      );
+      _logMsg('云端视觉辅助：ok=${result.ok}，failure=${result.failure}。');
+    } finally {
+      _cameraOwnership.unregisterCancellation(token);
+      _visionRuns.end(token);
+    }
   }
 
   // v0.5: every state has a Chinese name. A blind user hearing the
@@ -1963,7 +2011,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     setState(() {
       _riskActive = true;
       _straightConfirmed = false;
-      _yoloLiveOpen = false;
+      _closeYoloLiveView();
       _yoloRiskActive = false;
       _emergencyText = '${result.statusText}'
           '已联系帮助站：${result.contactClaimed}（v0.2 永不宣称已联系）。'
@@ -2026,7 +2074,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _perceptionText = '尚未模拟感知帧。';
       _amapText = '高德真实路线：未请求。';
       _amapSpeaker = null;
-      _yoloLiveOpen = false;
+      _closeYoloLiveView();
       _yoloLatencyMs = null;
       _yoloRiskActive = false;
       _yoloEmptyFrames = 0;
@@ -2186,9 +2234,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
               label: _yoloLiveOpen ? '关闭 YOLO 实时摄像头' : '打开 YOLO 实时摄像头（真机）',
               semanticsLabel: '打开或关闭 YOLO 实时摄像头',
               onPressed: () {
-                setState(() {
-                  _yoloLiveOpen = !_yoloLiveOpen;
-                });
+                if (_yoloLiveOpen) {
+                  setState(() {
+                    _closeYoloLiveView();
+                  });
+                } else if (_cameraOwnership.tryAcquire(CameraUse.yoloLive)) {
+                  setState(() {
+                    _yoloLiveOpen = true;
+                  });
+                } else {
+                  _logMsg('摄像头正被占用，YOLO 实时视图未打开（不双开摄像头）。');
+                }
               },
             ),
             _demoButton(

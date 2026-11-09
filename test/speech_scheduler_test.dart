@@ -249,5 +249,47 @@ void main() {
       );
       expect(s.droppedDuplicateLog, contains('a1-again'));
     });
+
+    test(
+        'a cloud-vision style alert queued behind an emergency '
+        'is still delivered after its nominal expiry, while an '
+        'info prompt queued with it is dropped', () {
+      final s = SpeechScheduler();
+      final t0 = DateTime(2026, 11, 9, 12);
+      expect(
+        s.submit(
+          req('em', SpeechKind.emergency, at: t0, neverExpires: true),
+          t0,
+        ),
+        isTrue,
+      );
+      // Exactly how main._request builds a cloud-vision
+      // announcement: kind alert, 5 s nominal expiry, neverExpires.
+      expect(
+        s.submit(
+          req('vision-result', SpeechKind.alert, at: t0, neverExpires: true),
+          t0,
+        ),
+        isTrue,
+      );
+      expect(s.submit(req('chatter', SpeechKind.info, at: t0), t0), isTrue);
+      s.completeActive();
+      // The user hears the result 10 minutes late rather than
+      // never: stale safety/failure speech is still delivered.
+      final SpeechRequest? promoted = s.promoteNext(
+        t0.add(const Duration(minutes: 10)),
+        straightSegmentConfirmed: false,
+        riskActive: false,
+      );
+      expect(promoted?.id, 'vision-result');
+      s.completeActive();
+      final SpeechRequest? after = s.promoteNext(
+        t0.add(const Duration(minutes: 10)),
+        straightSegmentConfirmed: false,
+        riskActive: false,
+      );
+      expect(after, isNull);
+      expect(s.droppedExpiredLog, contains('chatter'));
+    });
   });
 }

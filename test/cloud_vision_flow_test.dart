@@ -296,17 +296,43 @@ void main() {
         FakeFrameSource(CameraFrameCapture.ok(_fakeImage(8)));
     final FakeFrameSource single =
         FakeFrameSource(CameraFrameCapture.ok(_fakeImage(8)));
+    final CameraOwnership ownership = CameraOwnership();
     final RoutedCameraFrameSource routed = RoutedCameraFrameSource(
       yoloLiveActive: () => yoloActive,
       yoloSource: yolo,
       singleShotSource: single,
+      ownership: ownership,
     );
     await routed.captureSingleFrame();
     expect(yolo.calls, 1);
     expect(single.calls, 0); // YOLO owns the camera: no second open
     yoloActive = false;
-    await routed.captureSingleFrame();
+    final CameraFrameCapture shot = await routed.captureSingleFrame();
+    expect(shot.ok, isTrue);
     expect(yolo.calls, 1);
     expect(single.calls, 1);
+    // The one-shot released the camera when it finished.
+    expect(ownership.isHeld, isFalse);
+  });
+
+  test(
+      'routed source refuses a still while the arbiter is held '
+      'by another use: no double-open', () async {
+    final CameraOwnership ownership = CameraOwnership();
+    expect(ownership.tryAcquire(CameraUse.yoloLive), isTrue);
+    final FakeFrameSource single =
+        FakeFrameSource(CameraFrameCapture.ok(_fakeImage(8)));
+    final RoutedCameraFrameSource routed = RoutedCameraFrameSource(
+      yoloLiveActive: () => false, // view flag lags; arbiter rules
+      yoloSource: FakeFrameSource(
+        CameraFrameCapture.failed(CameraFrameFailure.unavailable),
+      ),
+      singleShotSource: single,
+      ownership: ownership,
+    );
+    final CameraFrameCapture capture = await routed.captureSingleFrame();
+    expect(capture.ok, isFalse);
+    expect(capture.failure, CameraFrameFailure.unavailable);
+    expect(single.calls, 0); // camera was never opened twice
   });
 }
