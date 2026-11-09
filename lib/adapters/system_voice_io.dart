@@ -27,6 +27,7 @@ import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
+import '../core/asr_errors.dart';
 import '../core/voice_log.dart';
 import '../core/voice_startup.dart';
 import 'voice_io.dart';
@@ -208,7 +209,7 @@ class SystemVoiceInput implements VoiceInput {
   /// status string nobody was watching, so a recogniser dying
   /// mid-session was silent and the turn-taking loop kept retrying
   /// into the failure. Listeners get one event per platform error
-  /// ('<errorMsg>|permanent=<bool>') and are responsible for
+  /// ('<code>|permanent=<bool>') and are responsible for
   /// announcing it once and stopping the retry loop.
   Stream<String> get errors => _errorController.stream;
 
@@ -228,7 +229,11 @@ class SystemVoiceInput implements VoiceInput {
   Future<bool> _doInitialize(stt.SpeechToText speech) async {
     return speech.initialize(
       onError: (SpeechRecognitionError error) {
-        _detail = 'NOT_CONFIGURED（系统语音识别出错：${error.errorMsg}）';
+        // Whitelist discipline: the raw platform error string
+        // is normalised to a known code here and discarded;
+        // only the code and its fixed Chinese text travel on.
+        final String code = asrErrorCode(error.errorMsg);
+        _detail = 'NOT_CONFIGURED（${asrErrorText(code)}）';
         if (error.permanent) {
           // A permanent error blocks recognition until resolved;
           // claiming availability afterwards would be a lie.
@@ -237,7 +242,7 @@ class SystemVoiceInput implements VoiceInput {
         }
         if (!_errorController.isClosed) {
           _errorController.add(
-            '${error.errorMsg}|permanent=${error.permanent}',
+            '$code|permanent=${error.permanent}',
           );
         }
       },

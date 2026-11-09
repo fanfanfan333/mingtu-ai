@@ -13,6 +13,7 @@ import 'adapters/voice_io.dart';
 import 'adapters/yolo_detector.dart';
 import 'adapters/yolo_live_view.dart';
 import 'config/app_config.dart';
+import 'config/verified_locations.dart';
 import 'core/camera_frame.dart';
 import 'core/event_bus.dart';
 import 'core/cloud_vision.dart';
@@ -20,6 +21,10 @@ import 'core/health_monitor.dart';
 import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
+import 'core/asr_errors.dart';
+import 'core/danger_alerts.dart';
+import 'core/destination_dialogue.dart';
+import 'core/navigation_tracker.dart';
 import 'core/real_navigation.dart';
 import 'core/startup_guard.dart';
 import 'core/voice_log.dart';
@@ -186,6 +191,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   StreamSubscription<String>? _asrErrorSub;
   StreamSubscription<void>? _asrSessionSub;
   bool _yoloErrorAnnounced = false;
+
+  // Step 2 voice navigation flow state.
+  NavigationTracker? _liveNav;
+  StreamSubscription<LocationResult>? _gpsSub;
+  String _liveNavDestName = '';
+  double? _liveNavRemainingM;
+  DateTime? _lastGpsErrorAt;
+  bool _awaitingDestination = false;
+  int _destAttempts = 0;
+  bool _yoloAvailableAtStartup = false;
+  final DangerAlertGate _dangerGate = DangerAlertGate();
   // Voice P0 re-test fixes: once TTS has failed at runtime the app
   // is in a perceptible voice-failed state (no simulated success,
   // no automatic ASR restart); once an ASR error has been announced
@@ -267,6 +283,247 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     if (!mounted) return;
     _announceStartupFailures(speechUsable: speechUsable);
+    unawaited(_kickoffVoiceNavFlow(speechUsable));
+  }
+
+  /// Step 2 kickoff, after the startup announcements: request
+  /// the location permission up front, open the camera
+  /// (YOLO live view) automatically, then ask "你要去哪里？".
+  /// The whole flow needs working speech; when speech is down
+  /// the degradation has already been surfaced by the plan
+  /// (haptics + screen) and there is nothing honest to ask
+  /// with. Failures here are logged, never fatal to startup.
+  Future<void> _kickoffVoiceNavFlow(bool speechUsable) async {
+    try {
+      if (!speechUsable) return;
+      final bool locOk = await _locationProvider.ensurePermission();
+      if (!mounted) return;
+      if (_yoloAvailableAtStartup) {
+        unawaited(_openYoloLive());
+      }
+      if (!locOk) {
+        mingtuVoiceLog('启动权限：定位未授权，跳过目的地提问');
+        _say(_request(
+          id: 'perm-location-denied',
+          eventId: 'perm-location-denied',
+          text: '定位权限未开启，无法导航。请在系统设置里允许明途使用定位。',
+          kind: SpeechKind.alert,
+        ));
+        return;
+      }
+      if (_tasks.state == TaskState.idle) {
+        _askDestination();
+      }
+    } catch (_) {
+      mingtuVoiceLog('语音导航启动流程异常，已跳过（不影响其他功能）');
+    }
+  }
+
+  /// Ask the destination question and open the answer slot.
+  void _askDestination({String prompt = destinationAskText}) {
+    _awaitingDestination = true;
+    _destAttempts = 0;
+    if (mounted) setState(() {});
+    _say(_request(
+      id: 'ask-destination-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'ask-destination-${DateTime.now().millisecondsSinceEpoch}',
+      text: prompt,
+      kind: SpeechKind.info,
+    ));
+  }
+
+  /// A spoken answer to the destination question. Matched:
+  /// start real navigation. Unmatched: re-ask (bounded), never
+  /// guess a place.
+  void _answerDestination(String raw) {
+    final VerifiedLocation? loc = resolveDestinationAnswer(raw);
+    if (loc == null) {
+      _destAttempts += 1;
+      if (_destAttempts >= 3) {
+        _awaitingDestination = false;
+        _say(_request(
+          id: 'dest-giveup',
+          eventId: 'dest-giveup',
+          text: destinationGiveUpText(),
+          kind: SpeechKind.info,
+        ));
+      } else {
+        _say(_request(
+          id: 'dest-retry-$_destAttempts',
+          eventId: 'dest-retry-$_destAttempts',
+          text: destinationNotFoundText(),
+          kind: SpeechKind.info,
+        ));
+      }
+      return;
+    }
+    _awaitingDestination = false;
+    _say(_request(
+      id: 'dest-ok',
+      eventId: 'dest-ok',
+      text: '好的，去${loc.name}。',
+      kind: SpeechKind.info,
+    ));
+    _startRealNavigation(loc.name);
+  }
+
+  /// Begin GPS-tracked live navigation for a ready route:
+  /// build the tracker from the route's step geometry and
+  /// subscribe to the (once-converted) position stream.
+  void _beginLiveNavigation(
+      RealNavigationOutcome outcome, String destinationName) {
+    final AmapWalkingResult result = outcome.route!;
+    final List<String> texts = <String>[];
+    final AmapStepSpeaker collector = AmapStepSpeaker(result.steps);
+    while (true) {
+      final String? t = collector.nextStepText();
+      if (t == null) break;
+      texts.add(t);
+    }
+    _liveNav = NavigationTracker(
+      steps: result.steps,
+      stepTexts: texts,
+      destination: outcome.destination!.pointGcj02,
+      destinationName: destinationName,
+    );
+    _liveNavDestName = destinationName;
+    _liveNavRemainingM = _liveNav!.remainingM;
+    _amapSpeaker = AmapStepSpeaker(result.steps);
+    _gpsSub?.cancel();
+    _gpsSub = _locationProvider.positions().listen(
+          _onLiveNavFix,
+          onError: (Object e) => mingtuVoiceLog('定位流出错，实时导航提示暂停'),
+        );
+    _logMsg('实时导航已开始：GPS 跟踪中（转向/偏航/到达自动播报）。');
+  }
+
+  void _onLiveNavFix(LocationResult r) {
+    if (!mounted || _liveNav == null) return;
+    if (!r.ok) {
+      final DateTime now = DateTime.now();
+      if (_lastGpsErrorAt == null ||
+          now.difference(_lastGpsErrorAt!) > const Duration(seconds: 60)) {
+        _lastGpsErrorAt = now;
+        _say(_request(
+          id: 'gps-lost-$now',
+          eventId: 'gps-lost',
+          text: '定位信号中断，暂时无法更新你的位置。',
+          kind: SpeechKind.info,
+        ));
+      }
+      return;
+    }
+    final List<NavEvent> events = _liveNav!.onFix(NavFix(
+      point: r.pointGcj02!,
+      accuracyM: r.accuracyM,
+      at: DateTime.now(),
+    ));
+    setState(() {
+      _liveNavRemainingM = _liveNav!.remainingM;
+    });
+    for (final NavEvent e in events) {
+      _handleNavEvent(e);
+    }
+  }
+
+  void _handleNavEvent(NavEvent e) {
+    final String ts = '${DateTime.now().millisecondsSinceEpoch}';
+    switch (e.kind) {
+      case NavEventKind.turnAhead:
+        _say(_request(
+          id: 'nav-turn-$ts',
+          eventId: 'nav-turn-$ts',
+          text: e.text,
+          kind: SpeechKind.turn,
+        ));
+      case NavEventKind.weakSignal:
+        _say(_request(
+          id: 'nav-weak-$ts',
+          eventId: 'nav-weak-$ts',
+          text: e.text,
+          kind: SpeechKind.info,
+        ));
+      case NavEventKind.arrived:
+        _say(_request(
+          id: 'nav-arrived-$ts',
+          eventId: 'nav-arrived',
+          text: e.text,
+          kind: SpeechKind.alert,
+        ));
+        _endLiveNavigation();
+        if (_tasks.state == TaskState.navigating) {
+          _tasks.transitionTo(TaskState.completed, trigger: 'nav-arrived');
+          _tasks.reset();
+        }
+        _askDestination(prompt: '还要去别的地方吗？');
+      case NavEventKind.offRoute:
+        final RerouteDecision decision =
+            _liveNav!.rerouteDecision(DateTime.now());
+        if (decision == RerouteDecision.doIt) {
+          _say(_request(
+            id: 'nav-offroute-$ts',
+            eventId: 'nav-offroute-$ts',
+            text: '你已偏离路线，正在重新规划。',
+            kind: SpeechKind.info,
+          ));
+          unawaited(_rerouteLiveNavigation());
+        } else if (decision == RerouteDecision.exhausted) {
+          _say(_request(
+            id: 'nav-offroute-max-$ts',
+            eventId: 'nav-offroute-max',
+            text: '你已偏离路线。已经多次重新规划仍未回到路线，'
+                '先停下来确认位置，再说“去$_liveNavDestName”重新开始。',
+            kind: SpeechKind.alert,
+          ));
+        } else {
+          _say(_request(
+            id: 'nav-offroute-wait-$ts',
+            eventId: 'nav-offroute-wait-$ts',
+            text: '你已偏离路线。',
+            kind: SpeechKind.info,
+          ));
+        }
+    }
+  }
+
+  /// Re-plan from the current position after an off-route
+  /// event (already throttled by the tracker). Failure keeps
+  /// the old tracker running and is announced honestly.
+  Future<void> _rerouteLiveNavigation() async {
+    final RealNavigationStarter starter = RealNavigationStarter(
+      locationProvider: _locationProvider,
+      client: _amapClient,
+    );
+    final RealNavigationOutcome outcome = await starter.start(_liveNavDestName);
+    if (!mounted || _liveNav == null) return;
+    if (!outcome.ready) {
+      _say(_request(
+        id: 'nav-reroute-failed',
+        eventId: 'nav-reroute-failed',
+        text: '重新规划失败：${outcome.failureAnnouncement}',
+        kind: SpeechKind.alert,
+      ));
+      return;
+    }
+    _beginLiveNavigation(outcome, _liveNavDestName);
+    final String? first = _amapSpeaker?.nextStepText();
+    _say(_request(
+      id: 'nav-rerouted',
+      eventId: 'nav-rerouted',
+      text: '已重新规划路线。${first == null ? '' : '第一段：$first'}',
+      kind: SpeechKind.info,
+    ));
+  }
+
+  /// Stop GPS tracking and clear the live session. Called on
+  /// arrival, on 停下, on task end and on emergency: the
+  /// microphone/speech stop alone must not leave a phantom
+  /// navigation running.
+  void _endLiveNavigation() {
+    _gpsSub?.cancel();
+    _gpsSub = null;
+    _liveNav = null;
+    _liveNavRemainingM = null;
   }
 
   /// The single announcement site for startup failures: every
@@ -310,6 +567,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _amapClient = init.amapClient;
     _locationProvider = init.locationProvider;
     _yoloDetector = init.yolo;
+    _yoloAvailableAtStartup = init.yolo.isAvailable;
     final SystemVoiceOutput? tts = init.tts;
     final bool ttsOk = init.ttsOk;
     final SystemVoiceInput? asr = init.asr;
@@ -318,7 +576,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (asrOk && asr != null) {
       _voiceInput = asr;
       _transcriptSub = asr.transcripts.listen((String text) {
-        if (mounted) _handleVoiceCommand(text);
+        if (!mounted) return;
+        // While the destination question is open, an utterance
+        // that is not a known command IS the answer. A real
+        // command (停下 / 求助 / 去图书馆 ...) supersedes the
+        // question and takes the normal path.
+        if (_awaitingDestination) {
+          if (parseVoiceCommand(text) == VoiceCommand.unknown) {
+            _answerDestination(text);
+            return;
+          }
+          _awaitingDestination = false;
+        }
+        _handleVoiceCommand(text);
       });
       // ASR runtime errors surface through the adapter's error
       // stream (previously they only rewrote an unwatched status
@@ -396,7 +666,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// already failed), report it, and switch the turn-taking loop
   /// OFF so nothing retries listening into a dead recogniser.
   void _handleAsrError(String error) {
-    mingtuVoiceLog('语音识别运行出错，已停止自动再听：$error');
+    // The stream carries '<code>|permanent=<bool>' with the
+    // code already whitelisted by the adapter; every surface
+    // below uses the code's FIXED Chinese text, never a raw
+    // platform string.
+    final String code = error.split('|').first;
+    final String fixedText = asrErrorText(code);
+    mingtuVoiceLog('语音识别运行出错（$code）：$fixedText 已停止自动再听');
     if (_asrErrorAnnounced) return;
     _asrErrorAnnounced = true;
     _autoListenEnabled = false;
@@ -404,9 +680,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _health.report(
       'voice_input',
       ServiceHealthStatus.degraded,
-      '语音识别运行中出错：$error',
+      '语音识别运行中出错：$fixedText',
     );
-    _logMsg('语音识别运行中出错（$error）：已停止自动再听，不会循环重试。');
+    _logMsg('语音识别运行中出错（$fixedText）：已停止自动再听，不会循环重试。');
     if (_voiceOutput.isAvailable && !_ttsFailed) {
       _say(_request(
         id: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
@@ -416,7 +692,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       ));
     } else {
       setState(() {
-        _voiceText = '语音识别运行中出错：$error。已停止自动聆听。';
+        _voiceText = '语音识别运行中出错：$fixedText。已停止自动聆听。';
       });
     }
   }
@@ -470,6 +746,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _transcriptSub?.cancel();
     _asrErrorSub?.cancel();
     _asrSessionSub?.cancel();
+    _gpsSub?.cancel();
     _voiceController.dispose();
     super.dispose();
   }
@@ -587,9 +864,28 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  /// Close the microphone BEFORE any speech starts (Codex
+  /// re-test of 9f6542b): the recogniser must never hear the
+  /// app's own voice. _finishSpeech reopens it afterwards via
+  /// _maybeStartListeningAfterSpeech. The stop also fires the
+  /// adapter's sessionEnded signal, but _onAsrSessionEnded
+  /// refuses to relisten while the scheduler has an active
+  /// request, so this cannot race the speech it precedes.
+  void _pauseListeningForSpeech() {
+    final VoiceInput input = _voiceInput;
+    if (input is SystemVoiceInput && input.isListening) {
+      mingtuVoiceLog('播报开始：先暂停监听，避免听到自己的播报');
+      unawaited(input.stopListening().catchError((Object e) {
+        mingtuVoiceLog('暂停监听失败：停止监听异常，播报继续');
+        return null;
+      }));
+    }
+  }
+
   /// Speak the currently active prompt: real TTS when available,
   /// simulated timing otherwise.
   void _speakActive(SpeechRequest request) {
+    _pauseListeningForSpeech();
     if (_voiceOutput.isAvailable) {
       _voiceOutput.speak(request.text).then((_) {
         // Stop-race guard (Codex re-test): a request the user has
@@ -891,6 +1187,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           (firstStep == null ? '' : '第一段：$firstStep'),
       kind: SpeechKind.info,
     ));
+    // Step 2: from here the navigation is LIVE -- GPS fixes
+    // drive turn / off-route / arrival announcements until
+    // arrival, 停下, cancel or emergency ends the session.
+    _beginLiveNavigation(outcome, destinationName);
   }
 
   /// The on-screen "real route" button runs the same real
@@ -1085,12 +1385,40 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       final String names = newObstacles
           .map((PerceptionEvent e) => _yoloObstacleLabels[e.label] ?? e.label)
           .join('、');
-      _say(_request(
-        id: 'yolo-obstacle-${now.millisecondsSinceEpoch}',
-        eventId: 'yolo-obstacle-${now.millisecondsSinceEpoch}',
-        text: '前方检测到$names，请注意。暂未确认距离，不给避让方向，请停下或寻求帮助。',
-        kind: SpeechKind.obstacleAvoidance,
-      ));
+      _logMsg('YOLO 危险：$names（播报受同类冷却限制）。');
+      // Step 2 danger alerts: short imperative text, alert
+      // priority (above navigation prompts), per-category
+      // cooldown so a persistent obstacle cannot spam. The
+      // risk STATE above changes regardless of the gate; only
+      // the speech is debounced.
+      final List<DangerCategory> categories = newObstacles
+          .map((PerceptionEvent e) => dangerCategoryFor(e.label))
+          .toSet()
+          .toList()
+        ..sort((DangerCategory a, DangerCategory b) =>
+            dangerPriority(a).compareTo(dangerPriority(b)));
+      DangerCategory? chosen;
+      for (final DangerCategory c in categories) {
+        if (_dangerGate.tryPass(c, now)) {
+          chosen = c;
+          break;
+        }
+      }
+      if (chosen != null) {
+        String otherName = '障碍物';
+        if (chosen == DangerCategory.other) {
+          final PerceptionEvent firstOther = newObstacles.firstWhere(
+              (PerceptionEvent e) =>
+                  dangerCategoryFor(e.label) == DangerCategory.other);
+          otherName = _yoloObstacleLabels[firstOther.label] ?? firstOther.label;
+        }
+        _say(_request(
+          id: 'yolo-danger-${now.millisecondsSinceEpoch}',
+          eventId: 'yolo-danger-${now.millisecondsSinceEpoch}',
+          text: dangerTextFor(chosen, otherName: otherName),
+          kind: SpeechKind.alert,
+        ));
+      }
     } else if (_yoloRiskActive && _yoloEmptyFrames >= 3) {
       _yoloRiskActive = false;
       if (_tasks.state == TaskState.avoidingObstacle) {
@@ -1805,6 +2133,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final VoiceCommand command = parseVoiceCommand(raw);
     switch (command) {
       case VoiceCommand.emergency:
+        _endLiveNavigation();
         _triggerEmergency();
         return;
       case VoiceCommand.startLibrary:
@@ -1840,9 +2169,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           // Sequenced: cancel old speech, WAIT for the engine stop
           // (or timeout), then speak the confirmation -- see
           // _stopSpeechThenConfirm.
+          final bool wasLiveNav = _liveNav != null;
+          if (wasLiveNav) _endLiveNavigation();
           unawaited(_stopSpeechThenConfirm(
             idPrefix: 'voice-pause',
-            confirmText: '已暂停导航，直行提醒已停止。说继续可以恢复，但要重新确认直行路段。',
+            confirmText: wasLiveNav
+                ? '已停下，实时导航已结束。'
+                : '已暂停导航，直行提醒已停止。说继续可以恢复，但要重新确认直行路段。',
           ));
         } else {
           _say(_request(
@@ -1888,6 +2221,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       case VoiceCommand.cancel:
         if (_tasks.canTransitionTo(TaskState.cancelled)) {
           _tasks.transitionTo(TaskState.cancelled, trigger: 'voice-cancel');
+          _endLiveNavigation();
           _stopStraightTimer();
           _scheduler.pauseStraight();
           // P0 + re-test: same sequenced stop semantics as pause.
@@ -2175,6 +2509,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 
+  /// The one big status line for the companion / TalkBack:
+  /// live navigation wins, then the open destination
+  /// question, then task state, then camera state.
+  String _bigStatusText() {
+    if (_liveNav != null) {
+      final double? r = _liveNavRemainingM;
+      return '导航中：$_liveNavDestName${r == null ? '' : ' ${r.round()} 米'}';
+    }
+    if (_awaitingDestination) return '请告诉我要去哪里';
+    if (_tasks.state == TaskState.navigating) return '导航中';
+    if (_yoloLiveOpen) return '摄像头已开启';
+    return '明途';
+  }
+
   @override
   Widget build(BuildContext context) {
     final TaskState state = _tasks.state;
@@ -2185,6 +2533,84 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
+            // Step 2 voice-first layout: the camera view and
+            // ONE large status line lead the page (this is what
+            // a sighted companion watches); the detailed demo
+            // panel remains below for review. TalkBack reads
+            // the status through the live region.
+            Semantics(
+              liveRegion: true,
+              label: '当前状态',
+              child: Text(
+                _bigStatusText(),
+                style:
+                    const TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (_yoloLiveOpen)
+              SizedBox(
+                height: 320,
+                child: YoloLiveView(
+                  modelPath: AppConfig.yoloModelPath,
+                  onDetections: _onYoloDetections,
+                  onLatencyMs: (double ms) {
+                    setState(() {
+                      _yoloLatencyMs = ms;
+                    });
+                  },
+                  onError: (Object error) {
+                    // The raw error is NOT surfaced (it can
+                    // embed paths); the user hears a fixed
+                    // Chinese announcement once, and the reason
+                    // class goes to the MingtuVoice log.
+                    mingtuVoiceLog('YOLO 实时视图出错：模型或摄像头不可用');
+                    _logMsg('YOLO 实时视图出错：目标检测模型或摄像头不可用。');
+                    setState(() {
+                      _yoloText = 'YOLO：实时视图出错，目标检测不可用';
+                    });
+                    if (!_yoloErrorAnnounced) {
+                      _yoloErrorAnnounced = true;
+                      _health.report(
+                        'yolo',
+                        ServiceHealthStatus.unavailable,
+                        '实时视图出错：模型或摄像头不可用',
+                      );
+                      _say(_request(
+                        id: 'yolo-view-error',
+                        eventId: 'yolo-view-error',
+                        text: '目标检测模型加载失败，YOLO 实时检测不可用。',
+                        kind: SpeechKind.alert,
+                      ));
+                    }
+                  },
+                ),
+              ),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: SizedBox(
+                    height: 64,
+                    child: ElevatedButton(
+                      onPressed: () => _handleVoiceCommand('停下'),
+                      child: const Text('停下', style: TextStyle(fontSize: 22)),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: SizedBox(
+                    height: 64,
+                    child: ElevatedButton(
+                      onPressed: () => _askDestination(),
+                      child:
+                          const Text('重新问目的地', style: TextStyle(fontSize: 22)),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
             const Text(
               '明途 AI：面向视障人士的校园出行辅助演示原型。',
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
@@ -2335,44 +2761,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                     }
                   : null,
             ),
-            if (_yoloLiveOpen)
-              SizedBox(
-                height: 320,
-                child: YoloLiveView(
-                  modelPath: AppConfig.yoloModelPath,
-                  onDetections: _onYoloDetections,
-                  onLatencyMs: (double ms) {
-                    setState(() {
-                      _yoloLatencyMs = ms;
-                    });
-                  },
-                  onError: (Object error) {
-                    // The raw error is NOT surfaced (it can
-                    // embed paths); the user hears a fixed
-                    // Chinese announcement once, and the reason
-                    // class goes to the MingtuVoice log.
-                    mingtuVoiceLog('YOLO 实时视图出错：模型或摄像头不可用');
-                    _logMsg('YOLO 实时视图出错：目标检测模型或摄像头不可用。');
-                    setState(() {
-                      _yoloText = 'YOLO：实时视图出错，目标检测不可用';
-                    });
-                    if (!_yoloErrorAnnounced) {
-                      _yoloErrorAnnounced = true;
-                      _health.report(
-                        'yolo',
-                        ServiceHealthStatus.unavailable,
-                        '实时视图出错：模型或摄像头不可用',
-                      );
-                      _say(_request(
-                        id: 'yolo-view-error',
-                        eventId: 'yolo-view-error',
-                        text: '目标检测模型加载失败，YOLO 实时检测不可用。',
-                        kind: SpeechKind.alert,
-                      ));
-                    }
-                  },
-                ),
-              ),
             _demoButton(
               label: '暂停导航（语音）',
               semanticsLabel: '暂停导航',

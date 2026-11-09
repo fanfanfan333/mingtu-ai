@@ -44,7 +44,9 @@ void main() {
 
     await tapText('模拟 YOLO 检测：前方行人（演示，无摄像头）');
     expect(find.text('当前任务状态：正在避障'), findsOneWidget);
-    expect(find.textContaining('前方检测到行人'), findsOneWidget);
+    // Step 2 danger alerts: short imperative text at alert
+    // priority (was: '前方检测到行人，请注意。暂未确认距离…').
+    expect(find.textContaining('前方有人，请停下'), findsOneWidget);
 
     await tapText('模拟 YOLO：连续 3 帧前方无障碍（演示）');
     expect(find.text('当前任务状态：正在导航'), findsOneWidget);

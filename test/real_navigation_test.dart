@@ -57,6 +57,12 @@ class FakeLocation implements CurrentLocationProvider {
     called = true;
     return result;
   }
+
+  @override
+  Future<bool> ensurePermission() async => true;
+
+  @override
+  Stream<LocationResult> positions() => const Stream<LocationResult>.empty();
 }
 
 LocationResult _goodFix() => LocationResult.fix(

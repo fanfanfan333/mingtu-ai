@@ -14,6 +14,8 @@
 /// and never pass through this adapter.
 library;
 
+import 'dart:async';
+
 import 'package:geolocator/geolocator.dart';
 
 import '../core/coordinate_convert.dart';
@@ -68,6 +70,17 @@ class LocationResult {
 
 abstract class CurrentLocationProvider {
   Future<LocationResult> currentLocation();
+
+  /// Ask for the location permission up front (step 2: the
+  /// app requests permissions at startup instead of failing
+  /// later). Defaults to false for providers without a real
+  /// device behind them; never throws.
+  Future<bool> ensurePermission() async => false;
+
+  /// Continuous fixes for live navigation tracking, each
+  /// already converted to GCJ-02 exactly once. Defaults to an
+  /// empty stream for providers that cannot stream.
+  Stream<LocationResult> positions() => const Stream<LocationResult>.empty();
 }
 
 /// Real implementation on the phone's GPS via geolocator.
@@ -120,6 +133,41 @@ class GeolocatorCurrentLocation implements CurrentLocationProvider {
       );
     }
   }
+
+  @override
+  Future<bool> ensurePermission() async {
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) return false;
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      return permission == LocationPermission.always ||
+          permission == LocationPermission.whileInUse;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Stream<LocationResult> positions() {
+    try {
+      return Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 5,
+        ),
+      ).map((Position position) {
+        // The platform fix is WGS-84; convert exactly once.
+        final GeoPoint gcj02 = wgs84ToGcj02(
+          GeoPoint(latitude: position.latitude, longitude: position.longitude),
+        );
+        return LocationResult.fix(gcj02, position.accuracy);
+      });
+    } catch (_) {
+      return const Stream<LocationResult>.empty();
+    }
+  }
 }
 
 /// Always-unavailable provider (web without GPS, VM, tests that
@@ -133,4 +181,10 @@ class UnavailableCurrentLocation implements CurrentLocationProvider {
         LocationFailure.failed,
         '当前环境没有可用的定位设备。',
       );
+
+  @override
+  Future<bool> ensurePermission() async => false;
+
+  @override
+  Stream<LocationResult> positions() => const Stream<LocationResult>.empty();
 }

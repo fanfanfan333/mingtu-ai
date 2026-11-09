@@ -302,12 +302,78 @@ void main() {
       expect(input.isListening, isFalse);
     });
 
+    test(
+        'ASR errors are whitelisted: a known code passes, a '
+        'raw platform string collapses to error_unknown and '
+        'never reaches the detail', () async {
+      final fake = FakeStt();
+      final input = SystemVoiceInput(fake);
+      await input.initialize();
+      final Future<String> first = input.errors.first;
+      fake.capturedOnError!(
+        SpeechRecognitionError('error_permission', true),
+      );
+      expect(await first, 'error_permission|permanent=true');
+
+      final FakeStt fake2 = FakeStt();
+      final SystemVoiceInput input2 = SystemVoiceInput(fake2);
+      await input2.initialize();
+      final Future<String> second = input2.errors.first;
+      fake2.capturedOnError!(
+        SpeechRecognitionError('raw platform detail sentence', false),
+      );
+      expect(await second, 'error_unknown|permanent=false');
+      expect(input2.status, isNot(contains('raw platform detail')));
+      expect(input2.status, contains('语音识别出错'));
+    });
+
     test('stopListening platform errors propagate, not swallowed', () async {
       final fake = FakeStt()..stopError = Exception('mic stuck');
       final input = SystemVoiceInput(fake);
       await input.initialize();
       await expectLater(input.stopListening(), throwsException);
       expect(input.isListening, isFalse);
+    });
+  });
+
+  group('speak/listen turn-taking (end-to-end sequence)', () {
+    test(
+        'listening pauses before speech, “停下” stop() lands '
+        'while speech is in flight, listening resumes after', () async {
+      final FakeTts tts = FakeTts();
+      final FakeStt sttFake = FakeStt();
+      final SystemVoiceOutput out = SystemVoiceOutput(tts);
+      final SystemVoiceInput input = SystemVoiceInput(sttFake);
+      expect(await out.initialize(), isTrue);
+      expect(await input.initialize(), isTrue);
+
+      // 1) The turn-taking loop is listening.
+      expect(await input.startListening(), isTrue);
+      expect(input.isListening, isTrue);
+
+      // 2) Speech is about to start: the app closes the mic
+      // FIRST (this is the exact call _speakActive makes via
+      // _pauseListeningForSpeech).
+      await input.stopListening();
+      expect(input.isListening, isFalse);
+
+      // 3) Speech runs; a “停下” during it delivers stop() to
+      // the engine while the utterance is still in flight.
+      tts.speakGate = Completer<dynamic>();
+      final Future<void> speaking = out.speak('前方有车，请停下。');
+      await Future<void>.delayed(Duration.zero);
+      expect(tts.speakInFlight, isTrue);
+      await out.stop();
+      expect(tts.stopCalls, 1);
+      expect(tts.stopCalledWhileSpeakInFlight, isTrue);
+      tts.speakGate!.complete(1);
+      await speaking;
+
+      // 4) Speech finished: the loop reopens the microphone
+      // (the call _finishSpeech drives via
+      // _maybeStartListeningAfterSpeech).
+      expect(await input.startListening(), isTrue);
+      expect(input.isListening, isTrue);
     });
   });
 }

@@ -90,15 +90,15 @@ void main() {
     final CloudVisionClient client = _client(
       sender: (Uri url, String body, Map<String, String> headers) async =>
           throw Exception(
-              'fixture-secret-token via https://fc.example.test/vision'),
+              'test-token-not-real via https://fc.example.test/vision'),
     );
     final CloudVisionResult result =
         await client.describe(imageBytes: _img, now: DateTime(2026, 1, 1));
     expect(result.ok, isFalse);
     expect(result.failure, CloudVisionFailure.network);
-    expect(result.detail, isNot(contains('fixture-secret-token')));
+    expect(result.detail, isNot(contains('test-token-not-real')));
     expect(result.detail, isNot(contains('fc.example.test')));
-    expect(result.speechText, isNot(contains('fixture-secret-token')));
+    expect(result.speechText, isNot(contains('test-token-not-real')));
     expect(result.speechText, isNot(contains('fc.example.test')));
   });
 
@@ -107,17 +107,17 @@ void main() {
       'speech or logs: fixed text only', () async {
     final CloudVisionClient client = _client(
       sender: (Uri url, String body, Map<String, String> headers) async =>
-          '{"error":"fixture-secret-credential '
-          'https://evil.example.com/?key=fixture-secret-credential"}',
+          '{"error":"test-credential-not-real '
+          'https://evil.example.com/?key=test-credential-not-real"}',
     );
     final CloudVisionResult result =
         await client.describe(imageBytes: _img, now: DateTime(2026, 1, 1));
     expect(result.ok, isFalse);
     expect(result.failure, CloudVisionFailure.upstream);
     expect(result.detail, '云端识图服务返回了未识别的错误。');
-    expect(result.detail, isNot(contains('fixture-secret-credential')));
+    expect(result.detail, isNot(contains('test-credential-not-real')));
     expect(result.detail, isNot(contains('evil.example.com')));
-    expect(result.speechText, isNot(contains('fixture-secret-credential')));
+    expect(result.speechText, isNot(contains('test-credential-not-real')));
     expect(result.speechText, isNot(contains('evil.example.com')));
   });
 
