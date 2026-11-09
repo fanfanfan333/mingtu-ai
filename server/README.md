@@ -89,8 +89,10 @@ Optional:
   503 and the app degrades
   to local detection; `/walking` is unaffected.
 - `PORT` — listen port (default 8080).
-- `AMAP_UPSTREAM_BASE` / `DASHSCOPE_UPSTREAM_BASE` — upstream
-  overrides for tests only; leave unset in production.
+- Upstream endpoints are pinned in code (no environment
+  override): the vision `Authorization` header and the walking
+  keyed URL only ever go to the pinned endpoints, and upstream
+  redirects are refused.
 
 Also recommended: bind the key to this server's egress IP in the
 Amap console (IP whitelist), and put the proxy behind HTTPS.

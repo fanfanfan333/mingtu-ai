@@ -39,14 +39,11 @@ Environment:
                        never returned. Without it /vision answers
                        503 and the app degrades to local detection.
     PORT               (optional, default 8080) listen port.
-    AMAP_UPSTREAM_BASE (optional, default
-                       https://restapi.amap.com/v3/direction/walking)
-                       upstream endpoint; overridable ONLY so the
-                       contract tests can point at a local stub --
-                       production must leave it unset.
-    DASHSCOPE_UPSTREAM_BASE (optional, default
-                       https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions)
-                       same test-only override rule.
+    Upstream endpoints are PINNED in code (Amap walking and
+    the Beijing DashScope compatible endpoint). There is NO
+    environment override: an earlier test-only override could
+    have redirected the Authorization header / keyed URL to an
+    arbitrary host. Tests inject fake transports instead.
 
 Deployment notes: bind the key to this server's egress IP in the
 Amap console (IP whitelist), run behind HTTPS (e.g. a reverse
@@ -493,11 +490,25 @@ def whitelist_vision_body(raw_body, secrets):
     return json.dumps(out).encode("utf-8")
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects. A 3xx from an upstream must never
+    re-send our credentials (the vision Authorization header,
+    the walking keyed URL) to a host we did not choose: with
+    redirect_request returning None, urllib raises HTTPError
+    for the 3xx and the callers map it to a generic 502."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def fetch_upstream(url, timeout=10):
     """GET the upstream and return (status, body-bytes). Isolated
     so tests can substitute a fake without any network."""
     req = urllib.request.Request(url, headers={"User-Agent": "mingtu-amap-proxy/1"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed https host by config)
+    with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 (pinned https host, redirects refused)
         return resp.status, resp.read()
 
 
@@ -515,7 +526,7 @@ def post_upstream(url, body_bytes, api_key, timeout=VISION_UPSTREAM_TIMEOUT_S):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+    with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
         return resp.status, resp.read()
 
 
@@ -600,6 +611,12 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
     request body. Returns (status, body_bytes). Pure with
     respect to transport: shared by the standalone HTTP server
     and the Function Compute handler."""
+    if vision_upstream != VISION_UPSTREAM_DEFAULT:
+        # The Authorization header may ONLY ever go to the
+        # pinned Beijing endpoint. Anything else (an env
+        # override, a typo, a hostile config) is refused before
+        # any credential is attached; the poster never runs.
+        return 502, json.dumps({"error": "upstream not allowed"}).encode()
     if not raw:
         return 400, json.dumps({"error": "empty body"}).encode()
     if len(raw) > VISION_MAX_BODY_BYTES:
@@ -690,8 +707,7 @@ def fc_handle_event(event, *, dashscope_key=None, expected_token=None,
     if expected_token is None:
         expected_token = os.environ.get("MINGTU_VISION_TOKEN", "")
     if vision_upstream is None:
-        vision_upstream = os.environ.get(
-            "DASHSCOPE_UPSTREAM_BASE", VISION_UPSTREAM_DEFAULT)
+        vision_upstream = VISION_UPSTREAM_DEFAULT  # pinned, no env override
     if poster is None:
         poster = post_upstream
     if limiter is None:
@@ -789,6 +805,11 @@ class WalkingHandler(BaseHTTPRequestHandler):
                 ).encode(),
             )
             return
+        if self.upstream_base != UPSTREAM_DEFAULT:
+            # Same pin as vision: the keyed URL may only go to
+            # the pinned Amap endpoint.
+            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
+            return
         url = build_upstream_url(
             self.upstream_base, origin, destination, self.api_key
         )
@@ -881,13 +902,11 @@ def main():
         sys.stderr.write("error: AMAP_WEB_KEY environment variable is required\n")
         return 1
     port = int(os.environ.get("PORT", "8080"))
-    upstream = os.environ.get("AMAP_UPSTREAM_BASE", UPSTREAM_DEFAULT)
+    upstream = UPSTREAM_DEFAULT  # pinned, no env override
     # Optional: without it the /vision endpoint answers 503 and
     # the app degrades to local detection; /walking is unaffected.
     dashscope_key = os.environ.get("MINGTU_DASHSCOPE_API_KEY", "")
-    vision_upstream = os.environ.get(
-        "DASHSCOPE_UPSTREAM_BASE", VISION_UPSTREAM_DEFAULT
-    )
+    vision_upstream = VISION_UPSTREAM_DEFAULT  # pinned, no env override
     server = make_server(
         port,
         key,

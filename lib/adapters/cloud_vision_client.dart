@@ -53,8 +53,7 @@ Future<String> _defaultSender(
     headers.forEach(request.headers.set);
     request.write(body);
     final HttpClientResponse response = await request.close();
-    final String responseBody =
-        await response.transform(utf8.decoder).join();
+    final String responseBody = await response.transform(utf8.decoder).join();
     return responseBody;
   } finally {
     client.close();
@@ -74,6 +73,11 @@ const Set<String> visionUnavailableErrorCodes = <String>{
   'unauthorized',
   'rate_limited',
   'vision_not_configured',
+  // The proxy answers an over-3MiB request body with HTTP 413
+  // and this code; the sender surfaces only the body, so the
+  // 413 maps here -- the user hears "识图暂时不可用"
+  // (unavailable), not a generic service error.
+  'body too large',
 };
 
 /// Downsamples encoded image [bytes] so the longest edge is at

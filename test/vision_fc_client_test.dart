@@ -84,6 +84,20 @@ void main() {
     }
   });
 
+  test(
+      'a proxy 413 (body too large) maps to unavailable: '
+      '识图暂时不可用', () async {
+    final CloudVisionClient client = _client(
+      sender: (Uri url, String body, Map<String, String> headers) async =>
+          '{"error":"body too large"}',
+    );
+    final CloudVisionResult result =
+        await client.describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.ok, isFalse);
+    expect(result.failure, CloudVisionFailure.unavailable);
+    expect(result.speechText, contains('识图暂时不可用'));
+  });
+
   test('an unrecognised proxy error stays the upstream failure', () async {
     final CloudVisionResult result = await _client(
       sender: (Uri u, String b, Map<String, String> h) async =>
