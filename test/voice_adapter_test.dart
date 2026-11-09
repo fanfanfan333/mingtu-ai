@@ -82,6 +82,7 @@ class FakeTts extends FlutterTts {
 /// touch (listen etc.).
 class FakeStt implements stt.SpeechToText {
   stt.SpeechErrorListener? capturedOnError;
+  stt.SpeechStatusListener? capturedOnStatus;
   bool initResult = true;
   Object? stopError;
   int stopCalls = 0;
@@ -95,6 +96,7 @@ class FakeStt implements stt.SpeechToText {
     List<stt.SpeechConfigOption>? options,
   }) async {
     capturedOnError = onError;
+    capturedOnStatus = onStatus;
     return initResult;
   }
 
@@ -105,8 +107,12 @@ class FakeStt implements stt.SpeechToText {
   }
 
   @override
-  dynamic noSuchMethod(Invocation invocation) =>
-      throw UnimplementedError('FakeStt: ${invocation.memberName}');
+  dynamic noSuchMethod(Invocation invocation) {
+    if (invocation.memberName == #listen) {
+      return Future<void>.value();
+    }
+    throw UnimplementedError('FakeStt: ${invocation.memberName}');
+  }
 }
 
 void main() {
@@ -123,8 +129,7 @@ void main() {
   });
 
   group('SystemVoiceOutput return-value validation', () {
-    test('setLanguage returning 0 fails zh-CN verification closed',
-        () async {
+    test('setLanguage returning 0 fails zh-CN verification closed', () async {
       final fake = FakeTts()..setLanguageResult = 0;
       final out = SystemVoiceOutput(fake);
       expect(await out.initialize(), isTrue); // engine answered
@@ -146,8 +151,7 @@ void main() {
       expect(out.chineseVoiceVerified, isFalse);
     });
 
-    test('speak returning 0 throws and marks the output unavailable',
-        () async {
+    test('speak returning 0 throws and marks the output unavailable', () async {
       final fake = FakeTts()..speakResult = 0;
       final out = SystemVoiceOutput(fake);
       await out.initialize();
@@ -164,8 +168,7 @@ void main() {
     });
   });
 
-  group('SystemVoiceOutput stop semantics and the stop/speak race',
-      () {
+  group('SystemVoiceOutput stop semantics and the stop/speak race', () {
     test('stop failure (result 0) is NOT swallowed', () async {
       final fake = FakeTts()..stopResult = 0;
       final out = SystemVoiceOutput(fake);
@@ -180,7 +183,8 @@ void main() {
       await expectLater(out.stop(), throwsException);
     });
 
-    test('stop issued while a speak is in flight reaches the engine '
+    test(
+        'stop issued while a speak is in flight reaches the engine '
         'before the speak completes (adapter ordering only)', () async {
       final fake = FakeTts();
       final gate = Completer<dynamic>();
@@ -199,9 +203,9 @@ void main() {
       expect(out.isAvailable, isTrue);
     });
 
-    test('stop-then-confirm ordering: the confirmation speak is '
-        'only submitted after stop COMPLETES (sequencer contract)',
-        () async {
+    test(
+        'stop-then-confirm ordering: the confirmation speak is '
+        'only submitted after stop COMPLETES (sequencer contract)', () async {
       // Mirrors main's _stopSpeechThenConfirm at the adapter
       // level: cancel old speech, await stop, then speak the
       // confirmation. Before the fix the confirmation was
@@ -240,7 +244,8 @@ void main() {
       );
     });
 
-    test('an in-flight speak that then reports failure still fails '
+    test(
+        'an in-flight speak that then reports failure still fails '
         'the caller after a stop (no fake success)', () async {
       final fake = FakeTts();
       final gate = Completer<dynamic>();
@@ -283,8 +288,21 @@ void main() {
       expect(input.isAvailable, isFalse);
     });
 
-    test('stopListening platform errors propagate, not swallowed',
-        () async {
+    test(
+        'a listening session end is signalled on the sessionEnded '
+        'stream (continuous-listen seam)', () async {
+      final fake = FakeStt();
+      final input = SystemVoiceInput(fake);
+      expect(await input.initialize(), isTrue);
+      final Future<void> ended = input.sessionEnded.first;
+      expect(await input.startListening(), isTrue);
+      expect(input.isListening, isTrue);
+      fake.capturedOnStatus!('done');
+      await ended.timeout(const Duration(seconds: 1));
+      expect(input.isListening, isFalse);
+    });
+
+    test('stopListening platform errors propagate, not swallowed', () async {
       final fake = FakeStt()..stopError = Exception('mic stuck');
       final input = SystemVoiceInput(fake);
       await input.initialize();

@@ -103,6 +103,25 @@ void main() {
   });
 
   test(
+      'an unknown server error is NEVER copied into detail, '
+      'speech or logs: fixed text only', () async {
+    final CloudVisionClient client = _client(
+      sender: (Uri url, String body, Map<String, String> headers) async =>
+          '{"error":"fixture-secret-credential '
+          'https://evil.example.com/?key=fixture-secret-credential"}',
+    );
+    final CloudVisionResult result =
+        await client.describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.ok, isFalse);
+    expect(result.failure, CloudVisionFailure.upstream);
+    expect(result.detail, '云端识图服务返回了未识别的错误。');
+    expect(result.detail, isNot(contains('fixture-secret-credential')));
+    expect(result.detail, isNot(contains('evil.example.com')));
+    expect(result.speechText, isNot(contains('fixture-secret-credential')));
+    expect(result.speechText, isNot(contains('evil.example.com')));
+  });
+
+  test(
       'a proxy 413 (body too large) maps to unavailable: '
       '识图暂时不可用', () async {
     final CloudVisionClient client = _client(

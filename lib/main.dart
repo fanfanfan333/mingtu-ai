@@ -22,6 +22,7 @@ import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
 import 'core/real_navigation.dart';
 import 'core/startup_guard.dart';
+import 'core/voice_log.dart';
 import 'adapters/startup_initializer.dart';
 import 'core/voice_commands.dart';
 import 'core/voice_startup.dart';
@@ -183,6 +184,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       const UnavailableCurrentLocation();
   StreamSubscription<String>? _transcriptSub;
   StreamSubscription<String>? _asrErrorSub;
+  StreamSubscription<void>? _asrSessionSub;
+  bool _yoloErrorAnnounced = false;
   // Voice P0 re-test fixes: once TTS has failed at runtime the app
   // is in a perceptible voice-failed state (no simulated success,
   // no automatic ASR restart); once an ASR error has been announced
@@ -320,6 +323,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // ASR runtime errors surface through the adapter's error
       // stream (previously they only rewrote an unwatched status
       // string and the listen loop retried into the failure).
+      _asrSessionSub = asr.sessionEnded.listen((_) {
+        if (mounted) _onAsrSessionEnded();
+      });
       _asrErrorSub = asr.errors.listen((String error) {
         if (mounted) _handleAsrError(error);
       });
@@ -353,6 +359,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _yoloText = 'YOLO：${_yoloDetector.status}';
       if (!plan.speechUsable) {
         _currentPrompt = voiceNoticeText(VoiceNoticeKind.ttsUnavailable);
+        mingtuVoiceLog('启动播报不可用：已振动提示，屏幕显示引擎检查引导');
       }
     });
     if (plan.speechUsable) {
@@ -389,6 +396,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// already failed), report it, and switch the turn-taking loop
   /// OFF so nothing retries listening into a dead recogniser.
   void _handleAsrError(String error) {
+    mingtuVoiceLog('语音识别运行出错，已停止自动再听：$error');
     if (_asrErrorAnnounced) return;
     _asrErrorAnnounced = true;
     _autoListenEnabled = false;
@@ -430,23 +438,26 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _startListening();
       return;
     }
-    switch (_tasks.state) {
-      case TaskState.navigating:
-      case TaskState.paused:
-      case TaskState.avoidingObstacle:
-      case TaskState.findingEntrance:
-      case TaskState.indoorGuidance:
-      case TaskState.waitingConfirmation:
-      case TaskState.planning:
-      case TaskState.understanding:
-      case TaskState.preparing:
-      case TaskState.executing:
-      case TaskState.degraded:
-      case TaskState.listening:
-        _startListening();
-      default:
-        return;
-    }
+    // Continuous voice control (real-device requirement):
+    // listening resumes after EVERY speech, in every task
+    // state including idle -- the previous task-state gate
+    // meant that after the welcome exchange the microphone
+    // never reopened and voice control appeared dead.
+    _startListening();
+  }
+
+  /// A recognition session ended (silence or a final result
+  /// that produced no speech): reopen the microphone so voice
+  /// control is continuous. Skipped while speech is playing
+  /// or queued (that path restarts via _finishSpeech) and
+  /// when the loop was deliberately switched off.
+  void _onAsrSessionEnded() {
+    if (!_autoListenEnabled || _ttsFailed) return;
+    if (_scheduler.active != null || _scheduler.queue.isNotEmpty) return;
+    if (_voiceInput is! SystemVoiceInput) return;
+    if ((_voiceInput as SystemVoiceInput).isListening) return;
+    mingtuVoiceLog('识别会话结束且无播报进行中：自动重新监听');
+    _startListening();
   }
 
   @override
@@ -458,6 +469,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _straightTimer?.cancel();
     _transcriptSub?.cancel();
     _asrErrorSub?.cancel();
+    _asrSessionSub?.cancel();
     _voiceController.dispose();
     super.dispose();
   }
@@ -616,6 +628,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// completion and NO automatic ASR restart (_ttsFailed also
   /// blocks _maybeStartListeningAfterSpeech).
   void _handleTtsFailure(Object error) {
+    mingtuVoiceLog('语音合成运行失败：已切换为不可用状态，停止自动聆听');
     _ttsFailed = true;
     _voiceOutput = UnavailableVoiceOutput();
     _health.report(
@@ -1001,6 +1014,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     required String idPrefix,
     required String confirmText,
   }) async {
+    mingtuVoiceLog('用户打断（停下）：取消待播报并停止当前播报');
     final List<String> cancelled = _scheduler.cancelAll();
     if (cancelled.isNotEmpty) {
       _logMsg('已取消 ${cancelled.length} 条待播报提示。');
@@ -2333,10 +2347,29 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                     });
                   },
                   onError: (Object error) {
-                    _logMsg('YOLO 实时视图出错：$error');
+                    // The raw error is NOT surfaced (it can
+                    // embed paths); the user hears a fixed
+                    // Chinese announcement once, and the reason
+                    // class goes to the MingtuVoice log.
+                    mingtuVoiceLog('YOLO 实时视图出错：模型或摄像头不可用');
+                    _logMsg('YOLO 实时视图出错：目标检测模型或摄像头不可用。');
                     setState(() {
-                      _yoloText = 'YOLO：实时视图出错：$error';
+                      _yoloText = 'YOLO：实时视图出错，目标检测不可用';
                     });
+                    if (!_yoloErrorAnnounced) {
+                      _yoloErrorAnnounced = true;
+                      _health.report(
+                        'yolo',
+                        ServiceHealthStatus.unavailable,
+                        '实时视图出错：模型或摄像头不可用',
+                      );
+                      _say(_request(
+                        id: 'yolo-view-error',
+                        eventId: 'yolo-view-error',
+                        text: '目标检测模型加载失败，YOLO 实时检测不可用。',
+                        kind: SpeechKind.alert,
+                      ));
+                    }
                   },
                 ),
               ),

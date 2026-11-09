@@ -54,6 +54,7 @@ Future<StartupInitResult> _run(
   SystemVoiceOutput Function()? tts,
   SystemVoiceInput Function()? asr,
   YoloDetector Function()? yolo,
+  Future<bool> Function(String)? probe,
 }) =>
     initializeStartup(
       frameSourceFactory: frame ?? () => _OkFrameSource(),
@@ -63,6 +64,7 @@ Future<StartupInitResult> _run(
       ttsFactory: tts ?? () => _FakeTts(true),
       asrFactory: asr ?? () => _FakeAsr(true),
       yoloFactory: yolo ?? () => UnavailableYoloDetector(),
+      modelAssetProbe: probe ?? (_) async => true,
       log: log,
     );
 
@@ -161,6 +163,16 @@ void main() {
     final StartupFailureLog log = StartupFailureLog();
     final StartupInitResult r =
         await _run(log, yolo: () => throw StateError('yolo'));
+    expect(r.yolo, isA<UnavailableYoloDetector>());
+    expect(log.modules, <String>['目标检测']);
+    expect(startupFailureAnnouncement(log.modules), contains('目标检测'));
+  });
+
+  test(
+      '模型资源缺失 (probe reports the bundled asset absent): '
+      '目标检测 recorded, unavailable detector, announced', () async {
+    final StartupFailureLog log = StartupFailureLog();
+    final StartupInitResult r = await _run(log, probe: (_) async => false);
     expect(r.yolo, isA<UnavailableYoloDetector>());
     expect(log.modules, <String>['目标检测']);
     expect(startupFailureAnnouncement(log.modules), contains('目标检测'));

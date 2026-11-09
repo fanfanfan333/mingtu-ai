@@ -25,3 +25,9 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    # Bundled YOLO11n int8 TFLite (official Ultralytics
+    # release; see README "YOLO 模型" and tool/fetch_model.sh).
+    # The file is fetched and SHA256-verified by
+    # tool/fetch_model.sh -- run it before building.
+    - assets/models/yolo11n.tflite

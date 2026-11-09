@@ -51,5 +51,16 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- Android 11+ package visibility: without these, the
+             app cannot SEE the system TTS engine or the speech
+             recognition service (Xiaomi/HyperOS included), and
+             flutter_tts / speech_to_text report unavailable
+             even when the services exist. -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE"/>
+        </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService"/>
+        </intent>
     </queries>
 </manifest>

@@ -16,6 +16,9 @@
 library;
 
 import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:flutter/services.dart' show rootBundle;
 
 import '../core/camera_frame.dart';
 import '../core/startup_guard.dart';
@@ -69,6 +72,19 @@ Future<void> _defaultConfigProbe() async {
   }
 }
 
+/// Default model-asset probe: an `assets/...` path must load
+/// from the bundle with real bytes. Non-asset paths (a
+/// --dart-define override pointing at a file) skip the probe.
+Future<bool> _defaultModelAssetProbe(String path) async {
+  if (!path.startsWith('assets/')) return true;
+  try {
+    final ByteData data = await rootBundle.load(path);
+    return data.lengthInBytes > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
 Future<StartupInitResult> initializeStartup({
   required CameraFrameSource Function() frameSourceFactory,
   Future<void> Function()? configProbe,
@@ -77,6 +93,7 @@ Future<StartupInitResult> initializeStartup({
   SystemVoiceOutput Function()? ttsFactory,
   SystemVoiceInput Function()? asrFactory,
   YoloDetector Function()? yoloFactory,
+  Future<bool> Function(String assetPath)? modelAssetProbe,
   StartupFailureLog? log,
 }) async {
   final StartupFailureLog failures = log ?? startupFailures;
@@ -144,11 +161,23 @@ Future<StartupInitResult> initializeStartup({
     log: failures,
   );
 
-  // 目标检测.
+  // 目标检测. The bundled model asset must actually be there:
+  // a missing/unreadable asset records the module and installs
+  // the unavailable detector, so the unified announcement
+  // names it (the on-device failure this prevents: the old
+  // bare 'yolo11n' ID made the plugin attempt a download that
+  // failed with "Could not open 'yolo11n'").
   final YoloDetector yolo = await guardStartupStep<YoloDetector>(
     '目标检测',
-    () async =>
-        (yoloFactory ?? () => createYoloDetector(AppConfig.yoloModelPath))(),
+    () async {
+      final bool present = await (modelAssetProbe ??
+          _defaultModelAssetProbe)(AppConfig.yoloModelPath);
+      if (!present) {
+        throw StateError('bundled YOLO model asset missing');
+      }
+      return (yoloFactory ??
+          () => createYoloDetector(AppConfig.yoloModelPath))();
+    },
     fallback: UnavailableYoloDetector(),
     log: failures,
   );

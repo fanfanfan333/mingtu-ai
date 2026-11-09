@@ -27,6 +27,7 @@ import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
+import '../core/voice_log.dart';
 import '../core/voice_startup.dart';
 import 'voice_io.dart';
 
@@ -122,14 +123,17 @@ class SystemVoiceOutput implements VoiceOutput {
           ? '系统语音合成已接入（zh-CN 中文语音已核实并设置成功，语速 0.85）'
           : '系统语音合成引擎可用，但 zh-CN 中文语音未核实成功'
               '（语言列表缺少中文，或设置语言未成功），中文播报不可用，语音不可依赖';
+      mingtuVoiceLog('语音合成初始化：引擎可用，中文语音已核实=$_chineseVerified');
       return true;
     } on TimeoutException {
       _available = false;
       _detail = 'NOT_CONFIGURED（系统语音合成不可用：超时未响应）';
+      mingtuVoiceLog('语音合成初始化失败：超时未响应（引擎不可用或未安装中文语音）');
       return false;
     } catch (e) {
       _available = false;
       _detail = 'NOT_CONFIGURED（系统语音合成不可用：$e）';
+      mingtuVoiceLog('语音合成初始化失败：平台调用异常');
       return false;
     }
   }
@@ -191,6 +195,8 @@ class SystemVoiceInput implements VoiceInput {
       StreamController<String>.broadcast();
   final StreamController<String> _errorController =
       StreamController<String>.broadcast();
+  final StreamController<void> _sessionEndController =
+      StreamController<void>.broadcast();
   bool _available = false;
   String _detail = '未初始化';
   bool _listening = false;
@@ -205,6 +211,19 @@ class SystemVoiceInput implements VoiceInput {
   /// ('<errorMsg>|permanent=<bool>') and are responsible for
   /// announcing it once and stopping the retry loop.
   Stream<String> get errors => _errorController.stream;
+
+  /// Fires when a listening session that was actually running
+  /// ends (silence timeout, final result, platform stop). The
+  /// app's continuous-listen loop restarts from here; without
+  /// it, a session that ended in silence left the microphone
+  /// closed forever and voice control appeared dead.
+  Stream<void> get sessionEnded => _sessionEndController.stream;
+
+  void _emitSessionEnded() {
+    if (!_sessionEndController.isClosed) {
+      _sessionEndController.add(null);
+    }
+  }
 
   Future<bool> _doInitialize(stt.SpeechToText speech) async {
     return speech.initialize(
@@ -224,7 +243,12 @@ class SystemVoiceInput implements VoiceInput {
       },
       onStatus: (String status) {
         if (status == 'done' || status == 'notListening') {
+          final bool wasListening = _listening;
           _listening = false;
+          if (wasListening) {
+            mingtuVoiceLog('语音识别会话结束（status=$status）');
+            _emitSessionEnded();
+          }
         }
       },
     );
@@ -239,6 +263,7 @@ class SystemVoiceInput implements VoiceInput {
       _detail = ok
           ? '系统语音识别已接入（zh-CN，单次最长 10 秒，非持续监听）'
           : 'NOT_CONFIGURED（系统语音识别未授权或不可用）';
+      mingtuVoiceLog('语音识别初始化：可用=$ok');
       return ok;
     } on TimeoutException {
       _available = false;

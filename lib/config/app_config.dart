@@ -62,8 +62,16 @@ class AppConfig {
   /// this repository and must be regenerated/revoked after the
   /// demo. Empty = no demo mode (proxy or unconfigured).
   static const String amapDemoKey = String.fromEnvironment('MINGTU_AMAP_KEY');
-  static const String yoloModelPath =
-      String.fromEnvironment('MINGTU_YOLO_MODEL_PATH', defaultValue: 'yolo11n');
+
+  /// Bundled model asset (assets/... paths are copied to a
+  /// real file by the ultralytics_yolo resolver). The previous
+  /// default 'yolo11n' was a bare model ID: the plugin tried
+  /// to download it on-device and failed ("Could not open
+  /// 'yolo11n'"), leaving YOLO dead on real hardware.
+  static const String yoloModelPath = String.fromEnvironment(
+    'MINGTU_YOLO_MODEL_PATH',
+    defaultValue: 'assets/models/yolo11n.tflite',
+  );
   static const String llmModelId =
       String.fromEnvironment('MINGTU_LLM_MODEL_ID');
 

@@ -1,5 +1,18 @@
 # 明途 AI v0.7
 
+## YOLO 模型（assets 内置，2026-11-09）
+
+实时检测模型已打进 APK，不再在手机上下载（旧默认 `yolo11n` 是裸模型 ID，插件会尝试联网下载并失败，真机日志为 `Could not open 'yolo11n'`）。
+
+- **文件**：`assets/models/yolo11n.tflite`（pubspec 已声明；`AppConfig.yoloModelPath` 默认指向它，插件会把 `assets/...` 路径复制到应用文档目录后加载）
+- **来源**：Ultralytics 官方 yolo-flutter-app 发布 v0.2.0 的 `yolo11n_int8.tflite`（YOLO11n 目标检测，int8 量化）：https://github.com/ultralytics/yolo-flutter-app/releases/download/v0.2.0/yolo11n_int8.tflite
+- **大小**：2831727 字节
+- **SHA256**：`414ff688f0c47cbe03cadd3118d22b9024f68e097c8c33bbb25f704d1ca0624d`
+- **许可证**：AGPL-3.0（Ultralytics）
+- **获取与校验**：构建前运行 `./tool/fetch_model.sh`（下载官方文件并校验大小与 SHA256，不符则拒绝安装）。该二进制不经过普通文本提交通道进仓库，由打包方运行脚本获取；脚本幂等，已存在且校验通过时直接跳过。
+
+模型缺失或加载失败时，应用会在启动汇总里播报“目标检测”不可用，打开实时视图失败时播报“目标检测模型加载失败，YOLO 实时检测不可用”，不会假装检测在工作。
+
 ## 构建演示 APK（先看这一节，P0）
 
 **小米 15 等纯 64 位手机必须用 arm64 包。** 教训（2026-11-09 真机反馈）：把只含 armeabi-v7a（32 位）的 APK 装到纯 64 位手机上，能安装、但一打开就退出——32 位 Flutter 引擎在纯 64 位系统上无法加载。不要用 `--target-platform android-arm` 打演示包。

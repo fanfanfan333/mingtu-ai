@@ -222,16 +222,22 @@ class CloudVisionClient {
     }
     final Object? errorCode = decoded['error'];
     if (errorCode != null) {
+      // ONLY the whitelisted codes map to a failure kind, and
+      // the detail is ALWAYS a fixed local text: an arbitrary
+      // server error string is attacker-controlled content (a
+      // compromised or hostile upstream could echo credentials
+      // or URLs into it) and must never reach the detail, the
+      // speech or the logs.
       if (errorCode is String &&
           visionUnavailableErrorCodes.contains(errorCode)) {
         return CloudVisionResult.failed(
           CloudVisionFailure.unavailable,
-          detail: errorCode,
+          detail: '识图暂时不可用（服务端拒绝或未配置）。',
         );
       }
       return CloudVisionResult.failed(
         CloudVisionFailure.upstream,
-        detail: '$errorCode',
+        detail: '云端识图服务返回了未识别的错误。',
       );
     }
     return _parseStructured(decoded);
