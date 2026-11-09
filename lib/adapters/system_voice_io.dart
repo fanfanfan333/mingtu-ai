@@ -23,11 +23,27 @@ library;
 import 'dart:async';
 
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import '../core/voice_startup.dart';
 import 'voice_io.dart';
+
+/// Whether a flutter_tts platform call actually succeeded.
+///
+/// Evidence (flutter_tts 4.2.5, Android plugin source, read
+/// directly): `setLanguage` answers `result.success(1)` only when
+/// the locale was available AND set, `result.success(0)` otherwise;
+/// `speak` with awaitSpeakCompletion completes via
+/// `speakCompletion(1)` when the utterance finishes and
+/// `speakCompletion(0)` on error; `stop` answers `success(1)`.
+/// iOS answers booleans. So success is exactly `1` or `true`;
+/// `0`, `false` or null mean the call did NOT do what it claims.
+/// Treating an unexamined return value as success is how a device
+/// without a Chinese voice -- or a rejected utterance -- got
+/// reported as working speech.
+bool ttsResultSucceeded(dynamic result) => result == 1 || result == true;
 
 /// System TTS output. [initialize] must be called once before use;
 /// it returns false (instead of throwing) when no TTS engine is
@@ -76,8 +92,13 @@ class SystemVoiceOutput implements VoiceOutput {
       }
     }
     if (chosen != null) {
-      await tts.setLanguage(chosen);
-      _chineseVerified = true;
+      // Validate the setLanguage RESULT (Codex re-test finding):
+      // the plugin answers 1 only when the locale was available
+      // and actually set. A 0 here means Chinese is NOT in effect
+      // even though the language list advertised it -- verification
+      // must fail closed.
+      final dynamic langResult = await tts.setLanguage(chosen);
+      _chineseVerified = ttsResultSucceeded(langResult);
     } else {
       _chineseVerified = false;
       // Best effort only; the status stays honest (see initialize)
@@ -98,9 +119,9 @@ class SystemVoiceOutput implements VoiceOutput {
       await _doInitialize(tts).timeout(const Duration(seconds: 3));
       _available = true;
       _detail = _chineseVerified
-          ? '系统语音合成已接入（zh-CN 中文语音已核实，语速 0.85）'
-          : '系统语音合成引擎可用，但设备未提供 zh-CN 中文语音数据'
-              '（中文播报不可用，语音不可依赖）';
+          ? '系统语音合成已接入（zh-CN 中文语音已核实并设置成功，语速 0.85）'
+          : '系统语音合成引擎可用，但 zh-CN 中文语音未核实成功'
+              '（语言列表缺少中文，或设置语言未成功），中文播报不可用，语音不可依赖';
       return true;
     } on TimeoutException {
       _available = false;
@@ -120,14 +141,22 @@ class SystemVoiceOutput implements VoiceOutput {
   String get status => _detail;
 
   /// Speak [text] and return when the engine reports completion.
-  /// Throws (after marking unavailable) only if the engine fails;
-  /// callers fall back to the simulated prompt in that case.
+  /// The platform RESULT is validated (Codex re-test finding):
+  /// with awaitSpeakCompletion the plugin completes the future
+  /// with 1 when the utterance actually finished and 0 on error,
+  /// so a 0/false/null result is a failure -- it throws (after
+  /// marking unavailable) instead of letting the caller treat the
+  /// prompt as spoken. Callers must handle the failure as a real
+  /// voice failure, never as simulated success.
   @override
   Future<void> speak(String text) async {
     final FlutterTts? tts = _tts;
     if (!_available || tts == null) return;
     try {
-      await tts.speak(text);
+      final dynamic result = await tts.speak(text);
+      if (!ttsResultSucceeded(result)) {
+        throw StateError('系统语音合成返回失败（speak result=$result）');
+      }
     } catch (e) {
       _available = false;
       _chineseVerified = false;
@@ -136,11 +165,16 @@ class SystemVoiceOutput implements VoiceOutput {
     }
   }
 
+  /// Stop playback. Completion and failure are NOT swallowed
+  /// (Codex re-test finding): a platform error propagates, and a
+  /// non-success result throws, so the caller learns that the stop
+  /// did not take effect instead of believing the speaker is quiet.
   Future<void> stop() async {
-    try {
-      await _tts?.stop();
-    } catch (_) {
-      // Stopping a dead engine is not an error worth surfacing.
+    final FlutterTts? tts = _tts;
+    if (tts == null) return;
+    final dynamic result = await tts.stop();
+    if (!ttsResultSucceeded(result)) {
+      throw StateError('停止语音播报未成功（stop result=$result）');
     }
   }
 }
@@ -155,16 +189,38 @@ class SystemVoiceInput implements VoiceInput {
   stt.SpeechToText? _speech;
   final StreamController<String> _controller =
       StreamController<String>.broadcast();
+  final StreamController<String> _errorController =
+      StreamController<String>.broadcast();
   bool _available = false;
   String _detail = '未初始化';
   bool _listening = false;
 
   SystemVoiceInput([stt.SpeechToText? speech]) : _speech = speech;
 
+  /// Recognition errors, as they happen (Codex re-test finding).
+  /// Before this, the platform onError callback only rewrote a
+  /// status string nobody was watching, so a recogniser dying
+  /// mid-session was silent and the turn-taking loop kept retrying
+  /// into the failure. Listeners get one event per platform error
+  /// ('<errorMsg>|permanent=<bool>') and are responsible for
+  /// announcing it once and stopping the retry loop.
+  Stream<String> get errors => _errorController.stream;
+
   Future<bool> _doInitialize(stt.SpeechToText speech) async {
     return speech.initialize(
-      onError: (Object e) {
-        _detail = 'NOT_CONFIGURED（系统语音识别出错：$e）';
+      onError: (SpeechRecognitionError error) {
+        _detail = 'NOT_CONFIGURED（系统语音识别出错：${error.errorMsg}）';
+        if (error.permanent) {
+          // A permanent error blocks recognition until resolved;
+          // claiming availability afterwards would be a lie.
+          _available = false;
+          _listening = false;
+        }
+        if (!_errorController.isClosed) {
+          _errorController.add(
+            '${error.errorMsg}|permanent=${error.permanent}',
+          );
+        }
       },
       onStatus: (String status) {
         if (status == 'done' || status == 'notListening') {
@@ -232,16 +288,20 @@ class SystemVoiceInput implements VoiceInput {
     }
   }
 
+  /// Stop listening. Like the TTS stop, errors are NOT swallowed:
+  /// they propagate so the caller knows the microphone may still
+  /// be open. [_listening] is cleared either way (finally), because
+  /// after a stop attempt the session state is no longer trusted.
   Future<void> stopListening() async {
     try {
       await _speech?.stop();
-    } catch (_) {
-      // See SystemVoiceOutput.stop.
+    } finally {
+      _listening = false;
     }
-    _listening = false;
   }
 
   void dispose() {
     _controller.close();
+    _errorController.close();
   }
 }

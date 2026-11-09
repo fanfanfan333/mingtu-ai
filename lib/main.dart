@@ -122,6 +122,13 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   VoiceInput _voiceInput = UnavailableVoiceInput();
   YoloDetector _yoloDetector = UnavailableYoloDetector();
   StreamSubscription<String>? _transcriptSub;
+  StreamSubscription<String>? _asrErrorSub;
+  // Voice P0 re-test fixes: once TTS has failed at runtime the app
+  // is in a perceptible voice-failed state (no simulated success,
+  // no automatic ASR restart); once an ASR error has been announced
+  // it is not announced again (no retry/announce loop).
+  bool _ttsFailed = false;
+  bool _asrErrorAnnounced = false;
   String _voiceText = '语音：未初始化（演示文本播报）。';
   String _amapText = '高德真实路线：未请求。';
   String _yoloText = 'YOLO：未接入。';
@@ -169,6 +176,12 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _voiceInput = asr;
       _transcriptSub = asr.transcripts.listen((String text) {
         if (mounted) _handleVoiceCommand(text);
+      });
+      // ASR runtime errors surface through the adapter's error
+      // stream (previously they only rewrote an unwatched status
+      // string and the listen loop retried into the failure).
+      _asrErrorSub = asr.errors.listen((String error) {
+        if (mounted) _handleAsrError(error);
       });
     }
     _yoloDetector = createYoloDetector(AppConfig.yoloModelPath);
@@ -232,11 +245,43 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     }
   }
 
+  /// An ASR error event from the adapter: announce it ONCE through
+  /// the still-working voice (or the status surface when voice is
+  /// already failed), report it, and switch the turn-taking loop
+  /// OFF so nothing retries listening into a dead recogniser.
+  void _handleAsrError(String error) {
+    if (_asrErrorAnnounced) return;
+    _asrErrorAnnounced = true;
+    _autoListenEnabled = false;
+    _welcomeListenPending = false;
+    _health.report(
+      'voice_input',
+      ServiceHealthStatus.degraded,
+      '语音识别运行中出错：$error',
+    );
+    _logMsg('语音识别运行中出错（$error）：已停止自动再听，不会循环重试。');
+    if (_voiceOutput.isAvailable && !_ttsFailed) {
+      _say(_request(
+        id: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
+        text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
+        kind: SpeechKind.info,
+      ));
+    } else {
+      setState(() {
+        _voiceText = '语音识别运行中出错：$error。已停止自动聆听。';
+      });
+    }
+  }
+
   /// Start one short ASR session, but only after speech has finished:
   /// the turn-taking loop for a blind user. Called from
   /// [_finishSpeech] (after the welcome greeting, and after every
   /// prompt while a task is running) -- never while TTS is speaking.
   void _maybeStartListeningAfterSpeech() {
+    // After a runtime TTS failure the loop stays off: speech state
+    // is untrusted, and ASR must not auto-restart (re-test fix).
+    if (_ttsFailed) return;
     if (!_autoListenEnabled || !_voiceInput.isAvailable) return;
     if (_voiceInput is! SystemVoiceInput) return;
     final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
@@ -269,6 +314,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   void dispose() {
     _straightTimer?.cancel();
     _transcriptSub?.cancel();
+    _asrErrorSub?.cancel();
     _voiceController.dispose();
     super.dispose();
   }
@@ -379,14 +425,44 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _voiceOutput.speak(request.text).then((_) {
         if (mounted) _finishSpeech(request.id);
       }).catchError((Object e) {
-        _logMsg('系统语音合成失败；以下提示仅显示为文字，未被语音播报：$e');
-        _voiceOutput = UnavailableVoiceOutput();
-        if (mounted) _simulateSpeechCompletion(request.id);
+        if (mounted) _handleTtsFailure(e);
         return null;
       });
     } else {
       _simulateSpeechCompletion(request.id);
     }
+  }
+
+  /// Runtime TTS failure (Codex re-test fix). The old behaviour --
+  /// swap in the unavailable output and *simulate* the prompt's
+  /// completion -- faked success: navigation kept running and the
+  /// speech-finish chain could restart ASR as if the user had
+  /// heard the prompt. Now the failure is a perceptible state:
+  /// vibration, the on-screen "not read aloud" notice (screen
+  /// reader), health=unavailable, all pending speech cancelled,
+  /// straight prompts stopped, the task paused, and NO simulated
+  /// completion and NO automatic ASR restart (_ttsFailed also
+  /// blocks _maybeStartListeningAfterSpeech).
+  void _handleTtsFailure(Object error) {
+    _ttsFailed = true;
+    _voiceOutput = UnavailableVoiceOutput();
+    _health.report(
+      'voice_output',
+      ServiceHealthStatus.unavailable,
+      '运行中语音合成失败：$error',
+    );
+    _stopStraightTimer();
+    _scheduler.cancelAll();
+    if (_tasks.canTransitionTo(TaskState.paused)) {
+      _tasks.transitionTo(TaskState.paused, trigger: 'tts-failure');
+    }
+    setState(() {
+      _straightConfirmed = false;
+      _currentPrompt = voiceNoticeText(VoiceNoticeKind.ttsUnavailable);
+    });
+    HapticFeedback.vibrate();
+    _logMsg('语音合成运行中失败：已振动提示并停用导航、取消全部待播报；'
+        '未模拟播报成功，也不会自动重启语音识别。错误：$error');
   }
 
   /// Demo fallback only: the old simulated 1200 ms completion, used
@@ -649,11 +725,23 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   /// Stop the physical TTS playback, when the real engine is in
   /// use. Queued/active scheduler entries are cancelled separately
   /// via SpeechScheduler.cancelAll; this stops what is already
-  /// coming out of the speaker.
-  void _stopTtsPlayback() {
+  /// coming out of the speaker. The adapter's stop() no longer
+  /// swallows errors, so a failed stop is caught HERE and surfaced
+  /// in the log/status -- the user is told the stop may not have
+  /// taken effect instead of the failure disappearing silently.
+  Future<void> _stopTtsPlayback() async {
     final VoiceOutput out = _voiceOutput;
     if (out is SystemVoiceOutput) {
-      out.stop();
+      try {
+        await out.stop();
+      } catch (e) {
+        _logMsg('停止语音播报失败，播报可能仍在继续：$e');
+        if (mounted) {
+          setState(() {
+            _voiceText = '停止语音播报失败：$e';
+          });
+        }
+      }
     }
   }
 
@@ -663,7 +751,13 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     _autoListenEnabled = false;
     _welcomeListenPending = false;
     if (_voiceInput is SystemVoiceInput) {
-      await (_voiceInput as SystemVoiceInput).stopListening();
+      try {
+        await (_voiceInput as SystemVoiceInput).stopListening();
+      } catch (e) {
+        // stopListening no longer swallows platform errors; surface
+        // them instead of pretending the microphone is closed.
+        _logMsg('停止语音识别失败，麦克风可能仍在监听：$e');
+      }
     }
     if (!mounted) return;
     setState(() {
