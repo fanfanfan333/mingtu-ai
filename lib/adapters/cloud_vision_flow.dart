@@ -3,22 +3,28 @@
 /// button) to one camera frame and one rate-limited cloud call.
 ///
 /// Order is deliberate:
-/// 1. Not configured -> announce the not-configured degradation;
-///    the camera is NOT opened for a call that cannot happen.
-/// 2. Rate-limited -> announce the skip; again no frame captured.
-/// 3. Announce "正在识别" FIRST, so the user hears progress (with
-///    the disclaimer) before any await.
-/// 4. Capture exactly ONE frame via [CameraFrameSource]. A
-///    permission denial / unavailable camera / capture failure is
-///    announced in Chinese and degraded to local detection.
-/// 5. Describe the frame via [CloudVisionClient] (downsample +
-///    payload cap + explicit timeout happen inside) and announce
-///    the result -- success or failure -- with the disclaimer.
+/// 1. Single-flight: if a recognition is already running, the
+///    trigger is answered with "正在识别，请稍候" -- no second
+///    camera open, no second reservation, no second upload.
+/// 2. Not configured -> announce the degradation; nothing opens.
+/// 3. RESERVE the rate-limit slot BEFORE the camera opens
+///    (client.tryReserve). A refused reservation announces the
+///    skip and no frame is ever captured; a taken slot stays
+///    taken even if the capture then fails (retry protection).
+/// 4. Announce "正在识别" (progress + disclaimer) before any
+///    await, so the user is never left in silence.
+/// 5. Capture exactly ONE frame through the routed frame source
+///    (YOLO live frame while navigation owns the camera, else a
+///    one-shot still -- never both, never a stream).
+/// 6. Describe via the reserved call (downsample + cap + timeout
+///    inside the client) and announce the template-generated
+///    result -- or the failure -- in Chinese.
 ///
-/// Nothing here runs on its own, uploads continuously, records
-/// video, or feeds the risk engine. Every announcement the flow
-/// makes is collected in the outcome so the caller can report
-/// health honestly.
+/// Cancellation: when the app goes to background or is disposed
+/// the owner cancels the run's [CloudVisionCancellation]; the
+/// flow then stops at the next stage boundary, discards any late
+/// result (it is NOT spoken) and releases the single-flight lock.
+/// Nothing here runs on its own or feeds the risk engine.
 library;
 
 import '../core/camera_frame.dart';
@@ -28,28 +34,42 @@ import 'cloud_vision_client.dart';
 class CloudVisionFlowOutcome {
   /// The vision-side result. On a camera failure this is
   /// [CloudVisionFailure.noImage] with the camera detail attached;
-  /// the precise spoken reason is the last announcement.
+  /// on a busy refusal it is [CloudVisionFailure.busy]; on
+  /// cancellation it is noImage with detail '已取消'.
   final CloudVisionResult visionResult;
 
   /// Every announcement made, in order (also passed live to the
   /// `announce` callback as they happened).
   final List<String> announcements;
 
-  const CloudVisionFlowOutcome(this.visionResult, this.announcements);
+  /// True when the run was cancelled by lifecycle (the result
+  /// was discarded, not announced).
+  final bool cancelled;
+
+  const CloudVisionFlowOutcome(
+    this.visionResult,
+    this.announcements, {
+    this.cancelled = false,
+  });
 }
 
 class OnDemandCloudVision {
   final CloudVisionClient client;
   final CameraFrameSource frameSource;
+  bool _inFlight = false;
 
-  const OnDemandCloudVision({
+  OnDemandCloudVision({
     required this.client,
     required this.frameSource,
   });
 
+  /// Whether a recognition is currently running (single-flight).
+  bool get inFlight => _inFlight;
+
   Future<CloudVisionFlowOutcome> run({
     required void Function(String text) announce,
     DateTime? now,
+    CloudVisionCancellation? cancellation,
   }) async {
     final List<String> announcements = <String>[];
     void say(String text) {
@@ -57,50 +77,86 @@ class OnDemandCloudVision {
       announce(text);
     }
 
+    if (_inFlight) {
+      final CloudVisionResult busy =
+          CloudVisionResult.failed(CloudVisionFailure.busy);
+      say(busy.speechText);
+      return CloudVisionFlowOutcome(busy, announcements);
+    }
     if (!client.isConfigured) {
       final CloudVisionResult result =
           CloudVisionResult.failed(CloudVisionFailure.notConfigured);
       say(result.speechText);
       return CloudVisionFlowOutcome(result, announcements);
     }
-    if (!client.canStartNow(now)) {
+    // Reserve BEFORE the camera: refusal here means zero capture.
+    if (!client.tryReserve(now)) {
       final CloudVisionResult result =
           CloudVisionResult.failed(CloudVisionFailure.rateLimited);
       say(result.speechText);
       return CloudVisionFlowOutcome(result, announcements);
     }
 
-    say(cloudVisionStartingSpeech);
-
-    final CameraFrameCapture capture;
+    _inFlight = true;
     try {
-      capture = await frameSource.captureSingleFrame();
-    } catch (e) {
-      say(cameraFrameFailureSpeech(CameraFrameFailure.failure));
-      return CloudVisionFlowOutcome(
-        CloudVisionResult.failed(
-          CloudVisionFailure.noImage,
-          detail: '拍照异常：$e',
-        ),
-        announcements,
-      );
-    }
-    if (!capture.ok) {
-      final CameraFrameFailure failure =
-          capture.failure ?? CameraFrameFailure.failure;
-      say(cameraFrameFailureSpeech(failure));
-      return CloudVisionFlowOutcome(
-        CloudVisionResult.failed(
-          CloudVisionFailure.noImage,
-          detail: capture.detail,
-        ),
-        announcements,
-      );
-    }
+      say(cloudVisionStartingSpeech);
+      if (cancellation?.isCancelled ?? false) {
+        return _cancelled(announcements);
+      }
 
-    final CloudVisionResult result =
-        await client.describe(imageBytes: capture.bytes!, now: now);
-    say(result.speechText);
-    return CloudVisionFlowOutcome(result, announcements);
+      final CameraFrameCapture capture;
+      try {
+        capture = await frameSource.captureSingleFrame();
+      } catch (e) {
+        say(cameraFrameFailureSpeech(CameraFrameFailure.failure));
+        return CloudVisionFlowOutcome(
+          CloudVisionResult.failed(
+            CloudVisionFailure.noImage,
+            detail: '拍照异常：$e',
+          ),
+          announcements,
+        );
+      }
+      if (cancellation?.isCancelled ?? false) {
+        return _cancelled(announcements);
+      }
+      if (!capture.ok) {
+        final CameraFrameFailure failure =
+            capture.failure ?? CameraFrameFailure.failure;
+        say(cameraFrameFailureSpeech(failure));
+        return CloudVisionFlowOutcome(
+          CloudVisionResult.failed(
+            CloudVisionFailure.noImage,
+            detail: capture.detail,
+          ),
+          announcements,
+        );
+      }
+
+      final CloudVisionResult result = await client.describeReserved(
+        imageBytes: capture.bytes!,
+      );
+      if (cancellation?.isCancelled ?? false) {
+        // The answer arrived after the app went away: discard it.
+        // Speaking a stale description to a user who has moved on
+        // would be worse than silence.
+        return _cancelled(announcements);
+      }
+      say(result.speechText);
+      return CloudVisionFlowOutcome(result, announcements);
+    } finally {
+      _inFlight = false;
+    }
+  }
+
+  CloudVisionFlowOutcome _cancelled(List<String> announcements) {
+    return CloudVisionFlowOutcome(
+      CloudVisionResult.failed(
+        CloudVisionFailure.noImage,
+        detail: '应用进入后台或销毁，识别已取消。',
+      ),
+      announcements,
+      cancelled: true,
+    );
   }
 }

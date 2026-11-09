@@ -15,6 +15,14 @@ import 'package:mingtu_ai/core/cloud_vision.dart';
 
 Uint8List _fakeImage(int n) => Uint8List.fromList(List<int>.filled(n, 7));
 
+class _FuncFrameSource implements CameraFrameSource {
+  final Future<CameraFrameCapture> Function() fn;
+  _FuncFrameSource(this.fn);
+
+  @override
+  Future<CameraFrameCapture> captureSingleFrame() => fn();
+}
+
 class FakeFrameSource implements CameraFrameSource {
   final CameraFrameCapture result;
   int calls = 0;
@@ -41,10 +49,16 @@ CloudVisionClient _client({
   );
 }
 
-String _visionOkBody(String content) => jsonEncode(<String, Object>{
-      'choices': <Object>[
+/// The proxy's structured response (enum-only JSON).
+String _visionOkBody() => jsonEncode(<String, Object>{
+      'scene': '室外',
+      'parsed': true,
+      'obstacles': <Object>[
         <String, Object>{
-          'message': <String, String>{'role': 'assistant', 'content': content},
+          'type': '行人',
+          'direction': '正前方',
+          'proximity': '较近',
+          'confidence': 0.9,
         },
       ],
     });
@@ -109,7 +123,7 @@ void main() {
     final OnDemandCloudVision flow = OnDemandCloudVision(
       client: _client(sender: (Uri u, String b) async {
         sends += 1;
-        return _visionOkBody('不应到达');
+        return _visionOkBody();
       }),
       frameSource: frames,
     );
@@ -152,7 +166,7 @@ void main() {
     final OnDemandCloudVision flow = OnDemandCloudVision(
       client: _client(sender: (Uri u, String b) async {
         sends += 1;
-        return _visionOkBody('前方有一张桌子和两把椅子。');
+        return _visionOkBody();
       }),
       frameSource: frames,
     );
@@ -162,7 +176,7 @@ void main() {
     expect(sends, 1);
     expect(heard, hasLength(2));
     expect(heard[0], cloudVisionStartingSpeech);
-    expect(heard[1], contains('前方有一张桌子和两把椅子'));
+    expect(heard[1], contains('正前方较近处有行人'));
     expect(heard[1], contains(cloudVisionDisclaimer));
     expect(outcome.visionResult.ok, isTrue);
   });
@@ -195,5 +209,104 @@ void main() {
       expect(text, isNot(contains('没有危险')));
       expect(text, isNot(contains('未检测到危险')));
     }
+  });
+
+  test(
+      'reservation is taken BEFORE capture: a failed capture '
+      'still consumes the slot', () async {
+    final FakeFrameSource frames = FakeFrameSource(
+      CameraFrameCapture.failed(CameraFrameFailure.unavailable),
+    );
+    final OnDemandCloudVision flow = OnDemandCloudVision(
+      client: _client(sender: (Uri u, String b) async => _visionOkBody()),
+      frameSource: frames,
+    );
+    final List<String> heard1 = <String>[];
+    await flow.run(announce: heard1.add, now: now);
+    expect(frames.calls, 1);
+    expect(heard1.last, contains('摄像头现在不可用'));
+    // Second trigger at the same time: the slot from the FAILED
+    // first attempt is gone, so this one is rate-limited and the
+    // camera is not opened again.
+    final List<String> heard2 = <String>[];
+    final CloudVisionFlowOutcome second =
+        await flow.run(announce: heard2.add, now: now);
+    expect(frames.calls, 1);
+    expect(heard2.single, contains('调用太频繁'));
+    expect(second.visionResult.failure, CloudVisionFailure.rateLimited);
+  });
+
+  test(
+      'single-flight: a second trigger during recognition is '
+      'answered 请稍候 and captures nothing', () async {
+    final Completer<CameraFrameCapture> gate = Completer<CameraFrameCapture>();
+    int captures = 0;
+    final CameraFrameSource slow = _FuncFrameSource(() {
+      captures += 1;
+      return gate.future;
+    });
+    final OnDemandCloudVision flow = OnDemandCloudVision(
+      client: _client(sender: (Uri u, String b) async => _visionOkBody()),
+      frameSource: slow,
+    );
+    final List<String> heard1 = <String>[];
+    final Future<CloudVisionFlowOutcome> first =
+        flow.run(announce: heard1.add, now: now);
+    await Future<void>.delayed(Duration.zero);
+    expect(flow.inFlight, isTrue);
+    final List<String> heard2 = <String>[];
+    final CloudVisionFlowOutcome second =
+        await flow.run(announce: heard2.add, now: now);
+    expect(heard2.single, '正在识别，请稍候。');
+    expect(second.visionResult.failure, CloudVisionFailure.busy);
+    expect(captures, 1); // no second camera open
+    gate.complete(CameraFrameCapture.ok(_fakeImage(32)));
+    final CloudVisionFlowOutcome firstOutcome = await first;
+    expect(firstOutcome.visionResult.ok, isTrue);
+    expect(flow.inFlight, isFalse);
+  });
+
+  test(
+      'cancellation after capture discards the result: the '
+      'sender is never called and nothing more is announced', () async {
+    final CloudVisionCancellation token = CloudVisionCancellation();
+    int sends = 0;
+    final CameraFrameSource cancelling = _FuncFrameSource(() async {
+      token.cancel(); // app went to background during capture
+      return CameraFrameCapture.ok(_fakeImage(32));
+    });
+    final OnDemandCloudVision flow = OnDemandCloudVision(
+      client: _client(sender: (Uri u, String b) async {
+        sends += 1;
+        return _visionOkBody();
+      }),
+      frameSource: cancelling,
+    );
+    final List<String> heard = <String>[];
+    final CloudVisionFlowOutcome outcome =
+        await flow.run(announce: heard.add, now: now, cancellation: token);
+    expect(outcome.cancelled, isTrue);
+    expect(sends, 0);
+    expect(heard, <String>[cloudVisionStartingSpeech]);
+  });
+
+  test('routed frame source never double-opens the camera', () async {
+    bool yoloActive = true;
+    final FakeFrameSource yolo =
+        FakeFrameSource(CameraFrameCapture.ok(_fakeImage(8)));
+    final FakeFrameSource single =
+        FakeFrameSource(CameraFrameCapture.ok(_fakeImage(8)));
+    final RoutedCameraFrameSource routed = RoutedCameraFrameSource(
+      yoloLiveActive: () => yoloActive,
+      yoloSource: yolo,
+      singleShotSource: single,
+    );
+    await routed.captureSingleFrame();
+    expect(yolo.calls, 1);
+    expect(single.calls, 0); // YOLO owns the camera: no second open
+    yoloActive = false;
+    await routed.captureSingleFrame();
+    expect(yolo.calls, 1);
+    expect(single.calls, 1);
   });
 }

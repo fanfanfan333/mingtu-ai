@@ -1,3 +1,4 @@
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/main.dart';
 
@@ -20,6 +21,33 @@ void main() {
 
     expect(find.textContaining('云端视觉未配置'), findsWidgets);
     expect(find.textContaining('已降级为本地检测'), findsWidgets);
+
+    for (int i = 0; i < 16; i++) {
+      await tester.pump(const Duration(milliseconds: 1500));
+    }
+  });
+
+  testWidgets(
+      'app lifecycle pause is handled: vision cancelled, '
+      'camera released, app keeps running', (WidgetTester tester) async {
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump(const Duration(seconds: 4));
+
+    // Going to background must not crash and must run the
+    // release path (cancel in-flight vision, close YOLO view).
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump();
+    expect(find.byType(MingtuApp), findsOneWidget);
+
+    // The framework's lifecycle machine requires the sequence
+    // paused -> hidden -> inactive -> resumed.
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump();
+    expect(find.byType(MingtuApp), findsOneWidget);
 
     for (int i = 0; i < 16; i++) {
       await tester.pump(const Duration(milliseconds: 1500));

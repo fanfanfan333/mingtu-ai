@@ -15,3 +15,6 @@ class UnavailableCameraFrameSource implements CameraFrameSource {
         detail: '本平台没有摄像头管线（仅手机端可拍照）。',
       );
 }
+
+/// Web / non-mobile YOLO frame source: no live view exists here.
+CameraFrameSource createYoloFrameSource() => UnavailableCameraFrameSource();

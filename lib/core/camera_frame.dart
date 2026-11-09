@@ -78,3 +78,41 @@ String cameraFrameFailureSpeech(CameraFrameFailure failure) {
           '已降级为本地检测。提醒：$cloudVisionDisclaimer';
   }
 }
+
+/// Cooperative cancellation for an in-flight recognition: the
+/// app cancels it when it goes to background or is disposed, so
+/// a late result is discarded instead of spoken, and the flow
+/// stops before opening anything else.
+class CloudVisionCancellation {
+  bool _cancelled = false;
+  bool get isCancelled => _cancelled;
+  void cancel() {
+    _cancelled = true;
+  }
+}
+
+/// Routes frame capture so the camera is never double-opened:
+/// while the YOLO live view is running (it owns the camera), the
+/// frame comes from THAT view's capture (its most recent live
+/// frame) via [yoloSource]; otherwise a dedicated one-shot still
+/// is taken via [singleShotSource]. Exactly one source is used
+/// per trigger -- the two never run together.
+class RoutedCameraFrameSource implements CameraFrameSource {
+  final bool Function() yoloLiveActive;
+  final CameraFrameSource yoloSource;
+  final CameraFrameSource singleShotSource;
+
+  const RoutedCameraFrameSource({
+    required this.yoloLiveActive,
+    required this.yoloSource,
+    required this.singleShotSource,
+  });
+
+  @override
+  Future<CameraFrameCapture> captureSingleFrame() {
+    if (yoloLiveActive()) {
+      return yoloSource.captureSingleFrame();
+    }
+    return singleShotSource.captureSingleFrame();
+  }
+}

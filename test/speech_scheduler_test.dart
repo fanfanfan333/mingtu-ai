@@ -113,4 +113,141 @@ void main() {
     expect(s.submit(obstacle('o2', 'e-same', now), now), isFalse);
     expect(s.droppedDuplicateLog, contains('o2'));
   });
+
+  group('critical delivery (neverExpires + alert)', () {
+    SpeechRequest req(
+      String id,
+      SpeechKind kind, {
+      required DateTime at,
+      bool neverExpires = false,
+      int ttlSeconds = 5,
+    }) =>
+        SpeechRequest(
+          id: id,
+          eventId: 'e-$id',
+          text: 'msg-$id',
+          kind: kind,
+          createdAt: at,
+          expiresAt: at.add(Duration(seconds: ttlSeconds)),
+          navigationStateVersion: 'v1',
+          neverExpires: neverExpires,
+        );
+
+    test(
+        'a neverExpires request is accepted long after its '
+        'nominal expiry; a normal one is dropped', () {
+      final s = SpeechScheduler();
+      final t0 = DateTime(2026, 11, 9, 12);
+      final late = t0.add(const Duration(minutes: 10));
+      expect(
+        s.submit(req('plain', SpeechKind.info, at: t0), late),
+        isFalse,
+      );
+      expect(s.droppedExpiredLog, contains('plain'));
+      expect(
+        s.submit(
+          req('crit', SpeechKind.alert, at: t0, neverExpires: true),
+          late,
+        ),
+        isTrue,
+      );
+      expect(s.active?.id, 'crit');
+    });
+
+    test(
+        'promoteNext never drops a neverExpires request as '
+        'expired, while an expired info request is dropped', () {
+      final s = SpeechScheduler();
+      final t0 = DateTime(2026, 11, 9, 12);
+      expect(s.submit(obstacle('o1', 'e-o1', t0), t0), isTrue);
+      expect(
+        s.submit(
+          req('crit', SpeechKind.alert, at: t0, neverExpires: true),
+          t0,
+        ),
+        isTrue,
+      );
+      expect(s.submit(req('plain', SpeechKind.info, at: t0), t0), isTrue);
+      s.completeActive();
+      final late = t0.add(const Duration(minutes: 10));
+      final SpeechRequest? promoted = s.promoteNext(
+        late,
+        straightSegmentConfirmed: false,
+        riskActive: false,
+      );
+      expect(promoted?.id, 'crit');
+      s.completeActive();
+      final SpeechRequest? after = s.promoteNext(
+        late,
+        straightSegmentConfirmed: false,
+        riskActive: false,
+      );
+      expect(after, isNull);
+      expect(s.droppedExpiredLog, contains('plain'));
+    });
+
+    test(
+        'alert interrupts info, but turn/info/straight cannot '
+        'interrupt an alert -- only an emergency can', () {
+      final s = SpeechScheduler();
+      final t0 = DateTime(2026, 11, 9, 12);
+      expect(s.submit(req('info1', SpeechKind.info, at: t0), t0), isTrue);
+      expect(
+        s.submit(
+          req('alert1', SpeechKind.alert, at: t0, neverExpires: true),
+          t0,
+        ),
+        isTrue,
+      );
+      expect(s.active?.id, 'alert1');
+      expect(s.interruptedLog, contains('info1'));
+      // Lower/equal priority kinds queue behind the alert.
+      expect(s.submit(req('turn1', SpeechKind.turn, at: t0), t0), isTrue);
+      expect(s.active?.id, 'alert1');
+      expect(
+        s.submit(req('info2', SpeechKind.info, at: t0), t0),
+        isTrue,
+      );
+      expect(s.active?.id, 'alert1');
+      // Only the strictly higher emergency interrupts it.
+      expect(
+        s.submit(
+          req('em1', SpeechKind.emergency, at: t0, neverExpires: true),
+          t0,
+        ),
+        isTrue,
+      );
+      expect(s.active?.id, 'em1');
+      expect(s.interruptedLog, contains('alert1'));
+    });
+
+    test(
+        'a neverExpires alert blocks its duplicate even after '
+        'the nominal expiry', () {
+      final s = SpeechScheduler();
+      final t0 = DateTime(2026, 11, 9, 12);
+      expect(
+        s.submit(
+          req('a1', SpeechKind.alert, at: t0, neverExpires: true),
+          t0,
+        ),
+        isTrue,
+      );
+      final SpeechRequest dup = SpeechRequest(
+        id: 'a1-again',
+        eventId: 'e-a1',
+        text: 'msg-a1',
+        kind: SpeechKind.alert,
+        createdAt: t0,
+        expiresAt: t0.add(const Duration(seconds: 5)),
+        navigationStateVersion: 'v1',
+        neverExpires: true,
+      );
+      expect(
+        s.submit(dup, t0.add(const Duration(minutes: 10))),
+        isFalse,
+      );
+      expect(s.droppedDuplicateLog, contains('a1-again'));
+    });
+  });
 }

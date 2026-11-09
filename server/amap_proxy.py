@@ -56,6 +56,22 @@ secrets, etc.). No account form or console step is automated here.
 Logging: only method + path (NO query string) is written to the
 access log, so neither coordinates nor any key can leak into logs
 through this process.
+
+Threat model (see server/README.md for the full version): the
+upstream provider is treated as potentially echoing / hostile.
+Substring "cleaning" is NOT a security control (it is bypassable
+by case, full-width forms, zero-width characters and splitting
+the secret across fields), so NO upstream free text crosses this
+proxy at all: every response is rebuilt from structured fields --
+fixed enums, bounded integers, validated coordinate structures,
+and (for /vision) an enum-only JSON scene rebuilt field by
+field. Normalisation (NFKC + zero-width removal) and secret
+stripping survive only as belt-and-braces on the polyline input,
+never as the control itself. Accepted residual risk, documented
+in the README: a purely numeric low-entropy "key" that coincides
+with a legitimate bounded-integer field value (e.g. a distance)
+is indistinguishable from data -- real keys are high-entropy
+tokens and the upstream is the key's own provider.
 """
 
 import json
@@ -63,6 +79,7 @@ import os
 import re
 import socket
 import sys
+import unicodedata
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -108,38 +125,64 @@ def build_upstream_url(base, origin, destination, key):
     return base + "?" + query
 
 
+_ZERO_WIDTH = ("\u200b", "\u200c", "\u200d", "\ufeff", "\u2060")
+
+
+def _normalize_text(value):
+    """NFKC-normalise a string and remove zero-width characters.
+    Full-width lookalikes fold to their standard forms and
+    invisible joiners vanish, so downstream exact-match checks
+    (enums, secret substrings) cannot be evaded by encoding
+    tricks."""
+    value = unicodedata.normalize("NFKC", value)
+    for zw in _ZERO_WIDTH:
+        value = value.replace(zw, "")
+    return value
+
+
 def _strip_secrets(value, secrets):
-    """Remove any secret substring from a string value,
-    CASE-INSENSITIVELY: an upstream echoing the key in a different
-    letter case (fixture-key vs FIXTURE-KEY) is still an echo.
-    Applied to every free-text field that survives the whitelist,
-    as defence in depth."""
+    """Remove secret substrings from a string, CASE-INSENSITIVELY,
+    after NFKC + zero-width normalisation of both the value and
+    the secret. BELT-AND-BRACES ONLY: the actual control is the
+    structural whitelist (no free text crosses); this is applied
+    to the polyline input, the one place raw upstream text is
+    parsed rather than rebuilt."""
     if not isinstance(value, str):
         return value
+    value = _normalize_text(value)
     for secret in secrets:
         if secret:
-            value = re.sub(re.escape(secret), "", value, flags=re.IGNORECASE)
+            needle = _normalize_text(secret)
+            if needle:
+                value = re.sub(
+                    re.escape(needle), "", value, flags=re.IGNORECASE
+                )
     return value
 
 
 def _contains_secret(value, secrets):
-    lowered = value.lower()
-    return any(secret and secret.lower() in lowered for secret in secrets)
+    lowered = _normalize_text(value).lower()
+    return any(
+        secret and _normalize_text(secret).lower() in lowered
+        for secret in secrets
+    )
 
 
 def _coerce_text(value, secrets, max_len):
-    """Force a value to a bounded string: non-strings become "",
-    secrets are stripped, length is capped."""
+    """Force a value to a bounded, normalised string. Retained
+    for internal use only -- no upstream free text is forwarded
+    to clients any more (see the threat model)."""
     if not isinstance(value, str):
         return ""
     return _strip_secrets(value, secrets)[:max_len]
 
 
-def _coerce_number(value, max_value):
-    """Force a value to a bounded number: numeric strings parse,
-    anything else (including strings with trailing junk) becomes
-    0, negatives clamp to 0, huge values clamp to max_value.
-    Integral results are returned as int."""
+def _coerce_bounded_int(value, max_value):
+    """Force a value to a bounded INTEGER in [0, max_value]:
+    numeric strings parse, anything else (junk, NaN, infinities,
+    booleans) becomes 0, the result is rounded and clamped, and
+    it is re-emitted as an int -- the upstream representation
+    (string/float/formatting) never crosses."""
     if isinstance(value, bool):
         return 0
     if isinstance(value, (int, float)):
@@ -153,8 +196,7 @@ def _coerce_number(value, max_value):
         return 0
     if number != number or number in (float("inf"), float("-inf")):
         return 0
-    number = min(max(number, 0.0), float(max_value))
-    return int(number) if number == int(number) else number
+    return int(min(max(round(number), 0), max_value))
 
 
 _COORD_PART = re.compile(r"-?\d{1,3}(\.\d{1,6})?$")
@@ -232,9 +274,12 @@ _WALK_ORIENTATIONS = frozenset(
 
 def _coerce_enum(value, allowed):
     """Force a value to a fixed enum member; anything else
-    (non-string, unknown text, an echoed key) becomes ""."""
-    if isinstance(value, str) and value in allowed:
-        return value
+    (non-string, unknown text, an echoed key) becomes "". The
+    candidate is NFKC-normalised and zero-width-stripped first,
+    so an enum padded with invisible characters still has to be
+    exactly the enum to pass."""
+    if isinstance(value, str) and _normalize_text(value).strip() in allowed:
+        return _normalize_text(value).strip()
     return ""
 
 
@@ -286,8 +331,8 @@ def whitelist_walking_body(raw_body, secrets):
                         step.get("orientation"), _WALK_ORIENTATIONS
                     ),
                     "polyline": _coerce_polyline(step.get("polyline"), secrets),
-                    "distance": _coerce_number(step.get("distance"), 10_000_000),
-                    "duration": _coerce_number(step.get("duration"), 1_000_000),
+                    "distance": _coerce_bounded_int(step.get("distance"), 100_000),
+                    "duration": _coerce_bounded_int(step.get("duration"), 86_400),
                 }
             )
     out = {
@@ -295,8 +340,8 @@ def whitelist_walking_body(raw_body, secrets):
         "route": {
             "paths": [
                 {
-                    "distance": _coerce_number(first.get("distance"), 10_000_000),
-                    "duration": _coerce_number(first.get("duration"), 1_000_000),
+                    "distance": _coerce_bounded_int(first.get("distance"), 100_000),
+                    "duration": _coerce_bounded_int(first.get("duration"), 86_400),
                     "steps": steps,
                 }
             ]
@@ -305,12 +350,76 @@ def whitelist_walking_body(raw_body, secrets):
     return json.dumps(out).encode("utf-8")
 
 
+# The vision model is instructed (client-side AND pinned again
+# here, server-side) to answer with JSON ONLY, using exactly
+# these enums. The proxy parses that JSON and rebuilds it field
+# by field: upstream prose NEVER crosses, so an upstream that
+# answers "前方安全，可以通过" (or echoes a key) produces the
+# structured "parsed": false response and the client announces
+# uncertainty instead of speaking the text.
+VISION_PROMPT = (
+    "只输出一个 JSON 对象，不要输出任何其他文字："
+    '{"scene": 场景, "obstacles": [{"type": 类型, '
+    '"direction": 方位, "proximity": 远近, '
+    '"confidence": 0到1的小数}]}。'
+    "场景只能是：室内、室外、楼梯间、电梯内、路口、不确定。"
+    "类型只能是：行人、自行车、电动车、汽车、公交车、柱子、"
+    "台阶、楼梯、墙壁、门、桌子、椅子、树木、护栏、指示牌、其他。"
+    "方位只能是：正前方、左前方、右前方、左侧、右侧、后方。"
+    "远近只能是：很近、较近、较远。"
+    "不要做任何安全判断，不要输出 JSON 以外的任何内容。"
+)
+VISION_SCENES = frozenset(
+    ["室内", "室外", "楼梯间", "电梯内", "路口", "不确定"]
+)
+VISION_TYPES = frozenset(
+    [
+        "行人", "自行车", "电动车", "汽车", "公交车", "柱子",
+        "台阶", "楼梯", "墙壁", "门", "桌子", "椅子", "树木",
+        "护栏", "指示牌", "其他",
+    ]
+)
+VISION_DIRECTIONS = frozenset(
+    ["正前方", "左前方", "右前方", "左侧", "右侧", "后方"]
+)
+VISION_PROXIMITIES = frozenset(["很近", "较近", "较远"])
+VISION_MIN_CONFIDENCE = 0.5
+VISION_MAX_OBSTACLES = 5
+
+
+def _coerce_confidence(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        return 0.0
+    return min(max(number, 0.0), 1.0)
+
+
+def _vision_unparsed():
+    return json.dumps(
+        {"scene": "不确定", "obstacles": [], "parsed": False}
+    ).encode("utf-8")
+
+
 def whitelist_vision_body(raw_body, secrets):
-    """Rebuild the /vision response: first choice only, role FORCED
-    to the fixed enum "assistant" (an echoed key in role dies
-    here), content coerced to a secret-stripped string capped at
-    2000 chars. Upstream error objects / unexpected shapes ->
-    None (generic 502; upstream text never crosses)."""
+    """Rebuild the /vision response as STRUCTURED ENUM JSON.
+
+    The upstream chat body is expected to carry a JSON string in
+    its first choice's message content. That string is parsed
+    and every value is coerced: scene/type/direction/proximity
+    through fixed enums, confidence clamped to [0, 1], obstacles
+    below 0.5 confidence dropped, at most 5 kept. Free upstream
+    text is never copied -- not the prose, not unknown enum
+    values, nothing.
+
+    Returns the structured bytes. "parsed" is False when the
+    content was not conforming JSON (plain prose, adversarial
+    text, wrong shapes, or every claimed obstacle had to be
+    dropped for unknown enum values) -- the client announces
+    "识别不确定" for it. Returns None only when the upstream
+    body is not even the expected chat shape (-> generic 502).
+    """
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except Exception:
@@ -329,16 +438,53 @@ def whitelist_vision_body(raw_body, secrets):
     content = message.get("content")
     if not isinstance(content, str):
         return None
-    out = {
-        "choices": [
+    try:
+        inner = json.loads(content)
+    except Exception:
+        return _vision_unparsed()
+    if not isinstance(inner, dict):
+        return _vision_unparsed()
+    scene_raw = inner.get("scene")
+    if not isinstance(scene_raw, str):
+        return _vision_unparsed()
+    scene = _coerce_enum(scene_raw, VISION_SCENES)
+    if not scene:
+        return _vision_unparsed()
+    raw_obstacles = inner.get("obstacles")
+    if raw_obstacles is None:
+        raw_obstacles = []
+    if not isinstance(raw_obstacles, list):
+        return _vision_unparsed()
+    kept = []
+    dropped_unknown = 0
+    for item in raw_obstacles:
+        if not isinstance(item, dict):
+            dropped_unknown += 1
+            continue
+        otype = _coerce_enum(item.get("type"), VISION_TYPES)
+        direction = _coerce_enum(item.get("direction"), VISION_DIRECTIONS)
+        proximity = _coerce_enum(item.get("proximity"), VISION_PROXIMITIES)
+        if not otype or not direction or not proximity:
+            dropped_unknown += 1
+            continue
+        confidence = _coerce_confidence(item.get("confidence"))
+        if confidence < VISION_MIN_CONFIDENCE:
+            continue  # low-confidence drop: recognised as unreliable
+        kept.append(
             {
-                "message": {
-                    "role": "assistant",
-                    "content": _coerce_text(content, secrets, 2000),
-                }
+                "type": otype,
+                "direction": direction,
+                "proximity": proximity,
+                "confidence": round(confidence, 2),
             }
-        ]
-    }
+        )
+        if len(kept) >= VISION_MAX_OBSTACLES:
+            break
+    if raw_obstacles and not kept and dropped_unknown == len(raw_obstacles):
+        # The model claimed obstacles but every one was unrecognised
+        # content: that is uncertainty, not "no obstacles".
+        return _vision_unparsed()
+    out = {"scene": scene, "obstacles": kept, "parsed": True}
     return json.dumps(out).encode("utf-8")
 
 
@@ -465,6 +611,18 @@ class WalkingHandler(BaseHTTPRequestHandler):
                 503, json.dumps({"error": "vision not configured"}).encode()
             )
             return
+        # Pin the instruction server-side: any text part the
+        # client sent is replaced with the JSON-only prompt, so
+        # the model is asked for enum JSON no matter what the
+        # client (or a tampered client) requested.
+        for message in payload["messages"]:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        part["text"] = VISION_PROMPT
         # Clamp the output budget and disable thinking server-side
         # too -- a client asking for more does not get more.
         requested = payload.get("max_tokens")

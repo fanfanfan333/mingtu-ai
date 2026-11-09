@@ -18,6 +18,7 @@ library;
 import 'package:camera/camera.dart';
 
 import '../core/camera_frame.dart';
+import 'yolo_live_view_mobile.dart';
 
 CameraFrameSource createCameraFrameSource() => CameraPackageFrameSource();
 
@@ -74,3 +75,39 @@ class CameraPackageFrameSource implements CameraFrameSource {
     }
   }
 }
+
+/// Frame source for when the YOLO live view owns the camera:
+/// captures one clean still (no overlays) from the LIVE view via
+/// its shared controller -- the camera is never opened twice.
+class YoloLiveFrameSource implements CameraFrameSource {
+  @override
+  Future<CameraFrameCapture> captureSingleFrame() async {
+    if (!yoloLiveViewMounted || !sharedYoloViewController.isInitialized) {
+      return CameraFrameCapture.failed(
+        CameraFrameFailure.unavailable,
+        detail: 'YOLO 实时视图未打开，无法取帧。',
+      );
+    }
+    try {
+      final bytes = await sharedYoloViewController.capturePhoto(
+        withOverlays: false,
+      );
+      if (bytes == null || bytes.isEmpty) {
+        return CameraFrameCapture.failed(
+          CameraFrameFailure.failure,
+          detail: 'YOLO 实时视图没有返回帧。',
+        );
+      }
+      return CameraFrameCapture.ok(bytes);
+    } catch (e) {
+      return CameraFrameCapture.failed(
+        CameraFrameFailure.failure,
+        detail: 'YOLO 取帧失败：$e',
+      );
+    }
+  }
+}
+
+/// Factory for the YOLO-live frame source (used by the router in
+/// core/camera_frame.dart).
+CameraFrameSource createYoloFrameSource() => YoloLiveFrameSource();

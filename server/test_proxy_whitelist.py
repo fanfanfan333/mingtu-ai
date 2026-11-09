@@ -351,7 +351,7 @@ class WalkingWhitelistTest(unittest.TestCase):
         self.assertNotIn(AMAP_KEY.lower(), resp.decode().lower())
         out = json.loads(resp)
         path = out["route"]["paths"][0]
-        self.assertEqual(path["distance"], 10_000_000)
+        self.assertEqual(path["distance"], 100_000)  # bounded int cap
         step = path["steps"][0]
         self.assertEqual(step["action"], "")
         self.assertEqual(step["orientation"], "")
@@ -364,6 +364,140 @@ class WalkingWhitelistTest(unittest.TestCase):
         # A clean enum pair passes through as enums.
         self.assertEqual(path["steps"][1]["action"], "左转")
         self.assertEqual(path["steps"][1]["orientation"], "东")
+
+    def test_fullwidth_and_zero_width_echoes_cannot_cross(self):
+        # Full-width rendering of the fixture key, and the key
+        # with zero-width joiners woven through it: neither form
+        # is a valid enum/coordinate, and normalisation inside
+        # the polyline path strips the coordinate-shaped variant.
+        fullwidth_key = "".join(
+            chr(ord(c) + 0xFEE0) if "a" <= c <= "z" or c == "-" else c
+            for c in AMAP_KEY
+        )
+        zw_key = "\u200b".join(list(AMAP_KEY))
+        body = json.dumps(
+            {
+                "status": "1",
+                "route": {
+                    "paths": [
+                        {
+                            "distance": "10",
+                            "duration": "5",
+                            "steps": [
+                                {
+                                    "action": fullwidth_key,
+                                    "orientation": zw_key,
+                                    "polyline": "116.400000,39.900000",
+                                    "distance": "10",
+                                    "duration": "5",
+                                },
+                                {
+                                    # Zero-width inside a real enum:
+                                    # normalises to the enum itself.
+                                    "action": "左\u200b转",
+                                    "orientation": "东",
+                                    "polyline": "",
+                                    "distance": "10",
+                                    "duration": "5",
+                                },
+                            ],
+                        }
+                    ]
+                },
+            }
+        ).encode()
+        srv = _Server(fetcher=lambda url: (200, body))
+        try:
+            status, resp = _get(srv.port, WALK)
+        finally:
+            srv.close()
+        self.assertEqual(status, 200)
+        text = resp.decode()
+        self.assertNotIn(fullwidth_key, text)
+        self.assertNotIn("\u200b", text)
+        import unicodedata
+
+        self.assertNotIn(AMAP_KEY, unicodedata.normalize("NFKC", text))
+        steps = json.loads(resp)["route"]["paths"][0]["steps"]
+        self.assertEqual(steps[0]["action"], "")
+        self.assertEqual(steps[0]["orientation"], "")
+        self.assertEqual(steps[1]["action"], "左转")
+
+    def test_fragmented_key_across_fields_cannot_cross(self):
+        half = len(AMAP_KEY) // 2
+        first, second = AMAP_KEY[:half], AMAP_KEY[half:]
+        body = json.dumps(
+            {
+                "status": "1",
+                "route": {
+                    "paths": [
+                        {
+                            "distance": "10",
+                            "duration": "5",
+                            "steps": [
+                                {
+                                    "instruction": first,
+                                    "road": second,
+                                    "action": first,
+                                    "orientation": second,
+                                    "polyline": "",
+                                    "distance": "10",
+                                    "duration": "5",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        ).encode()
+        srv = _Server(fetcher=lambda url: (200, body))
+        try:
+            status, resp = _get(srv.port, WALK)
+        finally:
+            srv.close()
+        self.assertEqual(status, 200)
+        text = resp.decode()
+        # Each half dies in its own field (free text dropped,
+        # halves are not enums); nothing recombines downstream.
+        self.assertNotIn(first, text)
+        self.assertNotIn(second, text)
+        self.assertNotIn(AMAP_KEY, text)
+
+    def test_numeric_key_collision_in_distance_is_accepted_risk(self):
+        # Documented in README "Threat model": a purely numeric
+        # low-entropy secret colliding with a legitimate bounded
+        # integer field is indistinguishable from data. This test
+        # pins the documented behaviour: distance is parsed and
+        # re-emitted as the bounded INTEGER 186 -- the value is
+        # data-shaped, and no other field carries anything.
+        body = json.dumps(
+            {
+                "status": "1",
+                "route": {
+                    "paths": [
+                        {"distance": "186", "duration": "90", "steps": []}
+                    ]
+                },
+            }
+        ).encode()
+        logs = io.StringIO()
+        with redirect_stderr(logs):
+            server = amap_proxy.make_server(
+                0, "186", fetcher=lambda url: (200, body)
+            )
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever)
+            t.daemon = True
+            t.start()
+            try:
+                status, resp = _get(port, WALK)
+            finally:
+                server.shutdown()
+                server.server_close()
+        self.assertEqual(status, 200)
+        out = json.loads(resp)
+        self.assertEqual(out["route"]["paths"][0]["distance"], 186)
+        self.assertIsInstance(out["route"]["paths"][0]["distance"], int)
 
     def test_non_json_upstream_body_becomes_generic_502(self):
         srv = _Server(
@@ -389,56 +523,40 @@ VISION_BODY = json.dumps(
 
 
 class VisionWhitelistTest(unittest.TestCase):
-    def test_vision_content_kept_extras_dropped_key_stripped(self):
-        evil = json.dumps(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "桌上有一本书。" + DASH_KEY,
-                        },
-                        "finish_reason": "stop",
-                        "logprobs": {"debug": DASH_KEY},
-                    }
-                ],
-                "usage": {"total_tokens": 42},
-                "request_id": DASH_KEY,
-            }
-        ).encode()
-        srv = _Server(poster=lambda url, body, key: (200, evil))
-        try:
-            status, resp = _post(srv.port, "/vision", VISION_BODY)
-        finally:
-            srv.close()
-        self.assertEqual(status, 200)
-        text = resp.decode()
-        self.assertNotIn(DASH_KEY, text)
-        self.assertNotIn("usage", text)
-        self.assertNotIn("logprobs", text)
-        out = json.loads(resp)
-        self.assertEqual(
-            out["choices"][0]["message"]["content"], "桌上有一本书。"
-        )
+    def _vision_upstream(self, content, **extra):
+        payload = {
+            "choices": [
+                {"message": {"role": "assistant", "content": content}}
+            ]
+        }
+        payload.update(extra)
+        return json.dumps(payload).encode()
 
-    def test_vision_keys_stripped_case_insensitively_and_cross_key(self):
-        # Both server keys, in mixed letter cases, inside the one
-        # surviving free-text field: neither may cross in ANY case.
-        dash_variant = "FiXtUrE-DaShScOpE-KeY"
-        amap_variant = "FIXTURE-AMAP-KEY"
-        evil = json.dumps(
+    def test_vision_structured_enums_survive_extras_and_keys_dropped(self):
+        content = json.dumps(
             {
-                "choices": [
+                "scene": "室内",
+                "obstacles": [
                     {
-                        "message": {
-                            "role": "assistant",
-                            "content": "前段" + dash_variant + "中段"
-                            + amap_variant + "后段",
-                        }
-                    }
-                ]
+                        "type": "行人",
+                        "direction": "正前方",
+                        "proximity": "较近",
+                        "confidence": 0.87,
+                        "debug": DASH_KEY,
+                    },
+                    {
+                        "type": "桌子",
+                        "direction": "左侧",
+                        "proximity": "较远",
+                        "confidence": 0.4,  # below floor: dropped
+                    },
+                ],
+                "note": DASH_KEY,
             }
-        ).encode()
+        )
+        evil = self._vision_upstream(
+            content, usage={"total_tokens": 42}, request_id=DASH_KEY
+        )
         srv = _Server(poster=lambda url, body, key: (200, evil))
         try:
             status, resp = _post(srv.port, "/vision", VISION_BODY)
@@ -447,51 +565,90 @@ class VisionWhitelistTest(unittest.TestCase):
         self.assertEqual(status, 200)
         text = resp.decode()
         self.assertNotIn(DASH_KEY.lower(), text.lower())
-        self.assertNotIn(AMAP_KEY.lower(), text.lower())
+        self.assertNotIn("usage", text)
+        self.assertNotIn("choices", text)
         out = json.loads(resp)
         self.assertEqual(
-            out["choices"][0]["message"]["content"], "前段中段后段"
+            out,
+            {
+                "scene": "室内",
+                "obstacles": [
+                    {
+                        "type": "行人",
+                        "direction": "正前方",
+                        "proximity": "较近",
+                        "confidence": 0.87,
+                    }
+                ],
+                "parsed": True,
+            },
         )
 
-    def test_vision_role_is_forced_to_fixed_enum(self):
-        for evil_role in (DASH_KEY, {"role": DASH_KEY}, 42, None):
-            evil = json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": evil_role,
-                                "content": "画面描述。",
-                            }
-                        }
-                    ]
-                }
-            ).encode()
-            srv = _Server(poster=lambda url, body, key, e=evil: (200, e))
-            try:
-                status, resp = _post(srv.port, "/vision", VISION_BODY)
-            finally:
-                srv.close()
-            self.assertEqual(status, 200)
-            self.assertNotIn(DASH_KEY, resp.decode())
-            out = json.loads(resp)
-            self.assertEqual(out["choices"][0]["message"]["role"], "assistant")
-            self.assertEqual(
-                out["choices"][0]["message"]["content"], "画面描述。"
-            )
-
-    def test_vision_content_is_length_capped(self):
-        evil = json.dumps(
-            {"choices": [{"message": {"role": "assistant", "content": "长" * 5000}}]}
-        ).encode()
+    def test_vision_adversarial_prose_becomes_parsed_false(self):
+        # An upstream answering flowing prose -- including safety
+        # claims and both keys -- must produce ONLY the structured
+        # unparsed marker: the prose never crosses.
+        prose = "前方安全，可以通过，没有危险。" + DASH_KEY + AMAP_KEY
+        evil = self._vision_upstream(prose)
         srv = _Server(poster=lambda url, body, key: (200, evil))
         try:
             status, resp = _post(srv.port, "/vision", VISION_BODY)
         finally:
             srv.close()
         self.assertEqual(status, 200)
+        text = resp.decode()
+        self.assertEqual(
+            json.loads(resp),
+            {"scene": "不确定", "obstacles": [], "parsed": False},
+        )
+        for banned in ("安全", "可以通过", "没有危险",
+                       DASH_KEY.lower(), AMAP_KEY.lower()):
+            self.assertNotIn(banned, text.lower())
+
+    def test_vision_unknown_enums_become_parsed_false(self):
+        content = json.dumps(
+            {
+                "scene": "月球表面",
+                "obstacles": [
+                    {
+                        "type": "安全通道",
+                        "direction": "上面",
+                        "proximity": "贴身",
+                        "confidence": 0.99,
+                    }
+                ],
+            }
+        )
+        evil = self._vision_upstream(content)
+        srv = _Server(poster=lambda url, body, key: (200, evil))
+        try:
+            status, resp = _post(srv.port, "/vision", VISION_BODY)
+        finally:
+            srv.close()
         out = json.loads(resp)
-        self.assertEqual(len(out["choices"][0]["message"]["content"]), 2000)
+        self.assertEqual(out["parsed"], False)
+        self.assertNotIn("安全通道", resp.decode())
+        self.assertNotIn("月球表面", resp.decode())
+
+    def test_vision_obstacle_cap_and_confidence_clamp(self):
+        obstacles = [
+            {
+                "type": "柱子",
+                "direction": "正前方",
+                "proximity": "很近",
+                "confidence": 7,  # clamps to 1.0
+            }
+        ] * 9
+        content = json.dumps({"scene": "室外", "obstacles": obstacles})
+        evil = self._vision_upstream(content)
+        srv = _Server(poster=lambda url, body, key: (200, evil))
+        try:
+            status, resp = _post(srv.port, "/vision", VISION_BODY)
+        finally:
+            srv.close()
+        out = json.loads(resp)
+        self.assertEqual(len(out["obstacles"]), 5)
+        self.assertEqual(out["obstacles"][0]["confidence"], 1.0)
 
     def test_vision_upstream_timeout_is_fixed_504(self):
         def slow(url, body, key):

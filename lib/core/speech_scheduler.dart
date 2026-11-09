@@ -7,14 +7,29 @@
 /// [completeActive].
 ///
 /// Priority: lower number = higher priority.
-///   P0 emergency, P1 high-risk avoidance, P2 turn, P3 straight, P4 info.
-enum SpeechKind { emergency, obstacleAvoidance, turn, straight, info }
+///   P0 emergency, P1 high-risk avoidance AND critical alerts
+///   (safety/failure announcements that must be delivered:
+///   recognition results, failures, permission denials),
+///   P2 turn, P3 straight, P4 info.
+///
+/// Delivery guarantee for critical speech: requests of kind
+/// emergency / obstacleAvoidance / alert are submitted with
+/// [SpeechRequest.neverExpires] by the app layer, so neither
+/// submission nor promotion can drop them as "expired" -- for a
+/// blind user a silently dropped safety/failure message is worse
+/// than a late one. An alert (P1) can be interrupted ONLY by a
+/// strictly higher priority (an emergency, P0); the user's own
+/// "停下" is not an interruption but an explicit cancelAll(),
+/// which is the one sanctioned way to clear everything.
+enum SpeechKind { emergency, obstacleAvoidance, alert, turn, straight, info }
 
 int priorityOf(SpeechKind kind) {
   switch (kind) {
     case SpeechKind.emergency:
       return 0;
     case SpeechKind.obstacleAvoidance:
+      return 1;
+    case SpeechKind.alert:
       return 1;
     case SpeechKind.turn:
       return 2;
@@ -34,6 +49,14 @@ class SpeechRequest {
   final DateTime expiresAt;
   final String navigationStateVersion;
   final bool requiresStraightSegment;
+
+  /// Critical-delivery flag: when true the request NEVER expires
+  /// -- submission and promotion must not drop it, however much
+  /// time passed. Reserved for safety and failure announcements
+  /// (see the SpeechKind documentation). Ordinary prompts keep
+  /// the default false and expire as before: a stale "直走" must
+  /// never be spoken late.
+  final bool neverExpires;
   const SpeechRequest({
     required this.id,
     required this.eventId,
@@ -43,10 +66,11 @@ class SpeechRequest {
     required this.expiresAt,
     required this.navigationStateVersion,
     this.requiresStraightSegment = false,
+    this.neverExpires = false,
   });
 
   int get priority => priorityOf(kind);
-  bool isExpired(DateTime now) => now.isAfter(expiresAt);
+  bool isExpired(DateTime now) => !neverExpires && now.isAfter(expiresAt);
 }
 
 class SpeechScheduler {

@@ -25,7 +25,24 @@ DASH_FIXTURE_KEY = "fixture-dashscope-key"
 VISION_OK = json.dumps(
     {
         "choices": [
-            {"message": {"role": "assistant", "content": "画面中有一张桌子。"}}
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "scene": "室内",
+                            "obstacles": [
+                                {
+                                    "type": "桌子",
+                                    "direction": "正前方",
+                                    "proximity": "较近",
+                                    "confidence": 0.9,
+                                }
+                            ],
+                        }
+                    ),
+                }
+            }
         ]
     }
 ).encode()
@@ -95,11 +112,18 @@ class VisionProxyTest(unittest.TestCase):
         self.server.server_close()
         self._stderr_cm.__exit__(None, None, None)
 
-    def test_vision_passthrough_key_only_in_upstream_call(self):
+    def test_vision_structured_response_key_only_in_upstream_call(self):
         status, body = _post(self.port, "/vision", _vision_body())
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"],
-                         "画面中有一张桌子。")
+        # The response is REBUILT structured enum JSON: the chat
+        # envelope and the model's raw content never cross.
+        out = json.loads(body)
+        self.assertEqual(out["scene"], "室内")
+        self.assertEqual(out["parsed"], True)
+        self.assertEqual(out["obstacles"][0]["type"], "桌子")
+        self.assertEqual(out["obstacles"][0]["confidence"], 0.9)
+        self.assertNotIn("choices", body.decode())
+        self.assertNotIn("content", body.decode())
         self.assertEqual(len(self.poster.calls), 1)
         url, sent_body, sent_key = self.poster.calls[0]
         # Key handed to the upstream poster (which puts it in the

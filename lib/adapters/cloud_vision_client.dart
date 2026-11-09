@@ -8,9 +8,15 @@
 /// compatible-mode configuration as the Bailian text client
 /// (https://dashscope.aliyuncs.com/compatible-mode/v1).
 ///
-/// Pipeline per call, in order: configured? -> rate limiter ->
-/// downsample -> payload cap -> POST -> parse. Any failure returns
-/// a [CloudVisionResult] whose speechText announces the
+/// Pipeline: the caller first RESERVES the rate-limit slot
+/// ([tryReserve]) BEFORE opening the camera, then hands the one
+/// captured frame to [describeReserved], which runs: downsample
+/// -> payload cap -> POST -> structured parse. The proxy answers
+/// with enum-only JSON (scene / obstacles / parsed); this client
+/// re-coerces every value against the same enum sets before
+/// building a [VisionScene], so model prose never reaches the
+/// app's speech templates. Any failure returns a
+/// [CloudVisionResult] whose speechText announces the
 /// degradation to local detection; this client never throws to
 /// the UI and never retries on its own.
 library;
@@ -102,23 +108,22 @@ class CloudVisionClient {
 
   bool get isConfigured => proxyBaseUrl.isNotEmpty;
 
-  /// Would a call started at [now] pass configuration + rate
-  /// limiting? Peek only -- the slot is taken inside [describe].
-  /// Lets the on-demand flow refuse BEFORE capturing a frame.
-  bool canStartNow(DateTime? now) =>
-      isConfigured && limiter.isAvailable(now ?? DateTime.now());
+  /// Reserve the rate-limit slot for a call at [now], BEFORE
+  /// any camera is opened: a refused reservation means no frame
+  /// is captured at all. Returns false when not configured or
+  /// when the previous call is too recent. The slot stays taken
+  /// even if the subsequent capture fails (retry protection).
+  bool tryReserve(DateTime? now) =>
+      isConfigured && limiter.tryAcquire(now ?? DateTime.now());
 
-  /// Describe one frame. [now] is injectable for tests.
-  Future<CloudVisionResult> describe({
+  /// Describe one frame whose slot was already reserved via
+  /// [tryReserve]. [now] is injectable for tests.
+  Future<CloudVisionResult> describeReserved({
     required Uint8List imageBytes,
     String prompt = cloudVisionPrompt,
-    DateTime? now,
   }) async {
     if (!isConfigured) {
       return CloudVisionResult.failed(CloudVisionFailure.notConfigured);
-    }
-    if (!limiter.tryAcquire(now ?? DateTime.now())) {
-      return CloudVisionResult.failed(CloudVisionFailure.rateLimited);
     }
     final Uint8List small;
     try {
@@ -168,19 +173,69 @@ class CloudVisionClient {
         detail: '${decoded['error']}',
       );
     }
-    final Object? choices = decoded['choices'];
-    if (choices is List && choices.isNotEmpty) {
-      final Object? first = choices.first;
-      if (first is Map<String, Object?>) {
-        final Object? message = first['message'];
-        if (message is Map<String, Object?>) {
-          final Object? content = message['content'];
-          if (content is String && content.trim().isNotEmpty) {
-            return CloudVisionResult.ok(content.trim());
-          }
+    return _parseStructured(decoded);
+  }
+
+  /// Convenience for callers that do not manage the reservation
+  /// themselves: reserve, then describe. A refused reservation
+  /// is the rateLimited failure.
+  Future<CloudVisionResult> describe({
+    required Uint8List imageBytes,
+    String prompt = cloudVisionPrompt,
+    DateTime? now,
+  }) async {
+    if (!isConfigured) {
+      return CloudVisionResult.failed(CloudVisionFailure.notConfigured);
+    }
+    if (!tryReserve(now)) {
+      return CloudVisionResult.failed(CloudVisionFailure.rateLimited);
+    }
+    return describeReserved(imageBytes: imageBytes, prompt: prompt);
+  }
+
+  /// Build a [CloudVisionResult] from the proxy's structured
+  /// body, re-coercing every value client-side: unknown enums
+  /// are dropped here too, `parsed: false` (or a missing flag)
+  /// is the uncertain failure, and no string from the response
+  /// is ever copied into a result.
+  CloudVisionResult _parseStructured(Map<String, Object?> decoded) {
+    if (decoded['parsed'] != true) {
+      return CloudVisionResult.failed(CloudVisionFailure.uncertain);
+    }
+    final Object? sceneRaw = decoded['scene'];
+    final String scene = sceneRaw is String && visionScenes.contains(sceneRaw)
+        ? sceneRaw
+        : '不确定';
+    final List<VisionObstacle> obstacles = <VisionObstacle>[];
+    final Object? rawList = decoded['obstacles'];
+    if (rawList is List) {
+      for (final Object? item in rawList) {
+        if (item is! Map<String, Object?>) continue;
+        final Object? type = item['type'];
+        final Object? direction = item['direction'];
+        final Object? proximity = item['proximity'];
+        final Object? confidence = item['confidence'];
+        if (type is! String || !visionObstacleTypes.contains(type)) {
+          continue;
         }
+        if (direction is! String || !visionDirections.contains(direction)) {
+          continue;
+        }
+        if (proximity is! String || !visionProximities.contains(proximity)) {
+          continue;
+        }
+        obstacles.add(VisionObstacle(
+          type: type,
+          direction: direction,
+          proximity: proximity,
+          confidence:
+              confidence is num ? confidence.toDouble().clamp(0.0, 1.0) : 0.0,
+        ));
+        if (obstacles.length >= 5) break;
       }
     }
-    return CloudVisionResult.failed(CloudVisionFailure.badResponse);
+    return CloudVisionResult.ok(
+      VisionScene(scene: scene, obstacles: obstacles),
+    );
   }
 }

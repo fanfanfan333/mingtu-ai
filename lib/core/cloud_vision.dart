@@ -52,11 +52,109 @@ const String cloudVisionDisclaimer = '仅供参考，请以盲杖和环境声音
 const String cloudVisionStartingSpeech =
     '正在识别前方画面，请稍等。提醒：$cloudVisionDisclaimer';
 
-/// The prompt sent with every frame. It asks for a plain scene
-/// description and explicitly forbids walking-safety judgements.
-const String cloudVisionPrompt = '请用简短中文描述这张图片里的场景和主要物体，'
-    '不超过三句话。不要给出任何行走方向，不要判断道路是否安全，'
-    '不要说可以安全通过。';
+/// The prompt sent with every frame (the proxy pins the same
+/// text server-side, replacing whatever a client sent). The
+/// model must answer with JSON ONLY, using the enum sets below:
+/// the app never speaks model prose -- it generates its Chinese
+/// announcement from the structured result with local templates,
+/// so an upstream sentence (including any safety claim) has no
+/// path to the user's ears.
+const String cloudVisionPrompt = '只输出一个 JSON 对象，不要输出任何其他文字：'
+    '{"scene": 场景, "obstacles": [{"type": 类型, '
+    '"direction": 方位, "proximity": 远近, '
+    '"confidence": 0到1的小数}]}。'
+    '场景只能是：室内、室外、楼梯间、电梯内、路口、不确定。'
+    '类型只能是：行人、自行车、电动车、汽车、公交车、柱子、'
+    '台阶、楼梯、墙壁、门、桌子、椅子、树木、护栏、指示牌、其他。'
+    '方位只能是：正前方、左前方、右前方、左侧、右侧、后方。'
+    '远近只能是：很近、较近、较远。'
+    '不要做任何安全判断，不要输出 JSON 以外的任何内容。';
+
+/// Enum domains for the structured vision result. The proxy
+/// coerces to the same sets server-side; the client coerces
+/// AGAIN on receipt (a rogue or buggy proxy cannot smuggle an
+/// unknown value into the spoken template either).
+const Set<String> visionScenes = <String>{
+  '室内',
+  '室外',
+  '楼梯间',
+  '电梯内',
+  '路口',
+  '不确定',
+};
+const Set<String> visionObstacleTypes = <String>{
+  '行人',
+  '自行车',
+  '电动车',
+  '汽车',
+  '公交车',
+  '柱子',
+  '台阶',
+  '楼梯',
+  '墙壁',
+  '门',
+  '桌子',
+  '椅子',
+  '树木',
+  '护栏',
+  '指示牌',
+  '其他',
+};
+const Set<String> visionDirections = <String>{
+  '正前方',
+  '左前方',
+  '右前方',
+  '左侧',
+  '右侧',
+  '后方',
+};
+const Set<String> visionProximities = <String>{'很近', '较近', '较远'};
+
+/// One recognised obstacle, enum fields only.
+class VisionObstacle {
+  final String type;
+  final String direction;
+  final String proximity;
+  final double confidence;
+  const VisionObstacle({
+    required this.type,
+    required this.direction,
+    required this.proximity,
+    required this.confidence,
+  });
+}
+
+/// A structured scene: an enum scene label plus enum obstacles.
+/// This is ALL the cloud is allowed to tell the app.
+class VisionScene {
+  final String scene;
+  final List<VisionObstacle> obstacles;
+  const VisionScene({required this.scene, required this.obstacles});
+}
+
+/// Generate the spoken Chinese for a structured scene, from the
+/// enum fields ONLY. Rules enforced by construction:
+/// - no obstacles -> the exact "未识别到明显障碍" sentence with
+///   the disclaimer; it never upgrades to "safe to walk";
+/// - obstacles -> direction + proximity + type phrases, at most
+///   three spoken, then the disclaimer and the unverified note;
+/// - the words 安全 / 可以通过 / 可以走 / 无危险 never appear:
+///   this template has no way to produce a safety judgement.
+String visionSceneSpeechText(VisionScene scene) {
+  if (scene.obstacles.isEmpty) {
+    return '云端视觉辅助：未识别到明显障碍，$cloudVisionDisclaimer';
+  }
+  final List<String> parts = <String>[
+    for (final VisionObstacle o in scene.obstacles.take(3))
+      '${o.direction}${o.proximity}处有${o.type}',
+  ];
+  final String more =
+      scene.obstacles.length > 3 ? '等${scene.obstacles.length}处' : '';
+  final String scenePart = scene.scene == '不确定' ? '' : '识别场景为${scene.scene}。';
+  return '云端视觉辅助：$scenePart${parts.join('；')}$more。'
+      '提醒：$cloudVisionDisclaimer'
+      '这只是低频辅助描述，未经验证，不能当作是否能通行的判断。';
+}
 
 /// Simple interval rate limiter with an injectable clock (callers
 /// pass `now`), so the policy is unit-testable without sleeping.
@@ -161,17 +259,24 @@ enum CloudVisionFailure {
 
   /// The response was not the expected shape.
   badResponse,
+
+  /// The model output could not be parsed into the structured
+  /// enum result (prose, unknown values, wrong shapes).
+  uncertain,
+
+  /// A recognition is already in flight (single-flight guard).
+  busy,
 }
 
 class CloudVisionResult {
-  final String? description;
+  final VisionScene? scene;
   final CloudVisionFailure? failure;
   final String? detail;
 
-  const CloudVisionResult._({this.description, this.failure, this.detail});
+  const CloudVisionResult._({this.scene, this.failure, this.detail});
 
-  factory CloudVisionResult.ok(String description) =>
-      CloudVisionResult._(description: description);
+  factory CloudVisionResult.ok(VisionScene scene) =>
+      CloudVisionResult._(scene: scene);
 
   factory CloudVisionResult.failed(
     CloudVisionFailure failure, {
@@ -179,18 +284,15 @@ class CloudVisionResult {
   }) =>
       CloudVisionResult._(failure: failure, detail: detail);
 
-  bool get ok => failure == null && description != null;
+  bool get ok => failure == null && scene != null;
 
-  /// What the user hears. A success is framed as unverified
-  /// assistive description -- never as a safety judgement. Every
-  /// failure announces the degradation back to local detection;
-  /// nothing fails silently.
+  /// What the user hears. A success is generated locally from
+  /// enum fields (see visionSceneSpeechText) -- never model
+  /// prose. Every failure announces the degradation back to
+  /// local detection; nothing fails silently. [busy] is a
+  /// concurrency notice, not a failure.
   String get speechText {
-    if (ok) {
-      return '云端视觉辅助描述：$description '
-          '提醒：$cloudVisionDisclaimer'
-          '这只是低频辅助描述，未经验证，不能当作道路安全判断。';
-    }
+    if (ok) return visionSceneSpeechText(scene!);
     switch (failure) {
       case CloudVisionFailure.notConfigured:
         return '云端视觉未配置：路线代理还没有部署，云端视觉不可用，'
@@ -209,6 +311,10 @@ class CloudVisionResult {
         return '云端视觉服务出错，已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.badResponse:
         return '云端视觉返回无法理解，已降级为本地检测。提醒：$cloudVisionDisclaimer';
+      case CloudVisionFailure.uncertain:
+        return '云端视觉识别不确定，已降级为本地检测。提醒：$cloudVisionDisclaimer';
+      case CloudVisionFailure.busy:
+        return '正在识别，请稍候。';
       case null:
         return '云端视觉不可用，已降级为本地检测。提醒：$cloudVisionDisclaimer';
     }

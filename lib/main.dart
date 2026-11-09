@@ -80,7 +80,8 @@ class MingtuHomePage extends StatefulWidget {
   State<MingtuHomePage> createState() => _MingtuHomePageState();
 }
 
-class _MingtuHomePageState extends State<MingtuHomePage> {
+class _MingtuHomePageState extends State<MingtuHomePage>
+    with WidgetsBindingObserver {
   TaskManager _tasks = TaskManager();
   SpeechScheduler _scheduler = SpeechScheduler();
   MapNavigationService _mapService = MapNavigationService(StubMapProvider());
@@ -130,7 +131,13 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   // one explicit trigger captures exactly one still frame via the
   // camera plugin and disposes the controller immediately -- no
   // streaming upload, no recording. On web it reports unavailable.
-  final CameraFrameSource _frameSource = createCameraFrameSource();
+  // Assigned in initState: the routing closure reads
+  // _yoloLiveOpen, which an initializer may not reference.
+  late final CameraFrameSource _frameSource;
+
+  /// Cancellation token for the current cloud-vision run; a new
+  /// one is created per run, and lifecycle/dispose cancels it.
+  CloudVisionCancellation _visionCancellation = CloudVisionCancellation();
   // The sequenced flow: configured/rate-limit checks BEFORE the
   // camera opens, "正在识别" announced first, then one frame, then
   // one rate-limited describe call. Every step is spoken.
@@ -177,7 +184,33 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _frameSource = RoutedCameraFrameSource(
+      yoloLiveActive: () => _yoloLiveOpen,
+      yoloSource: createYoloFrameSource(),
+      singleShotSource: createCameraFrameSource(),
+    );
     _initRealIntegrations();
+  }
+
+  /// Lifecycle release: going to background (or being hidden /
+  /// detached) cancels any in-flight cloud-vision recognition
+  /// (its late result is discarded, never spoken) and closes the
+  /// YOLO live view so the camera is released. Disposal does the
+  /// same via [dispose].
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      _visionCancellation.cancel();
+      if (_yoloLiveOpen && mounted) {
+        setState(() {
+          _yoloLiveOpen = false;
+        });
+        _logMsg('应用进入后台：已关闭 YOLO 实时摄像头并取消进行中的云端视觉识别。');
+      }
+    }
   }
 
   /// Try the phone's own engines once at startup. Each adapter
@@ -287,7 +320,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         id: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
         eventId: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
         text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
-        kind: SpeechKind.info,
+        kind: SpeechKind.alert,
       ));
     } else {
       setState(() {
@@ -334,6 +367,8 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _visionCancellation.cancel();
     _straightTimer?.cancel();
     _transcriptSub?.cancel();
     _asrErrorSub?.cancel();
@@ -357,8 +392,18 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     required SpeechKind kind,
     bool requiresStraight = false,
     int expiresSeconds = 5,
+    bool neverExpires = false,
   }) {
     final DateTime now = DateTime.now();
+    // Critical delivery: emergencies, danger prompts and alerts
+    // (safety/failure announcements) NEVER expire -- a dropped
+    // safety message is worse than a late one. Ordinary prompts
+    // keep their short expiry: a stale "直走" must not be
+    // spoken late.
+    final bool critical = neverExpires ||
+        kind == SpeechKind.emergency ||
+        kind == SpeechKind.obstacleAvoidance ||
+        kind == SpeechKind.alert;
     return SpeechRequest(
       id: id,
       eventId: eventId,
@@ -368,6 +413,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       expiresAt: now.add(Duration(seconds: expiresSeconds)),
       navigationStateVersion: _navVersion,
       requiresStraightSegment: requiresStraight,
+      neverExpires: critical,
     );
   }
 
@@ -697,7 +743,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         id: 'real-nav-failed-${DateTime.now().millisecondsSinceEpoch}',
         eventId: 'real-nav-failed-${DateTime.now().millisecondsSinceEpoch}',
         text: text,
-        kind: SpeechKind.info,
+        kind: SpeechKind.alert,
       ));
       return;
     }
@@ -791,7 +837,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         id: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
         eventId: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
         text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
-        kind: SpeechKind.info,
+        kind: SpeechKind.alert,
       ));
     }
   }
@@ -1558,8 +1604,11 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   /// only in the proxy's server environment; this device sends
   /// one downsampled frame to the proxy and nothing else.
   Future<void> _runCloudVisionAssist() async {
+    _visionCancellation = CloudVisionCancellation();
+    final CloudVisionCancellation token = _visionCancellation;
     int seq = 0;
     final CloudVisionFlowOutcome outcome = await _cloudVisionFlow.run(
+      cancellation: token,
       announce: (String text) {
         if (!mounted) return;
         seq += 1;
@@ -1575,6 +1624,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       },
     );
     if (!mounted) return;
+    if (outcome.cancelled) {
+      _logMsg('云端视觉辅助：应用进入后台/销毁，识别已取消，结果已丢弃。');
+      return;
+    }
     final CloudVisionResult result = outcome.visionResult;
     _health.report(
       'cloud_vision',
