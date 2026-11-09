@@ -213,8 +213,10 @@ class VisionRateLimiter {
 Map<String, Object> buildVisionRequestBody({
   required String imageBase64,
   String prompt = cloudVisionPrompt,
+  String? task,
 }) {
   return <String, Object>{
+    if (task != null) 'task': task,
     'model': cloudVisionModelId,
     'messages': <Object>[
       <String, Object>{

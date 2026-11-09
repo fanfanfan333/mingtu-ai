@@ -112,11 +112,11 @@ void main() {
       await tapText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
       // Same priority as the playing person danger: it must
       // QUEUE (not interrupt, not vanish).
-      expect(find.textContaining('已排队：前方有车，请停下'), findsOneWidget);
+      expect(find.textContaining('已排队：前方有机动车，请停下'), findsOneWidget);
 
       // Person danger finishes -> the vehicle danger is next.
       await tester.pump(const Duration(milliseconds: 1300));
-      expect(find.textContaining('前方有车，请停下'), findsWidgets);
+      expect(find.textContaining('前方有机动车，请停下'), findsWidgets);
       expect(find.text('当前任务状态：正在避障'), findsOneWidget);
       await drain(tester);
     });
@@ -154,7 +154,7 @@ void main() {
       // must speak next -- not the cleared info, not a
       // straight prompt.
       await tester.pump(const Duration(milliseconds: 1300));
-      expect(find.text('当前提示：前方有车，请停下。'), findsOneWidget);
+      expect(find.text('当前提示：前方有机动车，请停下。'), findsOneWidget);
 
       // The cleared info may only become current AFTER the
       // danger has spoken. Ambient info traffic (the health
@@ -164,10 +164,7 @@ void main() {
       bool infoSeen = false;
       for (int i = 0; i < 8 && !infoSeen; i++) {
         await tester.pump(const Duration(milliseconds: 1300));
-        infoSeen = find
-            .textContaining('当前提示：前方已无检测到的障碍')
-            .evaluate()
-            .isNotEmpty;
+        infoSeen = find.textContaining('当前提示：前方已无检测到的障碍').evaluate().isNotEmpty;
         expect(find.text('当前提示：直走'), findsNothing);
       }
       expect(infoSeen, isTrue);

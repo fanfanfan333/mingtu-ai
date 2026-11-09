@@ -28,6 +28,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import '../core/cloud_vision.dart';
+import '../core/cloud_vision_hazard.dart';
 
 /// POSTs [body] to [url] with [headers] and returns the raw
 /// response body for ANY HTTP status: the proxy answers guard
@@ -71,7 +72,6 @@ const String visionTokenHeader = 'X-Mingtu-Vision-Token';
 /// announced to the user as 识图暂时不可用.
 const Set<String> visionUnavailableErrorCodes = <String>{
   'unauthorized',
-  'rate_limited',
   'vision_not_configured',
   // The proxy answers an over-3MiB request body with HTTP 413
   // and this code; the sender surfaces only the body, so the
@@ -171,24 +171,69 @@ class CloudVisionClient {
         detail: '识图代理地址不是 https，已拒绝使用。',
       );
     }
+    final ({Map<String, Object?>? decoded, CloudVisionResult? failure}) reply =
+        await _decodedResponse(
+            imageBytes: imageBytes, prompt: prompt, task: null);
+    if (reply.failure != null) return reply.failure!;
+    return _parseStructured(reply.decoded!);
+  }
+
+  /// Hazard-mode counterpart of [describeReserved] (the slot
+  /// must already be reserved): sends the strict-JSON hazard
+  /// task and parses the answer with the hazard validator.
+  /// Same transport, same fixed-text failure discipline.
+  Future<HazardScanOutcome> describeHazardReserved({
+    required Uint8List imageBytes,
+  }) async {
+    if (!hasProxyUrl || !isConfigured) {
+      return const HazardScanOutcome.failed(CloudVisionFailure.notConfigured);
+    }
+    final ({Map<String, Object?>? decoded, CloudVisionResult? failure}) reply =
+        await _decodedResponse(
+            imageBytes: imageBytes,
+            prompt: cloudHazardPrompt,
+            task: 'hazard_scan');
+    if (reply.failure != null) {
+      return HazardScanOutcome.failed(reply.failure!.failure!);
+    }
+    return HazardScanOutcome.ok(parseHazardAssessment(reply.decoded));
+  }
+
+  /// Shared transport for both vision modes: downscale,
+  /// POST, decode, and map a structured proxy error to a
+  /// fixed-text failure. Returns exactly one of the two
+  /// record fields.
+  Future<({Map<String, Object?>? decoded, CloudVisionResult? failure})>
+      _decodedResponse({
+    required Uint8List imageBytes,
+    required String prompt,
+    required String? task,
+  }) async {
     final Uint8List small;
     try {
       small = await downsampler(imageBytes, cloudVisionMaxDimension);
     } catch (e) {
-      return CloudVisionResult.failed(
-        CloudVisionFailure.badResponse,
-        detail: '图片处理失败。',
+      return (
+        decoded: null,
+        failure: CloudVisionResult.failed(
+          CloudVisionFailure.badResponse,
+          detail: '图片处理失败。',
+        )
       );
     }
     if (small.length > cloudVisionMaxImageBytes) {
-      return CloudVisionResult.failed(CloudVisionFailure.imageTooLarge);
+      return (
+        decoded: null,
+        failure: CloudVisionResult.failed(CloudVisionFailure.imageTooLarge)
+      );
     }
     final String base = proxyBaseUrl.endsWith('/')
         ? proxyBaseUrl.substring(0, proxyBaseUrl.length - 1)
         : proxyBaseUrl;
     final Uri url = Uri.parse('$base/vision');
     final String body = jsonEncode(
-      buildVisionRequestBody(imageBase64: base64Encode(small), prompt: prompt),
+      buildVisionRequestBody(
+          imageBase64: base64Encode(small), prompt: prompt, task: task),
     );
     final Map<String, String> headers = demoToken.isEmpty
         ? const <String, String>{}
@@ -197,29 +242,42 @@ class CloudVisionClient {
     try {
       responseBody = await sender(url, body, headers).timeout(requestTimeout);
     } on TimeoutException {
-      return CloudVisionResult.failed(
-        CloudVisionFailure.timeout,
-        detail: '请求超过 ${requestTimeout.inSeconds} 秒未返回。',
+      return (
+        decoded: null,
+        failure: CloudVisionResult.failed(
+          CloudVisionFailure.timeout,
+          detail: '请求超过 ${requestTimeout.inSeconds} 秒未返回。',
+        )
       );
     } catch (_) {
       // Fixed text ONLY: a transport exception can embed the
       // request URL or other request details; nothing from the
       // exception may reach the result detail, the speech or
       // the logs.
-      return CloudVisionResult.failed(
-        CloudVisionFailure.network,
-        detail: '网络请求失败，未收到识图服务响应。',
+      return (
+        decoded: null,
+        failure: CloudVisionResult.failed(
+          CloudVisionFailure.network,
+          detail: '网络请求失败，未收到识图服务响应。',
+        )
       );
     }
-    final Object? decoded;
+    final Object? decodedRaw;
     try {
-      decoded = jsonDecode(responseBody);
+      decodedRaw = jsonDecode(responseBody);
     } catch (_) {
-      return CloudVisionResult.failed(CloudVisionFailure.badResponse);
+      return (
+        decoded: null,
+        failure: CloudVisionResult.failed(CloudVisionFailure.badResponse)
+      );
     }
-    if (decoded is! Map<String, Object?>) {
-      return CloudVisionResult.failed(CloudVisionFailure.badResponse);
+    if (decodedRaw is! Map<String, Object?>) {
+      return (
+        decoded: null,
+        failure: CloudVisionResult.failed(CloudVisionFailure.badResponse)
+      );
     }
+    final Map<String, Object?> decoded = decodedRaw;
     final Object? errorCode = decoded['error'];
     if (errorCode != null) {
       // ONLY the whitelisted codes map to a failure kind, and
@@ -227,20 +285,37 @@ class CloudVisionClient {
       // server error string is attacker-controlled content (a
       // compromised or hostile upstream could echo credentials
       // or URLs into it) and must never reach the detail, the
-      // speech or the logs.
-      if (errorCode is String &&
-          visionUnavailableErrorCodes.contains(errorCode)) {
-        return CloudVisionResult.failed(
-          CloudVisionFailure.unavailable,
-          detail: '识图暂时不可用（服务端拒绝或未配置）。',
+      // speech or the logs. rate_limited maps to its own
+      // failure so callers can apply the announce-once +
+      // exponential-backoff policy for 429s.
+      if (errorCode == 'rate_limited') {
+        return (
+          decoded: null,
+          failure: CloudVisionResult.failed(
+            CloudVisionFailure.rateLimited,
+            detail: '云端识图请求过于频繁。',
+          )
         );
       }
-      return CloudVisionResult.failed(
-        CloudVisionFailure.upstream,
-        detail: '云端识图服务返回了未识别的错误。',
+      if (errorCode is String &&
+          visionUnavailableErrorCodes.contains(errorCode)) {
+        return (
+          decoded: null,
+          failure: CloudVisionResult.failed(
+            CloudVisionFailure.unavailable,
+            detail: '识图暂时不可用（服务端拒绝或未配置）。',
+          )
+        );
+      }
+      return (
+        decoded: null,
+        failure: CloudVisionResult.failed(
+          CloudVisionFailure.upstream,
+          detail: '云端识图服务返回了未识别的错误。',
+        )
       );
     }
-    return _parseStructured(decoded);
+    return (decoded: decoded, failure: null);
   }
 
   /// Convenience for callers that do not manage the reservation

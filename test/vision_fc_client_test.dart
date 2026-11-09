@@ -70,18 +70,26 @@ void main() {
     expect(result.speechText, contains('识图未配置'));
   });
 
+  test('401 unauthorized maps to 识图暂时不可用', () async {
+    final CloudVisionResult result = await _client(
+      sender: (Uri u, String b, Map<String, String> h) async =>
+          jsonEncode(<String, String>{'error': 'unauthorized'}),
+    ).describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.failure, CloudVisionFailure.unavailable);
+    expect(result.speechText, contains('识图暂时不可用'));
+    expect(result.speechText, isNot(contains('安全')));
+  });
+
   test(
-      '401 unauthorized and 429 rate_limited both map to '
-      '识图暂时不可用', () async {
-    for (final String code in <String>['unauthorized', 'rate_limited']) {
-      final CloudVisionResult result = await _client(
-        sender: (Uri u, String b, Map<String, String> h) async =>
-            jsonEncode(<String, String>{'error': code}),
-      ).describe(imageBytes: _img, now: DateTime(2026, 1, 1));
-      expect(result.failure, CloudVisionFailure.unavailable, reason: code);
-      expect(result.speechText, contains('识图暂时不可用'), reason: code);
-      expect(result.speechText, isNot(contains('安全')), reason: code);
-    }
+      '429 rate_limited maps to the dedicated rateLimited '
+      'failure (the hazard-scan backoff keys on it)', () async {
+    final CloudVisionResult result = await _client(
+      sender: (Uri u, String b, Map<String, String> h) async =>
+          jsonEncode(<String, String>{'error': 'rate_limited'}),
+    ).describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.failure, CloudVisionFailure.rateLimited);
+    expect(result.speechText, contains('太频繁'));
+    expect(result.speechText, isNot(contains('安全')));
   });
 
   test(

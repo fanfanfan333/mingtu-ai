@@ -16,12 +16,24 @@ class Detection {
   final double confidence;
   final double cx; // normalised centre x, 0..1
   final double cy; // normalised centre y, 0..1
+
+  /// Normalised box width / height, 0..1. Zero means the
+  /// geometry is UNKNOWN (older callers, stub detectors):
+  /// consumers that need box geometry (nearness estimates)
+  /// must fail closed on zero, never guess.
+  final double w;
+  final double h;
   const Detection({
     required this.label,
     required this.confidence,
     required this.cx,
     required this.cy,
+    this.w = 0,
+    this.h = 0,
   });
+
+  /// Normalised y of the box's bottom edge.
+  double get bottom => cy + h / 2;
 }
 
 class TrackedObject {

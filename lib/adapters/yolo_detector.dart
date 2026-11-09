@@ -26,12 +26,16 @@ Detection yoloResultToDetection({
   required double confidence,
   required double centerX,
   required double centerY,
+  double boxWidth = 0,
+  double boxHeight = 0,
 }) {
   return Detection(
     label: label,
     confidence: confidence.clamp(0.0, 1.0),
     cx: centerX.clamp(0.0, 1.0),
     cy: centerY.clamp(0.0, 1.0),
+    w: boxWidth.clamp(0.0, 1.0),
+    h: boxHeight.clamp(0.0, 1.0),
   );
 }
 
@@ -51,8 +55,7 @@ class UnavailableYoloDetector implements YoloDetector {
   bool get isAvailable => false;
 
   @override
-  String get status =>
-      'NOT_CONFIGURED（YOLO 未接入：本平台不支持手机端推理，或模型未加载）';
+  String get status => 'NOT_CONFIGURED（YOLO 未接入：本平台不支持手机端推理，或模型未加载）';
 
   @override
   Future<List<Detection>> detectImage(List<int> imageBytes) async =>

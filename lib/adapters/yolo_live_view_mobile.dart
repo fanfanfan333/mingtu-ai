@@ -102,6 +102,8 @@ class _YoloLiveViewHostState extends State<_YoloLiveViewHost> {
                   confidence: r.confidence,
                   centerX: r.normalizedBox.left + r.normalizedBox.width / 2,
                   centerY: r.normalizedBox.top + r.normalizedBox.height / 2,
+                  boxWidth: r.normalizedBox.width,
+                  boxHeight: r.normalizedBox.height,
                 ))
             .toList());
       },

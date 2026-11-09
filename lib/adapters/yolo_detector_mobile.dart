@@ -70,6 +70,8 @@ class MobileYoloDetector implements YoloDetector {
           confidence: parsed.confidence,
           centerX: cx,
           centerY: cy,
+          boxWidth: parsed.normalizedBox.width,
+          boxHeight: parsed.normalizedBox.height,
         ));
       }
       _available = true;

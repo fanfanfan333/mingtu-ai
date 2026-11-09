@@ -23,6 +23,10 @@ import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
 import 'core/asr_errors.dart';
 import 'core/danger_alerts.dart';
+import 'core/avoidance_advisor.dart';
+import 'core/cloud_vision_hazard.dart';
+import 'core/orientation.dart';
+import 'adapters/orientation_monitor.dart';
 import 'core/destination_dialogue.dart';
 import 'core/navigation_tracker.dart';
 import 'core/yolo_error_speech.dart';
@@ -173,6 +177,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     client: _cloudVisionClient,
     frameSource: _frameSource,
   );
+  // Danger step (2026-11-09): the avoidance advisor owns the
+  // three-condition direction rule; the orientation monitor
+  // feeds condition 3 (fail-closed until the gyroscope seam
+  // is created at startup).
+  final AvoidanceAdvisor _avoidance = AvoidanceAdvisor();
+  OrientationMonitor _orientation = const UnavailableOrientationMonitor();
+  // Cloud-vision cycle merging + 429 backoff (hazard scans).
+  final VisionCycleCoordinator _visionCycle = VisionCycleCoordinator();
+  final VisionRateBackoff _visionBackoff = VisionRateBackoff();
+  Timer? _hazardScanTimer;
+  GeoPoint? _lastFixPoint;
+  GeoPoint? _scanAnchorPoint;
+  DateTime? _lastVisionCallAt;
+  bool _manualCycleOwned = false;
   String _perceptionText = '尚未模拟感知帧。';
   // v0.6 real integrations. Defaults are the unavailable fallbacks;
   // _initRealIntegrations replaces them only when the phone's own
@@ -289,6 +307,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       startupFailures.record('应用初始化');
     }
     if (!mounted) return;
+    _orientation = createOrientationMonitor()..start();
+    _hazardScanTimer?.cancel();
+    _hazardScanTimer = Timer.periodic(
+      const Duration(seconds: 8),
+      (_) => _hazardScanTick(),
+    );
     _announceStartupFailures(speechUsable: speechUsable);
     unawaited(_kickoffVoiceNavFlow(speechUsable));
   }
@@ -428,6 +452,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
       return;
     }
+    _lastFixPoint = r.pointGcj02;
     final List<NavEvent> events = _liveNav!.onFix(NavFix(
       point: r.pointGcj02!,
       accuracyM: r.accuracyM,
@@ -783,6 +808,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _visionRuns.cancelActive();
     _cameraOwnership.cancelAllAndRelease();
     _straightTimer?.cancel();
+    _hazardScanTimer?.cancel();
+    _orientation.dispose();
     _transcriptSub?.cancel();
     _asrErrorSub?.cancel();
     _asrSessionSub?.cancel();
@@ -1511,6 +1538,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// frames without such a detection, and straight never auto-resumes.
   void _onYoloDetections(List<Detection> detections) {
     final DateTime now = DateTime.now();
+    // Avoidance advisor bookkeeping for EVERY frame: the
+    // side-clear streaks behind the three-condition rule and
+    // the pending-action tracker (spec 7.7-12: speech
+    // completion never confirms an action; frame evidence
+    // does -- or reports it unconfirmed here).
+    final AvoidanceNotice? notice = _avoidance.observeFrame(detections);
+    if (notice == AvoidanceNotice.actionUncertain) {
+      _say(_request(
+        id: 'avoid-uncertain-${now.millisecondsSinceEpoch}',
+        eventId: 'avoid-uncertain-${now.millisecondsSinceEpoch}',
+        text: '尚未确认避开前方障碍，请停下。',
+        kind: SpeechKind.danger,
+      ));
+    }
     final List<PerceptionEvent> events =
         _perception.processFrame(detections, now);
     final bool hasObstacleNow = detections.any((Detection d) =>
@@ -1570,17 +1611,40 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
       }
       if (chosen != null) {
-        String otherName = '障碍物';
-        if (chosen == DangerCategory.other) {
-          final PerceptionEvent firstOther = newObstacles.firstWhere(
-              (PerceptionEvent e) =>
-                  dangerCategoryFor(e.label) == DangerCategory.other);
-          otherName = _yoloObstacleLabels[firstOther.label] ?? firstOther.label;
+        // The announcement text comes from the avoidance
+        // advisor: it names the hazard category and adds a
+        // one-step direction ONLY when all three conditions
+        // hold (central + near, other side clear for 3+
+        // frames, orientation stable); otherwise it is the
+        // stop instruction.
+        Detection? representative;
+        for (final Detection d in detections) {
+          if (dangerCategoryFor(d.label) == chosen &&
+              (representative == null ||
+                  d.confidence > representative.confidence)) {
+            representative = d;
+          }
+        }
+        final String text;
+        if (representative != null) {
+          final AvoidanceDecision decision = _avoidance.decide(
+            hazard: representative,
+            orientationStable: _orientation.isStable,
+          );
+          text = decision.speech;
+          if (decision.nearCenterHazard) {
+            // A near hazard in the corridor also triggers a
+            // cloud hazard frame, merged into the current
+            // vision cycle (never an extra request).
+            unawaited(_triggerHazardScan(VisionTrigger.yoloHazard));
+          }
+        } else {
+          text = dangerTextFor(chosen);
         }
         _say(_request(
           id: 'yolo-danger-${now.millisecondsSinceEpoch}',
           eventId: 'yolo-danger-${now.millisecondsSinceEpoch}',
-          text: dangerTextFor(chosen, otherName: otherName),
+          text: text,
           kind: SpeechKind.danger,
         ));
       }
@@ -2223,6 +2287,126 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// denial -- so no path is silent. The DashScope key exists
   /// only in the proxy's server environment; this device sends
   /// one downsampled frame to the proxy and nothing else.
+  /// Manual cloud-vision entry (voice command and button):
+  /// routes through the cycle coordinator so a tap during a
+  /// hazard scan JOINS that cycle's single request instead of
+  /// starting a second one, and a tap during a 429 backoff is
+  /// skipped silently (local detection continues).
+  void _triggerManualVision() {
+    if (!_visionBackoff.allow(DateTime.now())) {
+      _logMsg('云端视觉：429 退避中，手动识图已跳过，只用本地检测。');
+      return;
+    }
+    final CycleStart start = _visionCycle.trigger(VisionTrigger.manual);
+    if (start == CycleStart.joined) {
+      _logMsg('云端视觉：手动请求已合并到正在进行的扫描，完成后播报结果。');
+      return;
+    }
+    if (start == CycleStart.busy) {
+      // A manual run is already in flight; the existing
+      // refusal inside _runCloudVisionAssist speaks for it.
+      unawaited(_runCloudVisionAssist());
+      return;
+    }
+    _manualCycleOwned = true;
+    unawaited(_runCloudVisionAssist());
+  }
+
+  /// The 8-second walking-scan tick: only while walking, and
+  /// during live navigation only after the user has actually
+  /// moved (>= 2 m since the last scan's fix). Stationary or
+  /// not navigating -> no automatic cloud calls at all.
+  void _hazardScanTick() {
+    if (!mounted) return;
+    final bool walking = _liveNav != null ||
+        _tasks.state == TaskState.navigating ||
+        _tasks.state == TaskState.avoidingObstacle;
+    if (!walking) return;
+    if (_liveNav != null) {
+      final GeoPoint? fix = _lastFixPoint;
+      if (fix == null) return;
+      final GeoPoint? anchor = _scanAnchorPoint;
+      if (anchor != null && haversineMeters(anchor, fix) < 2) return;
+    }
+    unawaited(_triggerHazardScan(VisionTrigger.periodic));
+  }
+
+  /// One hazard-scan cycle (periodic or YOLO-triggered; the
+  /// coordinator merges overlapping triggers into this one
+  /// request). Silent by design except for ground hazards,
+  /// a tactile-paving identification, the single 429 notice
+  /// per backoff episode, and a manual request that joined.
+  Future<void> _triggerHazardScan(VisionTrigger kind) async {
+    if (!_cloudVisionClient.isConfigured) return;
+    final DateTime now = DateTime.now();
+    if (!_visionBackoff.allow(now)) return;
+    if (_lastVisionCallAt != null &&
+        now.difference(_lastVisionCallAt!) < const Duration(seconds: 8)) {
+      return;
+    }
+    final CycleStart start = _visionCycle.trigger(kind);
+    if (start != CycleStart.hazardRun) return;
+    _scanAnchorPoint = _lastFixPoint;
+    _lastVisionCallAt = now;
+    HazardAssessment? assessment;
+    try {
+      if (!_cloudVisionClient.tryReserve(now)) return;
+      final CameraFrameCapture capture =
+          await _frameSource.captureSingleFrame();
+      if (!capture.ok || capture.bytes == null) return;
+      final HazardScanOutcome outcome = await _cloudVisionClient
+          .describeHazardReserved(imageBytes: capture.bytes!);
+      if (outcome.failure == CloudVisionFailure.rateLimited) {
+        if (_visionBackoff.onRateLimited(DateTime.now())) {
+          _say(_request(
+            id: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
+            text: '识图暂时繁忙，稍后会自动重试，其间继续用本地检测。',
+            kind: SpeechKind.alert,
+          ));
+        }
+        return;
+      }
+      if (!outcome.ok) return;
+      _visionBackoff.onSuccess();
+      final HazardAssessment a = outcome.assessment!;
+      assessment = a;
+      if (!mounted) return;
+      final String? ground = hazardGroundSpeech(a);
+      if (ground != null) {
+        _say(_request(
+          id: 'hazard-ground-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'hazard-ground-${DateTime.now().millisecondsSinceEpoch}',
+          text: ground,
+          kind: SpeechKind.danger,
+        ));
+      } else {
+        final String? paving = hazardPavingSpeech(a);
+        if (paving != null) {
+          _say(_request(
+            id: 'hazard-paving-${DateTime.now().millisecondsSinceEpoch}',
+            eventId: 'hazard-paving-${DateTime.now().millisecondsSinceEpoch}',
+            text: paving,
+            kind: SpeechKind.info,
+          ));
+        }
+      }
+    } catch (_) {
+      // A scan failure stays silent: local detection is the
+      // primary channel and keeps running.
+    } finally {
+      final bool joined = _visionCycle.complete();
+      if (joined && assessment != null && mounted) {
+        _say(_request(
+          id: 'hazard-join-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'hazard-join-${DateTime.now().millisecondsSinceEpoch}',
+          text: hazardDescriptionSpeech(assessment),
+          kind: SpeechKind.alert,
+        ));
+      }
+    }
+  }
+
   Future<void> _runCloudVisionAssist() async {
     // Duplicate trigger: refuse WITHOUT creating a token. The
     // run in flight keeps its token, so background/dispose can
@@ -2230,6 +2414,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // field on every call and orphaned the running run).
     final CloudVisionCancellation? token = _visionRuns.begin();
     if (token == null) {
+      if (_manualCycleOwned) {
+        // Defensive: never leak a coordinator cycle.
+        _manualCycleOwned = false;
+        _visionCycle.complete();
+      }
       _say(_request(
         id: 'cloud-vision-busy-${DateTime.now().millisecondsSinceEpoch}',
         eventId: 'cloud-vision-busy-${DateTime.now().millisecondsSinceEpoch}',
@@ -2239,6 +2428,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     _cameraOwnership.registerCancellation(token);
+    _lastVisionCallAt = DateTime.now();
+    CloudVisionFailure? runFailure;
+    bool runCompleted = false;
     int seq = 0;
     try {
       final CloudVisionFlowOutcome outcome = await _cloudVisionFlow.run(
@@ -2268,6 +2460,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         return;
       }
       final CloudVisionResult result = outcome.visionResult;
+      runFailure = result.failure;
+      runCompleted = true;
       _health.report(
         'cloud_vision',
         result.ok ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
@@ -2277,6 +2471,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       );
       _logMsg('云端视觉辅助：ok=${result.ok}，failure=${result.failure}。');
     } finally {
+      if (runFailure == CloudVisionFailure.rateLimited) {
+        // The flow already announced this 429; record the
+        // strike so scans back off and nothing re-announces.
+        _visionBackoff.onRateLimited(DateTime.now());
+      } else if (runCompleted && runFailure == null) {
+        _visionBackoff.onSuccess();
+      }
+      if (_manualCycleOwned) {
+        _manualCycleOwned = false;
+        _visionCycle.complete();
+      }
       _cameraOwnership.unregisterCancellation(token);
       _visionRuns.end(token);
     }
@@ -2490,7 +2695,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         // Explicit trigger only: one frame, one low-frequency
         // cloud description, all stages spoken (see
         // _runCloudVisionAssist). Never runs in the background.
-        unawaited(_runCloudVisionAssist());
+        _triggerManualVision();
         return;
       case VoiceCommand.environment:
         _say(_request(
@@ -3115,7 +3320,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             _demoButton(
               label: '云端视觉辅助（低频，经代理，本地检测仍为主）',
               semanticsLabel: '云端视觉辅助',
-              onPressed: _runCloudVisionAssist,
+              onPressed: _triggerManualVision,
             ),
             _demoButton(
               label: '紧急求助（本地，不依赖网络和大模型）',

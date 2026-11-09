@@ -605,6 +605,127 @@ def vision_reject_reason(token, expected_token, limiter):
     return None
 
 
+# ------------------------------------------------------------------
+# Hazard mode (task == "hazard_scan" on /vision): the strict
+# JSON schema the walking scan uses for stairs / curbs / pits /
+# tactile paving. Same discipline as the scene mode -- the
+# prompt is pinned here, the upstream answer is parsed and
+# rebuilt field by field through fixed enums, and ANY
+# deviation collapses to the all-unknown object. The cloud's
+# suggested_action is advisory data only; whether a direction
+# is spoken is decided on-device by the local three-condition
+# rule, never by this payload. The summary is shape-checked
+# (<= 15 chars) and passed through as data; the client never
+# speaks it.
+# ------------------------------------------------------------------
+
+HAZARD_PROMPT = (
+    "只输出一个 json 对象，不要输出任何其他文字："
+    '{"type": 类型, "direction": 方位, "distance_level": 远近, '
+    '"confidence": 0到1的小数, "path_status": '
+    '{"suggested_action": 建议, "summary": "15字以内的概括"}}。'
+    "类型只能是：stairs_up、stairs_down、curb、tactile_paving、"
+    "pedestrian、vehicle、bicycle、pole、pit、unknown。"
+    "方位只能是：left、center、right、unknown。"
+    "远近只能是：immediate、near、far、unknown。"
+    "建议只能是：forward、shift_left、shift_right、stop。"
+    "看不清或拿不准时，相应字段一律填 unknown。"
+    "不要做任何通行判断，不要输出 json 以外的任何内容。"
+)
+HAZARD_TYPES = frozenset(
+    [
+        "stairs_up", "stairs_down", "curb", "tactile_paving",
+        "pedestrian", "vehicle", "bicycle", "pole", "pit", "unknown",
+    ]
+)
+HAZARD_DIRECTIONS = frozenset(["left", "center", "right", "unknown"])
+HAZARD_DISTANCES = frozenset(["immediate", "near", "far", "unknown"])
+HAZARD_ACTIONS = frozenset(["forward", "shift_left", "shift_right", "stop"])
+HAZARD_MAX_TOKENS = 300
+HAZARD_MAX_SUMMARY_CHARS = 15
+
+
+def _hazard_unknown():
+    return json.dumps(
+        {
+            "type": "unknown",
+            "direction": "unknown",
+            "distance_level": "unknown",
+            "confidence": 0,
+            "path_status": {"suggested_action": "stop", "summary": ""},
+            "parsed": False,
+        }
+    ).encode("utf-8")
+
+
+def whitelist_hazard_body(raw_body, secrets):
+    """Rebuild a hazard-mode upstream answer as STRICT JSON.
+
+    Mirrors whitelist_vision_body's contract: returns the
+    structured bytes (the all-unknown object whenever the
+    content does not conform exactly), or None when the
+    upstream body is not even the expected chat shape.
+    """
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("error") is not None:
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    try:
+        inner = json.loads(content)
+    except Exception:
+        return _hazard_unknown()
+    if not isinstance(inner, dict):
+        return _hazard_unknown()
+    htype = _coerce_enum(inner.get("type"), HAZARD_TYPES)
+    direction = _coerce_enum(inner.get("direction"), HAZARD_DIRECTIONS)
+    distance = _coerce_enum(inner.get("distance_level"), HAZARD_DISTANCES)
+    if not htype or not direction or not distance:
+        return _hazard_unknown()
+    confidence = inner.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(
+        confidence, (int, float)
+    ):
+        return _hazard_unknown()
+    path = inner.get("path_status")
+    if not isinstance(path, dict):
+        return _hazard_unknown()
+    action = _coerce_enum(path.get("suggested_action"), HAZARD_ACTIONS)
+    summary = path.get("summary")
+    if not action or not isinstance(summary, str):
+        return _hazard_unknown()
+    if len(summary) > HAZARD_MAX_SUMMARY_CHARS:
+        return _hazard_unknown()
+    if _strip_secrets(summary, secrets) != summary:
+        return _hazard_unknown()
+    return json.dumps(
+        {
+            "type": htype,
+            "direction": direction,
+            "distance_level": distance,
+            "confidence": _coerce_confidence(confidence),
+            "path_status": {
+                "suggested_action": action,
+                "summary": summary,
+            },
+            "parsed": True,
+        }
+    ).encode("utf-8")
+
+
 def handle_vision_body(raw, *, dashscope_key, vision_upstream,
                        poster, amap_key=""):
     """Parse, pin, clamp, forward and whitelist one /vision
@@ -631,8 +752,10 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
         return 400, json.dumps({"error": "messages required"}).encode()
     if not dashscope_key:
         return 503, json.dumps({"error": "vision not configured"}).encode()
+    hazard_mode = payload.pop("task", None) == "hazard_scan"
     # Pin the instruction server-side: any text part the client
-    # sent is replaced with the JSON-only prompt.
+    # sent is replaced with the mode's JSON-only prompt.
+    pinned_prompt = HAZARD_PROMPT if hazard_mode else VISION_PROMPT
     for message in payload["messages"]:
         if not isinstance(message, dict):
             continue
@@ -640,12 +763,19 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
         if isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
-                    part["text"] = VISION_PROMPT
+                    part["text"] = pinned_prompt
     # Clamp the output budget and disable thinking server-side.
+    # Hazard mode additionally pins the strict-JSON decoding
+    # parameters the schema requires.
     requested = payload.get("max_tokens")
     if not isinstance(requested, int) or requested <= 0:
         requested = VISION_MAX_TOKENS
-    payload["max_tokens"] = min(requested, VISION_MAX_TOKENS)
+    if hazard_mode:
+        payload["max_tokens"] = min(requested, HAZARD_MAX_TOKENS)
+        payload["response_format"] = {"type": "json_object"}
+        payload["temperature"] = 0
+    else:
+        payload["max_tokens"] = min(requested, VISION_MAX_TOKENS)
     payload["enable_thinking"] = False
     body = json.dumps(payload).encode("utf-8")
     try:
@@ -654,7 +784,10 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
         return 504, json.dumps({"error": "upstream timeout"}).encode()
     except Exception:  # no detail: errors may embed headers
         return 502, json.dumps({"error": "upstream failure"}).encode()
-    cleaned = whitelist_vision_body(resp_body, [amap_key, dashscope_key])
+    if hazard_mode:
+        cleaned = whitelist_hazard_body(resp_body, [amap_key, dashscope_key])
+    else:
+        cleaned = whitelist_vision_body(resp_body, [amap_key, dashscope_key])
     if cleaned is None:
         return 502, json.dumps({"error": "upstream failure"}).encode()
     return 200, cleaned
