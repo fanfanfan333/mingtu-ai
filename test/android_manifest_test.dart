@@ -34,8 +34,7 @@ void main() {
         content = file.readAsStringSync();
       });
 
-      test('has balanced comment delimiters and no "--" inside comments',
-          () {
+      test('has balanced comment delimiters and no "--" inside comments', () {
         var cursor = 0;
         var comments = 0;
         while (true) {
@@ -46,8 +45,7 @@ void main() {
               reason: 'unterminated XML comment starting at offset $open');
           final body = content.substring(open + 4, close);
           expect(body.contains('--'), isFalse,
-              reason:
-                  'XML comments must not contain "--" (invalid token in '
+              reason: 'XML comments must not contain "--" (invalid token in '
                   'the Android manifest merger). Comment body: $body');
           comments++;
           cursor = close + 3;
@@ -59,8 +57,8 @@ void main() {
       test('has no stray "--" outside comments either', () {
         // Strip every well-formed comment, then any remaining "--" would
         // be inside markup or text, which is likewise not legal here.
-        final stripped = content.replaceAll(
-            RegExp(r'<!--.*?-->', dotAll: true), '');
+        final stripped =
+            content.replaceAll(RegExp(r'<!--.*?-->', dotAll: true), '');
         expect(stripped.contains('--'), isFalse,
             reason: 'unexpected "--" outside an XML comment');
       });
@@ -70,9 +68,8 @@ void main() {
   test('main manifest launcher icon resource exists', () {
     final mainManifest =
         File('android/app/src/main/AndroidManifest.xml').readAsStringSync();
-    final iconMatch =
-        RegExp(r'android:icon="@mipmap/([A-Za-z0-9_]+)"').firstMatch(
-            mainManifest);
+    final iconMatch = RegExp(r'android:icon="@mipmap/([A-Za-z0-9_]+)"')
+        .firstMatch(mainManifest);
     expect(iconMatch, isNotNull,
         reason: 'main manifest must declare a mipmap launcher icon');
     final iconName = iconMatch!.group(1)!;
@@ -92,8 +89,7 @@ void main() {
     ];
     final found = candidates.where((p) => File(p).existsSync()).toList();
     expect(found, isNotEmpty,
-        reason:
-            '@mipmap/$iconName is referenced by the manifest but no icon '
+        reason: '@mipmap/$iconName is referenced by the manifest but no icon '
             'resource exists; AAPT linking fails without one. Looked for: '
             '${candidates.join(', ')}');
 
@@ -114,11 +110,26 @@ void main() {
       ],
     ];
     expect(legacy.where((p) => File(p).existsSync()), isNotEmpty,
-        reason:
-            'no pre-26 launcher icon fallback (density bucket) exists; '
+        reason: 'no pre-26 launcher icon fallback (density bucket) exists; '
             'looked for: ${legacy.join(', ')}');
-    expect(
-        File('$resDir/mipmap-anydpi-v26/$iconName.xml').existsSync(), isTrue,
+    expect(File('$resDir/mipmap-anydpi-v26/$iconName.xml').existsSync(), isTrue,
         reason: 'adaptive icon (API 26+) must also be present');
+  });
+
+  group('release launch identity and ABI (P0, 2026-11-09)', () {
+    test('the app label is 明途', () {
+      final String mainManifest =
+          File('android/app/src/main/AndroidManifest.xml').readAsStringSync();
+      expect(mainManifest, contains('android:label="明途"'));
+    });
+
+    test(
+        'the release-capable ABI list includes arm64-v8a '
+        '(64-bit-only phones must not get a v7a-only package)', () {
+      final String gradle =
+          File('android/app/build.gradle.kts').readAsStringSync();
+      expect(gradle, contains('abiFilters'));
+      expect(gradle, contains('"arm64-v8a"'));
+    });
   });
 }

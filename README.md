@@ -1,5 +1,26 @@
 # 明途 AI v0.7
 
+## 构建演示 APK（先看这一节，P0）
+
+**小米 15 等纯 64 位手机必须用 arm64 包。** 教训（2026-11-09 真机反馈）：把只含 armeabi-v7a（32 位）的 APK 装到纯 64 位手机上，能安装、但一打开就退出——32 位 Flutter 引擎在纯 64 位系统上无法加载。不要用 `--target-platform android-arm` 打演示包。
+
+```bash
+# 64 位手机（小米 15 等，演示首选）：
+flutter build apk --release --target-platform android-arm64
+
+# 通用包（同时含 arm64-v8a 与 armeabi-v7a，体积更大）：
+flutter build apk --release
+```
+
+工程的 `android/app/build.gradle.kts` 已把 `abiFilters` 固定为 `arm64-v8a` + `armeabi-v7a`（arm64 在前），不会再产出只有 32 位的包。构建时按需追加演示参数（值用占位符，勿把真值写进任何文档/仓库）：
+
+```bash
+flutter build apk --release --target-platform android-arm64 \
+  --dart-define=MINGTU_AMAP_KEY=<演示高德key，演示后作废> \
+  --dart-define=MINGTU_VISION_PROXY_URL=<识图FC的https地址> \
+  --dart-define=MINGTU_VISION_TOKEN=<演示令牌，演示后作废>
+```
+
 ## 演示直连模式与密钥警告（2026-11-09，用户决定）
 
 - 演示版可把高德 Web 服务 Key 通过 `--dart-define=MINGTU_AMAP_KEY=...`

@@ -29,6 +29,15 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // ABI coverage (P0, 2026-11-09): the demo APK must run
+        // on 64-bit-only phones (e.g. Xiaomi 15) -- an
+        // armeabi-v7a-only package installs there but exits
+        // immediately because the 32-bit engine cannot load.
+        // Keep arm64-v8a FIRST and never ship v7a alone; the
+        // per-ABI build command is in the root README.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {

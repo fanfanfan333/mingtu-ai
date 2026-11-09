@@ -21,6 +21,7 @@ import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
 import 'core/real_navigation.dart';
+import 'core/startup_guard.dart';
 import 'core/voice_commands.dart';
 import 'core/voice_startup.dart';
 import 'core/risk_engine.dart';
@@ -57,7 +58,16 @@ import 'skills/route_planning.dart';
 ///   orientation-and-mobility training, and it is NOT validated for
 ///   real-road safety. Do not use this demo for real navigation.
 void main() {
-  runApp(const MingtuApp());
+  // Startup backstop (P0): the whole app runs in a guarded
+  // zone with a FlutterError handler installed, so an
+  // unexpected framework/startup error is recorded and later
+  // ANNOUNCED (see _initRealIntegrations) instead of the app
+  // dying silently on launch.
+  runGuardedMain(() {
+    WidgetsFlutterBinding.ensureInitialized();
+    installFrameworkErrorBackstop();
+    runApp(const MingtuApp());
+  });
 }
 
 class MingtuApp extends StatelessWidget {
@@ -66,7 +76,7 @@ class MingtuApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return const MaterialApp(
-      title: '明途 AI v0.5',
+      title: '明途',
       home: MingtuHomePage(),
     );
   }
@@ -205,7 +215,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       singleShotSource: createCameraFrameSource(),
       ownership: _cameraOwnership,
     );
-    _initRealIntegrations();
+    // Fire-and-forget, but NEVER unguarded: any unexpected
+    // throw inside startup lands in the failure log and is
+    // announced; it cannot take the app down.
+    unawaited(_initRealIntegrations().catchError((Object e) {
+      startupFailures.record('应用初始化');
+    }));
   }
 
   /// Lifecycle release: going to background (or being hidden /
@@ -237,13 +252,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // A dead engine must never hang startup: 3 s per engine, then
     // the demo fallback stays in place.
     final SystemVoiceOutput tts = SystemVoiceOutput();
-    final bool ttsOk = await tts
-        .initialize()
-        .timeout(const Duration(seconds: 3), onTimeout: () => false);
+    final bool ttsOk = await guardStartupStep<bool>(
+      '语音合成',
+      () => tts
+          .initialize()
+          .timeout(const Duration(seconds: 3), onTimeout: () => false),
+      fallback: false,
+    );
     final SystemVoiceInput asr = SystemVoiceInput();
-    final bool asrOk = await asr
-        .initialize()
-        .timeout(const Duration(seconds: 3), onTimeout: () => false);
+    final bool asrOk = await guardStartupStep<bool>(
+      '语音识别',
+      () => asr
+          .initialize()
+          .timeout(const Duration(seconds: 3), onTimeout: () => false),
+      fallback: false,
+    );
     if (!mounted) return;
     if (asrOk) {
       _voiceInput = asr;
@@ -257,7 +280,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (mounted) _handleAsrError(error);
       });
     }
-    _yoloDetector = createYoloDetector(AppConfig.yoloModelPath);
+    _yoloDetector = await guardStartupStep<YoloDetector>(
+      '目标检测',
+      () async => createYoloDetector(AppConfig.yoloModelPath),
+      fallback: UnavailableYoloDetector(),
+    );
     // P0 startup plan (pure logic in core/voice_startup.dart): the
     // greeting is spoken whenever *Chinese* speech is verified
     // usable -- including when ASR failed, which previously left
@@ -313,6 +340,25 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       HapticFeedback.vibrate();
       _logMsg('语音播报不可用：已用振动提示，以上状态仅为文字显示，'
           '未被语音读出。${plan.summary}');
+    }
+    // Startup degradation summary (P0 backstop): every module
+    // whose initialization THREW (missing plugin class, native
+    // load failure, ...) was recorded by the step guards / the
+    // zone backstop. Announce them by name -- by voice when
+    // speech works, otherwise in the log + status surfaces --
+    // so a degraded launch is never a silent one.
+    if (startupFailures.hasFailures) {
+      final String failureText =
+          startupFailureAnnouncement(startupFailures.modules);
+      _logMsg(failureText);
+      if (plan.speechUsable) {
+        _say(_request(
+          id: 'startup-failures',
+          eventId: 'startup-failures',
+          text: failureText,
+          kind: SpeechKind.alert,
+        ));
+      }
     }
   }
 
