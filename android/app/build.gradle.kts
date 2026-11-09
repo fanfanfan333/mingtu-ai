@@ -29,27 +29,19 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // ABI coverage (P0, 2026-11-09): the demo APK must run
-        // on 64-bit-only phones (e.g. Xiaomi 15) -- an
-        // armeabi-v7a-only package installs there but exits
-        // immediately because the 32-bit engine cannot load.
-        // Keep arm64-v8a FIRST and never ship v7a alone; the
-        // per-ABI build command is in the root README.
-        ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
-        }
+        // ABI selection is deliberately NOT fixed here: a
+        // hardcoded ndk.abiFilters conflicts with Flutter's
+        // --split-per-abi / --target-platform. The build
+        // command chooses the ABI (see the root README):
+        // --target-platform android-arm64 for 64-bit-only
+        // phones such as Xiaomi 15, no flag for a universal APK.
     }
 
-    // Compress the native libraries inside the APK
-    // (extracted at install time): the arm64 demo APK was
-    // ~30 MB mostly because of the uncompressed engine /
-    // LiteRT .so files.
-    packaging {
-        jniLibs {
-            useLegacyPackaging = true
-        }
-    }
-
+    // NOTE on APK size: legacy packaging (compressed .so)
+    // was tried in 229601e and measured LARGER on the real
+    // demo build (38.4 MB), so it is deliberately NOT used.
+    // Size is controlled by building a single-ABI arm64 APK
+    // (--target-platform android-arm64, see the root README).
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.

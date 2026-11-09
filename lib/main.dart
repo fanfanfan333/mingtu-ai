@@ -22,6 +22,7 @@ import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
 import 'core/real_navigation.dart';
 import 'core/startup_guard.dart';
+import 'adapters/startup_initializer.dart';
 import 'core/voice_commands.dart';
 import 'core/voice_startup.dart';
 import 'core/risk_engine.dart';
@@ -144,7 +145,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // streaming upload, no recording. On web it reports unavailable.
   // Assigned in initState: the routing closure reads
   // _yoloLiveOpen, which an initializer may not reference.
-  late final CameraFrameSource _frameSource;
+  // Starts as the last-resort source; _initStartupModules
+  // replaces it with the guarded production pipeline.
+  CameraFrameSource _frameSource = const LastResortCameraFrameSource();
 
   /// The app's single camera arbiter: the YOLO live view and
   /// the one-shot still capture share it, so the camera can
@@ -171,6 +174,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   VoiceOutput _voiceOutput = UnavailableVoiceOutput();
   VoiceInput _voiceInput = UnavailableVoiceInput();
   YoloDetector _yoloDetector = UnavailableYoloDetector();
+
+  // Constructed behind startup guards (see _initStartupModules);
+  // the defaults are the honest unconfigured variants, replaced
+  // only when construction succeeds.
+  AmapWalkingClient _amapClient = AmapWalkingClient(proxyBaseUrl: '');
+  CurrentLocationProvider _locationProvider =
+      const UnavailableCurrentLocation();
   StreamSubscription<String>? _transcriptSub;
   StreamSubscription<String>? _asrErrorSub;
   // Voice P0 re-test fixes: once TTS has failed at runtime the app
@@ -209,18 +219,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _frameSource = RoutedCameraFrameSource(
-      yoloLiveActive: () => _yoloLiveOpen,
-      yoloSource: createYoloFrameSource(),
-      singleShotSource: createCameraFrameSource(),
-      ownership: _cameraOwnership,
-    );
-    // Fire-and-forget, but NEVER unguarded: any unexpected
-    // throw inside startup lands in the failure log and is
-    // announced; it cannot take the app down.
-    unawaited(_initRealIntegrations().catchError((Object e) {
-      startupFailures.record('应用初始化');
-    }));
+    // _initRealIntegrations never throws (every module is
+    // guarded inside the production initializer, and startup
+    // always ends with the unified announcement).
+    unawaited(_initRealIntegrations());
   }
 
   /// Lifecycle release: going to background (or being hidden /
@@ -248,27 +250,69 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// reports unavailable instead of throwing, so a missing engine
   /// (web, VM, test harness, denied permission) just leaves the
   /// demo fallback in place.
+  /// Startup entry point. Runs the module initialisation and
+  /// then ALWAYS finishes with the unified degradation
+  /// announcement -- even when initialisation threw before it
+  /// could summarise itself (the hole this restructure closes:
+  /// failures were recorded but, on that path, never spoken).
   Future<void> _initRealIntegrations() async {
-    // A dead engine must never hang startup: 3 s per engine, then
-    // the demo fallback stays in place.
-    final SystemVoiceOutput tts = SystemVoiceOutput();
-    final bool ttsOk = await guardStartupStep<bool>(
-      '语音合成',
-      () => tts
-          .initialize()
-          .timeout(const Duration(seconds: 3), onTimeout: () => false),
-      fallback: false,
-    );
-    final SystemVoiceInput asr = SystemVoiceInput();
-    final bool asrOk = await guardStartupStep<bool>(
-      '语音识别',
-      () => asr
-          .initialize()
-          .timeout(const Duration(seconds: 3), onTimeout: () => false),
-      fallback: false,
-    );
+    bool speechUsable = false;
+    try {
+      speechUsable = await _initStartupModules();
+    } catch (_) {
+      startupFailures.record('应用初始化');
+    }
     if (!mounted) return;
-    if (asrOk) {
+    _announceStartupFailures(speechUsable: speechUsable);
+  }
+
+  /// The single announcement site for startup failures: every
+  /// module whose construction / initialisation threw (camera,
+  /// config, Amap, location, TTS, ASR, YOLO -- plus anything the
+  /// zone backstop caught) is named here, by voice when speech
+  /// works, otherwise in the log (the status surfaces already
+  /// show the degradation; nothing is claimed to be spoken
+  /// when speech itself is down).
+  void _announceStartupFailures({required bool speechUsable}) {
+    if (!startupFailures.hasFailures) return;
+    final String failureText =
+        startupFailureAnnouncement(startupFailures.modules);
+    _logMsg(failureText);
+    if (speechUsable) {
+      _say(_request(
+        id: 'startup-failures',
+        eventId: 'startup-failures',
+        text: failureText,
+        kind: SpeechKind.alert,
+      ));
+    }
+  }
+
+  Future<bool> _initStartupModules() async {
+    // Every module is initialised behind its own guard by the
+    // production initializer (adapters/startup_initializer.dart):
+    // camera, configuration, Amap, location/permission, TTS,
+    // ASR, YOLO. It never throws; failures land in
+    // startupFailures and are announced by _initRealIntegrations.
+    final StartupInitResult init = await initializeStartup(
+      frameSourceFactory: () => RoutedCameraFrameSource(
+        yoloLiveActive: () => _yoloLiveOpen,
+        yoloSource: createYoloFrameSource(),
+        singleShotSource: createCameraFrameSource(),
+        ownership: _cameraOwnership,
+      ),
+      log: startupFailures,
+    );
+    _frameSource = init.frameSource;
+    _amapClient = init.amapClient;
+    _locationProvider = init.locationProvider;
+    _yoloDetector = init.yolo;
+    final SystemVoiceOutput? tts = init.tts;
+    final bool ttsOk = init.ttsOk;
+    final SystemVoiceInput? asr = init.asr;
+    final bool asrOk = init.asrOk;
+    if (!mounted) return false;
+    if (asrOk && asr != null) {
       _voiceInput = asr;
       _transcriptSub = asr.transcripts.listen((String text) {
         if (mounted) _handleVoiceCommand(text);
@@ -280,11 +324,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (mounted) _handleAsrError(error);
       });
     }
-    _yoloDetector = await guardStartupStep<YoloDetector>(
-      '目标检测',
-      () async => createYoloDetector(AppConfig.yoloModelPath),
-      fallback: UnavailableYoloDetector(),
-    );
     // P0 startup plan (pure logic in core/voice_startup.dart): the
     // greeting is spoken whenever *Chinese* speech is verified
     // usable -- including when ASR failed, which previously left
@@ -294,22 +333,23 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // a non-Chinese voice would be a false "voice works" signal.
     final StartupVoicePlan plan = planStartupVoice(
       ttsEngineOk: ttsOk,
-      chineseVoiceVerified: ttsOk && tts.chineseVoiceVerified,
+      chineseVoiceVerified: ttsOk && (tts?.chineseVoiceVerified ?? false),
       asrOk: asrOk,
     );
-    if (plan.speechUsable) _voiceOutput = tts;
+    if (plan.speechUsable && tts != null) _voiceOutput = tts;
     _health.report(
       'voice_output',
       plan.speechUsable ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
-      '${tts.status}｜${plan.summary}',
+      '${tts?.status ?? '语音合成初始化失败'}｜${plan.summary}',
     );
     _health.report(
       'voice_input',
       asrOk ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
-      asr.status,
+      asr?.status ?? '语音识别初始化失败',
     );
     setState(() {
-      _voiceText = '语音：TTS：${tts.status}；ASR：${asr.status}。${plan.summary}';
+      _voiceText =
+          '语音：TTS：${tts?.status ?? '语音合成初始化失败'}；ASR：${asr?.status ?? '语音识别初始化失败'}。${plan.summary}';
       _yoloText = 'YOLO：${_yoloDetector.status}';
       if (!plan.speechUsable) {
         _currentPrompt = voiceNoticeText(VoiceNoticeKind.ttsUnavailable);
@@ -341,25 +381,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _logMsg('语音播报不可用：已用振动提示，以上状态仅为文字显示，'
           '未被语音读出。${plan.summary}');
     }
-    // Startup degradation summary (P0 backstop): every module
-    // whose initialization THREW (missing plugin class, native
-    // load failure, ...) was recorded by the step guards / the
-    // zone backstop. Announce them by name -- by voice when
-    // speech works, otherwise in the log + status surfaces --
-    // so a degraded launch is never a silent one.
-    if (startupFailures.hasFailures) {
-      final String failureText =
-          startupFailureAnnouncement(startupFailures.modules);
-      _logMsg(failureText);
-      if (plan.speechUsable) {
-        _say(_request(
-          id: 'startup-failures',
-          eventId: 'startup-failures',
-          text: failureText,
-          kind: SpeechKind.alert,
-        ));
-      }
-    }
+    return plan.speechUsable;
   }
 
   /// An ASR error event from the adapter: announce it ONCE through
@@ -791,11 +813,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       kind: SpeechKind.info,
     ));
     final RealNavigationStarter starter = RealNavigationStarter(
-      locationProvider: const GeolocatorCurrentLocation(),
-      client: AmapWalkingClient(
-        proxyBaseUrl: AppConfig.routeProxyUrl,
-        demoKey: AppConfig.amapDemoKey,
-      ),
+      locationProvider: _locationProvider,
+      client: _amapClient,
     );
     final RealNavigationOutcome outcome = await starter.start(destinationName);
     if (!mounted) return;

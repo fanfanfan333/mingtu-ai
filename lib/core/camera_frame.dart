@@ -62,6 +62,21 @@ abstract class CameraFrameSource {
   Future<CameraFrameCapture> captureSingleFrame();
 }
 
+/// Last-resort frame source, installed when camera pipeline
+/// CONSTRUCTION itself failed at startup (the failure is
+/// recorded and announced by the startup guard). Every capture
+/// honestly reports unavailable; nothing is faked.
+class LastResortCameraFrameSource implements CameraFrameSource {
+  const LastResortCameraFrameSource();
+
+  @override
+  Future<CameraFrameCapture> captureSingleFrame() async =>
+      CameraFrameCapture.failed(
+        CameraFrameFailure.unavailable,
+        detail: '摄像头初始化失败',
+      );
+}
+
 /// The Chinese announcement for a capture failure. Every variant
 /// states the degradation back to local detection and carries the
 /// cloud-vision disclaimer; none of them claims anything about

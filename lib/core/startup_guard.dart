@@ -56,6 +56,35 @@ Future<T> guardStartupStep<T>(
   }
 }
 
+/// One named startup step. [run] performs the module's
+/// construction / initialisation; it may throw -- the runner
+/// below contains the throw.
+class StartupStep {
+  const StartupStep(this.module, this.run);
+
+  /// Chinese module name used in the announcement.
+  final String module;
+  final Future<void> Function() run;
+}
+
+/// Run every startup step in order, each behind its own
+/// guard: a throwing step records its [StartupStep.module] in
+/// [log] and the NEXT step still runs. This function never
+/// throws, so the caller's unified announcement at the end of
+/// startup is always reached.
+Future<void> runStartupSteps(
+  List<StartupStep> steps, {
+  StartupFailureLog? log,
+}) async {
+  for (final StartupStep step in steps) {
+    try {
+      await step.run();
+    } catch (_) {
+      (log ?? startupFailures).record(step.module);
+    }
+  }
+}
+
 /// Chinese announcement naming the failed startup modules.
 /// Ends with the honest degradation statement; it never claims
 /// a failed module works.

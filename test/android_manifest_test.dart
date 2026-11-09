@@ -124,20 +124,23 @@ void main() {
     });
 
     test(
-        'the release-capable ABI list includes arm64-v8a '
-        '(64-bit-only phones must not get a v7a-only package)', () {
+        'ABI is chosen by the build command, not a hardcoded '
+        'abiFilters (which conflicts with --split-per-abi)', () {
       final String gradle =
           File('android/app/build.gradle.kts').readAsStringSync();
-      expect(gradle, contains('abiFilters'));
-      expect(gradle, contains('"arm64-v8a"'));
+      expect(gradle, isNot(contains('abiFilters +=')));
+      expect(gradle, isNot(contains('abiFilters =')));
+      final String readme = File('README.md').readAsStringSync();
+      expect(readme, contains('--target-platform android-arm64'));
+      expect(readme, contains('--split-per-abi'));
     });
 
     test(
-        'native libraries are compressed in the APK '
-        '(legacy packaging keeps the arm64 APK small)', () {
+        'legacy packaging is NOT used (it measured larger on '
+        'the real demo build)', () {
       final String gradle =
           File('android/app/build.gradle.kts').readAsStringSync();
-      expect(gradle, contains('useLegacyPackaging = true'));
+      expect(gradle, isNot(contains('useLegacyPackaging = true')));
     });
 
     test(

@@ -85,6 +85,24 @@ void main() {
   });
 
   test(
+      'a transport exception never leaks the token, the URL '
+      'or request details into detail or speech', () async {
+    final CloudVisionClient client = _client(
+      sender: (Uri url, String body, Map<String, String> headers) async =>
+          throw Exception(
+              'fixture-secret-token via https://fc.example.test/vision'),
+    );
+    final CloudVisionResult result =
+        await client.describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.ok, isFalse);
+    expect(result.failure, CloudVisionFailure.network);
+    expect(result.detail, isNot(contains('fixture-secret-token')));
+    expect(result.detail, isNot(contains('fc.example.test')));
+    expect(result.speechText, isNot(contains('fixture-secret-token')));
+    expect(result.speechText, isNot(contains('fc.example.test')));
+  });
+
+  test(
       'a proxy 413 (body too large) maps to unavailable: '
       '识图暂时不可用', () async {
     final CloudVisionClient client = _client(

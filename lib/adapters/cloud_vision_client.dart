@@ -177,7 +177,7 @@ class CloudVisionClient {
     } catch (e) {
       return CloudVisionResult.failed(
         CloudVisionFailure.badResponse,
-        detail: '图片降采样失败：$e',
+        detail: '图片处理失败。',
       );
     }
     if (small.length > cloudVisionMaxImageBytes) {
@@ -201,10 +201,14 @@ class CloudVisionClient {
         CloudVisionFailure.timeout,
         detail: '请求超过 ${requestTimeout.inSeconds} 秒未返回。',
       );
-    } catch (e) {
+    } catch (_) {
+      // Fixed text ONLY: a transport exception can embed the
+      // request URL or other request details; nothing from the
+      // exception may reach the result detail, the speech or
+      // the logs.
       return CloudVisionResult.failed(
         CloudVisionFailure.network,
-        detail: '$e',
+        detail: '网络请求失败，未收到识图服务响应。',
       );
     }
     final Object? decoded;
