@@ -66,6 +66,8 @@ class HealthMonitor {
         return '紧急求助';
       case 'llm':
         return '云端模型';
+      case 'cloud_vision':
+        return '云端视觉辅助';
       default:
         return '一项服务';
     }

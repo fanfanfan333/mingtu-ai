@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
 import 'adapters/bailian_client.dart';
+import 'adapters/cloud_vision_client.dart';
 import 'adapters/current_location.dart';
 import 'adapters/system_voice_io.dart';
 import 'adapters/voice_io.dart';
@@ -12,6 +13,7 @@ import 'adapters/yolo_detector.dart';
 import 'adapters/yolo_live_view.dart';
 import 'config/app_config.dart';
 import 'core/event_bus.dart';
+import 'core/cloud_vision.dart';
 import 'core/health_monitor.dart';
 import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
@@ -116,6 +118,17 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   String _emergencyText = '未触发紧急求助。';
   String _recordingText = '未开始录像。';
   String _llmText = '未申请云端调用。';
+  String _cloudVisionText = '云端视觉辅助：未请求。';
+  // Cloud vision assist (low frequency): one client for the app's
+  // lifetime so its rate limiter spans taps. Configured only with
+  // the proxy base URL -- there is no key on this device.
+  final CloudVisionClient _cloudVisionClient =
+      CloudVisionClient(proxyBaseUrl: AppConfig.routeProxyUrl);
+  // The latest camera frame, when a frame source is wired to
+  // Dart. Today the YOLO live view keeps frames inside the plugin
+  // view, so this stays null and the assist honestly reports
+  // "没有可用画面" instead of inventing an image.
+  Uint8List? _latestFrameBytes;
   String _perceptionText = '尚未模拟感知帧。';
   // v0.6 real integrations. Defaults are the unavailable fallbacks;
   // _initRealIntegrations replaces them only when the phone's own
@@ -1476,6 +1489,41 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         '网关已用估算费用已记账，未记录 Key。');
   }
 
+  /// Low-frequency cloud vision ASSIST (user-tapped only). Local
+  /// YOLO stays primary: this never runs on its own, never feeds
+  /// the risk engine, and its spoken result is framed as an
+  /// unverified description. Every failure path announces the
+  /// degradation to local detection in Chinese. The DashScope key
+  /// exists only in the proxy's server environment; this device
+  /// sends one downsampled frame to the proxy and nothing else.
+  Future<void> _runCloudVisionAssist() async {
+    final Uint8List? frame = _latestFrameBytes;
+    final CloudVisionResult result;
+    if (frame == null) {
+      result = _cloudVisionClient.isConfigured
+          ? CloudVisionResult.failed(CloudVisionFailure.noImage)
+          : CloudVisionResult.failed(CloudVisionFailure.notConfigured);
+    } else {
+      result = await _cloudVisionClient.describe(imageBytes: frame);
+    }
+    if (!mounted) return;
+    _health.report(
+      'cloud_vision',
+      result.ok ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
+      result.ok ? '云端视觉辅助返回一次描述（未验证）。' : result.speechText,
+    );
+    setState(() {
+      _cloudVisionText = '云端视觉辅助：${result.speechText}';
+    });
+    _logMsg('云端视觉辅助：ok=${result.ok}，failure=${result.failure}。');
+    _say(_request(
+      id: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}',
+      text: result.speechText,
+      kind: SpeechKind.info,
+    ));
+  }
+
   // v0.5: every state has a Chinese name. A blind user hearing the
   // status must never hear an English enum name like "understanding".
   String _stateText(TaskState state) {
@@ -1968,6 +2016,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             Text('录像：$_recordingText'),
             const SizedBox(height: 8),
             Text('云端网关：$_llmText'),
+            Text(_cloudVisionText),
             const SizedBox(height: 8),
             Text('感知：$_perceptionText'),
             const SizedBox(height: 8),
@@ -2248,6 +2297,11 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
               label: '百炼真实调用（需本机 Key，点按才产生费用）',
               semanticsLabel: '百炼真实调用',
               onPressed: _llmRealCall,
+            ),
+            _demoButton(
+              label: '云端视觉辅助（低频，经代理，本地检测仍为主）',
+              semanticsLabel: '云端视觉辅助',
+              onPressed: _runCloudVisionAssist,
             ),
             _demoButton(
               label: '紧急求助（本地，不依赖网络和大模型）',

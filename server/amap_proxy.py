@@ -13,16 +13,34 @@ Contract:
     Invalid/missing coordinates -> 400 {"error": "..."} (no upstream call).
     Any other path -> 404.
 
+    POST /vision   (low-frequency cloud vision assist)
+    Body: an OpenAI-compatible chat JSON whose "model" MUST be
+    exactly "qwen3.7-flash" (lowercase; the server pins it --
+    anything else, including an uppercase variant, -> 400).
+    The proxy forwards to the Beijing DashScope compatible
+    endpoint with the server-side DashScope key as a Bearer token,
+    clamps max_tokens to 256 and forces "enable_thinking": false.
+    -> the upstream response body, verbatim.
+    No DashScope key configured on the server -> 503 (no call).
+    Oversize body (> 3 MB) -> 413 (no call).
+
 Environment:
     AMAP_WEB_KEY       (required) Amap Web Service key. Read from
                        the environment only; never logged, never
                        echoed, never returned to clients.
+    DASHSCOPE_API_KEY  (optional) DashScope key for /vision, same
+                       handling: environment only, never logged,
+                       never returned. Without it /vision answers
+                       503 and the app degrades to local detection.
     PORT               (optional, default 8080) listen port.
     AMAP_UPSTREAM_BASE (optional, default
                        https://restapi.amap.com/v3/direction/walking)
                        upstream endpoint; overridable ONLY so the
                        contract tests can point at a local stub --
                        production must leave it unset.
+    DASHSCOPE_UPSTREAM_BASE (optional, default
+                       https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions)
+                       same test-only override rule.
 
 Deployment notes: bind the key to this server's egress IP in the
 Amap console (IP whitelist), run behind HTTPS (e.g. a reverse
@@ -43,6 +61,13 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM_DEFAULT = "https://restapi.amap.com/v3/direction/walking"
+
+VISION_MODEL = "qwen3.7-flash"  # exact lowercase id; uppercase 404s upstream
+VISION_MAX_TOKENS = 256
+VISION_MAX_BODY_BYTES = 3 * 1024 * 1024
+VISION_UPSTREAM_DEFAULT = (
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+)
 
 
 def _valid_lonlat(value):
@@ -83,11 +108,33 @@ def fetch_upstream(url, timeout=10):
         return resp.status, resp.read()
 
 
+def post_upstream(url, body_bytes, api_key, timeout=30):
+    """POST JSON to the DashScope compatible endpoint with the
+    server-side key as a Bearer token. Isolated for tests. The key
+    travels ONLY in this outbound Authorization header."""
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + api_key,
+            "User-Agent": "mingtu-amap-proxy/1",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        return resp.status, resp.read()
+
+
 class WalkingHandler(BaseHTTPRequestHandler):
-    # Injected by make_server: api_key, upstream_base, fetcher.
+    # Injected by make_server: api_key, upstream_base, fetcher,
+    # dashscope_key, vision_upstream, poster.
     api_key = None
     upstream_base = UPSTREAM_DEFAULT
     fetcher = staticmethod(fetch_upstream)
+    dashscope_key = ""
+    vision_upstream = VISION_UPSTREAM_DEFAULT
+    poster = staticmethod(post_upstream)
 
     def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
         # Deliberately path-only: BaseHTTPRequestHandler's default
@@ -127,8 +174,73 @@ class WalkingHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, body)
 
+    def do_POST(self):  # noqa: N802 - stdlib name
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/vision":
+            self._send_json(404, json.dumps({"error": "not found"}).encode())
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            self._send_json(400, json.dumps({"error": "empty body"}).encode())
+            return
+        if length > VISION_MAX_BODY_BYTES:
+            # Drain and discard before answering, so the client is
+            # not cut off mid-send; the payload is never used.
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            self._send_json(413, json.dumps({"error": "body too large"}).encode())
+            return
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._send_json(400, json.dumps({"error": "invalid json"}).encode())
+            return
+        if not isinstance(payload, dict) or payload.get("model") != VISION_MODEL:
+            # The model is pinned server-side: the exact lowercase
+            # id or nothing. An uppercase variant would 404
+            # upstream; other models are out of scope and budget.
+            self._send_json(400, json.dumps({"error": "model not allowed"}).encode())
+            return
+        if not isinstance(payload.get("messages"), list):
+            self._send_json(400, json.dumps({"error": "messages required"}).encode())
+            return
+        if not self.dashscope_key:
+            self._send_json(
+                503, json.dumps({"error": "vision not configured"}).encode()
+            )
+            return
+        # Clamp the output budget and disable thinking server-side
+        # too -- a client asking for more does not get more.
+        requested = payload.get("max_tokens")
+        if not isinstance(requested, int) or requested <= 0:
+            requested = VISION_MAX_TOKENS
+        payload["max_tokens"] = min(requested, VISION_MAX_TOKENS)
+        payload["enable_thinking"] = False
+        body = json.dumps(payload).encode("utf-8")
+        try:
+            _status, resp_body = self.poster(
+                self.vision_upstream, body, self.dashscope_key
+            )
+        except Exception:  # no detail: errors may embed headers
+            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
+            return
+        self._send_json(200, resp_body)
 
-def make_server(port, api_key, upstream_base=UPSTREAM_DEFAULT, fetcher=None):
+
+def make_server(
+    port,
+    api_key,
+    upstream_base=UPSTREAM_DEFAULT,
+    fetcher=None,
+    dashscope_key="",
+    vision_upstream=VISION_UPSTREAM_DEFAULT,
+    poster=None,
+):
     handler = type(
         "BoundWalkingHandler",
         (WalkingHandler,),
@@ -136,6 +248,9 @@ def make_server(port, api_key, upstream_base=UPSTREAM_DEFAULT, fetcher=None):
             "api_key": api_key,
             "upstream_base": upstream_base,
             "fetcher": staticmethod(fetcher or fetch_upstream),
+            "dashscope_key": dashscope_key,
+            "vision_upstream": vision_upstream,
+            "poster": staticmethod(poster or post_upstream),
         },
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -149,7 +264,19 @@ def main():
         return 1
     port = int(os.environ.get("PORT", "8080"))
     upstream = os.environ.get("AMAP_UPSTREAM_BASE", UPSTREAM_DEFAULT)
-    server = make_server(port, key, upstream)
+    # Optional: without it the /vision endpoint answers 503 and
+    # the app degrades to local detection; /walking is unaffected.
+    dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "")
+    vision_upstream = os.environ.get(
+        "DASHSCOPE_UPSTREAM_BASE", VISION_UPSTREAM_DEFAULT
+    )
+    server = make_server(
+        port,
+        key,
+        upstream,
+        dashscope_key=dashscope_key,
+        vision_upstream=vision_upstream,
+    )
     sys.stderr.write("amap proxy listening on port %d\n" % port)
     server.serve_forever()
     return 0
