@@ -235,20 +235,76 @@ class SystemVoiceInput implements VoiceInput {
   /// closed forever and voice control appeared dead.
   Stream<AsrStatusEvent> get sessionEnded => _sessionEndController.stream;
 
-  /// The id the NEXT startListening() session will carry is
-  /// this value + 1; consumers that must tag their own
-  /// session bookkeeping in step with the adapter read the
-  /// id of the session they just started here.
-  int get currentSessionId => _sessionSeq;
+  /// The current listen generation: minted once per
+  /// startListening() call. Consumers read the generation
+  /// of the session they just started here and validate
+  /// incoming events against it. The generation is adapter
+  /// state (a plain counter), NOT something a result
+  /// callback captures -- callbacks are validated against
+  /// the live generation gate at event time (see _genOpen).
+  int get currentSessionId => _generation;
+  int get currentGeneration => _generation;
 
-  int _sessionSeq = 0;
+  int _generation = 0;
 
-  /// Which session the LIVE status callback belongs to. The
-  /// platform registers onStatus once at initialize() time,
-  /// before any session exists, so the status closure reads
-  /// this field at event time; each startListening() points
-  /// it at its own session id.
-  int _statusSessionId = 0;
+  /// The generation whose results are currently accepted,
+  /// or 0 when no generation is open. Set when a listen
+  /// actually starts; cleared the moment that session's
+  /// stop/cancel is INITIATED -- from then on every
+  /// callback of the old generation is ignored, however
+  /// the plugin routes it (the plugin keeps ONE listener,
+  /// so routing cannot distinguish generations; this gate
+  /// can).
+  int _genOpen = 0;
+
+  /// Pass-through window, owned by the app layer: while
+  /// true, results of the generation being stopped are
+  /// still accepted. The push-to-talk stopping window
+  /// needs exactly this: a final that belongs to the
+  /// press and arrives while stop() is in flight (or in
+  /// the grace right after) must be accepted and win over
+  /// the cached partial -- an already-accepted Codex
+  /// requirement. The app opens the window when a press
+  /// release starts its stop and closes it when the press
+  /// completes; a too-short press never opens it (its
+  /// session is cancelled and void). Default false: every
+  /// other stop/cancel closes the gate at initiation.
+  bool acceptStoppingResults = false;
+
+  bool _sessionOpen = false;
+  bool _stopReturned = false;
+  bool _closeStatusSeen = false;
+  Completer<void>? _closeCompleter;
+
+  /// True while a session is live or still closing; the
+  /// app reads this to hold back a new press's prompt step
+  /// until the previous session is fully closed.
+  bool get sessionOpen => _sessionOpen;
+
+  void _noteCloseProgress() {
+    if (_sessionOpen && _stopReturned && _closeStatusSeen) {
+      _sessionOpen = false;
+      final Completer<void>? c = _closeCompleter;
+      _closeCompleter = null;
+      if (c != null && !c.isCompleted) c.complete();
+    }
+  }
+
+  /// Wait until the previous session is fully closed,
+  /// bounded at 800 ms (after the bound the caller may
+  /// proceed; results arriving later still belong to the
+  /// old closure and are validated by consumers).
+  Future<void> awaitSessionClosed() async {
+    if (!_sessionOpen) return;
+    final Completer<void> c = _closeCompleter ??= Completer<void>();
+    try {
+      await c.future.timeout(const Duration(milliseconds: 800));
+    } on TimeoutException {
+      // Bounded wait elapsed: proceed; the platform may
+      // still deliver the old session's tail, which the
+      // old closure owns.
+    }
+  }
 
   void _emitSessionEnded(int sessionId, String status) {
     if (!_sessionEndController.isClosed) {
@@ -278,12 +334,21 @@ class SystemVoiceInput implements VoiceInput {
       },
       onStatus: (String status) {
         if (status == 'done' || status == 'notListening') {
+          // Order matters (project-lead): FIRST record the
+          // close progress for the serialization barrier;
+          // THEN report the session end, stamped with the
+          // generation snapshot taken NOW (no mutable
+          // session-id field is read) and only if a session
+          // was actually listening; the listening flag is
+          // cleared LAST, never before the decision.
+          _closeStatusSeen = true;
+          _noteCloseProgress();
           final bool wasListening = _listening;
-          _listening = false;
           if (wasListening) {
             mingtuVoiceLog('语音识别会话结束（status=$status）');
-            _emitSessionEnded(_statusSessionId, status);
+            _emitSessionEnded(_generation, status);
           }
+          _listening = false;
         }
       },
     );
@@ -332,17 +397,28 @@ class SystemVoiceInput implements VoiceInput {
   Future<bool> startListening() async {
     final stt.SpeechToText? speech = _speech;
     if (!_available || _listening || speech == null) return false;
-    // This call's own session id, captured by the result
-    // closure below (per-call closure, never a shared
-    // global callback): every result this session produces
-    // carries it, and late results from an older session
-    // carry the older id and are dropped by consumers.
-    final int sessionId = ++_sessionSeq;
-    _statusSessionId = sessionId;
+    // Serialization: never overlap the previous session.
+    await awaitSessionClosed();
+    if (_listening) return false;
+    // A new generation opens. The result closure stamps
+    // events with it, but the stamp is informational only:
+    // acceptance is decided at event time by the _genOpen
+    // gate, because the plugin's single listener can route
+    // an old session's late result through this closure.
+    final int sessionId = ++_generation;
+    _genOpen = sessionId;
+    _sessionOpen = true;
+    _stopReturned = false;
+    _closeStatusSeen = false;
+    _closeCompleter = null;
     try {
       await speech.listen(
         onResult: (SpeechRecognitionResult result) {
           if (result.recognizedWords.isEmpty) return;
+          // Generation gate: once this generation's stop or
+          // cancel has been initiated (_genOpen moved on or
+          // closed), its callbacks are ignored entirely.
+          if (_genOpen != sessionId && !acceptStoppingResults) return;
           if (result.finalResult) {
             _controller.add(AsrResultEvent(sessionId, result.recognizedWords));
           } else {
@@ -361,6 +437,7 @@ class SystemVoiceInput implements VoiceInput {
       _listening = true;
       return true;
     } catch (e) {
+      _sessionOpen = false;
       _detail = 'NOT_CONFIGURED（开始识别失败：${asrErrorText(_asrFailureCode(e))}）';
       return false;
     }
@@ -371,10 +448,35 @@ class SystemVoiceInput implements VoiceInput {
   /// be open. [_listening] is cleared either way (finally), because
   /// after a stop attempt the session state is no longer trusted.
   Future<void> stopListening() async {
+    // Close this generation's gate FIRST: from this moment
+    // its results are ignored, even while the platform
+    // stop is still in flight -- UNLESS the app opened the
+    // stopping pass-through window for exactly this stop
+    // (a push-to-talk release whose final may still be in
+    // flight; see acceptStoppingResults).
+    if (!acceptStoppingResults) _genOpen = 0;
     try {
       await _speech?.stop();
     } finally {
       _listening = false;
+      _stopReturned = true;
+      _noteCloseProgress();
+    }
+  }
+
+  /// Cancel listening: the session is VOIDED, not stopped
+  /// gracefully -- the platform discards its pending
+  /// result. Used for a too-short push-to-talk press, whose
+  /// session must never produce an executable result. Like
+  /// stop(), cancel counts toward the full-close barrier.
+  Future<void> cancelListening() async {
+    _genOpen = 0;
+    try {
+      await _speech?.cancel();
+    } finally {
+      _listening = false;
+      _stopReturned = true;
+      _noteCloseProgress();
     }
   }
 

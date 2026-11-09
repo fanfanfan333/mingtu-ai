@@ -283,6 +283,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   int _pttSession = 0;
   bool _pttPendingStop = false;
 
+  /// This press was released too short: its recognition
+  /// session is VOID. The adapter session is cancelled
+  /// (not stopped), and every later final/partial from it
+  /// is dropped; the press only ever speaks the too-short
+  /// notice.
+  bool _pttSessionVoided = false;
+
+  /// This press is waiting in prompting for the previous
+  /// recognition session to fully close (serialization
+  /// barrier); when the close completes it enters the
+  /// prompt step if still held.
+  bool _pttDeferredByClose = false;
+
   /// This press began during a P0 announcement: it waits
   /// (vibration only -- no cue, no ASR) and enters
   /// prompting when the P0 prompt finishes, IF the button
@@ -882,6 +895,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           // never executed, never cached.
           return;
         }
+        if (_pttSessionVoided) {
+          // A too-short press voided its session: nothing
+          // from it is ever cached or executed.
+          return;
+        }
         final String text = event.text;
         if (_pttState == _PttState.listening) {
           // Cache only: while the button is held nothing is
@@ -922,6 +940,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _partialSub = asr.partials.listen((AsrResultEvent event) {
         if (!mounted) return;
         if (event.sessionId != _asrSessionId) return;
+        if (_pttSessionVoided) return;
         // Partials are only ever the push-to-talk fallback
         // cache; automatic sessions never act on them.
         if (_pttState == _PttState.listening) {
@@ -1830,6 +1849,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttState = _PttState.prompting;
     _pttPendingStop = false;
     _pttDeferredByP0 = false;
+    _pttSessionVoided = false;
+    _pttDeferredByClose = false;
     _pttCachedText = null;
     _pttCachedIsFinal = false;
     _pushToTalkHeld = true;
@@ -1846,7 +1867,40 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _logMsg('按住说话：危险播报进行中，先等待播报结束。');
       return;
     }
+    if (_voiceInput is SystemVoiceInput &&
+        (_voiceInput as SystemVoiceInput).sessionOpen) {
+      // Serialization barrier: the previous recognition
+      // session has not fully closed (its stop/cancel is
+      // still awaiting the closing status). The press only
+      // vibrated; it waits here and enters prompting once
+      // the close completes, if still held. Until then no
+      // cue is spoken and no new listen can start, so a
+      // late result of the old session can never be
+      // mistaken for this press's input.
+      _pttDeferredByClose = true;
+      _logMsg('按住说话：等待上一个识别会话完全关闭。');
+      final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
+      unawaited(input.awaitSessionClosed().then((_) {
+        if (!mounted) return;
+        _maybeEnterPttAfterClose();
+      }));
+      return;
+    }
     unawaited(_pttPromptStep(sid));
+  }
+
+  /// The previous session finished closing: a press that
+  /// waited for the barrier enters prompting, if the
+  /// button is still held and the press is still live
+  /// (same shape as the P0 deferral hook).
+  void _maybeEnterPttAfterClose() {
+    if (_pttState != _PttState.prompting || !_pttDeferredByClose) return;
+    _pttDeferredByClose = false;
+    if (!_pushToTalkHeld) {
+      _pttState = _PttState.idle;
+      return;
+    }
+    unawaited(_pttPromptStep(_pttSession));
   }
 
   /// prompting: hand the microphone over, clear non-P0
@@ -1905,10 +1959,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     if (_pttPendingStop) {
-      // Released during the starting window: stop the
-      // session just opened, immediately.
+      // Released during the starting window: the press was
+      // necessarily too short, so the just-opened session
+      // is VOIDED -- cancelled (not stopped), and marked
+      // so nothing it still delivers is ever executed.
+      _pttSessionVoided = true;
       _pttState = _PttState.stopping;
-      await _stopListeningInternal();
+      await _cancelListeningInternal();
       if (!mounted || sid != _pttSession) return;
       _pttState = _PttState.idle;
       _pttPendingStop = false;
@@ -1932,6 +1989,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       case _PttState.idle:
         return;
       case _PttState.prompting:
+        if (_pttDeferredByClose) {
+          _pttDeferredByClose = false;
+          _pttState = _PttState.idle;
+          _pushToTalkHeld = false;
+          return;
+        }
         if (_pttDeferredByP0) {
           // A deferred press released before the P0 prompt
           // finished: cancel quietly; the finish hook must
@@ -1962,14 +2025,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  /// Release while listening (stopping window): the press
-  /// completes EXACTLY ONCE, at whichever comes first -- a
-  /// final of this session arriving (before stop() returns
-  /// or inside the grace after it), stop() returning with
-  /// a final already cached, or the overall 1.5 s deadline
-  /// expiring (partial fallback, else the no-content
-  /// notice). The deadline starts at the RELEASE, so a
-  /// slow stop() eats into the same 1.5 s, never beyond it.
+  /// Release while listening. A NORMAL press enters the
+  /// stopping window (see below); a TOO-SHORT press voids
+  /// its session instead: cancel() (not stop()), the
+  /// session is marked void, and only the too-short notice
+  /// is spoken -- no final or partial from it can ever be
+  /// executed, whenever it arrives.
   Future<void> _pttReleaseFromListening() async {
     final int sid = _pttSession;
     final DateTime? pressedAt = _pushToTalkPressedAt;
@@ -1978,13 +2039,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         DateTime.now().difference(pressedAt) <
             const Duration(milliseconds: 300);
     _pttState = _PttState.stopping;
+    if (!tooShort) _setPttStoppingWindow(true);
+    if (tooShort) {
+      _pttSessionVoided = true;
+      _pttCachedText = null;
+      _pttCachedIsFinal = false;
+      await _cancelListeningInternal();
+      if (!mounted || sid != _pttSession) return;
+      _pttState = _PttState.idle;
+      _announcePushToTalkTooShort();
+      return;
+    }
     _pttNoContentTimer = Timer(const Duration(milliseconds: 1500), () {
       if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
         return;
       }
-      if (tooShort) {
-        _pttCompletePress(sid, null, tooShort: true);
-      } else if (_pttCachedText != null) {
+      if (_pttCachedText != null) {
         _pttCompletePress(sid, _pttCachedText);
       } else {
         _pttCompletePress(sid, null);
@@ -1999,27 +2069,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // (state left stopping); reaching here with a cached
     // final means it was cached while held -- submit now.
     // Otherwise the deadline above finishes the press.
-    if (!tooShort && _pttCachedIsFinal && _pttCachedText != null) {
+    if (_pttCachedIsFinal && _pttCachedText != null) {
       _pttCompletePress(sid, _pttCachedText);
-    } else if (tooShort) {
-      _pttCompletePress(sid, null, tooShort: true);
     }
   }
 
   /// A final of the current press's session arrived during
   /// the stopping window: it wins over any cached partial
-  /// and completes the press immediately -- unless the
-  /// press was too short, in which case the final is
-  /// recorded (it still outranks the partial) but the
-  /// completion stays the too-short path.
+  /// and completes the press immediately. (Too-short
+  /// presses never reach here: their session is void and
+  /// the subscription drops their results first.)
   void _onPttFinalInStopping(String text) {
     _pttCachedText = text;
     _pttCachedIsFinal = true;
-    final DateTime? pressedAt = _pushToTalkPressedAt;
-    final bool tooShort = pressedAt == null ||
-        DateTime.now().difference(pressedAt) <
-            const Duration(milliseconds: 300);
-    if (tooShort) return;
     _pttCompletePress(_pttSession, text);
   }
 
@@ -2032,6 +2094,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (sid != _pttSession || _pttState != _PttState.stopping) return;
     _pttNoContentTimer?.cancel();
     _pttState = _PttState.idle;
+    _setPttStoppingWindow(false);
     _pttCachedText = null;
     _pttCachedIsFinal = false;
     if (text != null) {
@@ -2041,6 +2104,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _announcePushToTalkTooShort();
     } else {
       _announcePushToTalkNoContent();
+    }
+  }
+
+  /// Open/close the adapter's stopping pass-through
+  /// window in step with the press lifecycle: opened when
+  /// a normal press's release begins its stop, closed
+  /// whenever a press completes. A voided (too-short)
+  /// press never opens it.
+  void _setPttStoppingWindow(bool open) {
+    if (_voiceInput is SystemVoiceInput) {
+      (_voiceInput as SystemVoiceInput).acceptStoppingResults = open;
+    }
+  }
+
+  /// Cancel the current listening session (the session is
+  /// voided; the platform discards its pending result).
+  /// Sibling of _stopListeningInternal for too-short
+  /// push-to-talk releases.
+  Future<void> _cancelListeningInternal() async {
+    if (_voiceInput is SystemVoiceInput) {
+      try {
+        await (_voiceInput as SystemVoiceInput).cancelListening();
+      } catch (e) {
+        _logMsg('取消语音识别失败，麦克风可能仍在监听：$e');
+      }
     }
   }
 

@@ -60,6 +60,43 @@ class RecordingVoiceChannels {
   /// start. Null (the default) answers immediately, exactly
   /// as before.
   Completer<dynamic>? listenGate;
+  /// When set, the platform's answer to stop() stays in
+  /// flight until the completer completes -- a slow
+  /// engine stop. Null (the default) answers immediately,
+  /// exactly as before.
+  Completer<dynamic>? stopGate;
+
+  /// When set, the platform's answer to cancel() stays in
+  /// flight until the completer completes -- a slow engine
+  /// cancel. Null (the default) answers immediately,
+  /// exactly as before.
+  Completer<dynamic>? cancelGate;
+
+  /// Serialization barrier (production, this round): the
+  /// adapter considers a session fully closed only once
+  /// its stop()/cancel() has returned AND the closing
+  /// status (notListening/done) has been received. A real
+  /// platform always delivers that status, so by DEFAULT
+  /// this fake answers every stop/cancel with an automatic
+  /// notListening status on a microtask. Tests that need a
+  /// session stuck in "closing" set this to false and
+  /// deliver the status by hand via deliverCloseStatus().
+  bool autoCloseStatus = true;
+
+  /// Test-side bookkeeping: how many sessions have been
+  /// fully closed so far. The automatic closing status is
+  /// only delivered when a stop/cancel actually ends a
+  /// session that a listen opened; with several sessions
+  /// stopped (the mic-close before every scheduler speak,
+  /// the release stop, the plugin's own pause timer), only
+  /// the FIRST answer carries a status -- later stops find
+  /// no open session and, exactly like the real platform,
+  /// produce none. Without this the adapter's open-session
+  /// bookkeeping and the app's session-id validation drift
+  /// apart and unrelated prompts trigger phantom session
+  /// ends downstream.
+  int unclosedSessions = 0;
+  int pendingCloseStatuses = 0;
 
   void install() {
     final TestDefaultBinaryMessenger messenger =
@@ -95,6 +132,7 @@ class RecordingVoiceChannels {
             return asrInitResult;
           case 'listen':
             events.add('asr.listen');
+            unclosedSessions++;
             if (asrListenThrows) {
               throw PlatformException(
                 code: 'error_network',
@@ -106,9 +144,11 @@ class RecordingVoiceChannels {
             return true;
           case 'stop':
             events.add('asr.stop');
+            noteSessionStopped();
             return null;
           case 'cancel':
             events.add('asr.cancel');
+            noteSessionStopped();
             return null;
           case 'has_permission':
             return true;
@@ -144,6 +184,21 @@ class RecordingVoiceChannels {
         MethodChannel('dev.fluttercommunity.plus/sensors/$sensor'),
         (MethodCall call) async => null,
       );
+      // The app also SUBSCRIBES to the gyro/magnetometer
+      // event streams. Without a mock stream handler the
+      // subscription never activates, and when the widget
+      // tree is torn down after a FAILED test the stream
+      // deactivation throws MissingPluginException --
+      // which poisons the NEXT test in this file. A no-op
+      // handler makes listen/cancel on these channels
+      // always succeed (same guard as the codex file).
+      messenger.setMockStreamHandler(
+        EventChannel('dev.fluttercommunity.plus/sensors/$sensor'),
+        MockStreamHandler.inline(
+          onListen: (Object? arguments, MockStreamHandlerEventSink events) {},
+          onCancel: (Object? arguments) {},
+        ),
+      );
     }
   }
 
@@ -169,7 +224,48 @@ class RecordingVoiceChannels {
         MethodChannel('dev.fluttercommunity.plus/sensors/$sensor'),
         null,
       );
+      messenger.setMockStreamHandler(
+        EventChannel('dev.fluttercommunity.plus/sensors/$sensor'),
+        null,
+      );
     }
+  }
+
+  /// A stop/cancel ends the currently open session (if
+  /// any): queue its automatic closing status, delivered
+  /// once its gated future resolves. Mirrors the real
+  /// platform, which answers a session-ending stop with
+  /// exactly one notListening status -- and a stop that
+  /// finds no open session with none.
+  void noteSessionStopped() {
+    if (unclosedSessions > 0) {
+      unclosedSessions--;
+      pendingCloseStatuses++;
+    }
+  }
+
+  /// Deliver one queued automatic closing status, if the
+  /// auto-status behaviour is on. Called by the test
+  /// drivers after pumps, the same points at which the
+  /// real platform's status would have landed.
+  Future<void> deliverAutoCloseStatus() async {
+    if (!autoCloseStatus || pendingCloseStatuses == 0) return;
+    pendingCloseStatuses--;
+    await deliverCloseStatus();
+  }
+
+  /// Deliver the closing status (notListening) the way
+  /// the platform does: a notifyStatus platform->Dart call
+  /// on the plugin channel.
+  Future<void> deliverCloseStatus() async {
+    final ByteData data = const StandardMethodCodec()
+        .encodeMethodCall(const MethodCall('notifyStatus', 'notListening'));
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+      'plugin.csdcorp.com/speech_to_text',
+      data,
+      (ByteData? _) {},
+    );
   }
 
   int count(String e) => events.where((String x) => x == e).length;
@@ -216,6 +312,8 @@ Future<void> settleRecordedApp(
   int lastEventCount = -1;
   for (int round = 0; round < 64; round++) {
     await tester.pump(const Duration(milliseconds: 250));
+    await h.deliverAutoCloseStatus();
+    await tester.pump();
     if (h.pendingSpeaks().isEmpty && h.events.length == lastEventCount) {
       quietRounds++;
     } else {
@@ -249,6 +347,52 @@ Future<void> deliverFinalResult(WidgetTester tester, String words) async {
   await tester.pump(const Duration(milliseconds: 50));
 }
 
+/// Press, complete the cue, and wait until the PTT session
+/// has actually opened (an 'asr.listen' beyond the count
+/// already on the channel). Completing the cue only STARTS
+/// the session-open chain: the recogniser plugin's own
+/// stop() future and the adapter's close-barrier wait sit
+/// between the cue and the listen call, and fake-time pumps
+/// can run ahead of those real-event-loop turns. Poll in
+/// real time, delivering queued closing statuses, until the
+/// listen lands.
+Future<TestGesture> pressUntilPttListening(
+    WidgetTester tester, RecordingVoiceChannels h) async {
+  final int listensBefore = h.count('asr.listen');
+  final TestGesture g = await pressPtt(tester, h);
+  expect(h.completeSpeak('请说'), isTrue,
+      reason: 'cue spoken: ${h.events}');
+  for (int i = 0; i < 40; i++) {
+    await h.deliverAutoCloseStatus();
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    await tester.pump(const Duration(milliseconds: 50));
+    if (h.count('asr.listen') > listensBefore) return g;
+  }
+  fail('press never opened its session: ${h.events}');
+}
+
+/// Variant of [pressUntilPttListening] for a press whose
+/// cue was already requested (e.g. a press deferred by a
+/// P0 prompt, or one whose cue completion is asserted
+/// separately): completes the cue and polls until the
+/// session opens. Returns the gesture unchanged (held
+/// throughout).
+Future<TestGesture> pressUntilPttListeningFrom(WidgetTester tester,
+    RecordingVoiceChannels h, TestGesture g) async {
+  final int listensBefore = h.count('asr.listen');
+  expect(h.completeSpeak('请说'), isTrue,
+      reason: 'cue spoken: ${h.events}');
+  for (int i = 0; i < 40; i++) {
+    await h.deliverAutoCloseStatus();
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    await tester.pump(const Duration(milliseconds: 50));
+    if (h.count('asr.listen') > listensBefore) return g;
+  }
+  fail('press never opened its session: ${h.events}');
+}
+
 Finder pttBlock() => find.ancestor(
       of: find.text('按住说话', findRichText: true),
       matching: find.byType(Container),
@@ -257,12 +401,39 @@ Finder pttBlock() => find.ancestor(
 /// Press and hold the push-to-talk button: the gesture must
 /// pass the long-press timeout before the production press
 /// sequence starts.
-Future<TestGesture> pressPtt(WidgetTester tester) async {
+/// The raw gesture: starts the long-press and pumps the
+/// long-press timeout, nothing more.
+Future<TestGesture> startPttGesture(WidgetTester tester) async {
   final TestGesture g =
       await tester.startGesture(tester.getCenter(pttBlock()));
   await tester.pump(const Duration(milliseconds: 600));
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 50));
+  return g;
+}
+
+/// Press and hold the push-to-talk button. Under the
+/// serialization barrier a press whose predecessor session
+/// is still closing waits in prompting (vibration only)
+/// until the closing status lands, so after the gesture
+/// this delivers any queued automatic closing statuses and
+/// pumps until the press sequence has actually run (the
+/// cue was requested, or a session started, or -- for a
+/// press deferred by a still-playing P0 prompt -- nothing
+/// further can happen and the pumps simply settle).
+Future<TestGesture> pressPtt(WidgetTester tester,
+    [RecordingVoiceChannels? h]) async {
+  final TestGesture g = await startPttGesture(tester);
+  if (h != null) {
+    for (int i = 0; i < 10; i++) {
+      await h.deliverAutoCloseStatus();
+      await tester.pump(const Duration(milliseconds: 100));
+      if (h.events.contains('tts.speak:请说') ||
+          h.count('asr.listen') > 0) {
+        break;
+      }
+    }
+  }
   return g;
 }
 
@@ -323,6 +494,15 @@ Future<void> shutdownVoice(
   await tester.pump(const Duration(seconds: 3));
   h.completeAllSpeaks();
   await tester.pump(const Duration(milliseconds: 100));
+  // Detach the tree NOW, while this test's mock stream
+  // handlers are still installed: the orientation monitor
+  // cancels its gyroscope/magnetometer subscriptions in
+  // dispose(), and an EventChannel cancel that lands after
+  // uninstall() has dropped the handlers throws
+  // MissingPluginException and is charged to whichever
+  // test runs next.
+  await tester.pumpWidget(const SizedBox.shrink());
+  await tester.pump();
 }
 
 /// Really sleep while the button is held, so the press
@@ -405,7 +585,7 @@ void main() {
       await tapPanelText(tester, '停止语音识别');
       h.events.clear();
 
-      final TestGesture gesture = await pressPtt(tester);
+      TestGesture gesture = await pressPtt(tester, h);
       // Vibration comes first; the cue is spoken after it.
       expect(h.events.first, 'vibrate', reason: '${h.events}');
       final int cueIdx = h.events.indexOf('tts.speak:请说');
@@ -417,9 +597,9 @@ void main() {
       expect(h.count('asr.listen'), 0, reason: '${h.events}');
 
       // Cue completes -> only now does the session start.
-      expect(h.completeSpeak('请说'), isTrue);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
+      // (The gesture is already held; re-drive the press
+      // through the shared wait-until-listening driver.)
+      gesture = await pressUntilPttListeningFrom(tester, h, gesture);
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
 
       // A full press (real time past 300 ms), a final result
@@ -456,7 +636,7 @@ void main() {
       // Variant A: released while the cue is still playing.
       // The sequence discovers the release after the cue and
       // answers with the too-short notice.
-      TestGesture gesture = await pressPtt(tester);
+      TestGesture gesture = await pressPtt(tester, h);
       expect(h.events, contains('tts.speak:请说'),
           reason: '${h.events}');
       await gesture.up();
@@ -474,7 +654,7 @@ void main() {
       // Variant B: the cue's completion and the release land
       // back to back, before the sequence's next step runs.
       // Same outcome: notice spoken, no session started.
-      gesture = await pressPtt(tester);
+      gesture = await pressPtt(tester, h);
       expect(h.events, contains('tts.speak:请说'),
           reason: '${h.events}');
       expect(h.completeSpeak('请说'), isTrue);
@@ -498,10 +678,8 @@ void main() {
       await tapPanelText(tester, '停止语音识别');
       h.events.clear();
 
-      final TestGesture gesture = await pressPtt(tester);
-      expect(h.completeSpeak('请说'), isTrue);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
+      final TestGesture gesture =
+          await pressUntilPttListening(tester, h);
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
 
       // Held past the threshold, nothing recognised, then
@@ -534,7 +712,7 @@ void main() {
           reason: 'auto listen after startup: ${h.events}');
       h.events.clear();
 
-      final TestGesture gesture = await pressPtt(tester);
+      final TestGesture gesture = await pressPtt(tester, h);
       // The automatic session yields BEFORE the cue: an
       // asr.stop precedes the cue speak, and no session of
       // any kind starts before the cue completes.
@@ -548,8 +726,17 @@ void main() {
       expect(h.count('asr.listen'), 0, reason: '${h.events}');
 
       expect(h.completeSpeak('请说'), isTrue);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
+      // The cue's completion only STARTS the session-open
+      // chain (the adapter's startListening first awaits
+      // the previous session's full close): poll in real
+      // time until the listen call lands, the same driver
+      // the codex races use.
+      for (int i = 0; i < 40 && h.count('asr.listen') < 1; i++) {
+        await h.deliverAutoCloseStatus();
+        await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 50)));
+        await tester.pump(const Duration(milliseconds: 50));
+      }
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
 
       // While the button is held, the automatic loop must
@@ -615,7 +802,7 @@ void main() {
       // danger prompt, no session starts, and no physical
       // stop is issued against the danger utterance: the
       // P0 announcement is never interrupted.
-      final TestGesture gesture = await pressPtt(tester);
+      TestGesture gesture = await pressPtt(tester, h);
       final List<String> duringP0 = h.events.sublist(dangerIdx + 1);
       expect(duringP0, contains('vibrate'), reason: '${h.events}');
       expect(duringP0, isNot(contains('tts.speak:请说')),
@@ -651,9 +838,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 100));
       expect(find.textContaining('已取消播报的迟到完成'), findsNothing);
       await pumpUntilSpeak(tester, h, '请说');
-      expect(h.completeSpeak('请说'), isTrue);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
+      gesture = await pressUntilPttListeningFrom(tester, h, gesture);
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
 
       // Release: the session stops, and with nothing
@@ -705,7 +890,7 @@ void main() {
 
       // Press: a physical stop lands on the straight
       // utterance, before the cue is spoken.
-      final TestGesture gesture = await pressPtt(tester);
+      TestGesture gesture = await pressPtt(tester, h);
       await pumpUntilSpeak(tester, h, '请说');
       final int stopIdx = h.events.indexOf('tts.stop');
       final int cueIdx = h.events.indexOf('tts.speak:请说');
@@ -720,9 +905,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 100));
       expect(find.textContaining('已取消播报的迟到'), findsWidgets);
 
-      expect(h.completeSpeak('请说'), isTrue);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
+      gesture = await pressUntilPttListeningFrom(tester, h, gesture);
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
       await holdPastThreshold(tester);
       await gesture.up();
@@ -805,14 +988,25 @@ void main() {
       // without waiting out the round's 10 s window.
       final int mark = h.events.length;
       node.owner!.performAction(node.id, SemanticsAction.longPress);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
+      // The press first waits for the previous session's
+      // full close (serialization barrier): deliver the
+      // queued closing statuses until the cue is spoken.
+      for (int i = 0;
+          i < 10 && !h.events.contains('tts.speak:请说');
+          i++) {
+        await h.deliverAutoCloseStatus();
+        await tester.pump(const Duration(milliseconds: 100));
+      }
       final List<String> round = h.events.sublist(mark);
       expect(round, contains('vibrate'), reason: '$round');
       expect(round, contains('tts.speak:请说'), reason: '$round');
       expect(h.completeSpeak('请说'), isTrue);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
+      for (int i = 0; i < 40 && h.count('asr.listen') < 1; i++) {
+        await h.deliverAutoCloseStatus();
+        await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 50)));
+        await tester.pump(const Duration(milliseconds: 50));
+      }
       expect(h.count('asr.listen'), greaterThanOrEqualTo(1),
           reason: '${h.events}');
       handle.dispose();

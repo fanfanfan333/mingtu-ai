@@ -1,10 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:mingtu_ai/adapters/system_voice_io.dart';
 import 'package:mingtu_ai/adapters/voice_io.dart';
-import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:mingtu_ai/core/asr_errors.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -467,23 +468,84 @@ void main() {
       expect(ran, isTrue);
     });
   });
-  group('session id stamping (Codex re-test of 97e9c75)', () {
-    test(
-        'every result and status event carries its own '
-        'session id, increasing across sessions', () async {
-      final fake = FakeStt();
-      final input = SystemVoiceInput(fake);
-      addTearDown(input.dispose);
-      expect(await input.initialize(), isTrue);
+  group('generation gate via the plugin channel', () {
+    // PLUGIN-LAYER REWRITE (this round): the previous
+    // version of this group invoked FakeStt's captured
+    // per-listen onResult closures DIRECTLY to deliver
+    // "late" results. Production no longer distinguishes
+    // sessions by closure-captured ids, and the real
+    // plugin keeps ONE result listener (a new listen
+    // replaces it), so direct closure invocation proves
+    // nothing about production. This group therefore uses
+    // the REAL plugin (SystemVoiceInput's default
+    // SpeechToText) behind a MethodChannel platform fake,
+    // and every result/status is delivered exactly the
+    // way a platform delivers it: textRecognition /
+    // notifyStatus platform->Dart calls on
+    // plugin.csdcorp.com/speech_to_text, routed by the
+    // plugin's single listener.
+    //
+    // The plugin's initialize() short-circuits process-
+    // wide after its first success, so this file gets
+    // exactly ONE channel-driven adapter test; it walks
+    // three generations end to end.
+    const String sttChannel = 'plugin.csdcorp.com/speech_to_text';
 
+    Future<void> deliverPlatform(String method, Object? arg) async {
+      final ByteData data = const StandardMethodCodec()
+          .encodeMethodCall(MethodCall(method, arg));
+      await TestDefaultBinaryMessengerBinding
+          .instance.defaultBinaryMessenger
+          .handlePlatformMessage(sttChannel, data, (ByteData? _) {});
+    }
+
+    String resultJson(String words, int resultType) =>
+        jsonEncode(<String, dynamic>{
+          'alternates': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'recognizedWords': words,
+              'confidence': 0.95,
+            }
+          ],
+          'resultType': resultType,
+        });
+
+    test(
+        'late results between generations are dropped at '
+        'the adapter gate; statuses are handled in close '
+        'order; a status delayed past the barrier bound is '
+        'attributed to the live generation', () async {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      final List<String> platformCalls = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(const MethodChannel(sttChannel),
+              (MethodCall call) async {
+        platformCalls.add(call.method);
+        switch (call.method) {
+          case 'initialize':
+            return true;
+          case 'has_permission':
+            return true;
+          default:
+            return null;
+        }
+      });
+      addTearDown(() {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+                const MethodChannel(sttChannel), null);
+      });
+
+      final SystemVoiceInput input = SystemVoiceInput();
+      addTearDown(input.dispose);
       final List<AsrResultEvent> finals = <AsrResultEvent>[];
       final List<AsrResultEvent> partials = <AsrResultEvent>[];
-      final List<AsrStatusEvent> statuses = <AsrStatusEvent>[];
+      final List<AsrStatusEvent> ends = <AsrStatusEvent>[];
       final List<StreamSubscription<dynamic>> subs =
           <StreamSubscription<dynamic>>[
         input.transcripts.listen(finals.add),
         input.partials.listen(partials.add),
-        input.sessionEnded.listen(statuses.add),
+        input.sessionEnded.listen(ends.add),
       ];
       addTearDown(() async {
         for (final StreamSubscription<dynamic> sub in subs) {
@@ -491,85 +553,102 @@ void main() {
         }
       });
 
-      SpeechRecognitionResult result(String words, bool isFinal) =>
-          SpeechRecognitionResult(
-            <SpeechRecognitionWords>[SpeechRecognitionWords(words, null, 0.9)],
-            isFinal ? 2 : 0,
-          );
+      expect(await input.initialize(), isTrue);
 
-      // Session 1.
+      // --- Generation 1: live results flow, stamped 1.
       expect(await input.startListening(), isTrue);
-      final int id1 = input.currentSessionId;
-      expect(fake.resultListeners, hasLength(1));
-      fake.resultListeners[0]!(result('第一句', false));
-      fake.resultListeners[0]!(result('第一句完整', true));
+      final int gen1 = input.currentSessionId;
+      await deliverPlatform(
+          'textRecognition', resultJson('第一句', 0)); // partial
+      await deliverPlatform(
+          'textRecognition', resultJson('第一句完整', 2)); // final
       await Future<void>.delayed(Duration.zero);
-      // The adapter emits sessionEnded from the platform
-      // status callback only when it believes a session is
-      // live; its stopListening() clears that flag locally
-      // (the platform stop is fire-and-forget here), so the
-      // end status must be delivered BEFORE the local stop
-      // -- the same order a real engine produces (its done
-      // status is what ends the session).
-      fake.capturedOnStatus!('done');
-      await Future<void>.delayed(Duration.zero);
-      await input.stopListening();
-
-      // Session 2.
-      expect(await input.startListening(), isTrue);
-      final int id2 = input.currentSessionId;
-      expect(id2, greaterThan(id1));
-      expect(fake.resultListeners, hasLength(2));
-      fake.resultListeners[1]!(result('第二句', true));
-      await Future<void>.delayed(Duration.zero);
-      fake.capturedOnStatus!('done');
-      await Future<void>.delayed(Duration.zero);
-      await input.stopListening();
-
-      // Every event of session 1 carries id1; every event
-      // of session 2 carries id2 -- results (finals and
-      // partials) and status alike.
-      expect(partials.single.sessionId, id1);
+      expect(partials.single.sessionId, gen1);
       expect(partials.single.text, '第一句');
-      expect(finals.map((AsrResultEvent e) => e.sessionId),
-          <int>[id1, id2]);
-      expect(finals.map((AsrResultEvent e) => e.text),
-          <String>['第一句完整', '第二句']);
-      expect(statuses.map((AsrStatusEvent e) => e.sessionId),
-          <int>[id1, id2]);
-      expect(statuses.map((AsrStatusEvent e) => e.status),
-          <String>['done', 'done']);
+      expect(finals.single.sessionId, gen1);
+      expect(finals.single.text, '第一句完整');
 
-      // A LATE result through session 1's still-reachable
-      // closure (the recogniser delivering after stop, or
-      // an in-flight platform callback) is stamped with
-      // the OLD id: a consumer validating against the
-      // current session id (id2, then id3 below) drops it
-      // by construction. This is the direct evidence that
-      // stale callbacks are identifiable -- and therefore
-      // droppable -- rather than indistinguishable.
-      fake.resultListeners[0]!(result('迟到的旧结果', true));
-      await Future<void>.delayed(Duration.zero);
-      expect(finals.last.sessionId, id1);
-      expect(finals.last.text, '迟到的旧结果');
-      expect(input.currentSessionId, id2);
-      expect(
-        finals.last.sessionId == input.currentSessionId,
-        isFalse,
-        reason: 'a stale event must fail the currency check',
-      );
-
-      // And the status stream follows the LIVE session:
-      // after a third session starts, its end status
-      // carries id3, so an old session's end can never be
-      // mistaken for the current one's.
-      expect(await input.startListening(), isTrue);
-      final int id3 = input.currentSessionId;
-      expect(id3, greaterThan(id2));
-      fake.capturedOnStatus!('done');
-      await Future<void>.delayed(Duration.zero);
+      // --- Stop generation 1. Its closing status has not
+      // arrived: the session is CLOSING (sessionOpen).
       await input.stopListening();
-      expect(statuses.last.sessionId, id3);
+      expect(input.sessionOpen, isTrue);
+      expect(input.isListening, isFalse);
+
+      // A late result of generation 1, delivered through
+      // the channel NOW (between generations): the
+      // adapter's generation gate is closed, so it is
+      // dropped IN THE ADAPTER -- transcripts never emit
+      // it. (Delivered while generation 2 is live it
+      // would be indistinguishable from generation 2's
+      // own result: the single-listener limitation the
+      // serialization barrier exists to keep unreachable
+      // in the app flow.)
+      await deliverPlatform(
+          'textRecognition', resultJson('迟到的旧结果', 2));
+      await Future<void>.delayed(Duration.zero);
+      expect(finals, hasLength(1));
+      expect(partials, hasLength(1));
+
+      // The closing status arrives between generations:
+      // close progress is recorded FIRST (the session is
+      // now fully closed), and because no session is live
+      // at this moment, NO sessionEnded is emitted for it
+      // -- a stale end can never be mistaken for a later
+      // session's end.
+      await deliverPlatform('notifyStatus', 'notListening');
+      await Future<void>.delayed(Duration.zero);
+      expect(input.sessionOpen, isFalse);
+      expect(ends, isEmpty);
+
+      // --- Generation 2: the barrier is already satisfied
+      // by the delivered status, so the start does NOT
+      // wait out the 800 ms bound.
+      final Stopwatch sw2 = Stopwatch()..start();
+      expect(await input.startListening(), isTrue);
+      expect(sw2.elapsedMilliseconds, lessThan(700),
+          reason: 'a closed barrier must not wait');
+      final int gen2 = input.currentSessionId;
+      expect(gen2, greaterThan(gen1));
+      await deliverPlatform(
+          'textRecognition', resultJson('第二句', 2));
+      await Future<void>.delayed(Duration.zero);
+      expect(finals.last.sessionId, gen2);
+      expect(finals.last.text, '第二句');
+
+      // --- Generation 2 stops; its status is WITHHELD, so
+      // generation 3's start must wait out the barrier's
+      // 800 ms bound before proceeding.
+      await input.stopListening();
+      expect(input.sessionOpen, isTrue);
+      final Stopwatch sw3 = Stopwatch()..start();
+      expect(await input.startListening(), isTrue);
+      expect(sw3.elapsedMilliseconds, greaterThanOrEqualTo(700),
+          reason: 'an unclosed session must hold the next '
+              'listen to the barrier bound');
+      final int gen3 = input.currentSessionId;
+      expect(gen3, greaterThan(gen2));
+      expect(input.isListening, isTrue);
+
+      // NOW generation 2's withheld closing status
+      // arrives, while generation 3 is live. The platform
+      // status carries no generation, so the adapter
+      // attributes it to the LIVE generation: sessionEnded
+      // is emitted stamped gen3 and isListening clears.
+      // This is the pinned, known limitation of the
+      // single status listener -- it can only occur when
+      // a platform delays a closing status past the
+      // 800 ms barrier bound, and it is recorded here as
+      // observed behaviour for the reviewers, not as a
+      // guarantee.
+      await deliverPlatform('notifyStatus', 'notListening');
+      await Future<void>.delayed(Duration.zero);
+      expect(ends, hasLength(1));
+      expect(ends.single.sessionId, gen3);
+      expect(ends.single.status, 'notListening');
+      expect(input.isListening, isFalse);
+
+      await input.stopListening();
+      expect(platformCalls, contains('listen'));
     });
   });
   group('ASR error non-leak: raw platform strings never surface', () {
