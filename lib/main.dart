@@ -29,6 +29,7 @@ import 'core/orientation.dart';
 import 'adapters/orientation_monitor.dart';
 import 'core/destination_dialogue.dart';
 import 'core/navigation_tracker.dart';
+import 'core/straight_pacing.dart';
 import 'core/yolo_error_speech.dart';
 import 'core/real_navigation.dart';
 import 'core/startup_guard.dart';
@@ -131,7 +132,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _straightConfirmed = false;
   bool _riskActive = false;
   String _navVersion = 'nav-v0';
-  String _straightNavVersion = 'nav-v0';
   Timer? _straightTimer;
 
   String _routeText = '尚未规划路线。';
@@ -186,6 +186,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // Cloud-vision cycle merging + 429 backoff (hazard scans).
   final VisionCycleCoordinator _visionCycle = VisionCycleCoordinator();
   final VisionRateBackoff _visionBackoff = VisionRateBackoff();
+  final CloudVisionDowngradeGate _visionDowngrade =
+      CloudVisionDowngradeGate();
   Timer? _hazardScanTimer;
   GeoPoint? _lastFixPoint;
   GeoPoint? _scanAnchorPoint;
@@ -213,14 +215,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // Step 2 voice navigation flow state.
   NavigationTracker? _liveNav;
   RerouteBudget? _tripRerouteBudget;
-  Future<void>? _pendingPreemptStop;
-  // The ONE persistent straight-pause state (Codex re-test
-  // of f951240): entered via _pauseStraightForRisk (danger
-  // prompts, YOLO risk onset), left only via
-  // _recheckStraightResume. The nav version at pause time is
-  // anchored here; a resume is valid only against it.
-  bool _straightPausedByRisk = false;
-  String _straightPausedNavVersion = 'nav-v0';
+  // The ONE straight-pacing state machine (Codex re-test
+  // of d01a081): pause, timing and the resume re-check all
+  // live in StraightPacingMachine -- no separate pause flag,
+  // no direct scheduler resumes, exactly one timer, armed
+  // only on a machine transition into running.
+  final StraightPacingMachine _pacing = StraightPacingMachine();
+  // True while an off-route re-plan is in flight: the old
+  // tracker stays installed for the failure fallback but
+  // must not be read for straight confirmation.
+  bool _rerouting = false;
   StreamSubscription<LocationResult>? _gpsSub;
   String _liveNavDestName = '';
   double? _liveNavRemainingM;
@@ -432,7 +436,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         );
     // Live straight prompts: the shared 3 s tick reads its
     // confirmation from the tracker while live nav runs.
-    _startStraightTimer();
+    if (_pacing.state == StraightPacingState.suspendedForReroute) {
+      // A re-plan just installed the NEW tracker: straight
+      // guidance resumes only through the unified re-check
+      // against THIS tracker, never the replaced one.
+      _rerouting = false;
+      _recheckStraightResume();
+      if (!_pacing.canTick) _stopStraightTimer();
+    } else {
+      _pacing.begin();
+      _startStraightTimer();
+    }
     _logMsg('实时导航已开始：GPS 跟踪中（转向/偏航/到达自动播报）。');
   }
 
@@ -463,6 +477,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     });
     for (final NavEvent e in events) {
       _handleNavEvent(e);
+    }
+    if (_pacing.state == StraightPacingState.suspendedForReroute &&
+        !_rerouting) {
+      // A re-planned route whose first segment was not
+      // straight stays suspended; a later fix may reach a
+      // straight segment, judged by the NEW tracker only.
+      _recheckStraightResume();
     }
   }
 
@@ -534,6 +555,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// event (already throttled by the tracker). Failure keeps
   /// the old tracker running and is announced honestly.
   Future<void> _rerouteLiveNavigation() async {
+    // Suspend straight guidance for the whole re-plan. The
+    // old tracker stays installed ONLY as the failure
+    // fallback; while _rerouting is set it is not read for
+    // straight confirmation, and the tick cannot fire.
+    _rerouting = true;
+    _pacing.suspendForReroute();
+    _stopStraightTimer();
     final RealNavigationStarter starter = RealNavigationStarter(
       locationProvider: _locationProvider,
       client: _amapClient,
@@ -545,7 +573,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // off-route event must be able to retry the re-plan
       // (subject to the trip budget) instead of the failure
       // ending all retries.
+      _rerouting = false;
       _liveNav?.resetOffRouteStreak();
+      // The re-plan failed, so the still-installed tracker
+      // is the operative one again: the suspension ends via
+      // the same unified re-check as every other resume.
+      _recheckStraightResume();
       _say(_request(
         id: 'nav-reroute-failed',
         eventId: 'nav-reroute-failed',
@@ -573,7 +606,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _gpsSub = null;
     _liveNav = null;
     _liveNavRemainingM = null;
-    _straightPausedByRisk = false;
+    _pacing.stop();
+    _rerouting = false;
     _stopStraightTimer();
   }
 
@@ -886,22 +920,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   bool _say(SpeechRequest request) {
     final DateTime now = DateTime.now();
-    // Capture what is active BEFORE anything else: a danger
-    // submission first pauses straight guidance, and
-    // pauseStraight() itself interrupts an active straight
-    // prompt. The physical preemption stop below is keyed on
-    // the request that was active when this call began --
-    // capturing it after the pause made the stop unreachable
-    // for exactly the case it exists for (Codex re-test of
-    // f951240: the straight utterance kept playing under the
-    // danger prompt because the pause had already cleared it).
-    final SpeechRequest? activeBefore = _scheduler.active;
-    final int interruptedBefore = _scheduler.interruptedLog.length;
     if (request.kind == SpeechKind.danger) {
-      // A danger prompt kills any active straight prompt and
-      // clears its 3-second clock: after the danger, straight
-      // guidance resumes only via the unified re-check
-      // (_recheckStraightResume), never a catch-up replay.
+      // A danger prompt pauses straight guidance (the pacing
+      // machine's persistent hold + the scheduler's straight
+      // clock) and interrupts whatever it outranks via the
+      // scheduler's priority rule. The PHYSICAL stop is not
+      // decided here: the sequenced speak path stops the
+      // current utterance unconditionally before a danger or
+      // emergency prompt speaks (Codex re-test of d01a081).
       _pauseStraightForRisk();
     }
     final bool accepted = _scheduler.submit(request, now);
@@ -920,20 +946,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // prompt completes only when the engine reports completion.
     // Otherwise the old simulated 1200 ms timing is used.
     if (accepted && _scheduler.active?.id == request.id) {
-      if (activeBefore != null &&
-          activeBefore.id != request.id &&
-          _scheduler.interruptedLog.length > interruptedBefore &&
-          _scheduler.interruptedLog
-              .sublist(interruptedBefore)
-              .contains(activeBefore.id)) {
-        // Physical preemption (danger over a navigation
-        // prompt): the scheduler swapped the active request,
-        // but the interrupted utterance is still coming out
-        // of the speaker. Stop it; the sequenced speak path
-        // awaits this stop before the danger prompt starts.
-        _pendingPreemptStop = _stopTtsPlayback();
-        _logMsg('危险提示抢占了正在播报的导航提示（已停止其播放）。');
-      }
       _speakActive(request);
     }
     return accepted;
@@ -944,20 +956,26 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// it too, through the same real-or-simulated path.
   void _finishSpeech(String id) {
     if (_scheduler.active?.id == id) {
+      final SpeechRequest finished = _scheduler.active!;
       _scheduler.completeActive();
       final SpeechRequest? next = _scheduler.promoteNext(
         DateTime.now(),
         straightSegmentConfirmed: _straightSegmentConfirmedNow,
         riskActive: _riskActive,
       );
-      // Unified resume re-check (Codex re-test of f951240):
-      // it runs on EVERY completion -- not only when a danger
-      // prompt finishes with an empty queue -- and also when
-      // the risk state clears (_onYoloDetections) and when
-      // the user says 继续. It re-checks risk and navigation
-      // state at this moment and restarts the 3 s clock from
-      // now; missed straight prompts are never replayed.
-      _recheckStraightResume();
+      // Resume re-check, anchored to the DANGER completion
+      // callback (Codex re-test of d01a081): straight timing
+      // restarts only after a danger/emergency prompt has
+      // actually finished AND no other urgent prompt is now
+      // active or queued. The previous shape promoted the
+      // next prompt and then re-checked unconditionally, so
+      // a routine completion could re-time straight guidance
+      // while a danger was still pending.
+      if ((finished.kind == SpeechKind.danger ||
+              finished.kind == SpeechKind.emergency) &&
+          !_dangerPending) {
+        _recheckStraightResume();
+      }
       if (next == null) {
         // Speech is done and nothing is queued: the turn-taking
         // loop may open the microphone now (v0.7).
@@ -983,17 +1001,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// (Codex re-test of 037f25c): the microphone stop is
   /// AWAITED before playback starts -- the old
   /// fire-and-forget stop let speech begin over a still-open
-  /// microphone -- and a pending preemption stop is awaited
-  /// too. Cancellation that landed during the wait is
+  /// microphone -- and a danger/emergency prompt first awaits
+  /// an unconditional physical stop of the current utterance. Cancellation that landed during the wait is
   /// honoured: a superseded request never starts speaking.
   void _speakActive(SpeechRequest request) {
     unawaited(_speakActiveSequenced(request));
   }
 
   Future<void> _speakActiveSequenced(SpeechRequest request) async {
-    final Future<void>? preemptStop = _pendingPreemptStop;
-    _pendingPreemptStop = null;
-    if (preemptStop != null) await preemptStop;
+    if (request.kind == SpeechKind.danger ||
+        request.kind == SpeechKind.emergency) {
+      // Physical preemption, UNCONDITIONAL (Codex re-test of
+      // d01a081, as corrected): a high-priority prompt first
+      // stops the currently playing utterance and AWAITS the
+      // stop, then speaks. No active-flag test decides this:
+      // the old design inspected scheduler state that the
+      // straight pause had already mutated, so on the YOLO
+      // path the stop silently never ran. The stop is bounded
+      // so a hung engine cannot block the danger prompt.
+      try {
+        await _stopTtsPlayback().timeout(const Duration(milliseconds: 800));
+      } on TimeoutException {
+        _logMsg('停止当前播报 800 毫秒内未完成，继续播报高优先级提示；旧声音可能短暂残留。');
+      }
+      if (_scheduler.active?.id != request.id) return;
+    }
     final VoiceInput input = _voiceInput;
     final SystemVoiceInput? sysInput = input is SystemVoiceInput ? input : null;
     if (sysInput != null && sysInput.isListening) {
@@ -1098,43 +1130,55 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         fallbackConfirmed: _straightConfirmed,
       );
 
-  /// Enter the ONE persistent straight-pause state: the
-  /// active straight prompt is interrupted and its 3 s clock
-  /// cleared, and the navigation version is anchored (first
-  /// entry wins -- a second danger during the same pause must
-  /// not move the anchor the resume will be checked against).
+  /// Enter the pacing machine's persistent hold and disarm
+  /// the scheduler's straight clock. Interrupting the ACTIVE
+  /// straight prompt is not done here: the scheduler's
+  /// submit() priority rule does that when the danger prompt
+  /// is submitted, and the physical stop happens in the
+  /// sequenced speak path.
   void _pauseStraightForRisk() {
     _scheduler.pauseStraight();
-    if (_straightPausedByRisk) return;
-    _straightPausedByRisk = true;
-    _straightPausedNavVersion = _navVersion;
+    _pacing.hold(_navVersion);
   }
 
-  /// Leave the pause state, but only after re-checking at
-  /// THIS moment: no risk active, the CURRENT segment
-  /// confirmed straight (tracker-governed during live nav),
-  /// and the navigation version unchanged since the pause.
-  /// During live nav a version change re-anchors instead of
-  /// wedging the pause forever: the old segment's pause
-  /// premise no longer exists, and the new segment is
-  /// re-validated on its own state (spec 7.7 item 7).
-  /// resumeStraight restarts the 3 s clock from now, so
-  /// prompts never overlap and missed ones are not replayed.
+  /// True while a danger/emergency prompt is active or
+  /// queued: straight timing must not restart before it has
+  /// finished (see _finishSpeech).
+  bool get _dangerPending {
+    bool urgent(SpeechRequest? r) =>
+        r != null &&
+        (r.kind == SpeechKind.emergency || r.kind == SpeechKind.danger);
+    return urgent(_scheduler.active) || _scheduler.queue.any(urgent);
+  }
+
+  /// The ONLY resume path for straight guidance. The pacing
+  /// machine judges the state at THIS moment (risk, pending
+  /// danger, reroute tracker readiness, current segment);
+  /// see StraightPacingMachine.recheck.
   void _recheckStraightResume() {
-    if (!_straightPausedByRisk) return;
-    if (_liveNav != null && _navVersion != _straightPausedNavVersion) {
-      _straightPausedNavVersion = _navVersion;
-    }
-    final bool resumed = _scheduler.resumeStraight(
-      now: DateTime.now(),
-      straightSegmentConfirmed: _straightSegmentConfirmedNow,
+    final bool resumed = _pacing.recheck(
       riskActive: _riskActive,
-      currentNavigationVersion: _navVersion,
-      straightNavigationVersion: _straightPausedNavVersion,
+      dangerPending: _dangerPending,
+      trackerReady: _liveNav != null && !_rerouting,
+      currentSegmentStraight: _straightSegmentConfirmedNow,
+      currentNavVersion: _navVersion,
     );
-    if (resumed) {
-      _straightPausedByRisk = false;
-    }
+    if (!resumed) return;
+    // The machine judged the resume valid on current state;
+    // re-arm the scheduler's 3 s clock from NOW (no catch-up)
+    // and restart the single timer. This is the ONLY place
+    // either happens for a resume: no flow may call the
+    // scheduler's resume or the timer directly (the demo
+    // re-confirmation used to, bypassing the persistent
+    // pacing state entirely).
+    _scheduler.resumeStraight(
+      now: DateTime.now(),
+      straightSegmentConfirmed: true,
+      riskActive: false,
+      currentNavigationVersion: _navVersion,
+      straightNavigationVersion: _navVersion,
+    );
+    _startStraightTimer();
   }
 
   void _startStraightTimer() {
@@ -1155,7 +1199,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     if (_tasks.state != TaskState.navigating ||
-        _straightPausedByRisk ||
+        !_pacing.canTick ||
         !_straightSegmentConfirmedNow ||
         _riskActive) {
       return;
@@ -1664,9 +1708,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // the demo flow on the user's own re-confirmation
       // （继续）, in live nav on the tracker's current step.
       _recheckStraightResume();
-      if (_tasks.state == TaskState.navigating) {
-        _startStraightTimer();
-      }
       _say(_request(
         id: 'yolo-cleared-${now.millisecondsSinceEpoch}',
         eventId: 'yolo-cleared-${now.millisecondsSinceEpoch}',
@@ -1733,7 +1774,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _tasks.transitionTo(TaskState.navigating, trigger: 'start-navigation');
     setState(() {
       _straightConfirmed = true;
-      _straightNavVersion = _navVersion;
     });
     // v0.7: navigation starts the camera too -- a blind user must
     // not have to find and tap a button to turn perception on.
@@ -1742,6 +1782,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // physical release): if the camera is busy the view simply
     // does not open and navigation proceeds without it.
     unawaited(_openYoloLive());
+    _pacing.begin();
     _startStraightTimer();
     _logMsg('开始导航：直行路段已确认，3 秒直行节奏已启动。');
     final DateTime now = DateTime.now();
@@ -1788,6 +1829,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     _stopStraightTimer();
     _scheduler.pauseStraight();
+    _pacing.hold(_navVersion);
     setState(() {
       _straightConfirmed = false;
     });
@@ -1815,11 +1857,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // decides, via the unified re-check. Resume only when
       // it passes; say so when it does.
       _recheckStraightResume();
-      if (_straightPausedByRisk) {
+      if (!_pacing.canTick) {
         _logMsg('当前路段未经跟踪器确认直行，未恢复直行节奏。');
         return;
       }
-      _startStraightTimer();
       _logMsg('直行恢复：已按跟踪器当前路段重新检查，3 秒计时器已重启。');
       _say(_request(
         id: 'straight-resumed-live-${DateTime.now().millisecondsSinceEpoch}',
@@ -1831,34 +1872,25 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     final DateTime now = DateTime.now();
-    final bool resumed = _scheduler.resumeStraight(
-      now: now,
-      straightSegmentConfirmed: true,
-      riskActive: false,
-      currentNavigationVersion: _navVersion,
-      straightNavigationVersion: _straightNavVersion,
-    );
-    if (resumed) {
-      setState(() {
-        _straightConfirmed = true;
-      });
-      _startStraightTimer();
-      _logMsg('直行恢复：已重新确认直线路段与导航版本，3 秒计时器已重启。');
+    // Unified resume path (Codex re-test of d01a081): the
+    // demo re-confirmation goes through the SAME re-check
+    // and persistent pacing state as every other resume.
+    // The old code called the scheduler's resumeStraight
+    // directly (twice, with a version fallback), bypassing
+    // both the re-check and the pause state.
+    setState(() {
+      _straightConfirmed = true;
+    });
+    _recheckStraightResume();
+    if (_pacing.canTick) {
+      _logMsg('直行恢复：已重新确认直线路段，3 秒计时器已重启（统一重检），旧直行指令未补播。');
     } else {
-      setState(() {
-        _straightNavVersion = _navVersion;
-        _straightConfirmed = true;
-      });
-      _scheduler.resumeStraight(
-        now: now,
-        straightSegmentConfirmed: true,
-        riskActive: false,
-        currentNavigationVersion: _navVersion,
-        straightNavigationVersion: _navVersion,
-      );
-      _startStraightTimer();
-      _logMsg('直行恢复：导航版本已变化，已重新确认当前路段后重启计时器，'
-          '旧直行指令未补播。');
+      // The only remaining blocker here is a danger prompt
+      // that is still playing: the confirmation is registered
+      // and SPOKEN (queued behind the danger), and the timer
+      // restarts at that danger's completion re-check -- the
+      // resume never re-times before the danger finishes.
+      _logMsg('直行恢复：已确认直线路段，待危险播报结束后按统一重检重启计时。');
     }
     // v0.7: the re-confirmation must be HEARD, not only logged --
     // a blind user cannot see the log line.
@@ -1879,6 +1911,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _tasks.transitionTo(TaskState.avoidingObstacle, trigger: 'obstacle');
     _stopStraightTimer();
     _scheduler.pauseStraight();
+    _pacing.hold(_navVersion);
     setState(() {
       _riskActive = true;
     });
@@ -1940,16 +1973,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     setState(() {
       _riskActive = false;
       _straightConfirmed = true;
-      _straightNavVersion = _navVersion;
     });
-    _scheduler.resumeStraight(
-      now: DateTime.now(),
-      straightSegmentConfirmed: true,
-      riskActive: false,
-      currentNavigationVersion: _navVersion,
-      straightNavigationVersion: _navVersion,
-    );
-    _startStraightTimer();
+    // Resume ONLY through the unified pacing re-check (this
+    // handler used to resume the scheduler and restart the
+    // timer directly, bypassing the pacing machine).
+    _recheckStraightResume();
     _logMsg('障碍事件结束（演示重新评估）：已重新确认直行路段后恢复直行。');
   }
 
@@ -1961,6 +1989,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _tasks.transitionTo(TaskState.avoidingObstacle, trigger: 'obstacle');
     _stopStraightTimer();
     _scheduler.pauseStraight();
+    _pacing.hold(_navVersion);
     setState(() {
       _riskActive = true;
     });
@@ -2017,16 +2046,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     setState(() {
       _riskActive = false;
       _straightConfirmed = true;
-      _straightNavVersion = _navVersion;
     });
-    _scheduler.resumeStraight(
-      now: now,
-      straightSegmentConfirmed: true,
-      riskActive: false,
-      currentNavigationVersion: _navVersion,
-      straightNavigationVersion: _navVersion,
-    );
-    _startStraightTimer();
+    // Resume ONLY through the unified pacing re-check (this
+    // handler used to resume the scheduler and restart the
+    // timer directly, bypassing the pacing machine).
+    _recheckStraightResume();
     _logMsg('动作后重新感知（演示）：新事件 ${events.length} 条，'
         '原障碍帧不再出现，仍以本次重新感知为准恢复导航。');
   }
@@ -2331,11 +2355,36 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     unawaited(_triggerHazardScan(VisionTrigger.periodic));
   }
 
+  /// Speak the fixed cloud-vision downgrade sentence,
+  /// rate-limited by [_visionDowngrade]: repeated scan
+  /// failures (for example while the FC still runs the
+  /// pre-hazard build) announce ONCE per cooldown window,
+  /// never on every 8-second tick.
+  void _announceVisionDowngrade() {
+    if (!mounted) return;
+    if (!_visionDowngrade.shouldAnnounce(DateTime.now())) return;
+    _say(_request(
+      id: 'vision-downgrade-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'vision-downgrade-${DateTime.now().millisecondsSinceEpoch}',
+      text: cloudVisionDowngradeSpeech,
+      kind: SpeechKind.alert,
+    ));
+  }
+
   /// One hazard-scan cycle (periodic or YOLO-triggered; the
   /// coordinator merges overlapping triggers into this one
-  /// request). Silent by design except for ground hazards,
-  /// a tactile-paving identification, the single 429 notice
-  /// per backoff episode, and a manual request that joined.
+  /// request). Ground hazards and a tactile-paving
+  /// identification are spoken from the parsed result, a 429
+  /// gets the single notice per backoff episode, and EVERY
+  /// failure or unknown-format outcome announces the fixed
+  /// downgrade sentence (cloudVisionDowngradeSpeech),
+  /// rate-limited by the downgrade gate so it cannot repeat
+  /// on every tick. A manual request that joined the cycle
+  /// is answered with the result description, or with the
+  /// downgrade sentence when the cycle produced no usable
+  /// assessment. Only the rate limiter's own slot refusal
+  /// (tryReserve) stays silent: expected throttling, not a
+  /// failure.
   Future<void> _triggerHazardScan(VisionTrigger kind) async {
     if (!_cloudVisionClient.isConfigured) return;
     final DateTime now = DateTime.now();
@@ -2353,10 +2402,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (!_cloudVisionClient.tryReserve(now)) return;
       final CameraFrameCapture capture =
           await _frameSource.captureSingleFrame();
-      if (!capture.ok || capture.bytes == null) return;
+      if (!capture.ok || capture.bytes == null) {
+        if (mounted) {
+          _logMsg('云端识图：本轮自动扫描取帧失败，已降级为本地检测。');
+        }
+        _announceVisionDowngrade();
+        return;
+      }
       final HazardScanOutcome outcome = await _cloudVisionClient
           .describeHazardReserved(imageBytes: capture.bytes!);
       if (outcome.failure == CloudVisionFailure.rateLimited) {
+        if (mounted) {
+          _logMsg('云端识图：请求过于频繁，已按退避策略处理，其间只用本地检测。');
+        }
         if (_visionBackoff.onRateLimited(DateTime.now())) {
           _say(_request(
             id: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
@@ -2367,10 +2425,35 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       }
+      if (outcome.failure != null) {
+        // Any other failure (network, timeout, upstream,
+        // unconfigured, unparseable body) is spoken via the
+        // downgrade sentence, never silent. The log line is
+        // a fixed category text, written even when the
+        // downgrade gate mutes the announcement.
+        if (mounted) {
+          _logMsg('云端识图：本轮自动扫描请求失败，已降级为本地检测。');
+        }
+        _announceVisionDowngrade();
+        return;
+      }
       if (!outcome.ok) return;
-      _visionBackoff.onSuccess();
       final HazardAssessment a = outcome.assessment!;
       assessment = a;
+      if (!a.parsed) {
+        // Not a conforming hazard payload -- most likely
+        // the FC still runs the pre-hazard build and
+        // answered in the old scene shape. Unknown result:
+        // announce the downgrade sentence (rate-limited)
+        // and do NOT count this as a success.
+        if (mounted) {
+          _logMsg('云端识图：响应格式无法识别（可能仍是旧版服务），已按未知处理并降级为本地检测。');
+        }
+        _announceVisionDowngrade();
+        return;
+      }
+      _visionBackoff.onSuccess();
+      _visionDowngrade.noteSuccess();
       if (!mounted) return;
       final String? ground = hazardGroundSpeech(a);
       if (ground != null) {
@@ -2392,15 +2475,34 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
       }
     } catch (_) {
-      // A scan failure stays silent: local detection is the
-      // primary channel and keeps running.
+      // A scan failure is announced via the downgrade
+      // sentence (rate-limited by the gate): an automatic
+      // scan must never fail silently. Local detection is
+      // the primary channel and keeps running either way.
+      // The log uses a fixed category text only: the caught
+      // object itself is never written anywhere.
+      if (mounted) {
+        _logMsg('云端识图：本轮自动扫描出现异常，已降级为本地检测。');
+      }
+      _announceVisionDowngrade();
     } finally {
       final bool joined = _visionCycle.complete();
-      if (joined && assessment != null && mounted) {
+      if (joined && mounted) {
+        // A joined manual request is always answered: with
+        // the result description when the cycle produced a
+        // usable assessment, and with the fixed downgrade
+        // sentence when it did not (a failure, a capture
+        // problem, or an unknown-format answer) -- it never
+        // goes unanswered. This answer is spoken directly,
+        // not through the rate-limit gate: the user asked
+        // once, explicitly.
+        final HazardAssessment? joinedAssessment = assessment;
         _say(_request(
           id: 'hazard-join-${DateTime.now().millisecondsSinceEpoch}',
           eventId: 'hazard-join-${DateTime.now().millisecondsSinceEpoch}',
-          text: hazardDescriptionSpeech(assessment),
+          text: joinedAssessment != null && joinedAssessment.parsed
+              ? hazardDescriptionSpeech(joinedAssessment)
+              : cloudVisionDowngradeSpeech,
           kind: SpeechKind.alert,
         ));
       }
@@ -2842,7 +2944,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _straightConfirmed = false;
       _riskActive = false;
       _navVersion = 'nav-v0';
-      _straightNavVersion = 'nav-v0';
       _routeText = '尚未规划路线。';
       _obstacleText = '尚未模拟障碍。';
       _entranceText = '尚未寻找入口。';

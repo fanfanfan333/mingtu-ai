@@ -161,6 +161,31 @@ class SpeechScheduler {
       _activate(request);
       return true;
     }
+    if (request.kind == _active!.kind &&
+        (request.kind == SpeechKind.emergency ||
+            request.kind == SpeechKind.danger)) {
+      // Same-level urgent prompt, different event (a true
+      // duplicate of the SAME event was already dropped
+      // above): the new danger REPLACES the playing one. It
+      // interrupts immediately -- same-level dangers never
+      // queue behind each other -- and the interrupted
+      // prompt is never replayed.
+      interruptedLog.add(_active!.id);
+      _active = null;
+      _activate(request);
+      return true;
+    }
+    if (request.kind == SpeechKind.emergency ||
+        request.kind == SpeechKind.danger) {
+      // A QUEUED same-kind urgent prompt is replaced too:
+      // only the newest event of that level stays pending.
+      for (final SpeechRequest q in _queue
+          .where((SpeechRequest q) => q.kind == request.kind)
+          .toList()) {
+        _queue.remove(q);
+        interruptedLog.add(q.id);
+      }
+    }
     _queue.add(request);
     _queue.sort((a, b) {
       final p = a.priority.compareTo(b.priority);
@@ -196,15 +221,17 @@ class SpeechScheduler {
     _lastStraightPlayedAt = now;
   }
 
-  /// Pause a straight prompt (e.g. a higher-priority event arrived, a turn
-  /// is coming, or the segment is no longer confirmed straight). This
-  /// clears the active straight prompt and its timer; it does NOT queue it
-  /// for later replay.
+  /// Disarm the straight 3-second clock ONLY. This
+  /// deliberately does NOT touch the active request: whether
+  /// a playing prompt is interrupted is the submit()
+  /// priority rule's decision, and the physical playback
+  /// stop is the caller's sequenced stop before a
+  /// high-priority prompt speaks. An earlier version cleared
+  /// the active straight prompt here, which destroyed the
+  /// very state the preemption logic then inspected -- the
+  /// physical stop silently never happened (Codex re-tests
+  /// of f951240 and d01a081).
   void pauseStraight() {
-    if (_active?.kind == SpeechKind.straight) {
-      interruptedLog.add(_active!.id);
-      _active = null;
-    }
     _lastStraightPlayedAt = null;
   }
 

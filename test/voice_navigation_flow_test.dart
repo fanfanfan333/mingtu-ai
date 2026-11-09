@@ -299,9 +299,12 @@ void main() {
         'choke point', () {
       expect(mainDart, contains('unawaited(_speakActiveSequenced(request))'));
       expect(mainDart, contains('await speakAfterClosingMic('));
-      // Danger prompts stop the interrupted playback and the
-      // speak path awaits that stop.
-      expect(mainDart, contains('_pendingPreemptStop = _stopTtsPlayback()'));
+      // Danger/emergency prompts physically stop the current
+      // utterance first: the sequenced speak path awaits an
+      // unconditional, bounded stop before speaking (the
+      // order itself is proven behaviourally, with a
+      // recording fake TTS, in codex_d01a081_fix_test.dart).
+      expect(mainDart, contains('await _stopTtsPlayback().timeout'));
       expect(mainDart, contains('kind: SpeechKind.danger'));
       // The re-plan budget is trip-level: created once per
       // trip, shared by every rebuilt tracker.

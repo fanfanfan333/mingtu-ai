@@ -16,14 +16,22 @@ library;
 /// Judges orientation stability from gyroscope magnitudes.
 ///
 /// Stable means: at least [minSamples] samples inside the
-/// trailing [window], and every sample's angular speed is at
-/// or below [maxRadPerSec]. Walking produces a steady sway
+/// trailing [window], every sample's angular speed is at
+/// or below [maxRadPerSec], AND the data is fresh: if no
+/// new sample has arrived for more than [freshnessTimeout]
+/// (500 ms, project-lead value), the verdict is NOT stable
+/// -- an old "stable" conclusion is never carried forward
+/// across a sensor gap. Walking produces a steady sway
 /// well under the threshold; turning the body or swinging
 /// the phone exceeds it.
 class GyroStabilityJudge {
   static const int minSamples = 5;
   static const Duration window = Duration(seconds: 1);
   static const double maxRadPerSec = 0.35;
+
+  /// Freshness bound: no new sample for longer than this
+  /// and the orientation counts as unknown (unstable).
+  static const Duration freshnessTimeout = Duration(milliseconds: 500);
 
   final List<({DateTime at, double mag})> _samples =
       <({DateTime at, double mag})>[];
@@ -33,10 +41,28 @@ class GyroStabilityJudge {
     _samples.removeWhere((s) => now.difference(s.at) > window);
   }
 
-  bool get isStable {
-    if (_samples.length < minSamples) return false;
-    return _samples.every((s) => s.mag <= maxRadPerSec);
+  /// Stability verdict as of [now]. Stale data is never
+  /// stable: with no samples at all, or when the newest
+  /// sample is older than [freshnessTimeout], this returns
+  /// false whatever the old samples said.
+  bool isStableAt(DateTime now) {
+    if (_samples.isEmpty) return false;
+    final DateTime newest = _samples.last.at;
+    if (now.difference(newest) > freshnessTimeout) return false;
+    final List<({DateTime at, double mag})> recent = _samples
+        .where((s) => now.difference(s.at) <= window && !s.at.isAfter(now))
+        .toList();
+    if (recent.length < minSamples) return false;
+    return recent.every((s) => s.mag <= maxRadPerSec);
   }
+
+  /// Verdict at the newest sample's own timestamp (the
+  /// historical behaviour, kept for API compatibility).
+  /// Callers that poll over time must use [isStableAt] with
+  /// the current time, so a sensor stream that stops makes
+  /// the verdict go stale instead of sticking at stable.
+  bool get isStable =>
+      _samples.isEmpty ? false : isStableAt(_samples.last.at);
 
   void reset() => _samples.clear();
 }

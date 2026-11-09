@@ -128,6 +128,71 @@ void main() {
       );
       expect(d.advice, StepAdvice.stopOnly);
     });
+
+    test(
+        'condition 2 counts ANY detection: a chair occupies '
+        'the side it is seen on', () {
+      final AvoidanceAdvisor a = primed();
+      expect(a.leftClearStreak, 3);
+      expect(a.rightClearStreak, 3);
+      // A chair is not a hazard category, but it physically
+      // occupies the left side: the streak must reset.
+      a.observeFrame(<Detection>[
+        det('car', 0.5, 0.9),
+        det('chair', 0.15, 0.8),
+      ]);
+      expect(a.leftClearStreak, 0);
+      expect(a.rightClearStreak, 4);
+      // No step to the left any more; the still-clear right
+      // side remains a legal step.
+      final AvoidanceDecision d =
+          a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
+      expect(d.advice, StepAdvice.stepRight);
+      expect(d.speech, '前方有机动车，向右迈一步。');
+    });
+
+    test(
+        'the Codex failure case: a chair on the right for '
+        'three frames forbids the right step', () {
+      final AvoidanceAdvisor a = primed();
+      // Three consecutive frames with a chair (a NON-hazard
+      // label) on the right side, cx > 0.67; the hazard car
+      // stays central and near.
+      for (int i = 0; i < 3; i++) {
+        a.observeFrame(<Detection>[
+          det('car', 0.5, 0.9),
+          det('chair', 0.85, 0.8),
+        ]);
+      }
+      expect(a.rightClearStreak, 0);
+      expect(a.leftClearStreak, 6);
+      final AvoidanceDecision d =
+          a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
+      // The right step is forbidden; the clear left side is
+      // the only legal step.
+      expect(d.advice, StepAdvice.stepLeft);
+      expect(d.speech, '前方有机动车，向左迈一步。');
+      expect(d.speech, isNot(contains('向右')));
+    });
+
+    test(
+        'condition 2: non-hazard objects on BOTH sides -> '
+        'stop only', () {
+      final AvoidanceAdvisor a = AvoidanceAdvisor();
+      for (int i = 0; i < 3; i++) {
+        a.observeFrame(<Detection>[
+          det('car', 0.5, 0.9),
+          det('chair', 0.15, 0.8),
+          det('bench', 0.85, 0.8),
+        ]);
+      }
+      expect(a.leftClearStreak, 0);
+      expect(a.rightClearStreak, 0);
+      final AvoidanceDecision d =
+          a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, '前方有机动车，请停下。');
+    });
   });
 
   group(
@@ -183,6 +248,29 @@ void main() {
       const UnavailableOrientationMonitor m = UnavailableOrientationMonitor();
       expect(m.isAvailable, isFalse);
       expect(m.isStable, isFalse);
+    });
+
+    test(
+        'stale data is never stable: the 500 ms freshness '
+        'bound', () {
+      final GyroStabilityJudge j = GyroStabilityJudge();
+      final DateTime t0 = DateTime(2026, 1, 1);
+      // No samples at all: not stable at any time.
+      expect(j.isStableAt(t0), isFalse);
+      for (int i = 0; i < 5; i++) {
+        j.addSample(0.1, t0.add(Duration(milliseconds: 100 * i)));
+      }
+      final DateTime last = t0.add(const Duration(milliseconds: 400));
+      expect(j.isStableAt(last), isTrue);
+      expect(
+          j.isStableAt(last.add(const Duration(milliseconds: 400))), isTrue);
+      expect(
+          j.isStableAt(last.add(const Duration(milliseconds: 500))), isTrue);
+      // The stream stopped more than 500 ms ago: the old
+      // quiet samples must NOT keep the verdict stable.
+      expect(
+          j.isStableAt(last.add(const Duration(milliseconds: 600))), isFalse);
+      expect(j.isStableAt(last.add(const Duration(seconds: 10))), isFalse);
     });
   });
 
@@ -371,6 +459,83 @@ void main() {
           imageBytes: Uint8List.fromList(<int>[1]));
       expect(outcome.ok, isTrue);
       expect(outcome.assessment!.type, HazardType.stairsDown);
+    });
+
+    test(
+        'an old-FC scene-shaped answer collapses to unknown '
+        '(new client, old FC)', () async {
+      final CloudVisionClient client = CloudVisionClient(
+        proxyBaseUrl: 'https://fc.example.invalid',
+        sender: (Uri url, String body, Map<String, String> headers) async {
+          // The pre-hazard FC build answers in the scene
+          // shape: it HAS "parsed" but none of the hazard
+          // keys (no type / direction / path_status).
+          return jsonEncode(<String, Object?>{
+            'scene': '室外',
+            'obstacles': <Object?>[],
+            'parsed': true,
+          });
+        },
+        downsampler: (Uint8List b, int d) async => b,
+      );
+      final HazardScanOutcome outcome = await client.describeHazardReserved(
+          imageBytes: Uint8List.fromList(<int>[1]));
+      expect(outcome.ok, isTrue);
+      expect(outcome.failure, isNull);
+      expect(outcome.assessment!.parsed, isFalse);
+      expect(outcome.assessment!.type, HazardType.unknown);
+    });
+
+    test('a completely unrecognised answer shape collapses to unknown',
+        () async {
+      final CloudVisionClient client = CloudVisionClient(
+        proxyBaseUrl: 'https://fc.example.invalid',
+        sender: (Uri url, String body, Map<String, String> headers) async {
+          return jsonEncode(<String, Object?>{'hello': 'world'});
+        },
+        downsampler: (Uint8List b, int d) async => b,
+      );
+      final HazardScanOutcome outcome = await client.describeHazardReserved(
+          imageBytes: Uint8List.fromList(<int>[1]));
+      expect(outcome.ok, isTrue);
+      expect(outcome.failure, isNull);
+      expect(outcome.assessment!.parsed, isFalse);
+      expect(outcome.assessment!.type, HazardType.unknown);
+    });
+
+    test(
+        'a transport exception maps to the network failure '
+        '(a spoken fixed-text path, never a silent ok)', () async {
+      final CloudVisionClient client = CloudVisionClient(
+        proxyBaseUrl: 'https://fc.example.invalid',
+        sender: (Uri url, String body, Map<String, String> headers) async {
+          throw StateError('simulated transport failure');
+        },
+        downsampler: (Uint8List b, int d) async => b,
+      );
+      final HazardScanOutcome outcome = await client.describeHazardReserved(
+          imageBytes: Uint8List.fromList(<int>[1]));
+      expect(outcome.ok, isFalse);
+      expect(outcome.failure, CloudVisionFailure.network);
+    });
+  });
+
+  group('cloud-vision downgrade gate: announce once, rate-limited', () {
+    test(
+        'first failure speaks, repeats are muted for the '
+        'cooldown, a success re-arms', () {
+      final CloudVisionDowngradeGate g = CloudVisionDowngradeGate();
+      final DateTime t0 = DateTime(2026, 1, 1, 12);
+      expect(cloudVisionDowngradeSpeech, '云端识图暂不可用，请慢行。');
+      expect(g.shouldAnnounce(t0), isTrue);
+      expect(g.shouldAnnounce(t0.add(const Duration(seconds: 10))), isFalse);
+      expect(g.shouldAnnounce(t0.add(const Duration(seconds: 59))), isFalse);
+      expect(g.shouldAnnounce(t0.add(const Duration(seconds: 61))), isTrue);
+      // Muted again right after the second announcement...
+      expect(g.shouldAnnounce(t0.add(const Duration(seconds: 70))), isFalse);
+      // ...until a success resets the gate.
+      g.noteSuccess();
+      expect(g.shouldAnnounce(t0.add(const Duration(seconds: 71))), isTrue);
     });
   });
 

@@ -4,8 +4,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/adapters/amap_client.dart';
 import 'package:mingtu_ai/core/danger_alerts.dart';
 import 'package:mingtu_ai/core/navigation_tracker.dart';
+import 'package:mingtu_ai/core/avoidance_advisor.dart';
 import 'package:mingtu_ai/core/speech_scheduler.dart';
+import 'package:mingtu_ai/core/straight_pacing.dart';
 import 'package:mingtu_ai/modules/map_navigation.dart';
+import 'package:mingtu_ai/modules/visual_perception.dart';
 
 /// Unified speech dispatch -- the module-7 spec from the
 /// design conversation (ChatGPT share, section 7, read in
@@ -18,11 +21,11 @@ import 'package:mingtu_ai/modules/map_navigation.dart';
 /// filtering.
 ///
 /// The tests below are numbered after section 7.7 of that
-/// spec. Items 11, 12 and 15 concern the avoidance-action
-/// layer (side-space confirmation, action-result tracking,
-/// sensor-health gating) and are implemented with the
-/// avoidance module in the danger-recognition step; they
-/// are intentionally NOT claimed here.
+/// spec. Items 11 and 12 (side-space confirmation and
+/// action-result tracking) are covered below through the
+/// production avoidance advisor; item 15 (sensor-health
+/// gating: unknown geometry is never treated as near) is
+/// covered in test/avoidance_and_hazard_test.dart.
 void main() {
   final DateTime t0 = DateTime(2026, 1, 1, 12);
 
@@ -102,16 +105,34 @@ void main() {
       expect(s.submit(req('dg', SpeechKind.danger), t0), isTrue);
       expect(s.active!.id, 'dg');
       expect(s.interruptedLog, contains('st'));
-      // Production wiring: a danger submission enters the
-      // unified pause state, which clears the straight clock
-      // via pauseStraight and anchors the nav version. The
-      // behaviour itself (danger preempts, TTS stop is really
-      // issued) is covered by production-path widget tests in
-      // test/codex_f951240_fix_test.dart.
-      final String mainDart = File('lib/main.dart').readAsStringSync();
-      expect(mainDart, contains('_scheduler.pauseStraight()'));
-      expect(mainDart, contains('_pauseStraightForRisk();'));
-      expect(mainDart, contains('_straightPausedNavVersion = _navVersion'));
+      // pauseStraight is clock-only (Codex re-test of
+      // d01a081): it must NOT clear the active prompt -- the
+      // old behaviour destroyed the state the preemption
+      // logic inspected, so the physical stop never ran.
+      final SpeechScheduler s2 = SpeechScheduler();
+      s2.submit(req('st', SpeechKind.straight), t0);
+      s2.recordStraightPlayed(t0);
+      s2.pauseStraight();
+      expect(s2.active!.id, 'st');
+      expect(s2.interruptedLog, isNot(contains('st')));
+      expect(s2.lastStraightPlayedAt, isNull);
+      // The production pause state (the pacing machine):
+      // the hold blocks every tick until the unified
+      // re-check passes, and a live risk blocks the re-check.
+      final StraightPacingMachine m = StraightPacingMachine();
+      m.begin();
+      m.hold('v1');
+      expect(m.canTick, isFalse);
+      expect(
+        m.recheck(
+            riskActive: true,
+            dangerPending: false,
+            trackerReady: false,
+            currentSegmentStraight: true,
+            currentNavVersion: 'v1'),
+        isFalse,
+      );
+      expect(m.canTick, isFalse);
     });
 
     test(
@@ -168,14 +189,46 @@ void main() {
             riskActive: false),
         isTrue,
       );
-      // Production wiring (Codex re-test of f951240): the
-      // resume re-check now runs on EVERY speech completion
-      // through the unified _recheckStraightResume, and the
-      // confirmation it consults is the tracker-governed
-      // production rule.
-      final String mainDart = File('lib/main.dart').readAsStringSync();
-      expect(mainDart, contains('_recheckStraightResume();'));
-      expect(mainDart, contains('straightSegmentConfirmedNow('));
+      // The production resume path, behaviourally (Codex
+      // re-test of d01a081): the pacing machine releases its
+      // hold only through the unified re-check -- never
+      // while a danger prompt is still pending -- and arms
+      // the timer exactly once per transition into running.
+      final StraightPacingMachine m = StraightPacingMachine();
+      m.begin();
+      m.hold('v1');
+      expect(
+        m.recheck(
+            riskActive: false,
+            dangerPending: true,
+            trackerReady: false,
+            currentSegmentStraight: true,
+            currentNavVersion: 'v1'),
+        isFalse,
+        reason: 'a pending danger blocks the resume',
+      );
+      expect(
+        m.recheck(
+            riskActive: false,
+            dangerPending: false,
+            trackerReady: false,
+            currentSegmentStraight: true,
+            currentNavVersion: 'v1'),
+        isTrue,
+      );
+      expect(m.canTick, isTrue);
+      expect(m.armCount, 2, reason: 'begin + this resume');
+      expect(
+        m.recheck(
+            riskActive: false,
+            dangerPending: false,
+            trackerReady: false,
+            currentSegmentStraight: true,
+            currentNavVersion: 'v1'),
+        isFalse,
+        reason: 'already running: no second timer arm',
+      );
+      expect(m.armCount, 2);
     });
 
     test('7.7-6 when a turn state appears, the straight cycle stops', () {
@@ -252,6 +305,73 @@ void main() {
       expect(s.submit(req('tn', SpeechKind.turn), t0), isFalse);
       expect(s.droppedConflictLog, contains('tn'));
       expect(s.active!.id, 'av');
+    });
+
+    test(
+        '7.7-11 when side space cannot be confirmed, no '
+        'deterministic left/right step instruction is generated', () {
+      const Detection car = Detection(
+          label: 'car', confidence: 0.9, cx: 0.5, cy: 0.8, w: 0.4, h: 0.5);
+      // (a) Central and near, but neither side has any
+      // clear-frame history: stop only.
+      final AvoidanceAdvisor a1 = AvoidanceAdvisor();
+      AvoidanceDecision d = a1.decide(hazard: car, orientationStable: true);
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, '前方有机动车，请停下。');
+      // (b) A side has cleared, but the orientation is not
+      // stable: still stop only.
+      final AvoidanceAdvisor a2 = AvoidanceAdvisor();
+      for (int i = 0; i < 4; i++) {
+        a2.observeFrame(const <Detection>[]);
+      }
+      d = a2.decide(hazard: car, orientationStable: false);
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, isNot(contains('迈一步')));
+      // (c) Box geometry unknown (w/h zero): the distance
+      // is unknown, never near, so never a step.
+      const Detection ghost =
+          Detection(label: 'car', confidence: 0.9, cx: 0.5, cy: 0.5);
+      d = AvoidanceAdvisor().decide(hazard: ghost, orientationStable: true);
+      expect(d.advice, StepAdvice.stopOnly);
+    });
+
+    test(
+        '7.7-12 a spoken avoidance instruction is not treated '
+        'as a completed avoidance: frame evidence decides', () {
+      const Detection car = Detection(
+          label: 'car', confidence: 0.9, cx: 0.5, cy: 0.8, w: 0.4, h: 0.5);
+      AvoidanceAdvisor primed() {
+        final AvoidanceAdvisor a = AvoidanceAdvisor();
+        for (int i = 0; i < 4; i++) {
+          a.observeFrame(const <Detection>[]);
+        }
+        return a;
+      }
+
+      // A step IS advised when all three conditions hold...
+      final AvoidanceAdvisor a1 = primed();
+      final AvoidanceDecision d =
+          a1.decide(hazard: car, orientationStable: true);
+      expect(d.advice, isNot(StepAdvice.stopOnly));
+      expect(a1.hasPendingAction, isTrue);
+      // ...but while the hazard stays central, the action
+      // never confirms itself; after the window it resolves
+      // as UNCERTAIN (main speaks a stop instruction then).
+      AvoidanceNotice? notice;
+      for (int i = 0; i < 6; i++) {
+        notice = a1.observeFrame(const <Detection>[car]);
+      }
+      expect(notice, AvoidanceNotice.actionUncertain);
+      expect(a1.hasPendingAction, isFalse);
+      // Only frame evidence -- the centre clear on
+      // consecutive frames -- confirms an action.
+      final AvoidanceAdvisor a2 = primed();
+      a2.decide(hazard: car, orientationStable: true);
+      AvoidanceNotice? notice2;
+      for (int i = 0; i < 2; i++) {
+        notice2 = a2.observeFrame(const <Detection>[]);
+      }
+      expect(notice2, AvoidanceNotice.actionConfirmed);
     });
 
     test(
@@ -333,14 +453,40 @@ void main() {
       expect(s.active!.id, 'dg');
     });
 
-    test('pauseStraight drops the prompt and its clock', () {
+    test('pauseStraight disarms only the clock, never the active prompt', () {
       final SpeechScheduler s = SpeechScheduler();
       s.submit(req('st', SpeechKind.straight), t0);
       s.recordStraightPlayed(t0);
       s.pauseStraight();
-      expect(s.active, isNull);
-      expect(s.interruptedLog, contains('st'));
+      expect(s.active!.id, 'st');
+      expect(s.interruptedLog, isNot(contains('st')));
       expect(s.lastStraightPlayedAt, isNull);
+    });
+
+    test('a same-level danger replaces the playing danger (no queue)', () {
+      final SpeechScheduler s = SpeechScheduler();
+      s.submit(req('p', SpeechKind.danger), t0);
+      expect(s.submit(req('c', SpeechKind.danger), t0), isTrue);
+      expect(s.active!.id, 'c');
+      expect(s.queue, isEmpty);
+      expect(s.interruptedLog, contains('p'));
+    });
+
+    test('a same-event danger is deduped, never preemptive', () {
+      final SpeechScheduler s = SpeechScheduler();
+      s.submit(req('p', SpeechKind.danger), t0);
+      expect(s.submit(req('p', SpeechKind.danger), t0), isFalse);
+      expect(s.droppedDuplicateLog, contains('p'));
+      expect(s.active!.id, 'p');
+    });
+
+    test('a queued danger is replaced by a newer danger event', () {
+      final SpeechScheduler s = SpeechScheduler();
+      s.submit(req('em', SpeechKind.emergency), t0);
+      s.submit(req('d1', SpeechKind.danger), t0);
+      s.submit(req('d2', SpeechKind.danger), t0);
+      expect(s.queue.map((SpeechRequest q) => q.id), <String>['d2']);
+      expect(s.interruptedLog, contains('d1'));
     });
 
     test('straight is refused while a risk is active', () {

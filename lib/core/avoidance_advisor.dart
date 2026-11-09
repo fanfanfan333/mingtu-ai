@@ -6,8 +6,10 @@
 /// 1. the hazard is in the central corridor and NEAR --
 ///    estimated from the detection box (centre-x inside the
 ///    corridor, box bottom low in the frame);
-/// 2. the OTHER side has had no hazard detection at all for
-///    at least [sideClearFrames] consecutive frames;
+/// 2. the OTHER side has had NO detection of ANY kind --
+///    hazard or not (a chair occupies a side just as much
+///    as a vehicle does) -- for at least
+///    [sideClearFrames] consecutive frames;
 /// 3. the phone orientation is stable (gyroscope / compass
 ///    seam; unknown or unstable never passes).
 ///
@@ -142,9 +144,16 @@ class AvoidanceAdvisor {
     bool rightBusy = false;
     bool centerBusy = false;
     for (final Detection d in frame) {
-      if (hazardKindForLabel(d.label) == null) continue;
+      // Side occupancy counts EVERY detection, hazard or
+      // not: a side is only "clear" when nothing at all was
+      // seen there (a chair blocks a sideways step just as
+      // surely as a vehicle does).
       if (d.cx < corridorLeft) leftBusy = true;
       if (d.cx > corridorRight) rightBusy = true;
+      // The centre tracker keeps its hazard-only meaning:
+      // it resolves whether the hazard the user stepped
+      // away from is still standing in the corridor.
+      if (hazardKindForLabel(d.label) == null) continue;
       if (inCorridor(d) && distanceLevelOf(d) == BoxDistanceLevel.near) {
         centerBusy = true;
       }

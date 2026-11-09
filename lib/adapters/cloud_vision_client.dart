@@ -196,6 +196,17 @@ class CloudVisionClient {
     if (reply.failure != null) {
       return HazardScanOutcome.failed(reply.failure!.failure!);
     }
+    // Compatibility rule (new client against an older FC):
+    // a response that is not a conforming hazard payload --
+    // the old FC's scene shape (which HAS a "parsed" flag
+    // but none of the hazard keys), or any unrecognised
+    // shape -- is treated as UNKNOWN, never as an error and
+    // never as data: parseHazardAssessment collapses every
+    // such body to HazardAssessment.unknown (parsed ==
+    // false), and the caller announces the fixed downgrade
+    // sentence for it. Structured proxy errors never reach
+    // this line; they were mapped to failures inside
+    // _decodedResponse, and that mapping is unchanged.
     return HazardScanOutcome.ok(parseHazardAssessment(reply.decoded));
   }
 

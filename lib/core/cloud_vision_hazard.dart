@@ -267,6 +267,51 @@ String hazardDescriptionSpeech(HazardAssessment a) {
       '提醒：$cloudVisionDisclaimer';
 }
 
+/// Fixed downgrade speech for the cloud-vision channel
+/// (new-client / old-FC compatibility rule, 2026-11-09):
+/// whenever a hazard scan cannot produce a trustworthy
+/// assessment -- the FC still runs the pre-hazard build and
+/// answers in the old scene shape, the response shape is
+/// not recognised, or the request itself failed -- the user
+/// hears exactly this sentence. It is a fixed local text;
+/// no server string is ever copied into it.
+const String cloudVisionDowngradeSpeech = '云端识图暂不可用，请慢行。';
+
+/// Announce-once + rate limit for
+/// [cloudVisionDowngradeSpeech]. A scan that keeps failing
+/// (for example against an old FC deployment) must tell the
+/// user ONCE that cloud vision is unavailable and then stay
+/// quiet for [announceCooldown]; without the gate, the
+/// 8-second walking scan would repeat the sentence forever.
+/// A successful scan resets the gate, so the next failure
+/// episode may speak once again.
+class CloudVisionDowngradeGate {
+  final Duration announceCooldown;
+
+  DateTime? _lastAnnouncedAt;
+
+  CloudVisionDowngradeGate({
+    this.announceCooldown = const Duration(seconds: 60),
+  });
+
+  /// True when the downgrade sentence may be spoken at
+  /// [now]; records the announcement when it returns true.
+  bool shouldAnnounce(DateTime now) {
+    final DateTime? last = _lastAnnouncedAt;
+    if (last != null && now.difference(last) < announceCooldown) {
+      return false;
+    }
+    _lastAnnouncedAt = now;
+    return true;
+  }
+
+  /// A scan succeeded: the next failure is a new episode
+  /// and may be announced once again.
+  void noteSuccess() {
+    _lastAnnouncedAt = null;
+  }
+}
+
 /// Exponential backoff for cloud-vision 429s (project-lead
 /// rule): the first 429 may be announced ONCE; afterwards
 /// the scan stays silent and waits 30 s, 60 s, 120 s ...

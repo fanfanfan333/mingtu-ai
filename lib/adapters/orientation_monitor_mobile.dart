@@ -18,7 +18,11 @@ class GyroscopeOrientationMonitor implements OrientationMonitor {
   bool get isAvailable => _available;
 
   @override
-  bool get isStable => _available && _judge.isStable;
+  // Evaluated at query time (isStableAt), so a sensor
+  // stream that stops delivering turns the verdict
+  // unstable within the freshness bound instead of
+  // replaying the last good one.
+  bool get isStable => _available && _judge.isStableAt(DateTime.now());
 
   @override
   void start() {

@@ -99,8 +99,9 @@ void main() {
 
     testWidgets(
         'item 1+3: a new danger is announced while a risk is '
-        'already active; a same-level danger queues instead of '
-        'interrupting', (WidgetTester tester) async {
+        'already active; a same-level danger PREEMPTS the '
+        'playing one at once (Codex re-test of d01a081)',
+        (WidgetTester tester) async {
       await startDemoNavigation(tester);
       await tapText(tester, '模拟 YOLO 检测：前方行人（演示，无摄像头）');
       expect(find.text('当前任务状态：正在避障'), findsOneWidget);
@@ -110,51 +111,49 @@ void main() {
       // the f951240 code this was swallowed whole by the
       // _yoloRiskActive gate -- no announcement at all.
       await tapText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
-      // Same priority as the playing person danger: it must
-      // QUEUE (not interrupt, not vanish).
-      expect(find.textContaining('已排队：前方有机动车，请停下'), findsOneWidget);
+      // Same level, different event: the vehicle danger
+      // replaces the playing person danger IMMEDIATELY -- it
+      // does not queue behind it.
+      expect(find.text('当前提示：前方有机动车，请停下。'), findsOneWidget);
+      expect(find.text('当前任务状态：正在避障'), findsOneWidget);
 
-      // Person danger finishes -> the vehicle danger is next.
+      // The interrupted person danger is never replayed:
+      // after the vehicle danger completes, the person text
+      // does not come back as the current prompt.
       await tester.pump(const Duration(milliseconds: 1300));
-      expect(find.textContaining('前方有机动车，请停下'), findsWidgets);
+      expect(find.text('当前提示：前方有人，请停下。'), findsNothing);
+      await drain(tester);
+    });
+
+    testWidgets(
+        'item 2: a danger prompt takes over from the playing '
+        'straight prompt at once (the recorded physical-stop '
+        'proof lives in codex_d01a081_fix_test.dart)',
+        (WidgetTester tester) async {
+      await startDemoNavigation(tester);
+      // The straight prompt from navigation start is still
+      // playing (simulated speech completes after 1200 ms;
+      // no time has been pumped since).
+      await tapText(tester, '模拟 YOLO 检测：前方行人（演示，无摄像头）');
+      expect(find.text('当前提示：前方有人，请停下。'), findsOneWidget);
       expect(find.text('当前任务状态：正在避障'), findsOneWidget);
       await drain(tester);
     });
 
     testWidgets(
-        'item 2: a danger prompt really stops the playing '
-        'straight prompt first (preemption stop is issued)',
+        'item 3: release timing -- the risk-cleared info waits '
+        'for the active danger, and straight never jumps ahead',
         (WidgetTester tester) async {
       await startDemoNavigation(tester);
-      // The straight prompt from navigation start is still
-      // playing (simulated speech completes after 1200 ms;
-      // no time has been pumped since). The danger submission
-      // pauses straight via pauseStraight -- which used to
-      // consume the interruption before _say looked for it,
-      // so the physical TTS stop was never issued.
       await tapText(tester, '模拟 YOLO 检测：前方行人（演示，无摄像头）');
-      expect(find.textContaining('已停止其播放'), findsWidgets);
-      expect(find.textContaining('前方有人，请停下'), findsOneWidget);
-      await drain(tester);
-    });
-
-    testWidgets(
-        'item 3: release and queue timing -- a queued danger '
-        'speaks before the risk-cleared info, and straight '
-        'never jumps the queue', (WidgetTester tester) async {
-      await startDemoNavigation(tester);
-      await tapText(tester, '模拟 YOLO 检测：前方行人（演示，无摄像头）');
+      // Same-level preemption: the vehicle danger is the
+      // ACTIVE prompt now, not a queued one.
       await tapText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
+      expect(find.text('当前提示：前方有机动车，请停下。'), findsOneWidget);
       // Clear the obstacles while the vehicle danger is
-      // still QUEUED behind the person danger.
+      // still playing: the cleared info queues behind it.
       await tapText(tester, '模拟 YOLO：连续 3 帧前方无障碍（演示）');
       expect(find.text('当前任务状态：正在导航'), findsOneWidget);
-
-      // Person danger finishes: the queued VEHICLE danger
-      // must speak next -- not the cleared info, not a
-      // straight prompt.
-      await tester.pump(const Duration(milliseconds: 1300));
-      expect(find.text('当前提示：前方有机动车，请停下。'), findsOneWidget);
 
       // The cleared info may only become current AFTER the
       // danger has spoken. Ambient info traffic (the health

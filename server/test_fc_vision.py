@@ -9,7 +9,7 @@ import unittest
 
 import amap_proxy
 
-TOKEN = "fixture-vision-token"
+TOKEN = "test-placeholder-not-a-key"
 KEY = "fixture-dashscope-key"
 UPSTREAM_OK = json.dumps({
     "choices": [{
