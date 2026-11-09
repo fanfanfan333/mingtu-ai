@@ -131,5 +131,13 @@ void main() {
       expect(gradle, contains('abiFilters'));
       expect(gradle, contains('"arm64-v8a"'));
     });
+
+    test(
+        'native libraries are compressed in the APK '
+        '(legacy packaging keeps the arm64 APK small)', () {
+      final String gradle =
+          File('android/app/build.gradle.kts').readAsStringSync();
+      expect(gradle, contains('useLegacyPackaging = true'));
+    });
   });
 }

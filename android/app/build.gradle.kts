@@ -40,6 +40,16 @@ android {
         }
     }
 
+    // Compress the native libraries inside the APK
+    // (extracted at install time): the arm64 demo APK was
+    // ~30 MB mostly because of the uncompressed engine /
+    // LiteRT .so files.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.
