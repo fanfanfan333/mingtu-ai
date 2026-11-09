@@ -10,6 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_tts: ^4.2.5
+  geolocator: ^13.0.2
   speech_to_text: ^7.5.0
   ultralytics_yolo: ^0.7.1
 

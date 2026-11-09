@@ -51,10 +51,15 @@ void main() {
   test('amap walking route parses distance, steps and polyline', () async {
     bool called = false;
     final AmapWalkingClient client = AmapWalkingClient(
-      apiKey: 'test-key',
+      proxyBaseUrl: 'https://proxy.example.test',
       sender: (Uri url) async {
         called = true;
-        expect(url.host, 'restapi.amap.com');
+        // Proxy contract (navigation P0): the app talks to its own
+        // proxy and the request carries NO key parameter at all --
+        // the key exists only in the proxy's server environment.
+        expect(url.host, 'proxy.example.test');
+        expect(url.path, '/walking');
+        expect(url.queryParameters.containsKey('key'), isFalse);
         expect(url.queryParameters['origin'], '116.400000,39.900000');
         expect(url.queryParameters['destination'], '116.401000,39.900900');
         expect(url.queryParameters['output'], 'json');
@@ -81,11 +86,11 @@ void main() {
     expect(candidate.dataConfidence, 0.8);
   });
 
-  test('amap without a key makes no network call', () async {
+  test('amap without a configured proxy makes no network call', () async {
     final AmapWalkingClient client = AmapWalkingClient(
-      apiKey: '',
+      proxyBaseUrl: '',
       sender: (Uri url) async {
-        fail('must not call the network without a key');
+        fail('must not call the network without a proxy');
       },
     );
     final AmapWalkingResult result = await client.walkingRoute(
@@ -96,11 +101,13 @@ void main() {
     expect(result.candidate, isNull);
   });
 
-  test('amap error status is reported and the key is never leaked', () async {
+  test('amap transport error is reported; no key exists to leak', () async {
     final AmapWalkingClient client = AmapWalkingClient(
-      apiKey: 'secret-key-123',
+      proxyBaseUrl: 'https://proxy.example.test',
       sender: (Uri url) async {
-        // Simulate a transport failure whose message contains the URL.
+        // The client holds no credential by construction, so even
+        // a transport error embedding the URL cannot contain a key:
+        // the URL itself has no key parameter (asserted above).
         throw Exception('GET $url failed');
       },
     );
@@ -109,13 +116,12 @@ void main() {
       to: parseLonLat('116.401,39.9009')!,
     );
     expect(result.status, 'ERROR');
-    expect(result.error, isNot(contains('secret-key-123')));
-    expect(result.error, contains('[REDACTED]'));
+    expect(result.error, isNot(contains('key=')));
   });
 
   test('amap status 0 returns the provider info, not a route', () async {
     final AmapWalkingClient client = AmapWalkingClient(
-      apiKey: 'k',
+      proxyBaseUrl: 'https://proxy.example.test',
       sender: (Uri url) async => jsonEncode(<String, Object>{
         'status': '0',
         'info': 'INVALID_USER_KEY',

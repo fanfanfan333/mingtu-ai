@@ -1,23 +1,24 @@
-/// Amap (高德) walking-route client for Mingtu AI (v0.6).
+/// Amap (高德) walking-route client for Mingtu AI.
 ///
-/// Uses the Amap Web Service walking API -- a plain HTTPS GET, no
-/// Android SDK needed:
-///   https://restapi.amap.com/v3/direction/walking
-///   ?origin=lon,lat&destination=lon,lat&key=<Web 服务 Key>&output=json
-/// Coordinates are "lon,lat" (longitude first). The key is a Web
-/// Service key from the Amap console, supplied only via
-/// `--dart-define=MINGTU_AMAP_KEY=...` (see AppConfig). It is NEVER
-/// logged and NEVER appears in any error string: the request URL
-/// contains the key, so errors carry the status / Amap info only.
+/// The app NEVER calls Amap directly and NEVER holds the Amap Web
+/// Service key. It calls the project's own route proxy
+/// (server/amap_proxy.py), which holds the key in its server-side
+/// environment and forwards to the Amap Web Service walking API:
+///   GET {proxyBaseUrl}/walking?origin=lon,lat&destination=lon,lat
+/// The proxy answers with the Amap JSON body verbatim. Coordinates
+/// are "lon,lat" (longitude first) and GCJ-02 end to end: origins
+/// come from the GPS adapter already converted (see
+/// core/coordinate_convert.dart), destinations from
+/// config/verified_locations.dart (GCJ-02, human-verified).
 ///
 /// Honesty limits, enforced by construction:
 /// - The route's accessibility is UNKNOWN. Amap returns no blind-path
 ///   / tactile-paving information, so the candidate built from a real
 ///   route still scores with the UNKNOWN penalty (see route_scoring).
 ///   A real Amap route is a real walking route, NOT a "safe route".
-/// - No GPS is wired yet: the caller supplies from/to coordinates
-///   (read on site in the Amap app). Without them the client is not
-///   called at all; coordinates are never invented.
+/// - Without a configured proxy base URL the client is not called
+///   at all and reports NOT_CONFIGURED; coordinates are never
+///   invented.
 /// - The default transport uses dart:io HttpClient (same pattern as
 ///   BailianClient). Tests inject a fake [AmapSender] so no test ever
 ///   makes a real call.
@@ -29,8 +30,8 @@ import 'dart:io';
 import '../core/route_scoring.dart';
 import '../modules/map_navigation.dart';
 
-/// Sends one GET and returns the raw response body. Must never log
-/// the URL (it contains the key).
+/// Sends one GET and returns the raw response body. URLs here go to
+/// the project's own proxy and carry no credential.
 typedef AmapSender = Future<String> Function(Uri url);
 
 Future<String> _defaultSender(Uri url) async {
@@ -158,24 +159,24 @@ class AmapStepSpeaker {
 }
 
 class AmapWalkingClient {
-  final String apiKey;
-  final String baseUrl;
+  /// Base URL of the route proxy (no trailing path; the client
+  /// appends /walking). Empty means the proxy is not deployed or
+  /// not configured -- the client then makes no call at all.
+  final String proxyBaseUrl;
   final AmapSender sender;
 
   AmapWalkingClient({
-    required this.apiKey,
-    this.baseUrl = 'https://restapi.amap.com/v3/direction/walking',
+    required this.proxyBaseUrl,
     AmapSender? sender,
   }) : sender = sender ?? _defaultSender;
 
-  bool get isConfigured => apiKey.isNotEmpty;
+  bool get isConfigured => proxyBaseUrl.isNotEmpty;
 
-  String _redact(String value) =>
-      apiKey.isEmpty ? value : value.replaceAll(apiKey, '[REDACTED]');
-
-  /// Fetch one walking route. No call is made without a key.
-  /// [from] / [to] must have coordinates; a missing coordinate is a
-  /// caller error, reported as ERROR without a network call.
+  /// Fetch one walking route via the proxy. No call is made when
+  /// the proxy is not configured. [from] / [to] must have GCJ-02
+  /// coordinates; a missing coordinate is a caller error, reported
+  /// as ERROR without a network call. The request intentionally
+  /// contains NO key parameter: the key exists only server-side.
   Future<AmapWalkingResult> walkingRoute({
     required GeoPoint from,
     required GeoPoint to,
@@ -183,21 +184,23 @@ class AmapWalkingClient {
     if (!isConfigured) {
       return const AmapWalkingResult(
         status: 'NOT_CONFIGURED',
-        error: '未提供高德 Web 服务 Key（--dart-define），未调用高德。',
+        error: '路线代理未部署或未配置（MINGTU_ROUTE_PROXY_URL 为空），未请求路线。',
       );
     }
     if (!from.hasCoordinates || !to.hasCoordinates) {
       return const AmapWalkingResult(
         status: 'ERROR',
-        error: '未提供现场坐标（MINGTU_AMAP_FROM / MINGTU_AMAP_TO），未调用高德。',
+        error: '起点或终点缺少坐标，未请求路线。',
       );
     }
-    final Uri url = Uri.parse(baseUrl).replace(queryParameters: <String, String>{
+    final String base = proxyBaseUrl.endsWith('/')
+        ? proxyBaseUrl.substring(0, proxyBaseUrl.length - 1)
+        : proxyBaseUrl;
+    final Uri url = Uri.parse('$base/walking').replace(queryParameters: <String, String>{
       'origin':
           '${from.longitude!.toStringAsFixed(6)},${from.latitude!.toStringAsFixed(6)}',
       'destination':
           '${to.longitude!.toStringAsFixed(6)},${to.latitude!.toStringAsFixed(6)}',
-      'key': apiKey,
       'output': 'json',
     });
     try {
@@ -261,7 +264,10 @@ class AmapWalkingClient {
         polyline: polyline,
       );
     } catch (e) {
-      return AmapWalkingResult(status: 'ERROR', error: _redact(e.toString()));
+      // No credential exists on the client side, so the transport
+      // error text cannot leak one; it may contain the proxy URL,
+      // which is not a secret.
+      return AmapWalkingResult(status: 'ERROR', error: e.toString());
     }
   }
 }

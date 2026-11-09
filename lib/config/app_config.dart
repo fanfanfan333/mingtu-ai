@@ -4,18 +4,24 @@
 /// `--dart-define` only, never from hardcoded values and never from a
 /// file committed to the repository. Run, for example:
 ///
-///   flutter run --dart-define=MINGTU_AMAP_KEY=... \
-///     --dart-define=MINGTU_AMAP_FROM=116.4,39.9 \
-///     --dart-define=MINGTU_AMAP_TO=116.41,39.91 \
+///   flutter run --dart-define=MINGTU_ROUTE_PROXY_URL=https://your-server \
 ///     --dart-define=MINGTU_YOLO_MODEL_PATH=yolo11n \
 ///     --dart-define=MINGTU_LLM_MODEL_ID=... \
 ///     --dart-define=MINGTU_DASHSCOPE_API_KEY=...
 ///
-/// Amap coordinates are "lon,lat" (longitude first), read on site in
-/// the Amap app, never from memory. No GPS provider is wired yet, so a
-/// real Amap route needs MINGTU_AMAP_FROM / MINGTU_AMAP_TO supplied
-/// this way; without them the app reports NOT_CONFIGURED and never
-/// invents coordinates. YOLO model path defaults to the official
+/// Amap key rule (navigation P0, changed): the Amap Web Service key
+/// must NEVER be in the app -- not in source, not in the APK, not
+/// via --dart-define (dart-define values are compiled into the app
+/// binary and are extractable from a public APK). The key lives
+/// only in the route proxy's server-side environment (see
+/// server/amap_proxy.py); the app only knows the proxy base URL,
+/// which is not a secret. The old MINGTU_AMAP_KEY /
+/// MINGTU_AMAP_FROM / MINGTU_AMAP_TO dart-define channels are
+/// removed: real-route origins now come from the on-device GPS
+/// adapter (adapters/current_location.dart) and destinations only
+/// from config/verified_locations.dart (human-verified, GCJ-02).
+/// Without a proxy URL the app reports NOT_CONFIGURED and never
+/// invents a route. YOLO model path defaults to the official
 /// model id 'yolo11n' (the plugin downloads it on the phone); an
 /// asset path such as 'assets/models/custom.tflite' also works.
 ///
@@ -30,27 +36,27 @@
 /// voice result. Values are never printed or logged: only the status
 /// (configured / not configured) is shown.
 class AppConfig {
-  static const String amapApiKey =
-      String.fromEnvironment('MINGTU_AMAP_KEY');
+  /// Base URL of the self-hosted Amap route proxy (server side
+  /// holds the Amap key). A URL is not a credential. Empty = the
+  /// proxy is not deployed/configured, and real routes are
+  /// unavailable -- the app announces exactly that.
+  static const String routeProxyUrl =
+      String.fromEnvironment('MINGTU_ROUTE_PROXY_URL');
   static const String yoloModelPath =
       String.fromEnvironment('MINGTU_YOLO_MODEL_PATH', defaultValue: 'yolo11n');
-  // Amap route endpoints, "lon,lat". Empty = not supplied.
-  static const String amapFrom =
-      String.fromEnvironment('MINGTU_AMAP_FROM');
-  static const String amapTo = String.fromEnvironment('MINGTU_AMAP_TO');
   static const String llmModelId =
       String.fromEnvironment('MINGTU_LLM_MODEL_ID');
   static const String dashscopeApiKey =
       String.fromEnvironment('MINGTU_DASHSCOPE_API_KEY');
 
-  static bool get hasAmapKey => amapApiKey.isNotEmpty;
+  static bool get hasRouteProxy => routeProxyUrl.isNotEmpty;
   static bool get hasYoloModelPath => yoloModelPath.isNotEmpty;
   static bool get hasLlmModelId => llmModelId.isNotEmpty;
   static bool get hasDashscopeKey => dashscopeApiKey.isNotEmpty;
 
-  static String get amapStatus => hasAmapKey
-      ? '已配置密钥（值未显示，未验证真实高德接入）'
-      : 'NOT_CONFIGURED（未提供高德密钥，地图为接口占位，不会伪造路线）';
+  static String get routeProxyStatus => hasRouteProxy
+      ? '已配置路线代理地址（仅地址，非密钥；未验证代理真实可用）'
+      : 'NOT_CONFIGURED（路线代理未部署或未配置地址，真实路线不可用，不会伪造路线）';
   static String get yoloStatus => hasYoloModelPath
       ? '已配置模型路径（值未显示，未验证手机端推理）'
       : 'NOT_CONFIGURED（未提供 YOLO 模型路径，感知为接口演示，不会伪造检测）';

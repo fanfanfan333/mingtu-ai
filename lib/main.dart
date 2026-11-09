@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
 import 'adapters/bailian_client.dart';
+import 'adapters/current_location.dart';
 import 'adapters/system_voice_io.dart';
 import 'adapters/voice_io.dart';
 import 'adapters/yolo_detector.dart';
@@ -15,6 +16,7 @@ import 'core/health_monitor.dart';
 import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
+import 'core/real_navigation.dart';
 import 'core/voice_commands.dart';
 import 'core/voice_startup.dart';
 import 'core/risk_engine.dart';
@@ -600,72 +602,105 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     _say(_request(
       id: 'route-planned',
       eventId: 'route-planned',
-      text: '已规划路线，正在开始导航。',
+      // Simulation labelling (navigation P0): this flow is the
+      // stub/demo route, and its spoken start must SAY it is a
+      // simulation -- a blind user cannot see the on-screen 演示
+      // labels.
+      text: '模拟导航：已规划演示路线，正在开始模拟导航。',
       kind: SpeechKind.info,
     ));
   }
 
-  /// v0.6: fetch a REAL Amap walking route. Needs the Web Service key
-  /// plus on-site coordinates (AppConfig.amapFrom / amapTo, "lon,lat").
-  /// Without either, it reports NOT_CONFIGURED / missing coordinates
-  /// and never invents a route. The real candidate still scores with
-  /// accessibility UNKNOWN -- Amap gives no blind-path data.
-  Future<void> _fetchAmapRoute() async {
-    final GeoPoint? from = parseLonLat(AppConfig.amapFrom);
-    final GeoPoint? to = parseLonLat(AppConfig.amapTo);
-    final AmapWalkingClient client =
-        AmapWalkingClient(apiKey: AppConfig.amapApiKey);
-    if (!client.isConfigured) {
-      setState(() {
-        _amapText = '高德真实路线：NOT_CONFIGURED，未提供高德 Web 服务 Key。';
-      });
-      _logMsg('高德真实路线未请求：未提供 Key。');
+  /// Navigation P0: start REAL voice navigation to a verified
+  /// destination. The starter (core/real_navigation.dart) checks,
+  /// in order: verified destination -> route proxy configured ->
+  /// GPS fix -> accuracy -> route fetch. Every failure is spoken
+  /// in Chinese and navigation does NOT start; nothing falls back
+  /// to the simulated route silently. On success the task machine
+  /// walks its legal chain to navigating and the first step is
+  /// spoken; further steps stay manual ("下一步").
+  Future<void> _startRealNavigation(String destinationName) async {
+    if (_tasks.state != TaskState.idle) {
+      _say(_request(
+        id: 'real-nav-busy-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'real-nav-busy-${DateTime.now().millisecondsSinceEpoch}',
+        text: '已有任务在进行，请先取消或完成当前任务。',
+        kind: SpeechKind.info,
+      ));
       return;
     }
-    if (from == null || to == null) {
-      setState(() {
-        _amapText = '高德真实路线：未提供现场坐标（MINGTU_AMAP_FROM / MINGTU_AMAP_TO）。';
-      });
-      _logMsg('高德真实路线未请求：未提供现场坐标。');
-      return;
-    }
-    final AmapWalkingResult result =
-        await client.walkingRoute(from: from, to: to);
+    final RealNavigationStarter starter = RealNavigationStarter(
+      locationProvider: const GeolocatorCurrentLocation(),
+      client: AmapWalkingClient(proxyBaseUrl: AppConfig.routeProxyUrl),
+    );
+    final RealNavigationOutcome outcome = await starter.start(destinationName);
     if (!mounted) return;
-    if (!result.ok || result.candidate == null) {
+    if (!outcome.ready) {
+      final String text = outcome.failureAnnouncement;
+      final bool locationProblem = outcome.failure ==
+              RealNavigationFailure.locationServiceDisabled ||
+          outcome.failure == RealNavigationFailure.locationPermissionDenied ||
+          outcome.failure ==
+              RealNavigationFailure.locationPermissionDeniedForever ||
+          outcome.failure == RealNavigationFailure.locationFailed ||
+          outcome.failure == RealNavigationFailure.locationTooInaccurate;
+      _health.report(
+        locationProblem ? 'location' : 'map_navigation',
+        ServiceHealthStatus.degraded,
+        text,
+      );
       setState(() {
-        _amapText = '高德真实路线：${result.error ?? '调用失败'}';
+        _amapText = '真实导航未启动：$text';
+        _routeText = _amapText;
       });
-      _logMsg('高德真实路线调用失败：${result.error ?? '未知错误'}');
+      _logMsg('真实导航未启动：$text');
+      _say(_request(
+        id: 'real-nav-failed-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'real-nav-failed-${DateTime.now().millisecondsSinceEpoch}',
+        text: text,
+        kind: SpeechKind.info,
+      ));
       return;
     }
+    final AmapWalkingResult result = outcome.route!;
     final RouteCandidate candidate = result.candidate!;
-    final ScoredRoute scored =
-        RouteScoring.scoreRoutes(<RouteCandidate>[candidate]).first;
-    // v0.7: keep the steps and speak the first one -- a blind user
-    // cannot read the step list from the screen.
     _amapSpeaker = AmapStepSpeaker(result.steps);
     final String? firstStep = _amapSpeaker!.nextStepText();
+    _tasks.startTask(
+      id: 'real-nav-${DateTime.now().millisecondsSinceEpoch}',
+      goalText: '带我去$destinationName（真实路线）',
+    );
+    _tasks.transitionTo(TaskState.understanding, trigger: 'real-nav');
+    _tasks.transitionTo(TaskState.planning, trigger: 'real-nav');
+    _tasks.transitionTo(TaskState.navigating, trigger: 'real-nav');
+    _health.report('map_navigation', ServiceHealthStatus.ok,
+        '高德步行路线已返回真实数据（经代理；无障碍信息仍未知）。');
+    _health.report('location', ServiceHealthStatus.ok,
+        'GPS 起点已取得（精度约 ${outcome.accuracyM!.toStringAsFixed(0)} 米）。');
     setState(() {
       _amapText = '高德真实路线：距离 ${candidate.distanceM.toStringAsFixed(0)} 米，'
-          '预计 ${candidate.durationS.toStringAsFixed(0)} 秒，'
-          '${result.steps.length} 个路段，得分 ${scored.score.toStringAsFixed(3)}。'
-          '无障碍信息仍为 UNKNOWN，未按安全路线处理。';
+          '${result.steps.length} 个路段。无障碍信息仍为 UNKNOWN，未按安全路线处理。';
       _routeText = _amapText;
     });
-    _health.report('map_navigation', ServiceHealthStatus.ok,
-        '高德步行路线已返回真实数据（无障碍信息仍未知）。');
-    _logMsg('高德真实路线已返回：${candidate.distanceM.toStringAsFixed(0)} 米，'
-        '${result.steps.length} 个路段。');
+    _logMsg('真实导航已启动：${candidate.distanceM.toStringAsFixed(0)} 米，'
+        '${result.steps.length} 个路段（手动逐步播报）。');
     _say(_request(
-      id: 'amap-route',
-      eventId: 'amap-route',
-      text: '高德已返回步行路线，距离 ${candidate.distanceM.toStringAsFixed(0)} 米。'
-          '注意：高德不提供盲道信息，这条路线不是安全路线。'
-          '${firstStep == null ? '' : '第一段：$firstStep'}',
+      id: 'real-nav-ready-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'real-nav-ready-${DateTime.now().millisecondsSinceEpoch}',
+      text: realRouteReadyAnnouncement(
+            destinationName: destinationName,
+            distanceM: candidate.distanceM,
+            stepsCount: result.steps.length,
+          ) +
+          (firstStep == null ? '' : '第一段：$firstStep'),
       kind: SpeechKind.info,
     ));
   }
+
+  /// The on-screen "real route" button runs the same real
+  /// navigation attempt as the voice command (destination 图书馆，
+  /// which must exist in the verified registry).
+  Future<void> _fetchAmapRoute() => _startRealNavigation('图书馆');
 
   /// v0.7: speak the next Amap walking step, in order. Saying
   /// "下一步" while navigating speaks the next step; when the steps
@@ -1492,7 +1527,12 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         return;
       case VoiceCommand.startLibrary:
         if (_tasks.state == TaskState.idle) {
-          _startVoice();
+          // Navigation P0: a real voice request goes to REAL
+          // navigation (verified destination + GPS + proxy route).
+          // The simulated flow stays available only through its
+          // explicitly labelled demo buttons, never as a silent
+          // fallback for a real request.
+          _startRealNavigation('图书馆');
         } else {
           _say(_request(
             id: 'voice-busy-${DateTime.now().millisecondsSinceEpoch}',
@@ -1878,7 +1918,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
               '也未经过真实道路安全验证。',
             ),
             const SizedBox(height: 12),
-            Text('配置状态：地图：${AppConfig.amapStatus}；'
+            Text('配置状态：地图：${AppConfig.routeProxyStatus}；'
                 'YOLO：${AppConfig.yoloStatus}；'
                 '云端模型：${AppConfig.llmStatus}；'
                 '百炼：${AppConfig.bailianStatus}。'),
@@ -1974,7 +2014,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
               onPressed: () => _handleVoiceCommand(_voiceController.text),
             ),
             _demoButton(
-              label: '高德真实路线（需 Key 与现场坐标）',
+              label: '高德真实路线（真实导航：需已核验目的地与路线代理）',
               semanticsLabel: '高德真实路线',
               onPressed: _fetchAmapRoute,
             ),
