@@ -139,5 +139,21 @@ void main() {
           File('android/app/build.gradle.kts').readAsStringSync();
       expect(gradle, contains('useLegacyPackaging = true'));
     });
+
+    test(
+        'R8 cannot strip the Room/WorkManager classes again '
+        '(proguard rules exist, are wired in, demo minify off)', () {
+      final File rules = File('android/app/proguard-rules.pro');
+      expect(rules.existsSync(), isTrue);
+      final String pro = rules.readAsStringSync();
+      expect(pro, contains('-keep class * extends androidx.room.RoomDatabase'));
+      expect(pro, contains('-keep class androidx.room.**'));
+      expect(pro, contains('-keep class androidx.work.**'));
+      final String gradle =
+          File('android/app/build.gradle.kts').readAsStringSync();
+      expect(gradle, contains('"proguard-rules.pro"'));
+      expect(gradle, contains('isMinifyEnabled = false'));
+      expect(gradle, contains('isShrinkResources = false'));
+    });
   });
 }

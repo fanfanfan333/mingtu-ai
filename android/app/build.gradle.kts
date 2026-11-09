@@ -55,6 +55,22 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // P0 launch crash (Xiaomi 15 logcat, 229601e): the
+            // app died in androidx.startup with "Failed to
+            // create an instance of
+            // androidx.work.impl.WorkDatabase" -- R8 had
+            // stripped/obfuscated the Room-generated
+            // WorkDatabase_Impl. Demo builds therefore ship
+            // UNMINIFIED so no plugin class (Room/WorkManager,
+            // LiteRT, camera, TTS/ASR) can be stripped, and the
+            // keep rules in proguard-rules.pro are wired in for
+            // if minify is ever re-enabled.
+            isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 }
