@@ -19,6 +19,12 @@
 /// 4. the fix must be accurate enough to start from
 ///    ([maxStartAccuracyM]); a worse fix is announced and refused,
 ///    never silently used;
+/// 4b. for the demo route (a registry start point with id
+///    [demoStartLocationId] exists), the fix must be within
+///    [maxDemoStartDistanceM] of that start point -- the demo
+///    coordinates describe one specific place, and starting a
+///    demo navigation from somewhere else is announced as
+///    "你不在演示路线附近" and refused;
 /// 5. the walking route must come back ok from the proxy.
 ///
 /// Step advancement after a successful start stays MANUAL (the
@@ -26,6 +32,8 @@
 /// starter deliberately does not track position or claim live
 /// guidance or arrival -- one start fix is not a tracking system.
 library;
+
+import 'dart:math' as math;
 
 import '../adapters/amap_client.dart';
 import '../adapters/current_location.dart';
@@ -38,6 +46,23 @@ import '../modules/map_navigation.dart';
 /// bound for merely starting, and anything worse is refused aloud.
 const double maxStartAccuracyM = 50.0;
 
+/// Farthest the user may be from the demo start point for a demo
+/// navigation to start (see check 4b in the file header).
+const double maxDemoStartDistanceM = 300.0;
+
+/// Great-circle distance in metres between two GCJ-02 points.
+double haversineMeters(GeoPoint a, GeoPoint b) {
+  const double earthRadiusM = 6371000.0;
+  final double lat1 = a.latitude! * math.pi / 180.0;
+  final double lat2 = b.latitude! * math.pi / 180.0;
+  final double dLat = (b.latitude! - a.latitude!) * math.pi / 180.0;
+  final double dLon = (b.longitude! - a.longitude!) * math.pi / 180.0;
+  final double s = math.sin(dLat / 2) * math.sin(dLat / 2) +
+      math.cos(lat1) * math.cos(lat2) * math.sin(dLon / 2) * math.sin(dLon / 2);
+  final double root = math.sqrt(s);
+  return 2 * earthRadiusM * math.asin(root > 1 ? 1 : root);
+}
+
 enum RealNavigationFailure {
   destinationNotConfigured,
   proxyNotConfigured,
@@ -46,6 +71,7 @@ enum RealNavigationFailure {
   locationPermissionDeniedForever,
   locationFailed,
   locationTooInaccurate,
+  tooFarFromDemoStart,
   routeFetchFailed,
 }
 
@@ -57,6 +83,10 @@ class RealNavigationOutcome {
   final AmapWalkingResult? route;
   final String? routeError;
 
+  /// Distance in metres from the GPS fix to the demo start
+  /// point, when the demo-start check ran.
+  final double? startDistanceM;
+
   const RealNavigationOutcome._({
     this.failure,
     this.destination,
@@ -64,6 +94,7 @@ class RealNavigationOutcome {
     this.accuracyM,
     this.route,
     this.routeError,
+    this.startDistanceM,
   });
 
   factory RealNavigationOutcome.failed(
@@ -71,12 +102,14 @@ class RealNavigationOutcome {
     VerifiedLocation? destination,
     double? accuracyM,
     String? routeError,
+    double? startDistanceM,
   }) =>
       RealNavigationOutcome._(
         failure: failure,
         destination: destination,
         accuracyM: accuracyM,
         routeError: routeError,
+        startDistanceM: startDistanceM,
       );
 
   factory RealNavigationOutcome.ready({
@@ -84,12 +117,14 @@ class RealNavigationOutcome {
     required GeoPoint originGcj02,
     required double? accuracyM,
     required AmapWalkingResult route,
+    double? startDistanceM,
   }) =>
       RealNavigationOutcome._(
         destination: destination,
         originGcj02: originGcj02,
         accuracyM: accuracyM,
         route: route,
+        startDistanceM: startDistanceM,
       );
 
   bool get ready => failure == null && route != null && route!.ok;
@@ -121,6 +156,11 @@ class RealNavigationOutcome {
         return '当前定位精度不够（约 '
             '${accuracyM == null ? '未知' : '${accuracyM!.toStringAsFixed(0)} 米'}），'
             '用这个位置出发可能走错路，导航未启动。请到开阔处重试。';
+      case RealNavigationFailure.tooFarFromDemoStart:
+        return '你不在演示路线附近：当前位置离演示起点（校门口）约 '
+            '${startDistanceM == null ? '未知' : startDistanceM!.toStringAsFixed(0)} 米，'
+            '超过了三百米的演示范围，导航未启动。'
+            '请先到校门口附近再开始去图书馆的演示导航。';
       case RealNavigationFailure.routeFetchFailed:
         return '路线获取失败：网络或路线服务出错，导航未启动。'
             '请稍后重试。';
@@ -176,6 +216,23 @@ class RealNavigationStarter {
         accuracyM: accuracy,
       );
     }
+    // Check 4b: the demo-start proximity gate. The verified
+    // points are GCJ-02 and are used as-is here -- this distance
+    // compares the (already converted, exactly once) GPS fix
+    // against the registry's GCJ-02 start point.
+    double? startDistanceM;
+    for (final VerifiedLocation loc in registry) {
+      if (loc.id != demoStartLocationId) continue;
+      startDistanceM = haversineMeters(fix.pointGcj02!, loc.pointGcj02);
+      if (startDistanceM > maxDemoStartDistanceM) {
+        return RealNavigationOutcome.failed(
+          RealNavigationFailure.tooFarFromDemoStart,
+          destination: destination,
+          accuracyM: accuracy,
+          startDistanceM: startDistanceM,
+        );
+      }
+    }
     final AmapWalkingResult route = await client.walkingRoute(
       from: fix.pointGcj02!,
       to: destination.pointGcj02,
@@ -194,6 +251,7 @@ class RealNavigationStarter {
       originGcj02: fix.pointGcj02!,
       accuracyM: accuracy,
       route: route,
+      startDistanceM: startDistanceM,
     );
   }
 }

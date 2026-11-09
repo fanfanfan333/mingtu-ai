@@ -114,9 +114,32 @@ void main() {
   });
 
   group('verified destination registry', () {
-    test('the shipped registry is EMPTY (no field verification yet)', () {
-      expect(verifiedLocations, isEmpty);
-      expect(findVerifiedLocation('图书馆'), isNull);
+    test(
+        'the shipped registry holds exactly the two user-provided '
+        'demo points, verbatim GCJ-02 (never converted)', () {
+      // Provided by the user on site 2026-11-09 as lon,lat in
+      // GCJ-02; 未实地步行验证. Exact equality: any WGS->GCJ
+      // conversion (or a second one) would shift these values.
+      expect(verifiedLocations.length, 2);
+      final gate = findVerifiedLocation('校门口');
+      expect(gate, isNotNull);
+      expect(gate!.pointGcj02.longitude, 120.441723);
+      expect(gate.pointGcj02.latitude, 37.724409);
+      final lib = findVerifiedLocation('图书馆');
+      expect(lib, isNotNull);
+      expect(lib!.pointGcj02.longitude, 120.443212);
+      expect(lib.pointGcj02.latitude, 37.723667);
+      // Anything else is still not configured.
+      expect(findVerifiedLocation('食堂'), isNull);
+    });
+
+    test('gate to library straight-line distance is about 155 m', () {
+      final gate = findVerifiedLocation('校门口')!;
+      final lib = findVerifiedLocation('图书馆')!;
+      expect(
+        haversineMeters(gate.pointGcj02, lib.pointGcj02),
+        closeTo(155, 5),
+      );
     });
 
     test('lookup matches name and aliases in a fixture registry', () {
@@ -276,6 +299,90 @@ void main() {
       expect(speaker.remaining, 1);
       expect(speaker.nextStepText(), contains('第 2 段'));
       expect(speaker.nextStepText(), isNull);
+    });
+  });
+
+  group('demo route with the shipped registry (user coordinates)', () {
+    RealNavigationStarter demoStarter({
+      required CurrentLocationProvider location,
+      AmapSender? sender,
+    }) =>
+        RealNavigationStarter(
+          locationProvider: location,
+          client: AmapWalkingClient(
+            proxyBaseUrl: 'https://proxy.example.test',
+            sender: sender ?? (Uri url) async => _amapOkBody,
+          ),
+          registry: verifiedLocations,
+        );
+
+    test(
+        'at the gate: ready, and the destination goes to the '
+        'route service verbatim (no double conversion)', () async {
+      Uri? seen;
+      final outcome = await demoStarter(
+        location: FakeLocation(LocationResult.fix(
+          const GeoPoint(latitude: 37.724409, longitude: 120.441723),
+          10,
+        )),
+        sender: (Uri url) async {
+          seen = url;
+          return _amapOkBody;
+        },
+      ).start('图书馆');
+      expect(outcome.ready, isTrue);
+      expect(outcome.startDistanceM, closeTo(0, 1));
+      // The registry point reaches the request EXACTLY as the
+      // user provided it -- a conversion would change these.
+      expect(seen!.queryParameters['destination'], '120.443212,37.723667');
+      expect(seen!.queryParameters['origin'], '120.441723,37.724409');
+    });
+
+    test(
+        'the ready announcement names the destination and the '
+        'approximate distance', () {
+      final String text = realRouteReadyAnnouncement(
+        destinationName: '图书馆',
+        distanceM: 186,
+        stepsCount: 2,
+      );
+      expect(text, contains('图书馆'));
+      expect(text, contains('186 米'));
+    });
+
+    test('about 150 m from the gate: still inside the demo range', () async {
+      final outcome = await demoStarter(
+        location: FakeLocation(LocationResult.fix(
+          // ~150 m east of the gate.
+          const GeoPoint(latitude: 37.724409, longitude: 120.443400),
+          10,
+        )),
+      ).start('图书馆');
+      expect(outcome.ready, isTrue);
+      expect(outcome.startDistanceM, lessThan(300));
+    });
+
+    test(
+        'more than 300 m from the gate: announced '
+        '你不在演示路线附近, no route fetched, not started', () async {
+      bool senderCalled = false;
+      final outcome = await demoStarter(
+        location: FakeLocation(LocationResult.fix(
+          // ~500 m north of the gate.
+          const GeoPoint(latitude: 37.728909, longitude: 120.441723),
+          10,
+        )),
+        sender: (Uri url) async {
+          senderCalled = true;
+          return _amapOkBody;
+        },
+      ).start('图书馆');
+      expect(outcome.ready, isFalse);
+      expect(outcome.failure, RealNavigationFailure.tooFarFromDemoStart);
+      expect(outcome.failureAnnouncement, contains('你不在演示路线附近'));
+      expect(outcome.failureAnnouncement, contains('导航未启动'));
+      expect(outcome.startDistanceM, greaterThan(300));
+      expect(senderCalled, isFalse);
     });
   });
 }

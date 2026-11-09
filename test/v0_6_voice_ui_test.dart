@@ -5,10 +5,11 @@ import 'package:mingtu_ai/main.dart';
 /// with NO phone engine (flutter_test): the app must report the
 /// voice engines as unavailable instead of crashing, and the Amap
 /// button must honestly report why real navigation cannot start
-/// instead of inventing a route. Navigation P0 update: there is no
-/// in-app key any more (the key lives in the server proxy) and the
-/// destination registry is empty, so the expected report is now
-/// "目的地未配置" -- the first check in the starter's order.
+/// instead of inventing a route. Update (2026-11-09): the user
+/// provided the demo coordinates, so 图书馆 IS in the registry
+/// now; in this test environment there is no demo key and no
+/// proxy URL, so the expected report is the starter's second
+/// check: "路线服务未部署" (route service not configured).
 void main() {
   testWidgets('no phone engine: voice reports unavailable, real nav needs a verified destination',
       (WidgetTester tester) async {
@@ -32,7 +33,7 @@ void main() {
     await tester.tap(amapButton);
     await tester.pump();
     expect(find.textContaining('真实导航未启动'), findsWidgets);
-    expect(find.textContaining('目的地未配置'), findsWidgets);
+    expect(find.textContaining('路线服务未部署'), findsWidgets);
 
     // Drain the simulated speech-completion timer started by the
     // spoken failure announcement before teardown.
