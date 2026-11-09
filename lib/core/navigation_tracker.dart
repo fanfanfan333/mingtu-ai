@@ -8,7 +8,11 @@
 ///   that step's (locally generated, enum-based) spoken text;
 /// - offRoute: the fix stayed too far from the route --
 ///   re-planning is throttled by [rerouteDecision];
-/// - arrived: within the arrival radius of the destination;
+/// - arrived: within the entrance radius of the destination --
+///   route following stops here and the entrance-guidance
+///   phase (core/entrance_guidance.dart) takes over; the
+///   trip only completes when guidance reaches its own,
+///   smaller arrival radius;
 /// - weakSignal: GPS accuracy too poor to trust, throttled.
 ///
 /// Distances are along-route approximations from haversine
@@ -68,7 +72,14 @@ class NavigationTracker {
   static const double turnAnnounceDistanceM = 30;
   static const double offRouteDistanceM = 30;
   static const int offRouteFixesNeeded = 2;
-  static const double arrivalDistanceM = 20;
+  /// Hand-over radius for the entrance-guidance phase: the
+  /// arrived event fires once when a fix comes within this
+  /// distance of the destination. Mirrors
+  /// EntranceGuidance.enterRadiusM (kept as a local constant
+  /// so this file has no import cycle with the guidance
+  /// module). The trip's actual arrival radius (15 m) lives
+  /// in EntranceGuidance.arriveRadiusM.
+  static const double entranceRadiusM = 60;
   static const double weakAccuracyM = 50;
   static const Duration weakSignalCooldown = Duration(seconds: 60);
   static const Duration rerouteMinInterval = Duration(seconds: 60);
@@ -184,13 +195,18 @@ class NavigationTracker {
     final (int nearestIdx, double nearestD) = _nearest(fix.point);
     remainingM = (_cum.last - _cum[nearestIdx]).clamp(0, double.infinity);
 
-    // Arrival.
-    if (haversineMeters(fix.point, destination) <= arrivalDistanceM) {
+    // Hand-over to entrance guidance: within the entrance
+    // radius the route's job is done, but the trip is NOT
+    // over -- the guidance phase keeps announcing distance
+    // and bearing to the destination point. The event text
+    // is a neutral hand-over marker; main speaks the
+    // guidance phase's own first announcement instead, so
+    // this text never reaches the user as-is.
+    if (haversineMeters(fix.point, destination) <= entranceRadiusM) {
       arrived = true;
       events.add(NavEvent(
         NavEventKind.arrived,
-        '已到达$destinationName附近，导航结束。到达不代表已确认入口位置，'
-        '请通过语音或身边的人确认。',
+        '已到达$destinationName附近，进入入口指引。',
       ));
       return events;
     }

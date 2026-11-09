@@ -28,6 +28,7 @@ import 'core/cloud_vision_hazard.dart';
 import 'core/orientation.dart';
 import 'adapters/orientation_monitor.dart';
 import 'core/destination_dialogue.dart';
+import 'core/entrance_guidance.dart';
 import 'core/navigation_tracker.dart';
 import 'core/straight_pacing.dart';
 import 'core/yolo_error_speech.dart';
@@ -189,6 +190,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   final CloudVisionDowngradeGate _visionDowngrade = CloudVisionDowngradeGate();
   Timer? _hazardScanTimer;
   GeoPoint? _lastFixPoint;
+  double? _lastFixAccuracyM;
   GeoPoint? _scanAnchorPoint;
   DateTime? _lastVisionCallAt;
   bool _manualCycleOwned = false;
@@ -234,6 +236,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   String _liveNavDestName = '';
   double? _liveNavRemainingM;
   DateTime? _lastGpsErrorAt;
+  // Step D entrance guidance: created when the tracker hands
+  // over (fix within 60 m of the destination). While active,
+  // GPS fixes feed the guidance instead of the tracker, and
+  // the trip completes only at the guidance arrival radius.
+  EntranceGuidance? _entrance;
+  bool _entranceActive = false;
+  DateTime? _lastEntranceWeakAt;
   bool _awaitingDestination = false;
   int _destAttempts = 0;
   bool _yoloAvailableAtStartup = false;
@@ -438,6 +447,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
     _liveNavDestName = destinationName;
     _liveNavRemainingM = _liveNav!.remainingM;
+    // A newly installed route supersedes any entrance phase
+    // left over from the previous tracker (only reachable if
+    // a re-plan finished after the hand-over fix).
+    _entrance = null;
+    _entranceActive = false;
     // A stale demo-flow straight confirmation must not leak
     // into the live trip: while the tracker exists it alone
     // governs straight confirmation (see the getter).
@@ -487,6 +501,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     _lastFixPoint = r.pointGcj02;
+    _lastFixAccuracyM = r.accuracyM;
+    if (_entranceActive && _entrance != null) {
+      // Step D: the tracker has handed over; fixes now feed
+      // the entrance guidance, not route following.
+      _handleEntranceFix(r);
+      return;
+    }
     final List<NavEvent> events = _liveNav!.onFix(NavFix(
       point: r.pointGcj02!,
       accuracyM: r.accuracyM,
@@ -510,6 +531,62 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  /// One GPS fix during the entrance-guidance phase (step
+  /// D). Trusted fixes feed the guidance: a returned text is
+  /// a distance/bearing update (turn priority -- it IS the
+  /// route guidance now) or, at the arrival radius, the
+  /// completion line (alert), which ends the trip exactly
+  /// like the old tracker arrival did, only later. Untrusted
+  /// fixes produce no numbers: at most one throttled "paused"
+  /// notice per minute, mirroring the tracker's weak-signal
+  /// cooldown, so the phase never fails silently.
+  void _handleEntranceFix(LocationResult r) {
+    final EntranceGuidance g = _entrance!;
+    final DateTime now = DateTime.now();
+    final String? text = g.onFix(r.pointGcj02!, r.accuracyM, now);
+    setState(() {
+      // The status line reads g.lastDistanceM.
+    });
+    if (text == null) {
+      if (r.accuracyM == null ||
+          r.accuracyM! > EntranceGuidance.maxTrustedAccuracyM) {
+        if (_lastEntranceWeakAt == null ||
+            now.difference(_lastEntranceWeakAt!) >=
+                const Duration(seconds: 60)) {
+          _lastEntranceWeakAt = now;
+          _say(_request(
+            id: 'entrance-weak-$now',
+            eventId: 'entrance-weak',
+            text: 'GPS 信号较差，入口指引暂停，信号恢复后继续。',
+            kind: SpeechKind.info,
+          ));
+        }
+      }
+      return;
+    }
+    final bool done = g.completed;
+    _say(_request(
+      id: 'entrance-${done ? 'arrived' : 'guide'}-$now',
+      eventId: done ? 'entrance-arrived' : 'entrance-guide-$now',
+      text: text,
+      kind: done ? SpeechKind.alert : SpeechKind.turn,
+    ));
+    if (done) _finishEntranceTrip();
+  }
+
+  /// The entrance phase's trip end: identical to the old
+  /// tracker-arrival ending (session ends, task completes,
+  /// next-destination question) -- only the moment moved,
+  /// from the 60 m hand-over to the 15 m arrival radius.
+  void _finishEntranceTrip() {
+    _endLiveNavigation();
+    if (_tasks.state == TaskState.navigating) {
+      _tasks.transitionTo(TaskState.completed, trigger: 'entrance-arrived');
+      _tasks.reset();
+    }
+    _askDestination(prompt: '还要去别的地方吗？');
+  }
+
   void _handleNavEvent(NavEvent e) {
     final String ts = '${DateTime.now().millisecondsSinceEpoch}';
     switch (e.kind) {
@@ -528,18 +605,35 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           kind: SpeechKind.info,
         ));
       case NavEventKind.arrived:
+        // Step D hand-over: the route is done but the trip is
+        // NOT. Route-following speech stops (pacing halts);
+        // the GPS subscription and the live session stay
+        // alive and fixes now feed the entrance guidance,
+        // which announces distance + bearing to the
+        // destination point until its own arrival radius.
+        // The tracker's event text is a neutral hand-over
+        // marker and is deliberately NOT spoken -- the
+        // guidance phase's own first announcement replaces it.
+        _pacing.stop();
+        _stopStraightTimer();
+        _entrance = EntranceGuidance(
+          destinationName: _liveNavDestName,
+          destination: _liveNav!.destination,
+        );
+        _entranceActive = true;
+        final GeoPoint? handOverFix = _lastFixPoint;
+        final String? firstText = handOverFix == null
+            ? null
+            : _entrance!
+                .onFix(handOverFix, _lastFixAccuracyM, DateTime.now());
+        final bool doneNow = _entrance!.completed;
         _say(_request(
-          id: 'nav-arrived-$ts',
-          eventId: 'nav-arrived',
-          text: e.text,
-          kind: SpeechKind.alert,
+          id: 'entrance-${doneNow ? 'arrived' : 'start'}-$ts',
+          eventId: doneNow ? 'entrance-arrived' : 'entrance-start',
+          text: firstText ?? _entrance!.startAnnouncement(),
+          kind: doneNow ? SpeechKind.alert : SpeechKind.turn,
         ));
-        _endLiveNavigation();
-        if (_tasks.state == TaskState.navigating) {
-          _tasks.transitionTo(TaskState.completed, trigger: 'nav-arrived');
-          _tasks.reset();
-        }
-        _askDestination(prompt: '还要去别的地方吗？');
+        if (doneNow) _finishEntranceTrip();
       case NavEventKind.offRoute:
         final RerouteDecision decision =
             _liveNav!.rerouteDecision(DateTime.now());
@@ -636,6 +730,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _gpsSub = null;
     _liveNav = null;
     _liveNavRemainingM = null;
+    _entrance = null;
+    _entranceActive = false;
     _pacing.stop();
     _rerouting = false;
     _stopStraightTimer();
@@ -3053,6 +3149,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// live navigation wins, then the open destination
   /// question, then task state, then camera state.
   String _bigStatusText() {
+    if (_entranceActive && _entrance != null) {
+      final double? d = _entrance!.lastDistanceM;
+      return '入口指引中：$_liveNavDestName${d == null ? '' : ' 约${d.round()} 米'}';
+    }
     if (_liveNav != null) {
       final double? r = _liveNavRemainingM;
       return '导航中：$_liveNavDestName${r == null ? '' : ' ${r.round()} 米'}';
