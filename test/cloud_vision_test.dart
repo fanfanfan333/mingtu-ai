@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -165,6 +166,21 @@ void main() {
       final result = await client.describe(imageBytes: _fakeImage(10));
       expect(result.failure, CloudVisionFailure.imageTooLarge);
       expect(called, isFalse);
+    });
+
+    test('explicit timeout: a hanging request degrades with a '
+        'timeout announcement, not silence', () async {
+      final client = CloudVisionClient(
+        proxyBaseUrl: 'https://proxy.example.test',
+        sender: (Uri url, String body) =>
+            Completer<String>().future, // never completes
+        downsampler: (Uint8List b, int d) async => b,
+        requestTimeout: const Duration(milliseconds: 60),
+      );
+      final result = await client.describe(imageBytes: _fakeImage(10));
+      expect(result.failure, CloudVisionFailure.timeout);
+      expect(result.speechText, contains('请求超时'));
+      expect(result.speechText, contains('已降级为本地检测'));
     });
 
     test('transport failure -> network degrade, announced', () async {

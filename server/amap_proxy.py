@@ -60,6 +60,7 @@ through this process.
 
 import json
 import os
+import socket
 import sys
 import urllib.parse
 import urllib.request
@@ -70,6 +71,7 @@ UPSTREAM_DEFAULT = "https://restapi.amap.com/v3/direction/walking"
 VISION_MODEL = "qwen3.7-flash"  # exact lowercase id; uppercase 404s upstream
 VISION_MAX_TOKENS = 256
 VISION_MAX_BODY_BYTES = 3 * 1024 * 1024
+VISION_UPSTREAM_TIMEOUT_S = 20  # explicit upstream timeout for /vision
 VISION_UPSTREAM_DEFAULT = (
     "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 )
@@ -118,17 +120,77 @@ def _strip_secrets(value, secrets):
     return value
 
 
-def whitelist_walking_body(raw_body, secrets):
-    """Rebuild the /walking response from whitelisted fields ONLY.
+def _coerce_text(value, secrets, max_len):
+    """Force a value to a bounded string: non-strings become "",
+    secrets are stripped, length is capped."""
+    if not isinstance(value, str):
+        return ""
+    return _strip_secrets(value, secrets)[:max_len]
 
-    The upstream body is never passed through (Codex re-test
-    finding): an upstream that echoes the key -- in a debug field,
-    a URL, or an error string -- must not leak it to the client.
-    The app consumes exactly: status, info (on failure, sanitised),
-    route.paths[0].distance/duration and each step's
-    instruction/road/polyline/distance/duration. Anything else is
-    dropped. Returns the response bytes, or None when the upstream
-    body is not the expected JSON shape (-> generic 502).
+
+def _coerce_number(value, max_value):
+    """Force a value to a bounded number: numeric strings parse,
+    anything else (including strings with trailing junk) becomes
+    0, negatives clamp to 0, huge values clamp to max_value.
+    Integral results are returned as int."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return 0
+    else:
+        return 0
+    if number != number or number in (float("inf"), float("-inf")):
+        return 0
+    number = min(max(number, 0.0), float(max_value))
+    return int(number) if number == int(number) else number
+
+
+def _coerce_polyline(value, secrets):
+    """Force a polyline to a rebuilt "lon,lat;lon,lat" string:
+    only syntactically valid, in-range coordinate pairs survive,
+    re-rendered at 6 decimals, capped at 500 pairs. Anything else
+    is dropped pair by pair; a non-string becomes ""."""
+    if not isinstance(value, str):
+        return ""
+    pairs = []
+    for raw_pair in value.split(";"):
+        parts = raw_pair.split(",")
+        if len(parts) != 2:
+            continue
+        try:
+            lon = float(parts[0])
+            lat = float(parts[1])
+        except ValueError:
+            continue
+        if -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0:
+            pairs.append("%.6f,%.6f" % (lon, lat))
+        if len(pairs) >= 500:
+            break
+    return ";".join(pairs)
+
+
+def whitelist_walking_body(raw_body, secrets):
+    """Rebuild the /walking response from whitelisted fields, with
+    every field FORCED to a fixed enum / type / bound (Codex
+    re-test round 2: field-name whitelisting alone still passed
+    upstream content through, so values are now coerced, never
+    merely copied):
+
+    - status: the fixed enum "1" or "0" (anything not exactly the
+      success marker becomes "0"). A key echoed in status dies here.
+    - info on failure: the FIXED string "UPSTREAM_ERROR". Upstream
+      error text never crosses at all.
+    - distance/duration: coerced numbers (0..10^7 m / 0..10^6 s).
+    - step instruction/road: strings capped at 200 / 100 chars,
+      secrets stripped; non-strings become "".
+    - step polyline: rebuilt from validated coordinate pairs only.
+    Returns bytes, or None for an unexpected top-level shape
+    (-> generic 502).
     """
     try:
         payload = json.loads(raw_body.decode("utf-8"))
@@ -136,15 +198,11 @@ def whitelist_walking_body(raw_body, secrets):
         return None
     if not isinstance(payload, dict):
         return None
-    out = {"status": str(payload.get("status", "0"))}
-    if out["status"] != "1":
-        info = payload.get("info")
-        out["info"] = (
-            _strip_secrets(info, secrets)
-            if isinstance(info, str)
-            else "upstream error"
-        )
-        return json.dumps(out).encode("utf-8")
+    status = "1" if str(payload.get("status")) == "1" else "0"
+    if status != "1":
+        return json.dumps(
+            {"status": "0", "info": "UPSTREAM_ERROR"}
+        ).encode("utf-8")
     route = payload.get("route")
     paths = route.get("paths") if isinstance(route, dict) else None
     if not isinstance(paths, list) or not paths or not isinstance(paths[0], dict):
@@ -153,31 +211,41 @@ def whitelist_walking_body(raw_body, secrets):
     steps = []
     raw_steps = first.get("steps")
     if isinstance(raw_steps, list):
-        for step in raw_steps:
+        for step in raw_steps[:200]:
             if not isinstance(step, dict):
                 continue
-            kept = {}
-            for field in ("instruction", "road", "polyline", "distance", "duration"):
-                if field in step:
-                    kept[field] = _strip_secrets(step[field], secrets)
-            steps.append(kept)
-    out["route"] = {
-        "paths": [
-            {
-                "distance": _strip_secrets(first.get("distance"), secrets),
-                "duration": _strip_secrets(first.get("duration"), secrets),
-                "steps": steps,
-            }
-        ]
+            steps.append(
+                {
+                    "instruction": _coerce_text(
+                        step.get("instruction"), secrets, 200
+                    ),
+                    "road": _coerce_text(step.get("road"), secrets, 100),
+                    "polyline": _coerce_polyline(step.get("polyline"), secrets),
+                    "distance": _coerce_number(step.get("distance"), 10_000_000),
+                    "duration": _coerce_number(step.get("duration"), 1_000_000),
+                }
+            )
+    out = {
+        "status": "1",
+        "route": {
+            "paths": [
+                {
+                    "distance": _coerce_number(first.get("distance"), 10_000_000),
+                    "duration": _coerce_number(first.get("duration"), 1_000_000),
+                    "steps": steps,
+                }
+            ]
+        },
     }
     return json.dumps(out).encode("utf-8")
 
 
 def whitelist_vision_body(raw_body, secrets):
-    """Rebuild the /vision response from whitelisted fields ONLY:
-    the first choice's message role + content (secret-stripped).
-    An upstream error object or unexpected shape -> None (the
-    handler answers a generic 502; upstream text never crosses)."""
+    """Rebuild the /vision response: first choice only, role FORCED
+    to the fixed enum "assistant" (an echoed key in role dies
+    here), content coerced to a secret-stripped string capped at
+    2000 chars. Upstream error objects / unexpected shapes ->
+    None (generic 502; upstream text never crosses)."""
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except Exception:
@@ -200,8 +268,8 @@ def whitelist_vision_body(raw_body, secrets):
         "choices": [
             {
                 "message": {
-                    "role": message.get("role", "assistant"),
-                    "content": _strip_secrets(content, secrets),
+                    "role": "assistant",
+                    "content": _coerce_text(content, secrets, 2000),
                 }
             }
         ]
@@ -217,7 +285,7 @@ def fetch_upstream(url, timeout=10):
         return resp.status, resp.read()
 
 
-def post_upstream(url, body_bytes, api_key, timeout=30):
+def post_upstream(url, body_bytes, api_key, timeout=VISION_UPSTREAM_TIMEOUT_S):
     """POST JSON to the DashScope compatible endpoint with the
     server-side key as a Bearer token. Isolated for tests. The key
     travels ONLY in this outbound Authorization header."""
@@ -342,6 +410,10 @@ class WalkingHandler(BaseHTTPRequestHandler):
             _status, resp_body = self.poster(
                 self.vision_upstream, body, self.dashscope_key
             )
+        except (TimeoutError, socket.timeout):
+            # Explicit-timeout path: fixed body, no upstream detail.
+            self._send_json(504, json.dumps({"error": "upstream timeout"}).encode())
+            return
         except Exception:  # no detail: errors may embed headers
             self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
             return

@@ -15,6 +15,7 @@
 /// the UI and never retries on its own.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -85,11 +86,16 @@ class CloudVisionClient {
   final ImageDownsampler downsampler;
   final VisionRateLimiter limiter;
 
+  /// Explicit timeout for the proxy request (the proxy adds its
+  /// own 20 s upstream timeout server-side).
+  final Duration requestTimeout;
+
   CloudVisionClient({
     required this.proxyBaseUrl,
     VisionSender? sender,
     ImageDownsampler? downsampler,
     VisionRateLimiter? limiter,
+    this.requestTimeout = cloudVisionRequestTimeout,
   })  : sender = sender ?? _defaultSender,
         downsampler = downsampler ?? codecDownsampler,
         limiter = limiter ?? VisionRateLimiter();
@@ -129,7 +135,12 @@ class CloudVisionClient {
     );
     final String responseBody;
     try {
-      responseBody = await sender(url, body);
+      responseBody = await sender(url, body).timeout(requestTimeout);
+    } on TimeoutException {
+      return CloudVisionResult.failed(
+        CloudVisionFailure.timeout,
+        detail: '请求超过 ${requestTimeout.inSeconds} 秒未返回。',
+      );
     } catch (e) {
       return CloudVisionResult.failed(
         CloudVisionFailure.network,

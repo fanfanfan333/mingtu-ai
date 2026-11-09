@@ -34,6 +34,12 @@ const int cloudVisionMaxImageBytes = 1536 * 1024;
 /// still consumes the slot: low frequency is also retry protection.
 const Duration cloudVisionMinInterval = Duration(seconds: 20);
 
+/// Explicit client-side timeout for one vision request. The proxy
+/// applies its own upstream timeout (20 s) as well; a call that
+/// exceeds this is abandoned and announced as a degradation --
+/// never left hanging in silence.
+const Duration cloudVisionRequestTimeout = Duration(seconds: 15);
+
 /// The prompt sent with every frame. It asks for a plain scene
 /// description and explicitly forbids walking-safety judgements.
 const String cloudVisionPrompt = '请用简短中文描述这张图片里的场景和主要物体，'
@@ -126,6 +132,9 @@ enum CloudVisionFailure {
   /// Transport failed.
   network,
 
+  /// The request exceeded the explicit client timeout.
+  timeout,
+
   /// The proxy/upstream answered with an error.
   upstream,
 
@@ -173,6 +182,8 @@ class CloudVisionResult {
         return '当前没有可用的摄像头画面，云端视觉未执行，继续用本地检测。';
       case CloudVisionFailure.network:
         return '云端视觉网络失败，已降级为本地检测。';
+      case CloudVisionFailure.timeout:
+        return '云端视觉请求超时，已降级为本地检测。';
       case CloudVisionFailure.upstream:
         return '云端视觉服务出错，已降级为本地检测。';
       case CloudVisionFailure.badResponse:

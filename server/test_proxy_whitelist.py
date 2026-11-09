@@ -127,7 +127,9 @@ class WalkingWhitelistTest(unittest.TestCase):
         out = json.loads(body)
         self.assertEqual(out["status"], "1")
         path = out["route"]["paths"][0]
-        self.assertEqual(path["distance"], "186")
+        # distance/duration are coerced to NUMBERS by the whitelist.
+        self.assertEqual(path["distance"], 186)
+        self.assertEqual(path["duration"], 150)
         self.assertEqual(path["steps"][0]["instruction"], "向北步行80米")
         self.assertNotIn("extra", path["steps"][0])
 
@@ -166,7 +168,7 @@ class WalkingWhitelistTest(unittest.TestCase):
             out["route"]["paths"][0]["steps"][0]["instruction"], "前行十米"
         )
 
-    def test_failure_info_is_sanitised_and_nothing_else_crosses(self):
+    def test_failure_info_is_a_fixed_enum_and_nothing_else_crosses(self):
         body = json.dumps(
             {
                 "status": "0",
@@ -182,11 +184,81 @@ class WalkingWhitelistTest(unittest.TestCase):
             srv.close()
         self.assertEqual(status, 200)
         self.assertNotIn(AMAP_KEY, resp.decode())
+        self.assertNotIn("INVALID_USER_KEY", resp.decode())
         out = json.loads(resp)
-        self.assertEqual(out["status"], "0")
-        self.assertIn("INVALID_USER_KEY", out["info"])
-        self.assertNotIn("debug", out)
-        self.assertNotIn("infocode", out)
+        # Upstream error text never crosses: fixed enum only.
+        self.assertEqual(out, {"status": "0", "info": "UPSTREAM_ERROR"})
+
+    def test_status_field_is_a_fixed_enum(self):
+        # A key echoed inside status, or a non-string status type,
+        # must collapse to the "0" enum value with the fixed info.
+        for evil_status in ("1" + AMAP_KEY, {"echo": AMAP_KEY}, [AMAP_KEY], 2):
+            body = json.dumps(
+                {"status": evil_status, "route": {"paths": [{"distance": "1"}]}}
+            ).encode()
+            srv = _Server(fetcher=lambda url, b=body: (200, b))
+            try:
+                status, resp = _get(srv.port, WALK)
+            finally:
+                srv.close()
+            self.assertEqual(status, 200)
+            self.assertNotIn(AMAP_KEY, resp.decode())
+            self.assertEqual(
+                json.loads(resp), {"status": "0", "info": "UPSTREAM_ERROR"}
+            )
+
+    def test_nested_fields_are_type_coerced_and_rebuilt(self):
+        body = json.dumps(
+            {
+                "status": "1",
+                "route": {
+                    "paths": [
+                        {
+                            "distance": 10**12,  # clamps to 10^7
+                            "duration": "150",
+                            "steps": [
+                                {
+                                    "instruction": [AMAP_KEY],  # not a string
+                                    "road": {"name": AMAP_KEY},  # not a string
+                                    "polyline": "116.4,39.9;garbage;999,999;"
+                                    + AMAP_KEY
+                                    + ";116.401,39.9009",
+                                    "distance": "186;key=" + AMAP_KEY,
+                                    "duration": -5,
+                                },
+                                {
+                                    "instruction": "长" * 500,  # caps at 200
+                                    "road": "校园路",
+                                    "polyline": "116.4,39.9",
+                                    "distance": "80",
+                                    "duration": "60",
+                                },
+                            ],
+                        }
+                    ]
+                },
+            }
+        ).encode()
+        srv = _Server(fetcher=lambda url: (200, body))
+        try:
+            status, resp = _get(srv.port, WALK)
+        finally:
+            srv.close()
+        self.assertEqual(status, 200)
+        self.assertNotIn(AMAP_KEY, resp.decode())
+        out = json.loads(resp)
+        path = out["route"]["paths"][0]
+        self.assertEqual(path["distance"], 10_000_000)
+        step = path["steps"][0]
+        self.assertEqual(step["instruction"], "")
+        self.assertEqual(step["road"], "")
+        self.assertEqual(step["distance"], 0)  # junk string -> 0
+        self.assertEqual(step["duration"], 0)  # negative -> 0
+        # Only the two valid coordinate pairs survive, normalised.
+        self.assertEqual(
+            step["polyline"], "116.400000,39.900000;116.401000,39.900900"
+        )
+        self.assertEqual(len(path["steps"][1]["instruction"]), 200)
 
     def test_non_json_upstream_body_becomes_generic_502(self):
         srv = _Server(
@@ -243,6 +315,59 @@ class VisionWhitelistTest(unittest.TestCase):
         self.assertEqual(
             out["choices"][0]["message"]["content"], "桌上有一本书。"
         )
+
+    def test_vision_role_is_forced_to_fixed_enum(self):
+        for evil_role in (DASH_KEY, {"role": DASH_KEY}, 42, None):
+            evil = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": evil_role,
+                                "content": "画面描述。",
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+            srv = _Server(poster=lambda url, body, key, e=evil: (200, e))
+            try:
+                status, resp = _post(srv.port, "/vision", VISION_BODY)
+            finally:
+                srv.close()
+            self.assertEqual(status, 200)
+            self.assertNotIn(DASH_KEY, resp.decode())
+            out = json.loads(resp)
+            self.assertEqual(out["choices"][0]["message"]["role"], "assistant")
+            self.assertEqual(
+                out["choices"][0]["message"]["content"], "画面描述。"
+            )
+
+    def test_vision_content_is_length_capped(self):
+        evil = json.dumps(
+            {"choices": [{"message": {"role": "assistant", "content": "长" * 5000}}]}
+        ).encode()
+        srv = _Server(poster=lambda url, body, key: (200, evil))
+        try:
+            status, resp = _post(srv.port, "/vision", VISION_BODY)
+        finally:
+            srv.close()
+        self.assertEqual(status, 200)
+        out = json.loads(resp)
+        self.assertEqual(len(out["choices"][0]["message"]["content"]), 2000)
+
+    def test_vision_upstream_timeout_is_fixed_504(self):
+        def slow(url, body, key):
+            raise TimeoutError("timed out after 20s " + DASH_KEY)
+
+        srv = _Server(poster=slow)
+        try:
+            status, resp = _post(srv.port, "/vision", VISION_BODY)
+        finally:
+            srv.close()
+        self.assertEqual(status, 504)
+        self.assertNotIn(DASH_KEY, resp.decode())
+        self.assertEqual(json.loads(resp), {"error": "upstream timeout"})
 
     def test_vision_upstream_error_becomes_generic_502(self):
         err = json.dumps(
