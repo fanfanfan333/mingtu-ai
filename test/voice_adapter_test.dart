@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:mingtu_ai/adapters/system_voice_io.dart';
+import 'package:mingtu_ai/adapters/voice_io.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:mingtu_ai/core/asr_errors.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -84,6 +86,15 @@ class FakeTts extends FlutterTts {
 class FakeStt implements stt.SpeechToText {
   stt.SpeechErrorListener? capturedOnError;
   stt.SpeechStatusListener? capturedOnStatus;
+
+  /// The onResult listener of EVERY listen() call, in call
+  /// order. The adapter registers a fresh closure per
+  /// session; keeping them all lets tests invoke an OLD
+  /// session's closure after a newer session has started
+  /// -- the exact late-callback shape the session-id
+  /// stamping exists for.
+  final List<stt.SpeechResultListener?> resultListeners =
+      <stt.SpeechResultListener?>[];
   bool initResult = true;
   Object? stopError;
   Completer<void>? stopGate;
@@ -112,6 +123,15 @@ class FakeStt implements stt.SpeechToText {
   @override
   dynamic noSuchMethod(Invocation invocation) {
     if (invocation.memberName == #listen) {
+      stt.SpeechResultListener? onResult;
+      if (invocation.namedArguments.containsKey(#onResult)) {
+        onResult =
+            invocation.namedArguments[#onResult] as stt.SpeechResultListener?;
+      } else if (invocation.positionalArguments.isNotEmpty) {
+        onResult = invocation.positionalArguments.first
+            as stt.SpeechResultListener?;
+      }
+      resultListeners.add(onResult);
       return Future<void>.value();
     }
     throw UnimplementedError('FakeStt: ${invocation.memberName}');
@@ -445,6 +465,111 @@ void main() {
             ran = true;
           });
       expect(ran, isTrue);
+    });
+  });
+  group('session id stamping (Codex re-test of 97e9c75)', () {
+    test(
+        'every result and status event carries its own '
+        'session id, increasing across sessions', () async {
+      final fake = FakeStt();
+      final input = SystemVoiceInput(fake);
+      addTearDown(input.dispose);
+      expect(await input.initialize(), isTrue);
+
+      final List<AsrResultEvent> finals = <AsrResultEvent>[];
+      final List<AsrResultEvent> partials = <AsrResultEvent>[];
+      final List<AsrStatusEvent> statuses = <AsrStatusEvent>[];
+      final List<StreamSubscription<dynamic>> subs =
+          <StreamSubscription<dynamic>>[
+        input.transcripts.listen(finals.add),
+        input.partials.listen(partials.add),
+        input.sessionEnded.listen(statuses.add),
+      ];
+      addTearDown(() async {
+        for (final StreamSubscription<dynamic> sub in subs) {
+          await sub.cancel();
+        }
+      });
+
+      SpeechRecognitionResult result(String words, bool isFinal) =>
+          SpeechRecognitionResult(
+            <SpeechRecognitionWords>[SpeechRecognitionWords(words, null, 0.9)],
+            isFinal ? 2 : 0,
+          );
+
+      // Session 1.
+      expect(await input.startListening(), isTrue);
+      final int id1 = input.currentSessionId;
+      expect(fake.resultListeners, hasLength(1));
+      fake.resultListeners[0]!(result('第一句', false));
+      fake.resultListeners[0]!(result('第一句完整', true));
+      await Future<void>.delayed(Duration.zero);
+      // The adapter emits sessionEnded from the platform
+      // status callback only when it believes a session is
+      // live; its stopListening() clears that flag locally
+      // (the platform stop is fire-and-forget here), so the
+      // end status must be delivered BEFORE the local stop
+      // -- the same order a real engine produces (its done
+      // status is what ends the session).
+      fake.capturedOnStatus!('done');
+      await Future<void>.delayed(Duration.zero);
+      await input.stopListening();
+
+      // Session 2.
+      expect(await input.startListening(), isTrue);
+      final int id2 = input.currentSessionId;
+      expect(id2, greaterThan(id1));
+      expect(fake.resultListeners, hasLength(2));
+      fake.resultListeners[1]!(result('第二句', true));
+      await Future<void>.delayed(Duration.zero);
+      fake.capturedOnStatus!('done');
+      await Future<void>.delayed(Duration.zero);
+      await input.stopListening();
+
+      // Every event of session 1 carries id1; every event
+      // of session 2 carries id2 -- results (finals and
+      // partials) and status alike.
+      expect(partials.single.sessionId, id1);
+      expect(partials.single.text, '第一句');
+      expect(finals.map((AsrResultEvent e) => e.sessionId),
+          <int>[id1, id2]);
+      expect(finals.map((AsrResultEvent e) => e.text),
+          <String>['第一句完整', '第二句']);
+      expect(statuses.map((AsrStatusEvent e) => e.sessionId),
+          <int>[id1, id2]);
+      expect(statuses.map((AsrStatusEvent e) => e.status),
+          <String>['done', 'done']);
+
+      // A LATE result through session 1's still-reachable
+      // closure (the recogniser delivering after stop, or
+      // an in-flight platform callback) is stamped with
+      // the OLD id: a consumer validating against the
+      // current session id (id2, then id3 below) drops it
+      // by construction. This is the direct evidence that
+      // stale callbacks are identifiable -- and therefore
+      // droppable -- rather than indistinguishable.
+      fake.resultListeners[0]!(result('迟到的旧结果', true));
+      await Future<void>.delayed(Duration.zero);
+      expect(finals.last.sessionId, id1);
+      expect(finals.last.text, '迟到的旧结果');
+      expect(input.currentSessionId, id2);
+      expect(
+        finals.last.sessionId == input.currentSessionId,
+        isFalse,
+        reason: 'a stale event must fail the currency check',
+      );
+
+      // And the status stream follows the LIVE session:
+      // after a third session starts, its end status
+      // carries id3, so an old session's end can never be
+      // mistaken for the current one's.
+      expect(await input.startListening(), isTrue);
+      final int id3 = input.currentSessionId;
+      expect(id3, greaterThan(id2));
+      fake.capturedOnStatus!('done');
+      await Future<void>.delayed(Duration.zero);
+      await input.stopListening();
+      expect(statuses.last.sessionId, id3);
     });
   });
   group('ASR error non-leak: raw platform strings never surface', () {

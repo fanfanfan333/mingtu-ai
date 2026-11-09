@@ -212,10 +212,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   AmapWalkingClient _amapClient = AmapWalkingClient(proxyBaseUrl: '');
   CurrentLocationProvider _locationProvider =
       const UnavailableCurrentLocation();
-  StreamSubscription<String>? _transcriptSub;
-  StreamSubscription<String>? _partialSub;
+  StreamSubscription<AsrResultEvent>? _transcriptSub;
+  StreamSubscription<AsrResultEvent>? _partialSub;
   StreamSubscription<String>? _asrErrorSub;
-  StreamSubscription<void>? _asrSessionSub;
+  StreamSubscription<AsrStatusEvent>? _asrSessionSub;
   bool _yoloErrorAnnounced = false;
 
   // Step 2 voice navigation flow state.
@@ -298,10 +298,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// partial must not overwrite a cached final).
   bool _pttCachedIsFinal = false;
 
-  /// After a release with only a partial cached, the press
-  /// completes when the engine's final arrives (the stop
-  /// makes it deliver) or a 1.5 s grace timer expires.
-  bool _pttAwaitFinal = false;
+  /// The adapter session id of the recognition session
+  /// most recently started by this app (0 = none yet).
+  /// Every result and status event is validated against it
+  /// first: a late callback from an older session is
+  /// dropped, however plausible its text looks.
+  int _asrSessionId = 0;
 
   /// Waits for a post-release final result before the
   /// no-content notice may fire (1.5 s).
@@ -873,8 +875,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!mounted) return false;
     if (asrOk && asr != null) {
       _voiceInput = asr;
-      _transcriptSub = asr.transcripts.listen((String text) {
+      _transcriptSub = asr.transcripts.listen((AsrResultEvent event) {
         if (!mounted) return;
+        if (event.sessionId != _asrSessionId) {
+          // A late final from an older session: dropped,
+          // never executed, never cached.
+          return;
+        }
+        final String text = event.text;
         if (_pttState == _PttState.listening) {
           // Cache only: while the button is held nothing is
           // executed. The release path submits the cached
@@ -884,10 +892,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           return;
         }
         if (_pttState == _PttState.stopping) {
-          // The post-release final the release path is
-          // waiting for: completing the press happens in
-          // _onPttFinalArrived, not here.
-          if (_pttAwaitFinal) _onPttFinalArrived(text);
+          // A final of THIS press's session, anywhere in
+          // the stopping window -- while stop() is still in
+          // flight or inside the grace that follows: it is
+          // accepted and wins over any cached partial.
+          _onPttFinalInStopping(text);
           return;
         }
         if (_pttState != _PttState.idle) {
@@ -910,25 +919,29 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         _handleVoiceCommand(text);
       });
-      _partialSub = asr.partials.listen((String text) {
+      _partialSub = asr.partials.listen((AsrResultEvent event) {
         if (!mounted) return;
+        if (event.sessionId != _asrSessionId) return;
         // Partials are only ever the push-to-talk fallback
         // cache; automatic sessions never act on them.
         if (_pttState == _PttState.listening) {
           // A partial refreshes the fallback cache, but a
           // final already cached for this press outranks
           // any later partial.
-          if (!_pttCachedIsFinal) _pttCachedText = text;
-        } else if (_pttState == _PttState.stopping && _pttAwaitFinal) {
-          _pttCachedText = text;
-          _pttCachedIsFinal = true;
+          if (!_pttCachedIsFinal) _pttCachedText = event.text;
+        } else if (_pttState == _PttState.stopping && !_pttCachedIsFinal) {
+          _pttCachedText = event.text;
         }
       });
       // ASR runtime errors surface through the adapter's error
       // stream (previously they only rewrote an unwatched status
       // string and the listen loop retried into the failure).
-      _asrSessionSub = asr.sessionEnded.listen((_) {
-        if (mounted) _onAsrSessionEnded();
+      _asrSessionSub = asr.sessionEnded.listen((AsrStatusEvent event) {
+        if (!mounted) return;
+        // A status event from an older session must not
+        // drive the current session's bookkeeping.
+        if (event.sessionId != _asrSessionId) return;
+        _onAsrSessionEnded();
       });
       _asrErrorSub = asr.errors.listen((String error) {
         if (mounted) _handleAsrError(error);
@@ -1819,7 +1832,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttDeferredByP0 = false;
     _pttCachedText = null;
     _pttCachedIsFinal = false;
-    _pttAwaitFinal = false;
     _pushToTalkHeld = true;
     _pushToTalkPressedAt = DateTime.now();
     _autoListenWasActive = _voiceInput is SystemVoiceInput &&
@@ -1950,12 +1962,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  /// Release while listening: stop the session, then
-  /// complete the press exactly once -- a cached final is
-  /// submitted immediately; a cached partial waits for the
-  /// engine's post-stop final (grace 1.5 s); nothing cached
-  /// waits the same grace for a late final before the
-  /// no-content notice may fire.
+  /// Release while listening (stopping window): the press
+  /// completes EXACTLY ONCE, at whichever comes first -- a
+  /// final of this session arriving (before stop() returns
+  /// or inside the grace after it), stop() returning with
+  /// a final already cached, or the overall 1.5 s deadline
+  /// expiring (partial fallback, else the no-content
+  /// notice). The deadline starts at the RELEASE, so a
+  /// slow stop() eats into the same 1.5 s, never beyond it.
   Future<void> _pttReleaseFromListening() async {
     final int sid = _pttSession;
     final DateTime? pressedAt = _pushToTalkPressedAt;
@@ -1964,55 +1978,70 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         DateTime.now().difference(pressedAt) <
             const Duration(milliseconds: 300);
     _pttState = _PttState.stopping;
-    await _stopListeningInternal();
-    if (!mounted || sid != _pttSession) return;
-    if (tooShort) {
-      _pttState = _PttState.idle;
-      _pttCachedText = null;
-      _pttCachedIsFinal = false;
-      _announcePushToTalkTooShort();
-      return;
-    }
-    if (_pttCachedIsFinal && _pttCachedText != null) {
-      final String text = _pttCachedText!;
-      _pttState = _PttState.idle;
-      _pttCachedText = null;
-      _pttCachedIsFinal = false;
-      _processPushToTalkFinal(text);
-      _restoreAutoListenAfterPushToTalk();
-      return;
-    }
-    // Only a partial (or nothing) so far: the stop makes
-    // the engine deliver its final -- wait for it briefly.
-    _pttAwaitFinal = true;
-    final String? partial = _pttCachedText;
     _pttNoContentTimer = Timer(const Duration(milliseconds: 1500), () {
       if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
         return;
       }
-      _pttAwaitFinal = false;
-      _pttState = _PttState.idle;
-      _pttCachedText = null;
-      _pttCachedIsFinal = false;
-      if (partial != null) {
-        _processPushToTalkFinal(partial);
-        _restoreAutoListenAfterPushToTalk();
+      if (tooShort) {
+        _pttCompletePress(sid, null, tooShort: true);
+      } else if (_pttCachedText != null) {
+        _pttCompletePress(sid, _pttCachedText);
       } else {
-        _announcePushToTalkNoContent();
+        _pttCompletePress(sid, null);
       }
     });
+    await _stopListeningInternal();
+    if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
+      return;
+    }
+    // stop() has returned. A final that arrived during the
+    // stop was already submitted by _onPttFinalInStopping
+    // (state left stopping); reaching here with a cached
+    // final means it was cached while held -- submit now.
+    // Otherwise the deadline above finishes the press.
+    if (!tooShort && _pttCachedIsFinal && _pttCachedText != null) {
+      _pttCompletePress(sid, _pttCachedText);
+    } else if (tooShort) {
+      _pttCompletePress(sid, null, tooShort: true);
+    }
   }
 
-  /// The engine's final arrived inside the post-release
-  /// grace window: it wins over any cached partial.
-  void _onPttFinalArrived(String text) {
+  /// A final of the current press's session arrived during
+  /// the stopping window: it wins over any cached partial
+  /// and completes the press immediately -- unless the
+  /// press was too short, in which case the final is
+  /// recorded (it still outranks the partial) but the
+  /// completion stays the too-short path.
+  void _onPttFinalInStopping(String text) {
+    _pttCachedText = text;
+    _pttCachedIsFinal = true;
+    final DateTime? pressedAt = _pushToTalkPressedAt;
+    final bool tooShort = pressedAt == null ||
+        DateTime.now().difference(pressedAt) <
+            const Duration(milliseconds: 300);
+    if (tooShort) return;
+    _pttCompletePress(_pttSession, text);
+  }
+
+  /// The single completion point of a released press.
+  /// Guarded by the state machine: only a press still in
+  /// stopping can complete, and completing leaves stopping,
+  /// so a second caller (deadline, stop return, late final)
+  /// can never submit twice.
+  void _pttCompletePress(int sid, String? text, {bool tooShort = false}) {
+    if (sid != _pttSession || _pttState != _PttState.stopping) return;
     _pttNoContentTimer?.cancel();
-    _pttAwaitFinal = false;
     _pttState = _PttState.idle;
     _pttCachedText = null;
     _pttCachedIsFinal = false;
-    _processPushToTalkFinal(text);
-    _restoreAutoListenAfterPushToTalk();
+    if (text != null) {
+      _processPushToTalkFinal(text);
+      _restoreAutoListenAfterPushToTalk();
+    } else if (tooShort) {
+      _announcePushToTalkTooShort();
+    } else {
+      _announcePushToTalkNoContent();
+    }
   }
 
   /// Called from _finishSpeech: a deferred press whose P0
@@ -2151,6 +2180,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!pushToTalk) _autoListenEnabled = true;
     final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
     final bool started = await input.startListening();
+    if (started) {
+      // Tag the app's session bookkeeping with the id the
+      // adapter minted for THIS listen call; result and
+      // status events are validated against it.
+      _asrSessionId = input.currentSessionId;
+    }
     if (!mounted) return started;
     setState(() {
       _voiceText = started

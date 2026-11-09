@@ -56,6 +56,12 @@ class RecordingVoiceChannels {
   /// as before.
   Completer<dynamic>? listenGate;
 
+  /// When set, the platform's answer to stop() stays in
+  /// flight until the completer completes -- a slow
+  /// engine stop. Null (the default) answers immediately,
+  /// exactly as before.
+  Completer<dynamic>? stopGate;
+
   void install() {
     final TestDefaultBinaryMessenger messenger =
         TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
@@ -101,6 +107,8 @@ class RecordingVoiceChannels {
             return true;
           case 'stop':
             events.add('asr.stop');
+            final Completer<dynamic>? sGate = stopGate;
+            if (sGate != null) return sGate.future;
             return null;
           case 'cancel':
             events.add('asr.cancel');
@@ -132,6 +140,23 @@ class RecordingVoiceChannels {
         MethodChannel('dev.fluttercommunity.plus/sensors/$sensor'),
         (MethodCall call) async => null,
       );
+      // The app also SUBSCRIBES to the gyro/magnetometer
+      // event streams. Without a mock stream handler the
+      // subscription never activates, and when the widget
+      // tree is torn down after a FAILED test the stream
+      // deactivation throws MissingPluginException --
+      // which poisons the NEXT test in this file (the
+      // pre-existing cascade behind the R3 / R3-variant /
+      // corpus failures when run as a file). A no-op
+      // handler makes listen/cancel on these channels
+      // always succeed.
+      messenger.setMockStreamHandler(
+        EventChannel('dev.fluttercommunity.plus/sensors/$sensor'),
+        MockStreamHandler.inline(
+          onListen: (Object? arguments, MockStreamHandlerEventSink events) {},
+          onCancel: (Object? arguments) {},
+        ),
+      );
     }
   }
 
@@ -155,6 +180,10 @@ class RecordingVoiceChannels {
     ]) {
       messenger.setMockMethodCallHandler(
         MethodChannel('dev.fluttercommunity.plus/sensors/$sensor'),
+        null,
+      );
+      messenger.setMockStreamHandler(
+        EventChannel('dev.fluttercommunity.plus/sensors/$sensor'),
         null,
       );
     }
@@ -282,6 +311,15 @@ Future<void> shutdownVoice(
   await tester.pump(const Duration(seconds: 3));
   h.completeAllSpeaks();
   await tester.pump(const Duration(milliseconds: 100));
+  // Detach the tree NOW, while this test's mock stream
+  // handlers are still installed: the orientation monitor
+  // cancels its gyroscope/magnetometer subscriptions in
+  // dispose(), and an EventChannel cancel that lands after
+  // uninstall() has dropped the handlers throws
+  // MissingPluginException and is charged to whichever
+  // test runs next.
+  await tester.pumpWidget(const SizedBox.shrink());
+  await tester.pump();
 }
 
 Future<void> pumpUntilSpeak(
@@ -666,7 +704,22 @@ void main() {
       // partial '你好' would be answered with the
       // unknown-command reply, while the final '帮助' is
       // answered with the bare help text.
+      //
+      // Delivery mechanics under the stopping-window
+      // rewrite: the final completes the press through
+      // _onPttFinalInStopping WITHOUT waiting for stop()
+      // to return, and completing SUBMITS the text --
+      // _handleVoiceCommand then speaks the reply through
+      // the scheduler, whose speak path first closes the
+      // microphone (the adapter's stop). Processing the
+      // submitted final therefore issues a SECOND platform
+      // stop on top of the release stop. Pump until the
+      // reply actually lands on the TTS channel, then
+      // complete it so the speak-after-closing-mic
+      // sequence can finish.
       await deliverFinalResult(tester, '帮助');
+      await pumpUntilSpeak(tester, h, voiceCommandHelpText());
+      expect(h.completeSpeak(voiceCommandHelpText()), isTrue);
       await tester.pump(const Duration(milliseconds: 100));
       final String helpText = voiceCommandHelpText();
       final String unknownReply = '没听清。$helpText';
@@ -835,6 +888,220 @@ void main() {
       await tester.tap(stopNav);
       await tester.pump();
       await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+  });
+
+  group('ptt stopping window + session ids (Codex re-test of 97e9c75)', () {
+    // Shared driver for this group: press and wait until
+    // the production sequence has FULLY reached the
+    // listening state. Completing the cue's channel future
+    // is only half of the cue playback: the app also
+    // awaits the speech_to_text package's own stop() future
+    // (and the microtask chain around it) before it issues
+    // listen(), and fake-time pumps can run ahead of those
+    // real-event-loop turns -- a result delivered then
+    // lands in prompting, where production (correctly)
+    // drops it as stale. Poll in real time until the
+    // listen call is on the channel.
+    Future<TestGesture> pressUntilListening(
+        WidgetTester tester, RecordingVoiceChannels h) async {
+      final TestGesture g = await pressPtt(tester);
+      expect(h.completeSpeak('请说'), isTrue);
+      for (int i = 0; i < 40; i++) {
+        await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 50)));
+        await tester.pump(const Duration(milliseconds: 50));
+        if (h.count('asr.listen') >= 1) return g;
+      }
+      fail('press never reached listening: ${h.events}');
+    }
+
+    testWidgets(
+        'R4: a final arriving while stop() is still in flight '
+        'is submitted at once, before the stop even returns',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      // Flush the startup kickoff's late permission answer
+      // so it cannot speak in the middle of the window.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.events.clear();
+
+      final TestGesture gesture = await pressUntilListening(tester, h);
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+
+      await holdPastThreshold(tester);
+      // Only a partial while held: cached as the fallback,
+      // never executed.
+      await deliverPartialResult(tester, '你好');
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(
+        h.events.where((String e) => e.startsWith('tts.speak:')).length,
+        1, // the cue only
+        reason: '${h.events}',
+      );
+
+      // Release with the platform stop GATED: the app is
+      // inside the stopping window and stop() has not
+      // returned yet.
+      h.stopGate = Completer<dynamic>();
+      await gesture.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.stop'), greaterThanOrEqualTo(1),
+          reason: '${h.events}');
+      // The final word is '前面有什么' (the environment
+      // command) ON PURPOSE: its reply is a fixed template
+      // over state no other path mutates during this test
+      // ('前方情况：尚未模拟感知帧。'), so the reply is
+      // attributable to exactly one submission.
+      const String envReply = '前方情况：尚未模拟感知帧。';
+      final String unknownReply = '没听清。${voiceCommandHelpText()}';
+      expect(h.events, isNot(contains('tts.speak:$envReply')),
+          reason: '${h.events}');
+
+      // The session's final arrives BEFORE stop() returns.
+      // Under the rewrite it is accepted and submitted
+      // immediately (first of stop-return / final-arrival
+      // wins) and it beats the cached partial '你好' (whose
+      // processing would be the unknown-command reply).
+      await deliverFinalResult(tester, '前面有什么');
+      // The completion's speak chain crosses the plugin's
+      // own stop() future and several fake-clock timers
+      // (the scheduler's simulated-completion fallbacks):
+      // advancing fake time in small steps, completing
+      // speaks as they surface, is what carries the reply
+      // onto the prompt. A single long pump deadlocks
+      // against the gated stop (the reply's speak waits
+      // for it), so step in 250 ms increments.
+      for (int i = 0; i < 16; i++) {
+        await tester.pump(const Duration(milliseconds: 250));
+        h.completeAllSpeaks();
+        final String? d =
+            tester.widget<Text>(find.textContaining('当前提示：')).data;
+        if ((d ?? '').contains(envReply)) break;
+      }
+      // The submit half of the completion (the scheduler
+      // taking the reply as its active prompt, mirrored to
+      // the on-screen current prompt) lands within a few
+      // pumps of the delivery. The CHANNEL speak, however,
+      // is parked behind the still-gated platform stop by
+      // speakAfterClosingMic: by design it is emitted only
+      // once the microphone is really closed, so it cannot
+      // precede the stop's return.
+      final String? promptText =
+          tester.widget<Text>(find.textContaining('当前提示：')).data;
+      expect(
+        promptText,
+        contains(envReply),
+        reason: 'the final was submitted during the stop',
+      );
+      await pumpUntilSpeak(tester, h, envReply, rounds: 10);
+      expect(h.count('tts.speak:$envReply'), 0,
+          reason: 'speak must stay parked behind the gated mic stop');
+      expect(h.events, isNot(contains('tts.speak:$unknownReply')),
+          reason: '${h.events}');
+
+      // Release the gated stop: the parked speak is
+      // emitted now -- proof that the reply heard after
+      // the stop belongs to the final delivered DURING it.
+      // The press stays completed exactly once: no
+      // duplicate submission, no fallback to the partial,
+      // no no-content notice, and nothing more even after
+      // the 1.5 s deadline has long passed.
+      h.stopGate!.complete(null);
+      h.stopGate = null;
+      await pumpUntilSpeak(tester, h, envReply);
+      expect(h.completeSpeak(envReply), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 3));
+      expect(h.count('tts.speak:$envReply'), 1, reason: '${h.events}');
+      expect(h.events, isNot(contains('tts.speak:$unknownReply')),
+          reason: '${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'R5: a press completed by its final is never '
+        're-completed by a later delivery',
+        (WidgetTester tester) async {
+      // Evidence chain for "stale callbacks are dropped"
+      // at the app layer. Channel deliveries carry no id:
+      // the id is stamped by the adapter's per-listen
+      // onResult closure, and the plugin routes every
+      // channel result to the LAST registered closure --
+      // so a genuinely old-closure event cannot be
+      // synthesised through the channel at all. The
+      // adapter-level stamping proof lives in
+      // voice_adapter_test.dart (two sessions, strictly
+      // increasing ids on results AND status). What CAN be
+      // proven here: once a press has completed, the app
+      // is idle, and a delivery that arrives now belongs to
+      // whatever session is current (the auto-listen the
+      // completion restored, or no session at all) -- it
+      // must be handled under THAT session's rules, never
+      // attributed to the dead press: the PTT completion
+      // happens exactly once and its notices never fire
+      // retroactively.
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.events.clear();
+
+      // One complete press: final cached while held,
+      // submitted exactly once on release.
+      final TestGesture gesture = await pressUntilListening(tester, h);
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+      await holdPastThreshold(tester);
+      await deliverFinalResult(tester, '你好');
+      await tester.pump(const Duration(milliseconds: 100));
+      final String unknownReply = '没听清。${voiceCommandHelpText()}';
+      await gesture.up();
+      await tester.pump();
+      await pumpUntilSpeak(tester, h, unknownReply);
+      expect(h.completeSpeak(unknownReply), isTrue);
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('tts.speak:$unknownReply'), 1,
+          reason: '${h.events}');
+
+      // A "late" delivery now: it can only be stamped with
+      // the CURRENT session's id (the restored auto-listen,
+      // whose listen call is visible below) or dropped when
+      // no session is live. Either way the dead press must
+      // not complete a second time: no second submission
+      // reply attributable to it and -- critically -- the
+      // no-content notice, which only a live stopping
+      // window can produce, never appears.
+      await deliverFinalResult(tester, '帮助');
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 2));
+      await drainVoice(tester, h, rounds: 6);
+      expect(h.count('tts.speak:$unknownReply'), 1,
+          reason: '${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+      expect(h.events, isNot(contains('tts.speak:请按住说话')),
+          reason: '${h.events}');
+
       await shutdownVoice(tester, h);
     });
   });

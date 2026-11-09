@@ -205,14 +205,14 @@ class SystemVoiceInput implements VoiceInput {
   // Created lazily inside initialize(), for the same reason as
   // SystemVoiceOutput (see above).
   stt.SpeechToText? _speech;
-  final StreamController<String> _controller =
-      StreamController<String>.broadcast();
-  final StreamController<String> _partialController =
-      StreamController<String>.broadcast();
+  final StreamController<AsrResultEvent> _controller =
+      StreamController<AsrResultEvent>.broadcast();
+  final StreamController<AsrResultEvent> _partialController =
+      StreamController<AsrResultEvent>.broadcast();
   final StreamController<String> _errorController =
       StreamController<String>.broadcast();
-  final StreamController<void> _sessionEndController =
-      StreamController<void>.broadcast();
+  final StreamController<AsrStatusEvent> _sessionEndController =
+      StreamController<AsrStatusEvent>.broadcast();
   bool _available = false;
   String _detail = '未初始化';
   bool _listening = false;
@@ -233,11 +233,26 @@ class SystemVoiceInput implements VoiceInput {
   /// app's continuous-listen loop restarts from here; without
   /// it, a session that ended in silence left the microphone
   /// closed forever and voice control appeared dead.
-  Stream<void> get sessionEnded => _sessionEndController.stream;
+  Stream<AsrStatusEvent> get sessionEnded => _sessionEndController.stream;
 
-  void _emitSessionEnded() {
+  /// The id the NEXT startListening() session will carry is
+  /// this value + 1; consumers that must tag their own
+  /// session bookkeeping in step with the adapter read the
+  /// id of the session they just started here.
+  int get currentSessionId => _sessionSeq;
+
+  int _sessionSeq = 0;
+
+  /// Which session the LIVE status callback belongs to. The
+  /// platform registers onStatus once at initialize() time,
+  /// before any session exists, so the status closure reads
+  /// this field at event time; each startListening() points
+  /// it at its own session id.
+  int _statusSessionId = 0;
+
+  void _emitSessionEnded(int sessionId, String status) {
     if (!_sessionEndController.isClosed) {
-      _sessionEndController.add(null);
+      _sessionEndController.add(AsrStatusEvent(sessionId, status));
     }
   }
 
@@ -267,7 +282,7 @@ class SystemVoiceInput implements VoiceInput {
           _listening = false;
           if (wasListening) {
             mingtuVoiceLog('语音识别会话结束（status=$status）');
-            _emitSessionEnded();
+            _emitSessionEnded(_statusSessionId, status);
           }
         }
       },
@@ -303,7 +318,7 @@ class SystemVoiceInput implements VoiceInput {
   String get status => _detail;
 
   @override
-  Stream<String> get transcripts => _controller.stream;
+  Stream<AsrResultEvent> get transcripts => _controller.stream;
 
   bool get isListening => _listening;
 
@@ -312,19 +327,27 @@ class SystemVoiceInput implements VoiceInput {
   /// of a held press as its fallback text (used only when
   /// the session produced no final); automatic sessions
   /// ignore this stream entirely.
-  Stream<String> get partials => _partialController.stream;
+  Stream<AsrResultEvent> get partials => _partialController.stream;
 
   Future<bool> startListening() async {
     final stt.SpeechToText? speech = _speech;
     if (!_available || _listening || speech == null) return false;
+    // This call's own session id, captured by the result
+    // closure below (per-call closure, never a shared
+    // global callback): every result this session produces
+    // carries it, and late results from an older session
+    // carry the older id and are dropped by consumers.
+    final int sessionId = ++_sessionSeq;
+    _statusSessionId = sessionId;
     try {
       await speech.listen(
         onResult: (SpeechRecognitionResult result) {
           if (result.recognizedWords.isEmpty) return;
           if (result.finalResult) {
-            _controller.add(result.recognizedWords);
+            _controller.add(AsrResultEvent(sessionId, result.recognizedWords));
           } else {
-            _partialController.add(result.recognizedWords);
+            _partialController.add(
+                AsrResultEvent(sessionId, result.recognizedWords));
           }
         },
         listenOptions: stt.SpeechListenOptions(
