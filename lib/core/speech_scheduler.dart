@@ -61,6 +61,10 @@ class SpeechScheduler {
   // v0.4: conflicting action instructions (a turn vs an avoidance
   // step) are dropped, never played one after the other.
   final List<String> droppedConflictLog = [];
+  // P0 follow-up: requests cancelled by an explicit stop (voice
+  // pause / cancel command). A stopped prompt must never be played
+  // afterwards, so cancellation is recorded, not silent.
+  final List<String> cancelledLog = [];
   DateTime? _lastStraightPlayedAt;
 
   SpeechRequest? get active => _active;
@@ -189,6 +193,28 @@ class SpeechScheduler {
   /// separate concern handled by risk / task code.
   void completeActive() {
     _active = null;
+  }
+
+  /// Cancel everything: the active prompt and every queued prompt.
+  ///
+  /// P0 follow-up: a voice "停下 / 取消" must cancel pending
+  /// navigation speech, not only the currently playing straight
+  /// prompt -- before this, a turn prompt queued behind another
+  /// prompt could still be spoken after the user said stop. The
+  /// caller stops the actual TTS playback separately and then
+  /// submits its own confirmation prompt AFTER calling this, so the
+  /// confirmation itself is not cancelled. Returns the cancelled
+  /// request ids (active first, then queued in queue order).
+  List<String> cancelAll() {
+    final List<String> cancelled = <String>[
+      if (_active != null) _active!.id,
+      for (final SpeechRequest q in _queue) q.id,
+    ];
+    cancelledLog.addAll(cancelled);
+    _active = null;
+    _queue.clear();
+    _lastStraightPlayedAt = null;
+    return cancelled;
   }
 
   /// Promote the highest-priority queued request that is still valid.

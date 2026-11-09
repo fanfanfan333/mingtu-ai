@@ -40,10 +40,14 @@ class LlmGateway {
   ];
 
   LlmGateway({
-    // Default is a placeholder domestic low-cost style id. It is
-    // configurable and must be replaced with the exact model id shown in
-    // the provider console at integration time.
-    this.modelId = 'qwen3-vl-flash',
+    // Default is the verified TEXT model id (qwen-flash, confirmed
+    // by the project owner 2026-11-09). It is a text model: callers
+    // making vision calls must pass an explicit vision model id
+    // (as the Bailian client tests do with a VL model) -- this
+    // default must never be presented as a vision model. It stays
+    // configurable and must match the exact model id shown in the
+    // provider console at integration time.
+    this.modelId = 'qwen-flash',
     this.budgetCapRmb = 100.0,
   }) {
     final lower = modelId.toLowerCase();

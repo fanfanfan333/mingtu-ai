@@ -28,7 +28,13 @@ void main() {
     // Let the voice-engine startup timeouts finish (no engine here).
     await tester.pump(const Duration(seconds: 4));
     await tester.pump(const Duration(seconds: 4));
-    expect(find.textContaining('语音播报'), findsOneWidget);
+    // P0 follow-up: the startup voice plan now surfaces the honest
+    // voice state in several places (status line, current prompt,
+    // log), all of which legitimately contain 语音播报. This
+    // assertion therefore names the health line it actually checks:
+    // Chinese service names in the health announcement, and no
+    // English identifier anywhere.
+    expect(find.textContaining('系统健康：注意：语音播报、语音识别'), findsOneWidget);
     expect(find.textContaining('voice_output'), findsNothing);
 
     await tapText('语音开始（演示输入：带我去图书馆）');

@@ -96,5 +96,29 @@ void main() {
             '@mipmap/$iconName is referenced by the manifest but no icon '
             'resource exists; AAPT linking fails without one. Looked for: '
             '${candidates.join(', ')}');
+
+    // P0 follow-up: API 24-25 (minSdk 24) predates adaptive icons,
+    // so a legacy fallback must ALSO exist: a density-bucket icon
+    // (PNG or vector XML) that pre-26 devices can resolve. An
+    // anydpi-v26-only icon leaves API 24/25 with no launcher icon.
+    final legacy = <String>[
+      for (final density in const [
+        'mdpi',
+        'hdpi',
+        'xhdpi',
+        'xxhdpi',
+        'xxxhdpi',
+      ]) ...<String>[
+        '$resDir/mipmap-$density/$iconName.png',
+        '$resDir/mipmap-$density/$iconName.xml',
+      ],
+    ];
+    expect(legacy.where((p) => File(p).existsSync()), isNotEmpty,
+        reason:
+            'no pre-26 launcher icon fallback (density bucket) exists; '
+            'looked for: ${legacy.join(', ')}');
+    expect(
+        File('$resDir/mipmap-anydpi-v26/$iconName.xml').existsSync(), isTrue,
+        reason: 'adaptive icon (API 26+) must also be present');
   });
 }

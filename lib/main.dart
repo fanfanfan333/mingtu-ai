@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
 import 'adapters/bailian_client.dart';
@@ -15,6 +16,7 @@ import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
 import 'core/voice_commands.dart';
+import 'core/voice_startup.dart';
 import 'core/risk_engine.dart';
 import 'core/speech_scheduler.dart';
 import 'core/task_manager.dart';
@@ -163,7 +165,6 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         .initialize()
         .timeout(const Duration(seconds: 3), onTimeout: () => false);
     if (!mounted) return;
-    if (ttsOk) _voiceOutput = tts;
     if (asrOk) {
       _voiceInput = asr;
       _transcriptSub = asr.transcripts.listen((String text) {
@@ -171,10 +172,25 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       });
     }
     _yoloDetector = createYoloDetector(AppConfig.yoloModelPath);
+    // P0 startup plan (pure logic in core/voice_startup.dart): the
+    // greeting is spoken whenever *Chinese* speech is verified
+    // usable -- including when ASR failed, which previously left
+    // the user in total silence because the greeting only ran
+    // `if (asrOk)`. An engine that answers but has no zh-CN voice
+    // is NOT adopted as the voice output: speaking Chinese text in
+    // a non-Chinese voice would be a false "voice works" signal.
+    final StartupVoicePlan plan = planStartupVoice(
+      ttsEngineOk: ttsOk,
+      chineseVoiceVerified: ttsOk && tts.chineseVoiceVerified,
+      asrOk: asrOk,
+    );
+    if (plan.speechUsable) _voiceOutput = tts;
     _health.report(
       'voice_output',
-      ttsOk ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
-      tts.status,
+      plan.speechUsable
+          ? ServiceHealthStatus.ok
+          : ServiceHealthStatus.degraded,
+      '${tts.status}｜${plan.summary}',
     );
     _health.report(
       'voice_input',
@@ -182,23 +198,37 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       asr.status,
     );
     setState(() {
-      _voiceText = '语音：TTS：${tts.status}；ASR：${asr.status}。';
+      _voiceText = '语音：TTS：${tts.status}；ASR：${asr.status}。${plan.summary}';
       _yoloText = 'YOLO：${_yoloDetector.status}';
+      if (!plan.speechUsable) {
+        _currentPrompt = voiceNoticeText(VoiceNoticeKind.ttsUnavailable);
+      }
     });
-    // v0.7 hands-free entry: when the phone's recogniser is up, greet
-    // by voice and then listen -- a blind user must not have to find
-    // and tap a button on screen to start talking. Listening starts
-    // only after the greeting finishes (see _finishSpeech), so the
-    // microphone never hears the app's own voice as a command.
-    if (asrOk) {
-      _autoListenEnabled = true;
-      _welcomeListenPending = true;
+    if (plan.speechUsable) {
+      // Hands-free entry (v0.7): greet by voice first; listening
+      // starts only after the greeting finishes (see _finishSpeech),
+      // so the microphone never hears the app's own voice as a
+      // command. When ASR is down the greeting itself carries the
+      // failure and the recoverable next step, and auto-listen
+      // stays off (plan.startAutoListen is false then).
+      if (plan.startAutoListen) {
+        _autoListenEnabled = true;
+        _welcomeListenPending = true;
+      }
       _say(_request(
         id: 'voice-welcome',
         eventId: 'voice-welcome',
-        text: '明途已启动，语音识别已开启。请说一句话，例如带我去图书馆。',
+        text: plan.spokenText!,
         kind: SpeechKind.info,
       ));
+    } else {
+      // TTS cannot announce its own failure. Fall back to what is
+      // actually available: a vibration cue plus the on-screen
+      // status text above (readable by a screen reader), and say
+      // plainly in the log that nothing was spoken.
+      HapticFeedback.vibrate();
+      _logMsg('语音播报不可用：已用振动提示，以上状态仅为文字显示，'
+          '未被语音读出。${plan.summary}');
     }
   }
 
@@ -349,7 +379,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _voiceOutput.speak(request.text).then((_) {
         if (mounted) _finishSpeech(request.id);
       }).catchError((Object e) {
-        _logMsg('系统语音合成失败，已回退到演示文本播报：$e');
+        _logMsg('系统语音合成失败；以下提示仅显示为文字，未被语音播报：$e');
         _voiceOutput = UnavailableVoiceOutput();
         if (mounted) _simulateSpeechCompletion(request.id);
         return null;
@@ -602,7 +632,29 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
           ? '语音识别进行中：请说一句话（最长 10 秒，说完停顿即结束）。'
           : '语音识别：开始失败，${_voiceInput.status}';
     });
-    if (started) _logMsg('语音识别已开始：请说一句话。');
+    if (started) {
+      _logMsg('语音识别已开始：请说一句话。');
+    } else if (_voiceOutput.isAvailable) {
+      // Runtime ASR failure must not be silent either: announce it
+      // through the working voice, with the recoverable next step.
+      _say(_request(
+        id: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
+        text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
+        kind: SpeechKind.info,
+      ));
+    }
+  }
+
+  /// Stop the physical TTS playback, when the real engine is in
+  /// use. Queued/active scheduler entries are cancelled separately
+  /// via SpeechScheduler.cancelAll; this stops what is already
+  /// coming out of the speaker.
+  void _stopTtsPlayback() {
+    final VoiceOutput out = _voiceOutput;
+    if (out is SystemVoiceOutput) {
+      out.stop();
+    }
   }
 
   Future<void> _stopListening() async {
@@ -1361,6 +1413,13 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
           _tasks.transitionTo(TaskState.paused, trigger: 'voice-pause');
           _stopStraightTimer();
           _scheduler.pauseStraight();
+          // P0: "停下" must also cancel everything still pending
+          // (queued turn / navigation prompts) and stop the actual
+          // playback -- not only the straight prompt. The
+          // confirmation below is submitted after this, so it is
+          // not cancelled itself.
+          _scheduler.cancelAll();
+          _stopTtsPlayback();
           setState(() {
             _straightConfirmed = false;
           });
@@ -1416,6 +1475,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
           _tasks.transitionTo(TaskState.cancelled, trigger: 'voice-cancel');
           _stopStraightTimer();
           _scheduler.pauseStraight();
+          // P0: same stop semantics as pause -- cancel all pending
+          // navigation speech and stop actual playback first.
+          _scheduler.cancelAll();
+          _stopTtsPlayback();
           _say(_request(
             id: 'voice-cancel-${DateTime.now().millisecondsSinceEpoch}',
             eventId: 'voice-cancel-${DateTime.now().millisecondsSinceEpoch}',

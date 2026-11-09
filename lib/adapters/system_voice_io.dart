@@ -26,6 +26,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
+import '../core/voice_startup.dart';
 import 'voice_io.dart';
 
 /// System TTS output. [initialize] must be called once before use;
@@ -37,13 +38,52 @@ class SystemVoiceOutput implements VoiceOutput {
   // exists (plain Dart test) and must be caught, not constructed here.
   FlutterTts? _tts;
   bool _available = false;
+  bool _chineseVerified = false;
   String _detail = '未初始化';
 
   SystemVoiceOutput([FlutterTts? tts]) : _tts = tts;
 
+  /// Whether a zh-CN voice was *verified* on this device during
+  /// [initialize]. False until verification actually succeeded:
+  /// unknown is never reported as verified.
+  bool get chineseVoiceVerified => _chineseVerified;
+
   Future<void> _doInitialize(FlutterTts tts) async {
     await tts.awaitSpeakCompletion(true);
-    await tts.setLanguage('zh-CN');
+    // P0 zh-CN verification: an engine that answers is not proof
+    // it can speak Chinese -- a missing zh-CN voice data set would
+    // otherwise be silently reported as "zh-CN 已接入". Ask the
+    // engine for its language list and resolve zh-CN from evidence;
+    // fall back to the engine's own availability probe only when
+    // the list cannot be read.
+    String? chosen;
+    try {
+      final dynamic langs = await tts.getLanguages;
+      if (langs is List) {
+        chosen = resolveChineseTtsLocale(
+          langs.map((Object? e) => e.toString()).toList(),
+        );
+      }
+    } catch (_) {
+      chosen = null;
+    }
+    if (chosen == null) {
+      try {
+        final dynamic avail = await tts.isLanguageAvailable('zh-CN');
+        if (avail == true || avail == 1) chosen = 'zh-CN';
+      } catch (_) {
+        chosen = null;
+      }
+    }
+    if (chosen != null) {
+      await tts.setLanguage(chosen);
+      _chineseVerified = true;
+    } else {
+      _chineseVerified = false;
+      // Best effort only; the status stays honest (see initialize)
+      // and the startup plan will not rely on voice.
+      await tts.setLanguage('zh-CN');
+    }
     await tts.setSpeechRate(0.85);
     await tts.setVolume(1.0);
     await tts.setPitch(1.0);
@@ -57,7 +97,10 @@ class SystemVoiceOutput implements VoiceOutput {
       // and is reported, instead of leaving the caller waiting.
       await _doInitialize(tts).timeout(const Duration(seconds: 3));
       _available = true;
-      _detail = '系统语音合成已接入（zh-CN，语速 0.85）';
+      _detail = _chineseVerified
+          ? '系统语音合成已接入（zh-CN 中文语音已核实，语速 0.85）'
+          : '系统语音合成引擎可用，但设备未提供 zh-CN 中文语音数据'
+              '（中文播报不可用，语音不可依赖）';
       return true;
     } on TimeoutException {
       _available = false;
@@ -87,6 +130,7 @@ class SystemVoiceOutput implements VoiceOutput {
       await tts.speak(text);
     } catch (e) {
       _available = false;
+      _chineseVerified = false;
       _detail = 'NOT_CONFIGURED（系统语音合成失败：$e）';
       rethrow;
     }
