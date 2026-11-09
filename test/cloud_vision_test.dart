@@ -59,7 +59,7 @@ void main() {
       // safety judgements.
       final Map<String, String> text = content.last as Map<String, String>;
       expect(text['text'], contains('只输出一个 JSON 对象'));
-      expect(text['text'], contains('不要做任何安全判断'));
+      expect(text['text'], contains('不要做任何通行判断'));
     });
   });
 

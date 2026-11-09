@@ -7,7 +7,12 @@
 /// Accessibility rule (non-negotiable): UNKNOWN accessibility must be
 /// marked UNKNOWN and penalised as a missing cost of 1.0. It must NEVER
 /// be treated as SAFE (cost 0.0).
-enum AccessibilityStatus { unknown, accessible, partiallyAccessible, inaccessible }
+enum AccessibilityStatus {
+  unknown,
+  accessible,
+  partiallyAccessible,
+  inaccessible
+}
 
 class RouteCandidate {
   final String id;
@@ -84,17 +89,21 @@ class RouteScoring {
   }) {
     if (candidates.isEmpty) return const [];
     final w = weights.normalised;
-    final minD = candidates.map((c) => c.distanceM).reduce((a, b) => a < b ? a : b);
-    final maxD = candidates.map((c) => c.distanceM).reduce((a, b) => a > b ? a : b);
-    final minT = candidates.map((c) => c.durationS).reduce((a, b) => a < b ? a : b);
-    final maxT = candidates.map((c) => c.durationS).reduce((a, b) => a > b ? a : b);
+    final minD =
+        candidates.map((c) => c.distanceM).reduce((a, b) => a < b ? a : b);
+    final maxD =
+        candidates.map((c) => c.distanceM).reduce((a, b) => a > b ? a : b);
+    final minT =
+        candidates.map((c) => c.durationS).reduce((a, b) => a < b ? a : b);
+    final maxT =
+        candidates.map((c) => c.durationS).reduce((a, b) => a > b ? a : b);
     final scored = candidates.map((c) {
       final score = w.distance * _normalise(c.distanceM, minD, maxD) +
           w.time * _normalise(c.durationS, minT, maxT) +
           w.accessibilityMissing * c.accessibilityMissingCost +
           w.risk * c.knownRiskCost;
       final reason = c.accessibility == AccessibilityStatus.unknown
-          ? '无障碍信息未知（UNKNOWN），未按安全处理；得分已按缺失成本计入。'
+          ? '无障碍信息未知（UNKNOWN），未做无障碍确认；得分已按缺失成本计入。'
           : '无障碍状态：${c.accessibility.name}；已知风险成本：${c.knownRiskCost.toStringAsFixed(2)}。';
       return ScoredRoute(c, score, reason);
     }).toList();

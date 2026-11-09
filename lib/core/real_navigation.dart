@@ -257,8 +257,11 @@ class RealNavigationStarter {
 }
 
 /// The ready announcement's fixed part (the caller appends the
-/// first step). It keeps the "not a safe route" warning and the
-/// manual-step honesty: no live guidance, no arrival claim.
+/// first step). It states the route was not accessibility-
+/// checked, and it matches the shipped behaviour: step 2 added
+/// LIVE GPS guidance on top of this announcement (turn, off-
+/// route and arrival prompts), so the text must not claim the
+/// opposite.
 String realRouteReadyAnnouncement({
   required String destinationName,
   required double distanceM,
@@ -266,6 +269,6 @@ String realRouteReadyAnnouncement({
 }) =>
     '已获取到$destinationName的真实步行路线，距离 '
     '${distanceM.toStringAsFixed(0)} 米，共 $stepsCount 段。'
-    '注意：高德不提供盲道信息，这条路线不是安全路线。'
-    '我只会按你说的"下一步"逐段播报，不会自动实时引导，'
-    '也不会判断你是否到达。';
+    '注意：高德不提供盲道信息，这条路线没有经过无障碍核查。'
+    '接下来我会按你的实时位置播报转向和偏航，'
+    '到达时会提醒你。';

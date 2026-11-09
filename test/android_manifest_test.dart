@@ -116,6 +116,21 @@ void main() {
         reason: 'adaptive icon (API 26+) must also be present');
   });
 
+  group('APK size: legacy packaging + arm64-only native libs', () {
+    test('gradle compresses .so and excludes non-arm64 ABIs', () {
+      final String gradle =
+          File('android/app/build.gradle.kts').readAsStringSync();
+      expect(gradle, contains('useLegacyPackaging = true'));
+      expect(gradle, contains('"lib/x86_64/**"'));
+      expect(gradle, contains('"lib/x86/**"'));
+      expect(gradle, contains('"lib/armeabi-v7a/**"'));
+      // ABI choice stays in the build command (README), never
+      // in a hardcoded filter that would fight --split-per-abi.
+      expect(gradle, isNot(contains('abiFilters =')));
+      expect(gradle, isNot(contains('abiFilters +=')));
+    });
+  });
+
   group('release launch identity and ABI (P0, 2026-11-09)', () {
     test('the app label is 明途', () {
       final String mainManifest =
@@ -136,11 +151,13 @@ void main() {
     });
 
     test(
-        'legacy packaging is NOT used (it measured larger on '
-        'the real demo build)', () {
+        'legacy packaging IS used now, together with the '
+        'non-arm64 excludes (the earlier larger measurement '
+        'was a multi-ABI build without excludes)', () {
       final String gradle =
           File('android/app/build.gradle.kts').readAsStringSync();
-      expect(gradle, isNot(contains('useLegacyPackaging = true')));
+      expect(gradle, contains('useLegacyPackaging = true'));
+      expect(gradle, contains('"lib/x86_64/**"'));
     });
 
     test(

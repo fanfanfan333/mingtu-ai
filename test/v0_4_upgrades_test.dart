@@ -125,12 +125,14 @@ void main() {
     expect(RiskEngine.minSpatialConfidenceForStep, 0.6);
   });
 
-  test('registry has 13 skills, traffic info in, station out', () {
+  test('registry has 12 skills, traffic info in, station and hospital out', () {
     final registry = defaultSkillRegistry();
-    expect(registry.list().length, 13);
+    expect(registry.list().length, 12);
     expect(registry.get('traffic_scene_info'), isNotNull);
     expect(registry.get('station_assistance'), isNull);
-    expect(registry.get('hospital_registration'), isNotNull);
+    // The user's flow is navigation + obstacle avoidance
+    // only: the hospital skill is out of the registry.
+    expect(registry.get('hospital_registration'), isNull);
   });
 
   test('task context snapshot follows the one task manager', () {

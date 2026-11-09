@@ -292,4 +292,52 @@ void main() {
       expect(s.droppedExpiredLog, contains('chatter'));
     });
   });
+  group('danger priority and preemption (Codex re-test)', () {
+    SpeechRequest req(String id, SpeechKind kind, {required DateTime at}) =>
+        SpeechRequest(
+          id: id,
+          eventId: id,
+          text: 'x',
+          kind: kind,
+          createdAt: at,
+          expiresAt: at.add(const Duration(minutes: 5)),
+          navigationStateVersion: 'v1',
+        );
+
+    test('danger sits above navigation prompts and general alerts', () {
+      expect(priorityOf(SpeechKind.emergency), 0);
+      expect(priorityOf(SpeechKind.danger),
+          lessThan(priorityOf(SpeechKind.alert)));
+      expect(
+          priorityOf(SpeechKind.danger), lessThan(priorityOf(SpeechKind.turn)));
+      expect(
+          priorityOf(SpeechKind.danger), lessThan(priorityOf(SpeechKind.info)));
+      // Existing relative order is unchanged.
+      expect(
+          priorityOf(SpeechKind.alert), lessThan(priorityOf(SpeechKind.turn)));
+      expect(priorityOf(SpeechKind.turn),
+          lessThan(priorityOf(SpeechKind.straight)));
+      expect(priorityOf(SpeechKind.straight),
+          lessThan(priorityOf(SpeechKind.info)));
+    });
+
+    test('a danger prompt interrupts an active navigation prompt', () {
+      final s = SpeechScheduler();
+      final DateTime t0 = DateTime(2026, 1, 1, 12);
+      expect(s.submit(req('nav-turn', SpeechKind.turn, at: t0), t0), isTrue);
+      expect(s.active!.id, 'nav-turn');
+      expect(s.submit(req('danger-1', SpeechKind.danger, at: t0), t0), isTrue);
+      expect(s.active!.id, 'danger-1');
+      expect(s.interruptedLog, contains('nav-turn'));
+    });
+
+    test('danger does NOT interrupt an emergency announcement', () {
+      final s = SpeechScheduler();
+      final DateTime t0 = DateTime(2026, 1, 1, 12);
+      expect(s.submit(req('sos', SpeechKind.emergency, at: t0), t0), isTrue);
+      expect(s.submit(req('danger-2', SpeechKind.danger, at: t0), t0), isTrue);
+      expect(s.active!.id, 'sos');
+      expect(s.queue.map((q) => q.id), contains('danger-2'));
+    });
+  });
 }

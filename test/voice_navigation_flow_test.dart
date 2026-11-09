@@ -139,6 +139,49 @@ void main() {
       );
     });
 
+    test('the re-plan budget survives tracker rebuilds (trip level)', () {
+      final RerouteBudget budget = RerouteBudget();
+      NavigationTracker build() => NavigationTracker(
+            steps: steps,
+            stepTexts: const <String>['第一段：向东直行。', '第二段：左转，往南走。'],
+            destination: library,
+            destinationName: '图书馆',
+            budget: budget,
+          );
+      final DateTime t0 = DateTime(2026, 1, 1, 10);
+      final NavigationTracker first = build();
+      expect(first.rerouteDecision(t0), RerouteDecision.doIt);
+      expect(first.rerouteDecision(t0.add(const Duration(seconds: 61))),
+          RerouteDecision.doIt);
+      // A re-plan REBUILDS the tracker -- the budget must not
+      // reset (that was the Codex finding).
+      final NavigationTracker rebuilt = build();
+      expect(rebuilt.rerouteCount, 2);
+      expect(rebuilt.rerouteDecision(t0.add(const Duration(seconds: 122))),
+          RerouteDecision.doIt);
+      final NavigationTracker rebuiltAgain = build();
+      expect(rebuiltAgain.rerouteDecision(t0.add(const Duration(seconds: 183))),
+          RerouteDecision.exhausted);
+      expect(rebuiltAgain.rerouteCount, 3);
+    });
+
+    test('off-route re-arms after a failed or throttled re-plan', () {
+      final NavigationTracker t = tracker();
+      const GeoPoint farNorth =
+          GeoPoint(latitude: 37.725500, longitude: 120.441723);
+      expect(t.onFix(fix(farNorth)), isEmpty);
+      expect(t.onFix(fix(farNorth)).single.kind, NavEventKind.offRoute);
+      // Still off route: without a re-arm nothing fires again.
+      expect(t.onFix(fix(farNorth)), isEmpty);
+      expect(t.onFix(fix(farNorth)), isEmpty);
+      // The re-plan failed (or was throttled): main re-arms,
+      // and the next sustained off-route fires again so the
+      // re-plan can be retried under the trip budget.
+      t.resetOffRouteStreak();
+      expect(t.onFix(fix(farNorth)), isEmpty);
+      expect(t.onFix(fix(farNorth)).single.kind, NavEventKind.offRoute);
+    });
+
     test(
         'weak GPS is announced, throttled, and derives no '
         'turns', () {
@@ -252,12 +295,18 @@ void main() {
     final String mainDart = File('lib/main.dart').readAsStringSync();
 
     test(
-        'speech pauses listening first, via the single choke '
-        'point', () {
-      final int speakActive = mainDart.indexOf('void _speakActive');
-      final int pause = mainDart.indexOf('_pauseListeningForSpeech();');
-      expect(speakActive, greaterThanOrEqualTo(0));
-      expect(pause, greaterThan(speakActive));
+        'speech closes the mic first (awaited), via the single '
+        'choke point', () {
+      expect(mainDart, contains('unawaited(_speakActiveSequenced(request))'));
+      expect(mainDart, contains('await speakAfterClosingMic('));
+      // Danger prompts stop the interrupted playback and the
+      // speak path awaits that stop.
+      expect(mainDart, contains('_pendingPreemptStop = _stopTtsPlayback()'));
+      expect(mainDart, contains('kind: SpeechKind.danger'));
+      // The re-plan budget is trip-level: created once per
+      // trip, shared by every rebuilt tracker.
+      expect(mainDart, contains('_tripRerouteBudget = RerouteBudget()'));
+      expect(mainDart, contains('budget: _tripRerouteBudget'));
       expect(mainDart, contains('unawaited(_kickoffVoiceNavFlow'));
       expect(mainDart, contains('_locationProvider.ensurePermission()'));
       expect(

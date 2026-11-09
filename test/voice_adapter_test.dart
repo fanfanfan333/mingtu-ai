@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:mingtu_ai/adapters/system_voice_io.dart';
+import 'package:mingtu_ai/core/asr_errors.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
@@ -85,6 +86,7 @@ class FakeStt implements stt.SpeechToText {
   stt.SpeechStatusListener? capturedOnStatus;
   bool initResult = true;
   Object? stopError;
+  Completer<void>? stopGate;
   int stopCalls = 0;
 
   @override
@@ -103,6 +105,7 @@ class FakeStt implements stt.SpeechToText {
   @override
   Future<void> stop() async {
     stopCalls += 1;
+    if (stopGate != null) await stopGate!.future;
     if (stopError != null) throw stopError!;
   }
 
@@ -374,6 +377,104 @@ void main() {
       // _maybeStartListeningAfterSpeech).
       expect(await input.startListening(), isTrue);
       expect(input.isListening, isTrue);
+    });
+  });
+  group('speakAfterClosingMic: speech waits for the mic stop', () {
+    test('speak does not start until stopListening completes', () async {
+      final sttFake = FakeStt();
+      final input = SystemVoiceInput(sttFake);
+      addTearDown(input.dispose);
+      await input.initialize();
+      expect(await input.startListening(), isTrue);
+      expect(input.isListening, isTrue);
+
+      sttFake.stopGate = Completer<void>();
+      var speakStarted = false;
+      final List<String> order = <String>[];
+      final Future<void> sequence = speakAfterClosingMic(
+        input: input,
+        speak: () async {
+          speakStarted = true;
+          order.add('speak');
+        },
+      );
+      // Flush microtasks: the stop is gated, so speech must
+      // NOT have started yet -- this is the exact ordering
+      // the production speak path now uses.
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      expect(sttFake.stopCalls, 1);
+      expect(speakStarted, isFalse);
+      // The mic is not closed yet -- exactly why speech waits.
+      expect(input.isListening, isTrue);
+
+      order.add('stop-released');
+      sttFake.stopGate!.complete();
+      await sequence;
+      expect(input.isListening, isFalse);
+      expect(speakStarted, isTrue);
+      // The recorded order is the proof: speak ran strictly
+      // AFTER the microphone stop completed.
+      expect(order, <String>['stop-released', 'speak']);
+      // And listening can resume afterwards.
+      expect(await input.startListening(), isTrue);
+    });
+
+    test(
+        'no open mic: speak runs immediately; a failed stop does not block speech',
+        () async {
+      final sttFake = FakeStt();
+      final input = SystemVoiceInput(sttFake);
+      addTearDown(input.dispose);
+      await input.initialize();
+      var ran = false;
+      await speakAfterClosingMic(
+          input: input,
+          speak: () async {
+            ran = true;
+          });
+      expect(ran, isTrue);
+      expect(sttFake.stopCalls, 0);
+
+      expect(await input.startListening(), isTrue);
+      sttFake.stopError = StateError('stop failed');
+      ran = false;
+      await speakAfterClosingMic(
+          input: input,
+          speak: () async {
+            ran = true;
+          });
+      expect(ran, isTrue);
+    });
+  });
+  group('ASR error non-leak: raw platform strings never surface', () {
+    test(
+        'an errorMsg carrying a synthetic token and URL collapses '
+        'to the unknown code on every surface', () async {
+      final fake = FakeStt();
+      final input = SystemVoiceInput(fake);
+      addTearDown(input.dispose);
+      await input.initialize();
+      final List<String> entries = <String>[];
+      final StreamSubscription<String> sub = input.errors.listen(entries.add);
+      addTearDown(sub.cancel);
+      fake.capturedOnError!(
+        SpeechRecognitionError(
+          'error_network token=test-token-not-real '
+          'https://example.invalid/hook?k=test-token-not-real',
+          true,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(entries, hasLength(1));
+      // Exact-match whitelist: the junk-laden string is not a
+      // known code, so only the unknown code survives.
+      expect(entries.single, startsWith('error_unknown|'));
+      expect(entries.single, isNot(contains('test-token')));
+      expect(entries.single, isNot(contains('http')));
+      expect(entries.single, isNot(contains('example.invalid')));
+      expect(asrErrorText('error_unknown'), isNot(contains('http')));
+      expect(input.isAvailable, isFalse);
     });
   });
 }

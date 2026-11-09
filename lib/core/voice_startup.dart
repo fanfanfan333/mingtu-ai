@@ -85,11 +85,9 @@ class StartupVoicePlan {
   bool get speechUsable => channel == StartupVoiceChannel.speech;
 }
 
-const String _greetingOk =
-    '明途已启动，语音识别已开启。请说一句话，例如带我去图书馆。';
-const String _greetingAsrDown =
-    '明途已启动，但语音识别暂时不可用，你说话我可能听不见。'
-    '安全提示仍会用语音播报。你可以请身边的人帮忙点屏幕上的开始按钮，'
+const String _greetingOk = '明途已启动，语音识别已开启。请说一句话，例如带我去图书馆。';
+const String _greetingAsrDown = '明途已启动，但语音识别暂时不可用，你说话我可能听不见。'
+    '危险提示仍会用语音播报。你可以请身边的人帮忙点屏幕上的开始按钮，'
     '或检查麦克风权限后重新打开应用。';
 
 /// Decide the startup announcement from the *measured* engine
@@ -140,7 +138,7 @@ enum VoiceNoticeKind {
 ///
 /// Safety contract (pinned by tests): no text here contains a
 /// left/right step instruction （向左/向右/左转/右转） and none
-/// promises safe passage （安全前进/可以前进/放心走）. An unavailable
+/// promises safe passage (no "you may proceed" / "it is fine to walk" claims). An unavailable
 /// sensor or service is announced as unknown, never as safe.
 String voiceNoticeText(VoiceNoticeKind kind) {
   switch (kind) {

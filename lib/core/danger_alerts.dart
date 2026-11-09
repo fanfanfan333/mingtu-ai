@@ -6,7 +6,7 @@
 /// drown out navigation speech, so a category must cool down
 /// before it can speak again. Alerts never give a walking
 /// direction (a detection box has no distance) and never use
-/// the word 安全.
+/// a safe-passage claim.
 library;
 
 enum DangerCategory { vehicle, person, other }

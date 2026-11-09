@@ -40,6 +40,30 @@ class NavEvent {
 
 enum RerouteDecision { doIt, throttled, exhausted }
 
+/// Re-plan throttle state for a WHOLE TRIP. It deliberately
+/// lives OUTSIDE the tracker: re-planning rebuilds the
+/// tracker for the new route, and rebuilding must not reset
+/// the budget (Codex re-test: a fresh tracker zeroed the
+/// "at most 3 re-plans" limit on every re-plan).
+class RerouteBudget {
+  int count = 0;
+  DateTime? lastAt;
+
+  RerouteDecision decision(DateTime now) {
+    if (count >= NavigationTracker.rerouteMaxCount) {
+      return RerouteDecision.exhausted;
+    }
+    final DateTime? last = lastAt;
+    if (last != null &&
+        now.difference(last) < NavigationTracker.rerouteMinInterval) {
+      return RerouteDecision.throttled;
+    }
+    count += 1;
+    lastAt = now;
+    return RerouteDecision.doIt;
+  }
+}
+
 class NavigationTracker {
   static const double turnAnnounceDistanceM = 30;
   static const double offRouteDistanceM = 30;
@@ -55,6 +79,10 @@ class NavigationTracker {
   final GeoPoint destination;
   final String destinationName;
 
+  /// Trip-level re-plan budget (shared across the trackers
+  /// built for one trip's re-plans).
+  final RerouteBudget budget;
+
   final List<GeoPoint> _points = <GeoPoint>[];
   final List<double> _cum = <double>[]; // cumulative metres at each point
   final List<int> _stepStartPointIndex = <int>[];
@@ -62,8 +90,6 @@ class NavigationTracker {
   int currentStepIndex = 0;
   double? remainingM;
   bool arrived = false;
-  int rerouteCount = 0;
-  DateTime? _lastRerouteAt;
   DateTime? _lastWeakAt;
   int _offRouteStreak = 0;
   bool _offRouteAnnounced = false;
@@ -74,7 +100,8 @@ class NavigationTracker {
     required this.stepTexts,
     required this.destination,
     required this.destinationName,
-  }) {
+    RerouteBudget? budget,
+  }) : budget = budget ?? RerouteBudget() {
     double acc = 0;
     for (int i = 0; i < steps.length; i++) {
       final List<GeoPoint> line = steps[i].polyline;
@@ -111,18 +138,21 @@ class NavigationTracker {
     return (best, bestD);
   }
 
-  /// Throttled re-plan gate: at most one re-plan per
-  /// [rerouteMinInterval] and [rerouteMaxCount] per trip.
-  RerouteDecision rerouteDecision(DateTime now) {
-    if (rerouteCount >= rerouteMaxCount) return RerouteDecision.exhausted;
-    final DateTime? last = _lastRerouteAt;
-    if (last != null && now.difference(last) < rerouteMinInterval) {
-      return RerouteDecision.throttled;
-    }
-    rerouteCount += 1;
-    _lastRerouteAt = now;
-    return RerouteDecision.doIt;
+  /// Throttled re-plan gate, delegated to the trip-level
+  /// [budget]: at most one re-plan per [rerouteMinInterval]
+  /// and [rerouteMaxCount] per TRIP, across tracker rebuilds.
+  RerouteDecision rerouteDecision(DateTime now) => budget.decision(now);
+
+  /// Re-arm off-route detection after a re-plan attempt
+  /// failed or was throttled: without this, the announced
+  /// flag would suppress every later off-route event and an
+  /// off-route user could never get another re-plan try.
+  void resetOffRouteStreak() {
+    _offRouteStreak = 0;
+    _offRouteAnnounced = false;
   }
+
+  int get rerouteCount => budget.count;
 
   List<NavEvent> onFix(NavFix fix) {
     final List<NavEvent> events = <NavEvent>[];

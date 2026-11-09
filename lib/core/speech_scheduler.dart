@@ -21,22 +21,37 @@
 /// strictly higher priority (an emergency, P0); the user's own
 /// "停下" is not an interruption but an explicit cancelAll(),
 /// which is the one sanctioned way to clear everything.
-enum SpeechKind { emergency, obstacleAvoidance, alert, turn, straight, info }
+enum SpeechKind {
+  emergency,
+  danger,
+  obstacleAvoidance,
+  alert,
+  turn,
+  straight,
+  info
+}
 
 int priorityOf(SpeechKind kind) {
   switch (kind) {
     case SpeechKind.emergency:
       return 0;
+    case SpeechKind.danger:
+      // Imminent-danger alerts (a vehicle/person directly
+      // ahead) sit ABOVE every navigation prompt and above
+      // general alerts: they interrupt whatever is playing
+      // (see SpeechScheduler.submit's interruption rule and
+      // the caller's physical playback stop).
+      return 1;
     case SpeechKind.obstacleAvoidance:
-      return 1;
-    case SpeechKind.alert:
-      return 1;
-    case SpeechKind.turn:
       return 2;
-    case SpeechKind.straight:
+    case SpeechKind.alert:
+      return 2;
+    case SpeechKind.turn:
       return 3;
-    case SpeechKind.info:
+    case SpeechKind.straight:
       return 4;
+    case SpeechKind.info:
+      return 5;
   }
 }
 

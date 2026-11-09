@@ -43,7 +43,7 @@ flutter build apk --release --split-per-abi
 
 ABI 由构建命令决定，工程里**不写死 `ndk.abiFilters`**（写死会与 `--split-per-abi` 冲突）：`--target-platform android-arm64` 出纯 64 位包；`--split-per-abi` 出分 ABI 的多个包（其中就有 arm64-v8a）；不带参数出同时含 64/32 位的通用包。构建时按需追加演示参数（值用占位符，勿把真值写进任何文档/仓库）：
 
-**体积与 ABI 完整性（如实记录）**：演示包请只用 `--target-platform android-arm64` 构建——这种包里只有 arm64 的 `libapp.so`/`libflutter.so` 是完整的，**不要把它装到 32 位（armeabi-v7a）或 x86_64 设备/模拟器上，会崩**；需要多 ABI 就用通用包命令（每个 ABI 的 so 都完整，但体积更大）。`useLegacyPackaging`（压缩 .so）在 229601e 试过，Codex 实测带演示 key 的构建反而涨到 **38.4MB**，故已移除、不再使用；当前控体积的唯一手段就是单 ABI arm64。
+**体积与 ABI 完整性（如实记录）**：演示包请只用 `--target-platform android-arm64` 构建——演示 APK 通过聊天发送、上限 25MB，未压缩 .so 的 arm64 包曾达 61MB 且混入了插件的 x86_64 .so（如 libLiteRt.so）。现行控体积手段（`android/app/build.gradle.kts` 的 `packaging.jniLibs`）：`useLegacyPackaging = true` 压缩 .so，并用 excludes 排除 `lib/x86_64/**`、`lib/x86/**`、`lib/armeabi-v7a/**`，目标约 20MB；ABI 仍由构建命令决定，**不写死 abiFilters**（与 `--split-per-abi` 冲突）。注意：这样打出的包里只有 arm64 的 `libapp.so`/`libflutter.so` 完整的，**不要装到 32 位或 x86_64 设备上，会崩**。历史记录：`useLegacyPackaging` 在 229601e 试过，Codex 实测当时的多 ABI 构建反而涨到 38.4MB 故一度移除；本次是与“排除非 arm64 .so”组合后重新启用，实际体积以下一次真机构建实测为准。
 
 ```bash
 flutter build apk --release --target-platform android-arm64 \

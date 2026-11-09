@@ -272,15 +272,16 @@ void main() {
 
     test(
         'ready announcement keeps the not-a-safe-route warning and '
-        'the manual-step honesty', () {
+        'announcement matches the live GPS guidance', () {
       final String text = realRouteReadyAnnouncement(
         destinationName: '图书馆',
         distanceM: 186,
         stepsCount: 2,
       );
-      expect(text, contains('不是安全路线'));
-      expect(text, contains('不会自动实时引导'));
-      expect(text, contains('也不会判断你是否到达'));
+      expect(text, contains('没有经过无障碍核查'));
+      expect(text, contains('实时位置'));
+      expect(text, contains('到达时会提醒'));
+      expect(text, isNot(contains('不会自动实时引导')));
     });
 
     test('steps advance ONLY manually through the speaker', () {

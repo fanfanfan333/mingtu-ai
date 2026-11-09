@@ -25,6 +25,7 @@ import 'core/asr_errors.dart';
 import 'core/danger_alerts.dart';
 import 'core/destination_dialogue.dart';
 import 'core/navigation_tracker.dart';
+import 'core/yolo_error_speech.dart';
 import 'core/real_navigation.dart';
 import 'core/startup_guard.dart';
 import 'core/voice_log.dart';
@@ -36,7 +37,6 @@ import 'core/speech_scheduler.dart';
 import 'core/task_manager.dart';
 import 'modules/blind_path.dart';
 import 'modules/emergency.dart';
-import 'modules/hospital_task.dart';
 import 'modules/entrance_finding.dart';
 import 'modules/indoor_task.dart';
 import 'modules/map_navigation.dart';
@@ -194,6 +194,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   // Step 2 voice navigation flow state.
   NavigationTracker? _liveNav;
+  RerouteBudget? _tripRerouteBudget;
+  Future<void>? _pendingPreemptStop;
   StreamSubscription<LocationResult>? _gpsSub;
   String _liveNavDestName = '';
   double? _liveNavRemainingM;
@@ -231,8 +233,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // user can ask to hear it again.
   final TextEditingController _voiceController = TextEditingController();
   String _lastSpokenText = '';
-  HospitalTask _hospital = HospitalTask();
-  String _hospitalText = '医院挂号未开始（逻辑步骤演示，非真实挂号）。';
 
   @override
   void initState() {
@@ -385,6 +385,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       stepTexts: texts,
       destination: outcome.destination!.pointGcj02,
       destinationName: destinationName,
+      budget: _tripRerouteBudget ??= RerouteBudget(),
     );
     _liveNavDestName = destinationName;
     _liveNavRemainingM = _liveNav!.remainingM;
@@ -476,6 +477,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             kind: SpeechKind.alert,
           ));
         } else {
+          // Throttled: re-arm the tracker so a later
+          // off-route event can retry once the interval has
+          // passed (the trip budget still bounds retries).
+          _liveNav?.resetOffRouteStreak();
           _say(_request(
             id: 'nav-offroute-wait-$ts',
             eventId: 'nav-offroute-wait-$ts',
@@ -497,6 +502,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final RealNavigationOutcome outcome = await starter.start(_liveNavDestName);
     if (!mounted || _liveNav == null) return;
     if (!outcome.ready) {
+      // Re-arm: the user is still off route, and a later
+      // off-route event must be able to retry the re-plan
+      // (subject to the trip budget) instead of the failure
+      // ending all retries.
+      _liveNav?.resetOffRouteStreak();
       _say(_request(
         id: 'nav-reroute-failed',
         eventId: 'nav-reroute-failed',
@@ -677,6 +687,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _asrErrorAnnounced = true;
     _autoListenEnabled = false;
     _welcomeListenPending = false;
+    // ASR down but TTS usable: the spoken notice below is
+    // paired with a vibration, so the user feels the state
+    // change even in a noisy environment.
+    HapticFeedback.vibrate();
     _health.report(
       'voice_input',
       ServiceHealthStatus.degraded,
@@ -777,6 +791,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // spoken late.
     final bool critical = neverExpires ||
         kind == SpeechKind.emergency ||
+        kind == SpeechKind.danger ||
         kind == SpeechKind.obstacleAvoidance ||
         kind == SpeechKind.alert;
     return SpeechRequest(
@@ -818,6 +833,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   bool _say(SpeechRequest request) {
     final DateTime now = DateTime.now();
+    final SpeechRequest? activeBefore = _scheduler.active;
     final bool accepted = _scheduler.submit(request, now);
     if (accepted) _publishSpeech(request);
     setState(() {
@@ -834,6 +850,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // prompt completes only when the engine reports completion.
     // Otherwise the old simulated 1200 ms timing is used.
     if (accepted && _scheduler.active?.id == request.id) {
+      if (activeBefore != null &&
+          activeBefore.id != request.id &&
+          _scheduler.interruptedLog.contains(activeBefore.id)) {
+        // Physical preemption (danger over a navigation
+        // prompt): the scheduler swapped the active request,
+        // but the interrupted utterance is still coming out
+        // of the speaker. Stop it; the sequenced speak path
+        // awaits this stop before the danger prompt starts.
+        _pendingPreemptStop = _stopTtsPlayback();
+        _logMsg('危险提示抢占了正在播报的导航提示（已停止其播放）。');
+      }
       _speakActive(request);
     }
     return accepted;
@@ -871,21 +898,43 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// adapter's sessionEnded signal, but _onAsrSessionEnded
   /// refuses to relisten while the scheduler has an active
   /// request, so this cannot race the speech it precedes.
-  void _pauseListeningForSpeech() {
-    final VoiceInput input = _voiceInput;
-    if (input is SystemVoiceInput && input.isListening) {
-      mingtuVoiceLog('播报开始：先暂停监听，避免听到自己的播报');
-      unawaited(input.stopListening().catchError((Object e) {
-        mingtuVoiceLog('暂停监听失败：停止监听异常，播报继续');
-        return null;
-      }));
-    }
+  /// Speak the currently active prompt. Sequenced
+  /// (Codex re-test of 037f25c): the microphone stop is
+  /// AWAITED before playback starts -- the old
+  /// fire-and-forget stop let speech begin over a still-open
+  /// microphone -- and a pending preemption stop is awaited
+  /// too. Cancellation that landed during the wait is
+  /// honoured: a superseded request never starts speaking.
+  void _speakActive(SpeechRequest request) {
+    unawaited(_speakActiveSequenced(request));
   }
 
-  /// Speak the currently active prompt: real TTS when available,
+  Future<void> _speakActiveSequenced(SpeechRequest request) async {
+    final Future<void>? preemptStop = _pendingPreemptStop;
+    _pendingPreemptStop = null;
+    if (preemptStop != null) await preemptStop;
+    final VoiceInput input = _voiceInput;
+    final SystemVoiceInput? sysInput = input is SystemVoiceInput ? input : null;
+    if (sysInput != null && sysInput.isListening) {
+      mingtuVoiceLog('播报开始：先暂停监听，避免听到自己的播报');
+    }
+    await speakAfterClosingMic(
+      input: sysInput,
+      speak: () async {
+        if (!mounted) return;
+        if (_scheduler.cancelledLog.contains(request.id)) {
+          _logMsg('等待监听关闭期间已被取消的播报不再开始（${request.id}）。');
+          return;
+        }
+        if (_scheduler.active?.id != request.id) return;
+        _playActiveRequest(request);
+      },
+    );
+  }
+
+  /// Play the active prompt: real TTS when available,
   /// simulated timing otherwise.
-  void _speakActive(SpeechRequest request) {
-    _pauseListeningForSpeech();
+  void _playActiveRequest(SpeechRequest request) {
     if (_voiceOutput.isAvailable) {
       _voiceOutput.speak(request.text).then((_) {
         // Stop-race guard (Codex re-test): a request the user has
@@ -1078,7 +1127,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
     });
     _logMsg('路线规划完成：${result.all.length} 条候选，'
-        '无障碍信息均为 UNKNOWN，未按安全处理。');
+        '无障碍信息均为 UNKNOWN，未做无障碍确认。');
     _say(_request(
       id: 'route-planned',
       eventId: 'route-planned',
@@ -1171,7 +1220,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         'GPS 起点已取得（精度约 ${outcome.accuracyM!.toStringAsFixed(0)} 米）。');
     setState(() {
       _amapText = '高德真实路线：距离 ${candidate.distanceM.toStringAsFixed(0)} 米，'
-          '${result.steps.length} 个路段。无障碍信息仍为 UNKNOWN，未按安全路线处理。';
+          '${result.steps.length} 个路段。无障碍信息仍为 UNKNOWN，未按无障碍路线处理。';
       _routeText = _amapText;
     });
     _logMsg('真实导航已启动：${candidate.distanceM.toStringAsFixed(0)} 米，'
@@ -1190,6 +1239,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // Step 2: from here the navigation is LIVE -- GPS fixes
     // drive turn / off-route / arrival announcements until
     // arrival, 停下, cancel or emergency ends the session.
+    // A fresh trip gets a fresh re-plan budget; re-plans
+    // within the trip share it (never reset by a rebuild).
+    _tripRerouteBudget = RerouteBudget();
     _beginLiveNavigation(outcome, destinationName);
   }
 
@@ -1416,7 +1468,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           id: 'yolo-danger-${now.millisecondsSinceEpoch}',
           eventId: 'yolo-danger-${now.millisecondsSinceEpoch}',
           text: dangerTextFor(chosen, otherName: otherName),
-          kind: SpeechKind.alert,
+          kind: SpeechKind.danger,
         ));
       }
     } else if (_yoloRiskActive && _yoloEmptyFrames >= 3) {
@@ -2363,31 +2415,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  void _hospitalAdvance() {
-    if (_hospital.preRegistrationComplete) {
-      setState(() {
-        _hospitalText = _hospital.currentStepText;
-      });
-      _say(_request(
-        id: 'hospital-done-${DateTime.now().millisecondsSinceEpoch}',
-        eventId: 'hospital-done-${DateTime.now().millisecondsSinceEpoch}',
-        text: _hospital.currentStepText,
-        kind: SpeechKind.info,
-      ));
-      return;
-    }
-    final bool ok = _hospital.tryAdvance(verified: true, evidence: 'demo');
-    setState(() {
-      _hospitalText = _hospital.currentStepText;
-    });
-    _say(_request(
-      id: 'hospital-${DateTime.now().millisecondsSinceEpoch}',
-      eventId: 'hospital-${DateTime.now().millisecondsSinceEpoch}',
-      text: ok ? _hospital.currentStepText : '医院挂号步骤不能前进，需要先核验。',
-      kind: SpeechKind.info,
-    ));
-  }
-
   void _triggerEmergency() {
     final DateTime now = DateTime.now();
     _events.publish(
@@ -2456,8 +2483,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _mapService = MapNavigationService(StubMapProvider());
       _routeSkill = RoutePlanningSkill(_mapService);
       _indoor = IndoorTask();
-      _hospital = HospitalTask();
-      _hospitalText = '医院挂号未开始（逻辑步骤演示，非真实挂号）。';
       _lastSpokenText = '';
       _voiceController.clear();
       _recording = RecordingManager();
@@ -2560,26 +2585,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                     });
                   },
                   onError: (Object error) {
-                    // The raw error is NOT surfaced (it can
-                    // embed paths); the user hears a fixed
-                    // Chinese announcement once, and the reason
-                    // class goes to the MingtuVoice log.
-                    mingtuVoiceLog('YOLO 实时视图出错：模型或摄像头不可用');
-                    _logMsg('YOLO 实时视图出错：目标检测模型或摄像头不可用。');
+                    // Classified, never raw: a CAMERA
+                    // PERMISSION denial and a MODEL LOAD
+                    // failure get DIFFERENT announcements --
+                    // the remedies differ (open system
+                    // settings vs fix the bundled model). One
+                    // shared sentence for both was a Codex
+                    // re-test finding.
+                    final YoloViewErrorKind errorKind =
+                        classifyYoloViewError(error);
+                    mingtuVoiceLog('YOLO 实时视图出错类别：${errorKind.name}');
+                    _logMsg('YOLO 实时视图出错：${yoloViewErrorStatus(errorKind)}。');
                     setState(() {
-                      _yoloText = 'YOLO：实时视图出错，目标检测不可用';
+                      _yoloText = yoloViewErrorStatus(errorKind);
                     });
                     if (!_yoloErrorAnnounced) {
                       _yoloErrorAnnounced = true;
                       _health.report(
                         'yolo',
                         ServiceHealthStatus.unavailable,
-                        '实时视图出错：模型或摄像头不可用',
+                        yoloViewErrorStatus(errorKind),
                       );
                       _say(_request(
                         id: 'yolo-view-error',
                         eventId: 'yolo-view-error',
-                        text: '目标检测模型加载失败，YOLO 实时检测不可用。',
+                        text: yoloViewErrorSpeech(errorKind),
                         kind: SpeechKind.alert,
                       ));
                     }
@@ -2622,7 +2652,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
               '当前在网页 / 虚拟机中运行的是模拟流程，'
               '不是真实传感器导航，不能用于真实道路，'
               '也不能替代盲杖、导盲犬或专业定向行走训练，'
-              '也未经过真实道路安全验证。',
+              '也未经过真实道路验证。',
             ),
             const SizedBox(height: 12),
             Text('配置状态：地图：${AppConfig.routeProxyStatus}；'
@@ -2679,12 +2709,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             const SizedBox(height: 8),
             Text('感知：$_perceptionText'),
             const SizedBox(height: 8),
-            Text('医院挂号：$_hospitalText'),
             const SizedBox(height: 8),
             Text('路口：$_trafficText'),
             const SizedBox(height: 8),
             Text(
-                'Skill 注册：${_registry.list().length} 个（车站、医院完整挂号未注册；路口只提示不放行；相册导出 NOT_CONFIGURED）。'),
+                'Skill 注册：${_registry.list().length} 个（车站完整服务未注册；路口只提示不放行；相册导出 NOT_CONFIGURED）。'),
             const SizedBox(height: 24),
             const Text('语音控制（盲人优先：不用看屏幕点步骤也能控制）',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
@@ -2791,11 +2820,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
               onPressed: _tasks.canTransitionTo(TaskState.cancelled)
                   ? () => _handleVoiceCommand('取消')
                   : null,
-            ),
-            _demoButton(
-              label: '医院挂号下一步（逻辑步骤，非真实挂号）',
-              semanticsLabel: '医院挂号下一步',
-              onPressed: _hospitalAdvance,
             ),
             const SizedBox(height: 24),
             const Text('演示步骤（按顺序点按）',

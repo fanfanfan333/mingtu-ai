@@ -231,17 +231,6 @@ SkillRegistry defaultSkillRegistry() {
     maturity: SkillMaturity.tested,
   ));
   registry.register(const SkillDefinition(
-    id: 'hospital_registration',
-    name: '医院挂号辅助（前置步骤）',
-    version: '0.2',
-    scene: 'hospital',
-    inputs: ['verified_evidence'],
-    outputs: ['next_step'],
-    requiredModules: ['hospital_task'],
-    riskLevel: RiskLevel.r2,
-    maturity: SkillMaturity.tested,
-  ));
-  registry.register(const SkillDefinition(
     id: 'emergency_assistance',
     name: '紧急求助',
     version: '1.0',
@@ -269,7 +258,11 @@ SkillRegistry defaultSkillRegistry() {
     name: '路口信息提示（只提示，不放行）',
     version: '1.0',
     scene: 'outdoor',
-    inputs: ['light_detected', 'light_direction_confirmed', 'location_accuracy_ok'],
+    inputs: [
+      'light_detected',
+      'light_direction_confirmed',
+      'location_accuracy_ok'
+    ],
     outputs: ['caution_or_info_text'],
     requiredModules: ['traffic_scene', 'risk_engine'],
     riskLevel: RiskLevel.r2,

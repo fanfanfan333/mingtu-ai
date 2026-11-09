@@ -12,7 +12,7 @@
 /// 1. Uncertain side space -> NEVER a left/right step instruction.
 ///    Returns a cautious stop / ask-for-help prompt instead.
 /// 2. A missed detection (no evidence) -> NEVER treated as safe.
-///    Returns a cautious prompt, never "前方安全".
+///    Returns a cautious prompt, never a claim that the way ahead is clear.
 /// 3. Expired events are invalid and must not drive a prompt.
 /// 4. Conflicting step directions (left vs right) resolve to a cautious
 ///    stop, never to playing both instructions in sequence.
@@ -28,7 +28,8 @@ class PerceptionEvidence {
   final bool hasDistanceEstimate;
   final double? distanceM;
   final bool sideSpaceConfirmed;
-  final StepDirection confirmedSafeSide; // only meaningful if sideSpaceConfirmed
+  final StepDirection
+      confirmedSafeSide; // only meaningful if sideSpaceConfirmed
   final bool movingTowardsUser;
   const PerceptionEvidence({
     required this.detectionConfidence,
@@ -120,7 +121,7 @@ class RiskEngine {
       return const RiskAssessment(
         level: RiskLevel.r2,
         action: RiskAction.stop,
-        speechText: '前方可能存在障碍，暂时无法确认安全绕行方向，请先停下。',
+        speechText: '前方可能存在障碍，暂时无法确认绕行方向，请先停下。',
         reason: 'uncertain-side-space',
         stepDirection: StepDirection.none,
       );
@@ -132,15 +133,13 @@ class RiskEngine {
       return const RiskAssessment(
         level: RiskLevel.r2,
         action: RiskAction.stop,
-        speechText: '前方可能存在障碍，暂时无法确认安全绕行方向，请先停下。',
+        speechText: '前方可能存在障碍，暂时无法确认绕行方向，请先停下。',
         reason: 'insufficient-spatial-evidence',
         stepDirection: StepDirection.none,
       );
     }
     // Emergency: close and moving towards the user.
-    if (ev.movingTowardsUser &&
-        ev.distanceM != null &&
-        ev.distanceM! < 2.0) {
+    if (ev.movingTowardsUser && ev.distanceM != null && ev.distanceM! < 2.0) {
       return const RiskAssessment(
         level: RiskLevel.r4,
         action: RiskAction.emergency,
@@ -151,12 +150,14 @@ class RiskEngine {
     // Confirmed safe side + sufficient spatial evidence -> step allowed.
     final sideText =
         ev.confirmedSafeSide == StepDirection.left ? '向左移动一步' : '向右移动一步';
-    final level =
-        (ev.distanceM != null && ev.distanceM! < 3.0) ? RiskLevel.r3 : RiskLevel.r2;
+    final level = (ev.distanceM != null && ev.distanceM! < 3.0)
+        ? RiskLevel.r3
+        : RiskLevel.r2;
     return RiskAssessment(
       level: level,
       action: RiskAction.caution,
-      speechText: '前方有障碍，已确认${ev.confirmedSafeSide == StepDirection.left ? '左侧' : '右侧'}有可通行空间。$sideText',
+      speechText:
+          '前方有障碍，已确认${ev.confirmedSafeSide == StepDirection.left ? '左侧' : '右侧'}有可通行空间。$sideText',
       reason: 'confirmed-side-space',
       stepDirection: ev.confirmedSafeSide,
     );
@@ -178,7 +179,8 @@ class RiskEngine {
     valid.sort((a, b) => b.level.index.compareTo(a.level.index));
     final top = valid.first;
     final steps = valid
-        .where((a) => a.stepDirection != null && a.stepDirection != StepDirection.none)
+        .where((a) =>
+            a.stepDirection != null && a.stepDirection != StepDirection.none)
         .map((a) => a.stepDirection!)
         .toSet();
     if (steps.length > 1) {

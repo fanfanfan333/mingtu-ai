@@ -37,11 +37,28 @@ android {
         // phones such as Xiaomi 15, no flag for a universal APK.
     }
 
-    // NOTE on APK size: legacy packaging (compressed .so)
-    // was tried in 229601e and measured LARGER on the real
-    // demo build (38.4 MB), so it is deliberately NOT used.
-    // Size is controlled by building a single-ABI arm64 APK
-    // (--target-platform android-arm64, see the root README).
+    // APK size (the demo APK is delivered by chat, 25 MB
+    // ceiling): legacy packaging COMPRESSES the .so files
+    // inside the APK, and the jniLibs excludes drop every
+    // non-arm64 native library -- plugins such as LiteRT
+    // ship x86_64 / x86 / armeabi-v7a .so files that an
+    // android-arm64 build would otherwise still bundle
+    // (that combination produced a 61 MB package). An
+    // earlier multi-ABI build measured legacy packaging as
+    // larger; with the excludes the arm64 package is the
+    // deliverable and the target is ~20 MB. ABI selection
+    // stays in the build command: no ndk.abiFilters here
+    // (it conflicts with --split-per-abi).
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            excludes += listOf(
+                "lib/x86_64/**",
+                "lib/x86/**",
+                "lib/armeabi-v7a/**"
+            )
+        }
+    }
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.

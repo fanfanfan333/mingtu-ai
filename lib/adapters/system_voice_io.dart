@@ -335,3 +335,26 @@ class SystemVoiceInput implements VoiceInput {
     _errorController.close();
   }
 }
+
+/// Speak only AFTER the microphone is fully closed
+/// (Codex re-test of 037f25c): the caller awaits this, so
+/// [speak] cannot start while a recognition session is still
+/// shutting down -- the previous fire-and-forget stop let
+/// speech begin over an open microphone. A failed stop is
+/// swallowed HERE (and logged by the caller via the input's
+/// state) because speech must still happen; the recogniser
+/// being slow to close must not silence a danger alert.
+Future<void> speakAfterClosingMic({
+  required SystemVoiceInput? input,
+  required Future<void> Function() speak,
+}) async {
+  if (input != null && input.isListening) {
+    try {
+      await input.stopListening();
+    } catch (_) {
+      // The session state is untrusted after a failed stop;
+      // the adapter has already marked it not-listening.
+    }
+  }
+  await speak();
+}

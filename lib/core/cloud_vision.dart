@@ -68,7 +68,7 @@ const String cloudVisionPrompt = '只输出一个 JSON 对象，不要输出任�
     '台阶、楼梯、墙壁、门、桌子、椅子、树木、护栏、指示牌、其他。'
     '方位只能是：正前方、左前方、右前方、左侧、右侧、后方。'
     '远近只能是：很近、较近、较远。'
-    '不要做任何安全判断，不要输出 JSON 以外的任何内容。';
+    '不要做任何通行判断，不要输出 JSON 以外的任何内容。';
 
 /// Enum domains for the structured vision result. The proxy
 /// coerces to the same sets server-side; the client coerces
@@ -138,7 +138,7 @@ class VisionScene {
 ///   the disclaimer; it never upgrades to "safe to walk";
 /// - obstacles -> direction + proximity + type phrases, at most
 ///   three spoken, then the disclaimer and the unverified note;
-/// - the words 安全 / 可以通过 / 可以走 / 无危险 never appear:
+/// - safe-passage wording (the Chinese equivalents of "safe", "you can pass", "you can walk", "no danger") never appears:
 ///   this template has no way to produce a safety judgement.
 String visionSceneSpeechText(VisionScene scene) {
   if (scene.obstacles.isEmpty) {
