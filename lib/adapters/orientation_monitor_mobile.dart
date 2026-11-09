@@ -11,8 +11,17 @@ import '../core/orientation.dart';
 /// is unit-tested without hardware.
 class GyroscopeOrientationMonitor implements OrientationMonitor {
   final GyroStabilityJudge _judge = GyroStabilityJudge();
+  final HeadingTracker _heading = HeadingTracker();
   StreamSubscription<GyroscopeEvent>? _sub;
+  StreamSubscription<MagnetometerEvent>? _magSub;
   bool _available = false;
+
+  /// The phone's compass heading right now, or null when
+  /// the magnetometer has not produced a sample within
+  /// the 500 ms freshness bound (entrance guidance then
+  /// announces distance only).
+  @override
+  double? get currentHeadingDeg => _heading.headingAt(DateTime.now());
 
   @override
   bool get isAvailable => _available;
@@ -41,12 +50,28 @@ class GyroscopeOrientationMonitor implements OrientationMonitor {
     } catch (_) {
       _available = false;
     }
+    // Heading source for entrance guidance (step D): the
+    // magnetometer feeds the pure HeadingTracker. Failure
+    // here only means "no heading" (distance-only guidance)
+    // -- it never affects the stability verdict above.
+    try {
+      _magSub = magnetometerEventStream().listen(
+        (MagnetometerEvent e) {
+          _heading.addField(e.x, e.y, DateTime.now());
+        },
+        onError: (Object _) {},
+      );
+    } catch (_) {
+      // No magnetometer: heading stays unknown.
+    }
   }
 
   @override
   void dispose() {
     _sub?.cancel();
     _sub = null;
+    _magSub?.cancel();
+    _magSub = null;
   }
 }
 

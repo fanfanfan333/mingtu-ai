@@ -67,24 +67,12 @@ void main() {
     });
   });
 
-  group('ASR unavailable: voice + vibration, fixed texts only', () {
-    test('the runtime ASR error handler vibrates and speaks a fixed notice',
-        () {
-      final String mainDart = File('lib/main.dart').readAsStringSync();
-      final int start = mainDart.indexOf('void _handleAsrError');
-      final int end = mainDart.indexOf('void _maybeStartListeningAfterSpeech');
-      expect(start, greaterThanOrEqualTo(0));
-      expect(end, greaterThan(start));
-      final String body = mainDart.substring(start, end);
-      expect(body, contains('HapticFeedback.vibrate()'));
-      expect(body, contains('asrErrorText(code)'));
-      expect(body, contains('VoiceNoticeKind.asrUnavailable'));
-      // The raw stream entry is never interpolated into a
-      // surface: only its whitelisted code prefix is read.
-      expect(body, contains("error.split('|').first"));
-      expect(body, isNot(contains('errorMsg')));
-    });
-  });
+  // The ASR-unavailable source assertions that stood here
+  // were replaced by behavioural tests in
+  // test/codex_ptt_fix_test.dart (recording fake
+  // TTS/ASR/haptics: a failed start vibrates and speaks
+  // the fixed notice verbatim, for both the unavailable
+  // recogniser and the engine-refuses-listen paths).
 
   group('YOLO view error classification', () {
     test('camera permission denial gets its own announcement', () {

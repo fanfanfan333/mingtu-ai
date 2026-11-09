@@ -13,6 +13,8 @@
 /// advisor falls back to "please stop" announcements.
 library;
 
+import 'dart:math' as math;
+
 /// Judges orientation stability from gyroscope magnitudes.
 ///
 /// Stable means: at least [minSamples] samples inside the
@@ -76,6 +78,12 @@ abstract class OrientationMonitor {
   /// is unavailable or has not produced enough samples yet.
   bool get isStable;
 
+  /// The phone's current compass heading in degrees, or
+  /// null when no fresh heading sample exists (older than
+  /// 500 ms) or the source has no magnetometer. Entrance
+  /// guidance treats null as "distance only".
+  double? get currentHeadingDeg;
+
   /// Begin listening (idempotent).
   void start();
 
@@ -97,8 +105,60 @@ class UnavailableOrientationMonitor implements OrientationMonitor {
   bool get isStable => false;
 
   @override
+  double? get currentHeadingDeg => null;
+
+  @override
   void start() {}
 
   @override
   void dispose() {}
+}
+
+/// Tracks the phone's compass heading from magnetometer
+/// samples, for the entrance guidance's relative directions
+/// (step D adjustment). Pure sample store plus the same
+/// 500 ms freshness rule as the gyroscope judge: a heading
+/// older than [HeadingTracker.freshnessTimeout] is not a
+/// heading at all -- callers must treat it as unknown and
+/// announce distance only, never a direction derived from
+/// stale data.
+class HeadingTracker {
+  static const Duration freshnessTimeout = Duration(milliseconds: 500);
+
+  double? _headingDeg;
+  DateTime? _at;
+
+  /// Record one heading sample (degrees clockwise from
+  /// north; any range is accepted and normalised on read).
+  void addSample(double headingDeg, DateTime now) {
+    _headingDeg = headingDeg;
+    _at = now;
+  }
+
+  /// Record a raw magnetometer vector (microteslas). The
+  /// heading assumes the phone is roughly level with its
+  /// top edge pointing the way the user faces -- the
+  /// chest-worn premise of this app; a strongly tilted
+  /// device makes the value approximate, which is why the
+  /// spoken directions stay coarse (six wide sectors).
+  void addField(double x, double y, DateTime now) {
+    if (x == 0 && y == 0) return;
+    addSample(math.atan2(x, -y) * 180.0 / math.pi, now);
+  }
+
+  /// The heading as of [now], or null when there is no
+  /// sample or the newest sample is older than the
+  /// freshness timeout.
+  double? headingAt(DateTime now) {
+    final DateTime? at = _at;
+    final double? h = _headingDeg;
+    if (at == null || h == null) return null;
+    if (now.difference(at) > freshnessTimeout) return null;
+    return ((h % 360.0) + 360.0) % 360.0;
+  }
+
+  void reset() {
+    _headingDeg = null;
+    _at = null;
+  }
 }

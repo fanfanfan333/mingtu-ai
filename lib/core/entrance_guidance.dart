@@ -1,21 +1,25 @@
 /// Entrance guidance (step D): the phase AFTER the walking
-/// route ends. The route tracker announces "arrived" once the
-/// user is within 60 m of the
-/// destination point; from there this module keeps using the
-/// GPS fixes and the destination's verified GCJ-02 coordinates
-/// to announce the remaining distance and the compass bearing
-/// of the destination point, until the user is within
+/// route ends. The route tracker hands over once the user
+/// is within 30 m of the destination point with a fix
+/// accurate to 20 m or better; from there this module keeps
+/// using the GPS fixes and the destination's verified
+/// GCJ-02 coordinates to announce the remaining distance
+/// and the direction of the destination point RELATIVE to
+/// the phone's current heading （前方/左前方/右前方/左侧/右侧/
+/// 身后）, until the user is within
 /// [EntranceGuidance.arriveRadiusM] and the completion line
-/// is spoken.
+/// is spoken. Relative directions need the heading: when
+/// heading data is stale (over 500 ms old) or unavailable,
+/// only the distance is announced.
 ///
 /// Honesty boundary (also stated in the README): phone GPS
 /// near buildings can be off by tens of metres, so this guides
 /// the user to the VICINITY of the destination coordinates.
-/// It never confirms a doorway: the bearing is a compass
-/// direction of the destination point, NOT a walking
+/// It never confirms a doorway: the relative direction
+/// points at the destination point, it is NOT a walking
 /// instruction -- no step-left/step-right wording exists here,
-/// and arrival copy says the entrance itself still has to be
-/// confirmed by cane probing or by asking someone nearby.
+/// and arrival copy says the entrance itself still has to
+/// be confirmed by cane probing or by asking someone nearby.
 ///
 /// Pure and fully testable with simulated fixes.
 library;
@@ -72,10 +76,11 @@ String compassWord(double bearingDeg) {
 /// throttled, or already completed).
 class EntranceGuidance {
   /// Distance (m) at which the route tracker hands over to
-  /// this phase. NavigationTracker.entranceRadiusM mirrors
-  /// this value: the tracker owns the hand-over event, this
-  /// constant is the phase's own bound.
-  static const double enterRadiusM = 60;
+  /// this phase (30 m, adjusted for the ~155 m demo route).
+  /// NavigationTracker.entranceRadiusM mirrors this value:
+  /// the tracker owns the hand-over event, this constant
+  /// is the phase's own bound.
+  static const double enterRadiusM = 30;
 
   /// Distance (m) at or below which the user counts as
   /// arrived and the completion line is spoken.
@@ -132,19 +137,60 @@ class EntranceGuidance {
   static int roundedDistanceM(double distanceM) =>
       ((distanceM + 1e-6) / 10).floor() * 10;
 
-  String _guidanceText(double distanceM, {required bool first}) {
+  /// The six relative direction words. The sector layout
+  /// follows natural language, NOT equal slices: sounds
+  /// from the user's own frame -- ahead means within
+  /// +/-45 degrees, behind within 45 degrees of dead
+  /// behind, and each SIDE (left/right) owns the full
+  /// 90-degree quadrant between them, split at 45 degrees
+  /// from the side axis into front-side and back-side:
+  ///   前方   [-45, 45)     (centred on 0)
+  ///   右前方  [45, 67.5)   (the front part of the
+  ///                        front-right diagonal zone)
+  ///   右侧    [67.5, 135)  (centred on 112.5: everything
+  ///                        from past the diagonal to the
+  ///                        behind boundary is the side)
+  ///   身后    [135, 225)   (centred on 180)
+  ///   左侧    [225, 292.5) (the mirror of the right side)
+  ///   左前方  [292.5, 315) (up to the ahead boundary)
+  /// So +80 degrees is 右侧 (not 右前方): at 80 degrees off
+  /// the nose the destination is beside the user, and the
+  /// announcement must say so.
+  static String relativeDirectionWord(double relativeBearingDeg) {
+    final double r =
+        ((relativeBearingDeg % 360.0) + 360.0) % 360.0;
+    if (r < 45.0 || r >= 315.0) return '前方';
+    if (r < 67.5) return '右前方';
+    if (r < 135.0) return '右侧';
+    if (r < 225.0) return '身后';
+    if (r < 292.5) return '左侧';
+    return '左前方';
+  }
+
+  String _guidanceText(double distanceM,
+      {required bool first, double? headingDeg}) {
     final int n = roundedDistanceM(distanceM);
-    final String word = compassWord(bearingDegrees(_lastPoint!, destination));
+    // The direction clause exists only with a heading: the
+    // caller passes one only when the heading sample is
+    // fresh (see HeadingTracker); a stale or missing
+    // heading announces the distance alone.
+    final String dirClause = headingDeg == null
+        ? ''
+        : '，入口大致在${relativeDirectionWord(bearingDegrees(_lastPoint!, destination) - headingDeg)}';
     if (first) {
       return '已到达$destinationName附近，继续为你指引入口方向。'
-          '还剩约$n米，入口大致在$word方向。请以盲杖探测和现场声音为准。';
+          '还剩约$n米$dirClause。请以盲杖探测和现场声音为准。';
     }
-    return '还剩约$n米，入口大致在$word方向。';
+    return '还剩约$n米$dirClause。';
   }
 
   /// Feed one GPS fix. [accuracyM] is the fix's horizontal
-  /// accuracy in metres (null when unknown).
-  String? onFix(GeoPoint point, double? accuracyM, DateTime now) {
+  /// accuracy in metres (null when unknown). [headingDeg]
+  /// is the phone's current heading in degrees clockwise
+  /// from north, or null when no fresh heading is available
+  /// (announcements then carry the distance only).
+  String? onFix(GeoPoint point, double? accuracyM, DateTime now,
+      {double? headingDeg}) {
     if (_completed) return null;
     if (accuracyM == null || accuracyM > maxTrustedAccuracyM) {
       // Untrusted fix: never derive a distance or bearing
@@ -163,7 +209,7 @@ class EntranceGuidance {
       _started = true;
       _lastAnnouncedDistanceM = d;
       _lastAnnouncedAt = now;
-      return _guidanceText(d, first: true);
+      return _guidanceText(d, first: true, headingDeg: headingDeg);
     }
     final double changed = (d - _lastAnnouncedDistanceM!).abs();
     final bool waited = _lastAnnouncedAt == null ||
@@ -171,7 +217,7 @@ class EntranceGuidance {
     if (changed >= announceEveryM && waited) {
       _lastAnnouncedDistanceM = d;
       _lastAnnouncedAt = now;
-      return _guidanceText(d, first: false);
+      return _guidanceText(d, first: false, headingDeg: headingDeg);
     }
     return null;
   }

@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/adapters/amap_client.dart';
 import 'package:mingtu_ai/core/entrance_guidance.dart';
 import 'package:mingtu_ai/core/navigation_tracker.dart';
+import 'package:mingtu_ai/core/orientation.dart';
 import 'package:mingtu_ai/modules/map_navigation.dart';
 
 /// Step D: entrance guidance after the route ends. Fixtures
@@ -73,7 +74,12 @@ void main() {
       final String? text = g.onFix(southOfLibrary(55), 10, t0);
       expect(text, isNotNull);
       expect(text, contains('已到达图书馆附近，继续为你指引入口方向。'));
-      expect(text, contains('还剩约50米，入口大致在正北方向。'));
+      // No heading was passed, so the announcement is
+      // distance only -- no direction clause at all (a
+      // direction clause now appears only as a RELATIVE
+      // direction with a fresh heading; see below).
+      expect(text, contains('还剩约50米。'));
+      expect(text, isNot(contains('入口大致在')));
       expect(text, contains('请以盲杖探测和现场声音为准。'));
       expect(g.completed, isFalse);
       expect(g.lastDistanceM, closeTo(55, 0.5));
@@ -97,7 +103,7 @@ void main() {
       // 11 m closer and 30 s later: speaks the short update.
       final String? text = g.onFix(
           southOfLibrary(44), 10, t0.add(const Duration(seconds: 30)));
-      expect(text, '还剩约40米，入口大致在正北方向。');
+      expect(text, '还剩约40米。');
     });
 
     test('distance change without the interval stays silent', () {
@@ -112,7 +118,7 @@ void main() {
       expect(
           g.onFix(southOfLibrary(40), 10,
               t0.add(const Duration(seconds: 16))),
-          '还剩约40米，入口大致在正北方向。');
+          '还剩约40米。');
     });
 
     test('untrusted fixes never produce numbers', () {
@@ -165,38 +171,142 @@ void main() {
     });
   });
 
-  group('tracker hand-over', () {
+  group('relative direction words (Step D adjustment)', () {
+    test('the six sector centres', () {
+      expect(EntranceGuidance.relativeDirectionWord(0), '前方');
+      expect(EntranceGuidance.relativeDirectionWord(60), '右前方');
+      expect(EntranceGuidance.relativeDirectionWord(112), '右侧');
+      expect(EntranceGuidance.relativeDirectionWord(180), '身后');
+      expect(EntranceGuidance.relativeDirectionWord(247), '左侧');
+      expect(EntranceGuidance.relativeDirectionWord(303), '左前方');
+    });
+
+    test('sector boundaries follow natural language', () {
+      // Ahead/behind own +/-45 degrees around 0/180; each
+      // side quadrant splits at 45 degrees from the side
+      // axis (the project lead's examples: +80 is the right
+      // SIDE -- the destination is beside the user, not
+      // front-right -- and -80 is the left side).
+      expect(EntranceGuidance.relativeDirectionWord(44), '前方');
+      expect(EntranceGuidance.relativeDirectionWord(45), '右前方');
+      expect(EntranceGuidance.relativeDirectionWord(80), '右侧');
+      expect(EntranceGuidance.relativeDirectionWord(89), '右侧');
+      expect(EntranceGuidance.relativeDirectionWord(-80), '左侧');
+      expect(EntranceGuidance.relativeDirectionWord(-90), '左侧');
+      expect(EntranceGuidance.relativeDirectionWord(134), '右侧');
+      expect(EntranceGuidance.relativeDirectionWord(135), '身后');
+      expect(EntranceGuidance.relativeDirectionWord(269), '左侧');
+      expect(EntranceGuidance.relativeDirectionWord(292), '左侧');
+      expect(EntranceGuidance.relativeDirectionWord(293), '左前方');
+    });
+
     test(
-        'arrived fires once inside the 60 m entrance radius '
-        'and route following stops', () {
-      final NavigationTracker t = NavigationTracker(
-        steps: const <AmapStep>[
-          AmapStep(
-            action: '直行',
-            orientation: '南',
-            polyline: <GeoPoint>[gate, library],
-            distanceM: 180,
-            durationS: 150,
-          ),
-        ],
-        stepTexts: const <String>['直行。'],
-        destination: library,
-        destinationName: '图书馆',
-      );
-      NavFix fix(GeoPoint p) => NavFix(
-            point: p,
-            accuracyM: 10,
-            at: DateTime(2026, 1, 1, 12),
-          );
-      // ~50 m out: hand-over fires (the old 20 m arrival
-      // would not have fired here).
-      final List<NavEvent> ev = t.onFix(fix(southOfLibrary(50)));
+        'end to end through onFix: heading rotates the '
+        'relative direction', () {
+      final DateTime t0 = DateTime(2026, 1, 1, 12);
+      EntranceGuidance make() =>
+          EntranceGuidance(destinationName: '图书馆', destination: library);
+      // Standing 25 m due south of the library: the
+      // destination bears due north (0 degrees).
+      final String? ahead =
+          make().onFix(southOfLibrary(25), 10, t0, headingDeg: 0);
+      expect(ahead, contains('入口大致在前方'));
+      final String? behind =
+          make().onFix(southOfLibrary(25), 10, t0, headingDeg: 180);
+      expect(behind, contains('入口大致在身后'));
+      expect(behind, contains('身后'));
+      // Heading 90 (facing east): relative bearing is
+      // 0 - 90 = -90, squarely the left SIDE sector.
+      final String? side =
+          make().onFix(southOfLibrary(25), 10, t0, headingDeg: 90);
+      expect(side, contains('入口大致在左侧'));
+    });
+  });
+
+  group('heading freshness (Step D adjustment)', () {
+    test(
+        'a heading sample is fresh at 400 ms and stale at '
+        '600 ms; a stale heading announces distance only', () {
+      final DateTime t0 = DateTime(2026, 1, 1, 12);
+      final HeadingTracker tracker = HeadingTracker();
+      tracker.addSample(90, t0);
+      expect(tracker.headingAt(t0.add(const Duration(milliseconds: 400))),
+          90);
+      expect(tracker.headingAt(t0.add(const Duration(milliseconds: 600))),
+          isNull);
+
+      // The caller passes headingDeg only when headingAt is
+      // non-null; with the expired sample it passes null
+      // and the announcement carries no direction clause.
+      final EntranceGuidance g =
+          EntranceGuidance(destinationName: '图书馆', destination: library);
+      final String? text = g.onFix(southOfLibrary(25), 10, t0,
+          headingDeg:
+              tracker.headingAt(t0.add(const Duration(milliseconds: 600))));
+      expect(text, contains('还剩约'));
+      expect(text, isNot(contains('入口大致在')));
+    });
+  });
+
+  group('tracker hand-over', () {
+    NavigationTracker makeTracker() => NavigationTracker(
+          steps: const <AmapStep>[
+            AmapStep(
+              action: '直行',
+              orientation: '南',
+              polyline: <GeoPoint>[gate, library],
+              distanceM: 180,
+              durationS: 150,
+            ),
+          ],
+          stepTexts: const <String>['直行。'],
+          destination: library,
+          destinationName: '图书馆',
+        );
+    NavFix fix(GeoPoint p, double acc) => NavFix(
+          point: p,
+          accuracyM: acc,
+          at: DateTime(2026, 1, 1, 12),
+        );
+
+    test(
+        'hand-over needs BOTH <= 30 m and accuracy <= 20 m: '
+        '50 m does not fire, 28 m with accuracy 10 fires once',
+        () {
+      final NavigationTracker t = makeTracker();
+      // ~50 m out with a good fix: inside the OLD 60 m
+      // radius but outside the adjusted 30 m one -- no
+      // arrived event (ordinary route processing only).
+      final List<NavEvent> ev50 = t.onFix(fix(southOfLibrary(50), 10));
+      expect(ev50.where((NavEvent e) => e.kind == NavEventKind.arrived),
+          isEmpty);
+      expect(t.arrived, isFalse);
+      // 28 m with accuracy 10: hand-over fires, exactly
+      // once.
+      final List<NavEvent> ev = t.onFix(fix(southOfLibrary(28), 10));
       expect(ev.single.kind, NavEventKind.arrived);
       expect(ev.single.text, contains('已到达图书馆附近'));
       expect(t.arrived, isTrue);
       // Once handed over, no further route events at all.
-      expect(t.onFix(fix(southOfLibrary(30))), isEmpty);
-      expect(t.onFix(fix(southOfLibrary(80))), isEmpty);
+      expect(t.onFix(fix(southOfLibrary(28), 10)), isEmpty);
+      expect(t.onFix(fix(southOfLibrary(80), 10)), isEmpty);
+    });
+
+    test(
+        'the accuracy gate alone can hold the hand-over: '
+        '25 m with accuracy 30 waits, accuracy 15 hands over',
+        () {
+      final NavigationTracker t = makeTracker();
+      final List<NavEvent> coarse = t.onFix(fix(southOfLibrary(25), 30));
+      expect(
+          coarse.where((NavEvent e) => e.kind == NavEventKind.arrived),
+          isEmpty);
+      expect(t.arrived, isFalse);
+      // Same distance, accuracy now good enough: the gate
+      // was the accuracy, not the position.
+      final List<NavEvent> fine = t.onFix(fix(southOfLibrary(25), 15));
+      expect(fine.single.kind, NavEventKind.arrived);
+      expect(t.arrived, isTrue);
     });
   });
 

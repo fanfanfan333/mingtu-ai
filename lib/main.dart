@@ -264,6 +264,33 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// but the guard keeps the contract explicit).
   bool _pushToTalkHeld = false;
 
+  /// True while the push-to-talk press sequence is running
+  /// (cue spoken directly, then the session starts). A
+  /// release that lands mid-sequence cancels the pending
+  /// session start instead of leaving the microphone open.
+  bool _pushToTalkStarting = false;
+
+  /// True when THIS press owns the listening session: the
+  /// automatic session (if any) was stopped for the press
+  /// and must not be mistaken for the push-to-talk session,
+  /// and releasing the button stops exactly this session.
+  bool _pushToTalkSession = false;
+
+  /// Whether any transcript arrived during the current
+  /// push-to-talk session; releasing with none (too short,
+  /// or nothing recognised) gets the fixed no-content
+  /// notice instead of silence.
+  bool _pushToTalkHeard = false;
+
+  /// When the current press began (for the under-300ms
+  /// too-short rule), and whether the AUTOMATIC session was
+  /// the one listening when the press began. The press stops
+  /// that session first; on release the automatic loop
+  /// resumes only if it was actually running before --
+  /// push-to-talk must not invent auto-listen state.
+  DateTime? _pushToTalkPressedAt;
+  bool _autoListenWasActive = false;
+
   /// The ownership lease for the live view, held while it is
   /// open; only this lease can release the camera, and the
   /// release waits for the view to actually unmount.
@@ -282,6 +309,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // user can ask to hear it again.
   final TextEditingController _voiceController = TextEditingController();
   String _lastSpokenText = '';
+
+  /// When the utterance the sequencer most recently started
+  /// playing began; a push-to-talk press uses it to recognise
+  /// a just-started P0 utterance whose scheduler entry has
+  /// already completed (see _interruptSpeechForPushToTalk).
+  DateTime? _lastSpeechStartedAt;
+
+  /// The text of the most recent P0 (danger/emergency)
+  /// utterance actually played; compared against
+  /// _lastSpokenText by the push-to-talk interruption rules.
+  String _lastP0SpokenText = '';
+
+  /// When a physical stop was last issued inside an
+  /// utterance's first moments; see _trackedSpeak.
+  DateTime? _pttStoppedUtteranceAt;
 
   @override
   void initState() {
@@ -543,7 +585,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _handleEntranceFix(LocationResult r) {
     final EntranceGuidance g = _entrance!;
     final DateTime now = DateTime.now();
-    final String? text = g.onFix(r.pointGcj02!, r.accuracyM, now);
+    final String? text = g.onFix(
+      r.pointGcj02!,
+      r.accuracyM,
+      now,
+      headingDeg: _currentHeadingDeg(),
+    );
     setState(() {
       // The status line reads g.lastDistanceM.
     });
@@ -573,6 +620,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
     if (done) _finishEntranceTrip();
   }
+
+  /// The phone's current compass heading, or null when it
+  /// is stale (over 500 ms) or the platform has no heading
+  /// source -- entrance guidance then announces the
+  /// distance alone, never a direction from old data.
+  double? _currentHeadingDeg() => _orientation.currentHeadingDeg;
 
   /// The entrance phase's trip end: identical to the old
   /// tracker-arrival ending (session ends, task completes,
@@ -624,8 +677,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         final GeoPoint? handOverFix = _lastFixPoint;
         final String? firstText = handOverFix == null
             ? null
-            : _entrance!
-                .onFix(handOverFix, _lastFixAccuracyM, DateTime.now());
+            : _entrance!.onFix(
+                handOverFix,
+                _lastFixAccuracyM,
+                DateTime.now(),
+                headingDeg: _currentHeadingDeg(),
+              );
         final bool doneNow = _entrance!.completed;
         _say(_request(
           id: 'entrance-${doneNow ? 'arrived' : 'start'}-$ts',
@@ -788,6 +845,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _voiceInput = asr;
       _transcriptSub = asr.transcripts.listen((String text) {
         if (!mounted) return;
+        if (_pushToTalkSession) _pushToTalkHeard = true;
         // While the destination question is open, an utterance
         // that is not a known command IS the answer. A real
         // command (停下 / 求助 / 去图书馆 ...) supersedes the
@@ -927,6 +985,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// [_finishSpeech] (after the welcome greeting, and after every
   /// prompt while a task is running) -- never while TTS is speaking.
   void _maybeStartListeningAfterSpeech() {
+    // Push-to-talk owns the microphone while held: the
+    // automatic loop must never start a second, overlapping
+    // session (Codex re-test of Step C).
+    if (_pushToTalkHeld || _pushToTalkStarting || _pushToTalkSession) {
+      return;
+    }
     // After a runtime TTS failure the loop stays off: speech state
     // is untrusted, and ASR must not auto-restart (re-test fix).
     if (_ttsFailed) return;
@@ -953,6 +1017,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// or queued (that path restarts via _finishSpeech) and
   /// when the loop was deliberately switched off.
   void _onAsrSessionEnded() {
+    if (_pushToTalkHeld || _pushToTalkStarting || _pushToTalkSession) {
+      return;
+    }
     if (!_autoListenEnabled || _ttsFailed) return;
     if (_scheduler.active != null || _scheduler.queue.isNotEmpty) return;
     if (_voiceInput is! SystemVoiceInput) return;
@@ -1171,11 +1238,44 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 
+  /// Speak [request] through the output while tracking the
+  /// playback for the push-to-talk interruption rules: the
+  /// start time and (for P0 kinds) the text are recorded
+  /// when playback actually begins, and a physical stop
+  /// issued within the current utterance's first moments
+  /// does not let that utterance's instant completion
+  /// finish the request early.
+  Future<void> _trackedSpeak(SpeechRequest request) async {
+    _lastSpeechStartedAt = DateTime.now();
+    if (request.kind == SpeechKind.danger ||
+        request.kind == SpeechKind.emergency) {
+      _lastP0SpokenText = request.text;
+    }
+    final DateTime myStart = _lastSpeechStartedAt!;
+    final Future<void> playback = _voiceOutput.speak(request.text);
+    final DateTime? stoppedAt = _pttStoppedUtteranceAt;
+    if (stoppedAt == null || stoppedAt.isBefore(myStart)) {
+      await playback;
+      return;
+    }
+    // A stop landed inside this utterance's first moments
+    // (a push-to-talk press interrupting it): the engine
+    // may complete instantly for the stop, but the request
+    // stays active and its completion is ignored by the
+    // scheduler's cancel guard, so wait the playback out.
+    try {
+      await playback;
+    } catch (_) {
+      // Treated like a completed (interrupted) utterance;
+      // the caller's cancelled-request guard discards it.
+    }
+  }
+
   /// Play the active prompt: real TTS when available,
   /// simulated timing otherwise.
   void _playActiveRequest(SpeechRequest request) {
     if (_voiceOutput.isAvailable) {
-      _voiceOutput.speak(request.text).then((_) {
+      _trackedSpeak(request).then((_) {
         // Stop-race guard (Codex re-test): a request the user has
         // since cancelled (pause/cancel -> cancelAll) may complete
         // late; its completion must not drive _finishSpeech (which
@@ -1239,6 +1339,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _simulateSpeechCompletion(String id) {
     Future<void>.delayed(const Duration(milliseconds: 1200), () {
       if (!mounted) {
+        return;
+      }
+      // An entry cancelled while its simulated playback ran
+      // (e.g. a push-to-talk press interrupting it) must not
+      // complete: its finish would reopen the microphone
+      // mid-press. Real playback gets the same protection
+      // from the stop-race guard on the speak callbacks.
+      if (_scheduler.cancelledLog.contains(id)) {
+        _logMsg('已取消播报的模拟完成已忽略（$id）。');
         return;
       }
       _finishSpeech(id);
@@ -1576,53 +1685,225 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
-  /// v0.6: one short ASR session (max 10 s). Recognised text flows
-  /// through the transcript subscription into _handleVoiceCommand.
-  /// Not continuous listening: the session stops on silence.
-  /// Step C push-to-talk, press start: haptic confirmation
-  /// plus the spoken cue. The prompt goes through the normal
-  /// scheduler, so when voice output itself is unavailable it
-  /// follows the existing honest fallback (status text, no
-  /// simulated success).
+  /// Push-to-talk press sequence (Step C, ordering fixed
+  /// by the Codex re-test, refined per the project lead):
+  ///   1. vibrate;
+  ///   2. stop the AUTOMATIC listening session if one is
+  ///      open, and stop any playing TTS utterance --
+  ///      EXCEPT a P0 danger/emergency prompt, which a
+  ///      press must never interrupt;
+  ///   3. speak the short cue DIRECTLY through the voice
+  ///      output and AWAIT its completion (never through
+  ///      the scheduler, whose finish would reopen the
+  ///      automatic loop mid-press), so the cue is never
+  ///      recorded;
+  ///   4. only then start the push-to-talk session.
+  /// Release stops the session and the recogniser delivers
+  /// its final result through the existing transcript
+  /// subscription (that delivery IS the submission). A
+  /// press released under 300 ms is too short: the fixed
+  /// notice asks the user to hold the button. A start
+  /// failure vibrates and speaks the fixed ASR-unavailable
+  /// notice like every other ASR failure path.
   void _pushToTalkStart() {
     if (_pushToTalkHeld) return;
     _pushToTalkHeld = true;
+    _pushToTalkStarting = true;
+    _pushToTalkHeard = false;
+    _pushToTalkPressedAt = DateTime.now();
+    _autoListenWasActive = _voiceInput is SystemVoiceInput &&
+        (_voiceInput as SystemVoiceInput).isListening;
     HapticFeedback.vibrate();
-    _say(_request(
-      id: 'push-to-talk-${DateTime.now().millisecondsSinceEpoch}',
-      eventId: 'push-to-talk-${DateTime.now().millisecondsSinceEpoch}',
-      text: '请说',
-      kind: SpeechKind.info,
-    ));
+    unawaited(_pushToTalkSequence());
   }
 
-  /// Step C push-to-talk, release: start recognition through
-  /// the EXISTING path -- _startListening already handles an
-  /// unavailable recogniser (logs it, no fake success), the
-  /// auto-listen flag and the startup failure announcements.
-  /// Coexists with the automatic continuous relisten loop,
-  /// which is untouched.
-  void _pushToTalkEnd() {
-    if (!_pushToTalkHeld) return;
-    _pushToTalkHeld = false;
-    if (_voiceInput.isAvailable &&
-        _voiceInput is SystemVoiceInput &&
-        (_voiceInput as SystemVoiceInput).isListening) {
-      _logMsg('按住说话：识别已在进行中，本次松开不重复启动。');
+  Future<void> _pushToTalkSequence() async {
+    // (2a) The automatic session yields the microphone.
+    if (_autoListenWasActive) {
+      await _stopListeningInternal();
+    }
+    // (2b) A playing non-P0 utterance is interrupted; a P0
+    // danger/emergency prompt is left playing untouched.
+    await _interruptSpeechForPushToTalk();
+    if (!mounted) return;
+    // (3) The cue, directly and awaited.
+    if (_voiceOutput.isAvailable && !_ttsFailed) {
+      setState(() {
+        _currentPrompt = '请说';
+      });
+      try {
+        await speakAfterClosingMic(
+          input: _voiceInput is SystemVoiceInput
+              ? _voiceInput as SystemVoiceInput
+              : null,
+          speak: () => _voiceOutput.speak('请说'),
+        );
+      } catch (e) {
+        if (mounted) _handleTtsFailure(e);
+      }
+    }
+    if (!mounted) return;
+    _pushToTalkStarting = false;
+    if (!_pushToTalkHeld) {
+      // Released while the sequence still ran: too short.
+      _announcePushToTalkTooShort();
       return;
     }
+    // (4) The session starts only now.
+    final bool started = await _startListening(pushToTalk: true);
+    if (!mounted) return;
+    if (started) {
+      _pushToTalkSession = true;
+    } else if (_pushToTalkHeld) {
+      // The failure was already announced by _startListening
+      // (vibration + fixed notice). The press is over.
+      _pushToTalkHeld = false;
+      _restoreAutoListenAfterPushToTalk();
+    }
+  }
+
+  /// Release of the push-to-talk button: stop the session
+  /// owned by this press and let the final result arrive
+  /// through the transcript subscription. No content at
+  /// all (or a press under 300 ms) gets the fixed notices,
+  /// never silence. The automatic loop then resumes ONLY
+  /// if it was running before the press, through the
+  /// ordinary turn-taking conditions.
+  Future<void> _pushToTalkEnd() async {
+    if (!_pushToTalkHeld) return;
+    _pushToTalkHeld = false;
+    final DateTime? pressedAt = _pushToTalkPressedAt;
+    _pushToTalkPressedAt = null;
+    final bool tooShort = pressedAt == null ||
+        DateTime.now().difference(pressedAt) <
+            const Duration(milliseconds: 300);
+    if (_pushToTalkStarting) {
+      // The sequence notices the release and answers with
+      // the too-short notice; nothing starts here.
+      return;
+    }
+    if (!_pushToTalkSession) return;
+    _pushToTalkSession = false;
+    if (tooShort) {
+      await _stopListeningInternal();
+      if (!mounted) return;
+      _announcePushToTalkTooShort();
+      return;
+    }
+    await _stopListeningInternal();
+    if (!mounted) return;
+    if (!_pushToTalkHeard) {
+      _announcePushToTalkNoContent();
+      return;
+    }
+    // Content was submitted and handled quietly (a command
+    // that speaks for itself reopens the loop through its
+    // own finish-speech anyway): hand the microphone back.
+    _restoreAutoListenAfterPushToTalk();
+  }
+
+  /// Stop the currently playing utterance for a press --
+  /// unless it is P0. Two layers, because the physical stop
+  /// has no cancel callback: while a cancellable prompt is
+  /// still the scheduler's ACTIVE entry, cancelAll both
+  /// drops it (its late completion is ignored by the
+  /// stop-race guard) and the physical stop silences it.
+  /// When the entry already completed -- a simulated
+  /// prompt whose playback outlives its entry, or a P0
+  /// prompt inside its post-completion window -- the
+  /// playback is recognised by recency and kind: recent
+  /// non-P0 playback is stopped physically, recent P0
+  /// playback is left completely alone.
+  Future<void> _interruptSpeechForPushToTalk() async {
+    final SpeechRequest? active = _scheduler.active;
+    if (active != null) {
+      if (active.kind == SpeechKind.danger ||
+          active.kind == SpeechKind.emergency) {
+        return; // P0 playing: never interrupt.
+      }
+      _scheduler.cancelAll();
+      await _stopTtsPlayback();
+      return;
+    }
+    final DateTime? startedAt = _lastSpeechStartedAt;
+    if (startedAt != null &&
+        DateTime.now().difference(startedAt) <
+            const Duration(milliseconds: 1500)) {
+      if (_lastSpokenText == _lastP0SpokenText) return;
+      await _stopTtsPlayback();
+    }
+  }
+
+  /// Resume the automatic loop after a press, ONLY when it
+  /// was running before the press and the ordinary
+  /// turn-taking conditions hold (loop enabled, no TTS
+  /// failure, nothing speaking or queued).
+  void _restoreAutoListenAfterPushToTalk() {
+    if (!_autoListenWasActive) return;
+    _autoListenWasActive = false;
+    if (!_autoListenEnabled || _ttsFailed) return;
+    if (_scheduler.active != null || _scheduler.queue.isNotEmpty) return;
+    if (_voiceInput is! SystemVoiceInput) return;
+    if ((_voiceInput as SystemVoiceInput).isListening) return;
     unawaited(_startListening());
   }
 
-  Future<void> _startListening() async {
+  /// Too-short press (under 300 ms): the fixed instruction.
+  void _announcePushToTalkTooShort() {
+    _logMsg('按住说话：按住时间不足 300 毫秒，未启动识别。');
+    _restoreAutoListenAfterPushToTalk();
+    if (_voiceOutput.isAvailable && !_ttsFailed) {
+      _say(_request(
+        id: 'ptt-short-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'ptt-short-${DateTime.now().millisecondsSinceEpoch}',
+        text: '请按住说话',
+        kind: SpeechKind.alert,
+      ));
+    }
+  }
+
+  /// A full press that recognised nothing: the fixed retry
+  /// instruction (distinct from the too-short text).
+  void _announcePushToTalkNoContent() {
+    _logMsg('按住说话：未识别到内容（没有听清）。');
+    _restoreAutoListenAfterPushToTalk();
+    if (_voiceOutput.isAvailable && !_ttsFailed) {
+      _say(_request(
+        id: 'ptt-empty-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'ptt-empty-${DateTime.now().millisecondsSinceEpoch}',
+        text: '没有听清，请按住按钮再说一次。',
+        kind: SpeechKind.alert,
+      ));
+    }
+  }
+
+  /// Start one listening session. With [pushToTalk] the
+  /// session belongs to the held button and the automatic
+  /// turn-taking flag is left untouched. Returns whether a
+  /// session actually started. EVERY failure to start --
+  /// recogniser unavailable or engine refusal -- vibrates
+  /// and speaks the fixed ASR-unavailable notice through
+  /// the working voice: no ASR failure path is silent or
+  /// vibration-free (the startup and error-stream paths
+  /// already did; the start paths now match).
+  Future<bool> _startListening({bool pushToTalk = false}) async {
     if (!_voiceInput.isAvailable) {
       _logMsg('语音识别不可用：${_voiceInput.status}');
-      return;
+      HapticFeedback.vibrate();
+      if (_voiceOutput.isAvailable) {
+        _say(_request(
+          id: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
+          text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
+          kind: SpeechKind.alert,
+        ));
+      }
+      return false;
     }
-    _autoListenEnabled = true;
+    if (!pushToTalk) _autoListenEnabled = true;
     final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
     final bool started = await input.startListening();
-    if (!mounted) return;
+    if (!mounted) return started;
     setState(() {
       _voiceText = started
           ? '语音识别进行中：请说一句话（最长 10 秒，说完停顿即结束）。'
@@ -1630,15 +1911,34 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     });
     if (started) {
       _logMsg('语音识别已开始：请说一句话。');
-    } else if (_voiceOutput.isAvailable) {
-      // Runtime ASR failure must not be silent either: announce it
-      // through the working voice, with the recoverable next step.
-      _say(_request(
-        id: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
-        eventId: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
-        text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
-        kind: SpeechKind.alert,
-      ));
+    } else {
+      HapticFeedback.vibrate();
+      if (_voiceOutput.isAvailable) {
+        // Runtime ASR failure must not be silent either: announce it
+        // through the working voice, with the recoverable next step.
+        _say(_request(
+          id: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'asr-failed-${DateTime.now().millisecondsSinceEpoch}',
+          text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
+          kind: SpeechKind.alert,
+        ));
+      }
+    }
+    return started;
+  }
+
+  /// Stop the current listening session WITHOUT touching
+  /// the automatic turn-taking flags (unlike the manual
+  /// _stopListening button path, which deliberately switches
+  /// the loop off). Used by push-to-talk, which borrows the
+  /// microphone and hands it back.
+  Future<void> _stopListeningInternal() async {
+    if (_voiceInput is SystemVoiceInput) {
+      try {
+        await (_voiceInput as SystemVoiceInput).stopListening();
+      } catch (e) {
+        _logMsg('停止语音识别失败，麦克风可能仍在监听：$e');
+      }
     }
   }
 
@@ -1652,6 +1952,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   Future<void> _stopTtsPlayback() async {
     final VoiceOutput out = _voiceOutput;
     if (out is SystemVoiceOutput) {
+      _pttStoppedUtteranceAt = DateTime.now();
       try {
         await out.stop();
       } catch (e) {
@@ -3251,39 +3552,65 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                     color: Colors.black12,
                     alignment: Alignment.center,
                     padding: const EdgeInsets.all(16),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: <Widget>[
-                        const Text(
-                          '摄像头未开启',
-                          style: TextStyle(
-                              fontSize: 24, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 4),
-                        const Text('导航开始时会自动开启；也可以点下面按钮开启。'),
-                        const SizedBox(height: 8),
-                        ElevatedButton(
-                          onPressed: () => unawaited(_openYoloLive()),
-                          child: const Text('打开摄像头（YOLO 实时检测）',
-                              style: TextStyle(fontSize: 20)),
-                        ),
-                      ],
+                    // The placeholder content scales down on
+                    // small screens with large text instead of
+                    // overflowing the fixed camera area. (No
+                    // nested scrollable here: the demo panel
+                    // below is the page's single vertical
+                    // scroll region.)
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: <Widget>[
+                          const Text(
+                            '摄像头未开启',
+                            style: TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.bold),
+                          ),
+                          const SizedBox(height: 4),
+                          const Text('导航开始时会自动开启；也可以点下面按钮开启。'),
+                          const SizedBox(height: 8),
+                          ElevatedButton(
+                            onPressed: () => unawaited(_openYoloLive()),
+                            child: const Text('打开摄像头（YOLO 实时检测）',
+                                style: TextStyle(fontSize: 20)),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
           ),
           const SizedBox(height: 12),
           // Step C: the one very large push-to-talk button.
-          // Hold: vibrate + speak the cue. Release: start
-          // recognition through the existing _startListening
-          // path. The button is never disabled: with no
-          // recogniser the release still produces the existing
-          // logged feedback instead of dead silence.
+          // Hold: vibrate, stop the automatic session and
+          // any non-P0 speech, speak the cue and await it,
+          // then listen while held. Release: stop listening
+          // and submit the result. The button is never
+          // disabled: with no recogniser the press still
+          // produces the vibrated, spoken failure feedback
+          // instead of dead silence. The semantics node
+          // carries a long-press action so TalkBack users
+          // can trigger the same press-and-hold flow.
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 24),
             child: Semantics(
               button: true,
               container: true,
               label: '按住说话按钮，按住后说话，松开结束',
+              onLongPress: () {
+                _pushToTalkStart();
+                // TalkBack has no physical hold-and-release:
+                // a long-press action starts the turn, and a
+                // generous window later the turn ends and
+                // submits, like a release.
+                Future<void>.delayed(const Duration(seconds: 10), () {
+                  if (mounted && _pushToTalkHeld) {
+                    unawaited(_pushToTalkEnd());
+                  }
+                });
+              },
               child: GestureDetector(
                 onLongPressStart: (_) => _pushToTalkStart(),
                 onLongPressEnd: (_) => _pushToTalkEnd(),

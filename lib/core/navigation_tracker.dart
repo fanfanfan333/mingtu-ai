@@ -79,7 +79,17 @@ class NavigationTracker {
   /// so this file has no import cycle with the guidance
   /// module). The trip's actual arrival radius (15 m) lives
   /// in EntranceGuidance.arriveRadiusM.
-  static const double entranceRadiusM = 60;
+  /// Hand-over radius to entrance guidance (step D,
+  /// adjusted): the demo route is only ~155 m long, so the
+  /// route keeps guiding until 30 m out. Mirrored by
+  /// EntranceGuidance.enterRadiusM.
+  static const double entranceRadiusM = 30;
+
+  /// The hand-over additionally requires a trustworthy fix:
+  /// only accuracy at or below this (m) may end route
+  /// following. A sloppy fix that close to the destination
+  /// is not evidence the user is really there.
+  static const double handoverMaxAccuracyM = 20;
   static const double weakAccuracyM = 50;
   static const Duration weakSignalCooldown = Duration(seconds: 60);
   static const Duration rerouteMinInterval = Duration(seconds: 60);
@@ -196,13 +206,18 @@ class NavigationTracker {
     remainingM = (_cum.last - _cum[nearestIdx]).clamp(0, double.infinity);
 
     // Hand-over to entrance guidance: within the entrance
-    // radius the route's job is done, but the trip is NOT
-    // over -- the guidance phase keeps announcing distance
-    // and bearing to the destination point. The event text
-    // is a neutral hand-over marker; main speaks the
-    // guidance phase's own first announcement instead, so
-    // this text never reaches the user as-is.
-    if (haversineMeters(fix.point, destination) <= entranceRadiusM) {
+    // radius AND with a fix accurate enough to trust at
+    // that range (see handoverMaxAccuracyM), the route's
+    // job is done, but the trip is NOT over -- the guidance
+    // phase keeps announcing distance and relative
+    // direction to the destination point. A fix inside the
+    // radius but too inaccurate does NOT hand over: route
+    // following continues. The event text is a neutral
+    // hand-over marker; main speaks the guidance phase's
+    // own first announcement instead, so this text never
+    // reaches the user as-is.
+    if (haversineMeters(fix.point, destination) <= entranceRadiusM &&
+        accM <= handoverMaxAccuracyM) {
       arrived = true;
       events.add(NavEvent(
         NavEventKind.arrived,
