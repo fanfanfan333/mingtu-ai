@@ -202,6 +202,23 @@ String _asrFailureCode(Object e) {
 }
 
 class SystemVoiceInput implements VoiceInput {
+  /// Codes of transient recogniser outcomes that are NOT
+  /// failures: a stop whose session produced no final
+  /// match, a silence timeout. Real recognisers deliver
+  /// these routinely at the end of a stopped session.
+  /// Error codes that are routine session OUTCOMES, not
+  /// engine failures: a session that ends without a match,
+  /// or in silence. A recogniser reports these for
+  /// ordinary sessions constantly (every silence-ended
+  /// auto-listen, every stopped session with no final).
+  /// They never travel on the error stream: the app's
+  /// error handler disables its listening loop on ANY
+  /// error it receives, so forwarding them would kill
+  /// voice control on the first quiet session.
+  static const Set<String> _benignCloseErrorCodes = <String>{
+    'error_no_match',
+    'error_speech_timeout',
+  };
   // Created lazily inside initialize(), for the same reason as
   // SystemVoiceOutput (see above).
   stt.SpeechToText? _speech;
@@ -213,6 +230,8 @@ class SystemVoiceInput implements VoiceInput {
       StreamController<String>.broadcast();
   final StreamController<AsrStatusEvent> _sessionEndController =
       StreamController<AsrStatusEvent>.broadcast();
+  final StreamController<String> _engineController =
+      StreamController<String>.broadcast();
   bool _available = false;
   String _detail = '未初始化';
   bool _listening = false;
@@ -234,6 +253,23 @@ class SystemVoiceInput implements VoiceInput {
   /// it, a session that ended in silence left the microphone
   /// closed forever and voice control appeared dead.
   Stream<AsrStatusEvent> get sessionEnded => _sessionEndController.stream;
+
+  /// Set by the owner when this input is being torn
+  /// down: a disposed input must not restart its engine
+  /// (its streams are closed; the restart would leak
+  /// timers past the owner's lifetime). The adapter's own
+  /// dispose() also sets it, but owners that merely drop
+  /// the input (a widget State being disposed while the
+  /// input object itself is never disposed) must set it
+  /// too.
+  bool engineDisposed = false;
+
+  /// The engine object registrations were made against,
+  /// or null when no engine object exists yet (the real
+  /// plugin path constructs it lazily in [initialize]).
+  /// Exposed so tests can tell an in-place re-initialize
+  /// of an injected recogniser apart from a fresh engine.
+  Object? get engineInstanceForTest => _engineSpeech;
 
   /// The current listen generation: minted once per
   /// startListening() call. Consumers read the generation
@@ -271,38 +307,242 @@ class SystemVoiceInput implements VoiceInput {
   /// other stop/cancel closes the gate at initiation.
   bool acceptStoppingResults = false;
 
-  bool _sessionOpen = false;
-  bool _stopReturned = false;
-  bool _closeStatusSeen = false;
+  // --- Unconfirmed-close bookkeeping (this round) ---
+  //
+  // Platform results and statuses carry NO session
+  // identity, so the adapter never GUESSES one from a
+  // timeout. Instead it counts unconfirmed closes:
+  // every stop()/cancel() the app initiates opens one
+  // pending close; the session-closing platform status
+  // (notListening/done) consumes exactly one. While the
+  // count is above zero, NO new listen may start, a
+  // closing status is consumed silently (it never ends
+  // -- or is mistaken for -- any live session), and
+  // results still arrive under the OLD session's own
+  // closure and id. Only when the count reaches zero
+  // again is a session allowed to open.
+  int _pendingCloses = 0;
+
+  /// How many initiated stops/cancels still await their
+  /// closing platform status.
+  int get pendingCloses => _pendingCloses;
+
   Completer<void>? _closeCompleter;
 
-  /// True while a session is live or still closing; the
-  /// app reads this to hold back a new press's prompt step
-  /// until the previous session is fully closed.
-  bool get sessionOpen => _sessionOpen;
+  /// True while any initiated stop/cancel still awaits
+  /// its closing status; the app reads this to hold back
+  /// a new press's prompt step until the previous
+  /// session is confirmed closed. Kept from the previous
+  /// round under its old meaning: "a session is still
+  /// closing", now carried by the pending-close count.
+  bool get sessionOpen => _pendingCloses > 0;
 
-  void _noteCloseProgress() {
-    if (_sessionOpen && _stopReturned && _closeStatusSeen) {
-      _sessionOpen = false;
+  /// Engine-generation events. The only value today is
+  /// 'restarted': the watchdog force-restarted the
+  /// recognition engine because unconfirmed closes never
+  /// resolved, and every pre-restart session is void.
+  Stream<String> get engineEvents => _engineController.stream;
+
+  /// An in-flight session-open attempt, abortable by an
+  /// engine restart. See startListening for the
+  /// generation-handoff race this exists for.
+  Completer<void>? _startBarrier;
+
+  /// The engine generation (epoch): minted at 0 and
+  /// bumped by every watchdog restart. Every engine
+  /// callback registration captures the epoch it was
+  /// registered under; a callback whose epoch is not the
+  /// current one is dropped at entry -- belt and braces
+  /// on top of the plugin's single-listener replacement.
+  int get engineEpoch => _engineEpoch;
+  int _engineEpoch = 0;
+
+  /// The engine instance registrations were made against.
+  /// After a watchdog restart this is a FRESH instance,
+  /// so the forced re-initialize reaches the platform
+  /// instead of short-circuiting inside the singleton.
+  stt.SpeechToText? _engineSpeech;
+
+  /// Whether the current engine object is one this
+  /// adapter constructed itself (a real plugin instance)
+  /// rather than an injected recogniser. Only a
+  /// self-constructed engine is replaced by a fresh
+  /// instance on restart; an injected recogniser is
+  /// re-initialized in place.
+  bool _engineIsPluginInstance = false;
+
+  Timer? _engineWatchdog;
+  Timer? _engineRetryTimer;
+  bool _engineRestarting = false;
+
+  /// Record close progress: one closing status consumes
+  /// one pending close. Callers guarantee the count is
+  /// above zero. When the last close lands, every waiter
+  /// on [awaitSessionClosed] wakes.
+  void _consumePendingClose() {
+    if (_pendingCloses > 0) _pendingCloses--;
+    if (_pendingCloses == 0) {
+      // Every close is confirmed: the watchdog ladder is
+      // stood down. Without this the 3 s timer would fire
+      // on a LATER session's pending close and restart
+      // the engine under a healthy flow.
+      _engineWatchdog?.cancel();
+      _engineWatchdog = null;
+      _engineRetryTimer?.cancel();
+      _engineRetryTimer = null;
       final Completer<void>? c = _closeCompleter;
       _closeCompleter = null;
       if (c != null && !c.isCompleted) c.complete();
     }
   }
 
-  /// Wait until the previous session is fully closed,
-  /// bounded at 800 ms (after the bound the caller may
-  /// proceed; results arriving later still belong to the
-  /// old closure and are validated by consumers).
+  /// Wait until every initiated close is confirmed by a
+  /// platform status -- with NO timeout release: an
+  /// unconfirmed close never opens a new session. The
+  /// only ways out are the closing status itself or the
+  /// watchdog restart (which also completes the wait).
   Future<void> awaitSessionClosed() async {
-    if (!_sessionOpen) return;
+    if (_pendingCloses == 0) return;
     final Completer<void> c = _closeCompleter ??= Completer<void>();
+    await c.future;
+  }
+
+  /// Drive a pending close to its confirmation and wait
+  /// for it. A stopped recogniser's terminal outcome is
+  /// reported to the status listener the plugin registered
+  /// at initialize() time; re-registering the CURRENT
+  /// epoch's listeners through a fresh initialize cycle
+  /// makes the plugin deliver the recogniser's actual
+  /// current status to them (its status listener is
+  /// invoked with the last known status on registration),
+  /// which is the closing outcome this close is waiting
+  /// for. This is NOT a timeout release: nothing proceeds
+  /// until the closing outcome has actually been consumed
+  /// and the count reaches zero (or the watchdog restart
+  /// resolves the wait). Used by the app when IT initiated
+  /// the close and now needs the microphone for a new
+  /// session.
+  Future<void> confirmSessionClose() async {
+    if (_pendingCloses == 0) return;
+    final stt.SpeechToText? speech = _speech;
+    if (speech != null) {
+      try {
+        await _doInitialize(speech);
+      } catch (_) {
+        // A failed re-registration changes nothing: the
+        // wait below still requires the real confirmation.
+      }
+    }
+    await awaitSessionClosed();
+  }
+
+  /// The close watchdog (escalation ladder): while any
+  /// close is unconfirmed, at 3 s the engine is prodded
+  /// with ONE cancel; if the count is still above zero
+  /// 1 s later, the engine is force-restarted. Real-time
+  /// timers: the deadline is wall-clock, not frame time.
+  void _armCloseWatchdog() {
+    _engineWatchdog?.cancel();
+    _engineWatchdog = Timer(const Duration(seconds: 3), () {
+      if (_pendingCloses == 0 || _engineRestarting) return;
+      if (engineDisposed) return;
+      unawaited(_watchdogCancelStep());
+    });
+  }
+
+  Future<void> _watchdogCancelStep() async {
     try {
-      await c.future.timeout(const Duration(milliseconds: 800));
-    } on TimeoutException {
-      // Bounded wait elapsed: proceed; the platform may
-      // still deliver the old session's tail, which the
-      // old closure owns.
+      // A prod, NOT a new session close: it must not
+      // raise the pending-close count, or the count could
+      // never reach zero through it.
+      await _speech?.cancel();
+    } catch (_) {
+      // A failed prod does not change the ladder: the
+      // restart step below still runs.
+    }
+    if (_pendingCloses == 0 || _engineRestarting) return;
+    if (engineDisposed) return;
+    _engineRetryTimer?.cancel();
+    _engineRetryTimer = Timer(const Duration(seconds: 1), () {
+      if (_pendingCloses == 0 || _engineRestarting) return;
+      if (engineDisposed) return;
+      unawaited(_restartEngine());
+    });
+  }
+
+  /// Force-restart the recognition engine: a fresh
+  /// SpeechToText instance (the process-wide singleton's
+  /// own initialize() short-circuits once it has
+  /// succeeded, so re-initializing the SAME instance
+  /// would never reach the platform), registrations
+  /// re-made under a bumped epoch, every pending close
+  /// forgiven, and the app notified via [engineEvents].
+  Future<void> _restartEngine() async {
+    if (_engineRestarting) return;
+    _engineRestarting = true;
+    // A restart must never run under a disposed input:
+    // after dispose the streams are closed and the
+    // restart's own one-second retry timer would leak
+    // past the owner's lifetime (in tests: a pending-
+    // timer failure at tree teardown).
+    if (_engineController.isClosed || engineDisposed) {
+      _engineRestarting = false;
+      return;
+    }
+    // Release any in-flight session-open attempt FIRST:
+    // it belongs to the engine generation being replaced,
+    // and the re-initialize below would otherwise consume
+    // the plugin's one-shot initialize latch while the
+    // attempt still waits for its listen() to be issued.
+    final Completer<void>? early = _startBarrier;
+    _startBarrier = null;
+    if (early != null && !early.isCompleted) early.complete();
+    _engineWatchdog?.cancel();
+    _engineWatchdog = null;
+    _engineRetryTimer?.cancel();
+    _engineRetryTimer = null;
+    final int epoch = ++_engineEpoch;
+    // A fresh instance UNLESS the current engine object
+    // was injected (tests inject a fake recogniser): an
+    // injected engine is re-initialized in place, which
+    // re-registers its listeners under the new epoch and
+    // is exactly the observable restart contract.
+    // Yield once first: the in-flight attempt released
+    // above resolves its listen race on this turn and its
+    // post-listen bookkeeping (which still belongs to the
+    // OLD epoch) settles BEFORE this restart's state
+    // writes below -- otherwise the attempt's tail could
+    // clear this restart's _listening or re-stamp its
+    // generation gate after the restart finished.
+    await Future<void>.delayed(Duration.zero);
+    final stt.SpeechToText fresh =
+        identical(_speech, _engineSpeech) && _engineIsPluginInstance
+            ? stt.SpeechToText()
+            : _speech!;
+    _speech = fresh;
+    _engineSpeech = fresh;
+    _engineIsPluginInstance = true;
+    bool ok = false;
+    try {
+      ok = await _doInitialize(fresh, epoch)
+          .timeout(const Duration(seconds: 3));
+    } catch (_) {
+      ok = false;
+    }
+    _available = ok;
+    _listening = false;
+    _genOpen = 0;
+    _pendingCloses = 0;
+    _engineRestarting = false;
+    _detail = ok
+        ? '系统语音识别已接入（引擎已重启，zh-CN，单次最长 10 秒，非持续监听）'
+        : 'NOT_CONFIGURED（语音引擎重启后仍不可用）';
+    mingtuVoiceLog('语音引擎已强制重启（epoch=$epoch）：旧会话全部作废');
+    final Completer<void>? c = _closeCompleter;
+    _closeCompleter = null;
+    if (c != null && !c.isCompleted) c.complete();
+    if (!_engineController.isClosed) {
+      _engineController.add('restarted');
     }
   }
 
@@ -312,9 +552,15 @@ class SystemVoiceInput implements VoiceInput {
     }
   }
 
-  Future<bool> _doInitialize(stt.SpeechToText speech) async {
-    return speech.initialize(
-      onError: (SpeechRecognitionError error) {
+  Future<bool> _doInitialize(stt.SpeechToText speech,
+      [int epoch = -1]) async {
+    final int regEpoch = epoch < 0 ? _engineEpoch : epoch;
+    void onError(SpeechRecognitionError error) {
+        // Stale registration: a registration made before
+        // an engine restart must never act. (The plugin
+        // replaces its single listener on re-initialize,
+        // so this is the application-level guarantee.)
+        if (regEpoch != _engineEpoch) return;
         // Whitelist discipline: the raw platform error string
         // is normalised to a known code here and discarded;
         // only the code and its fixed Chinese text travel on.
@@ -326,23 +572,59 @@ class SystemVoiceInput implements VoiceInput {
           _available = false;
           _listening = false;
         }
+        if (_pendingCloses > 0) {
+          // The error belongs to a session that is already
+          // closing: it consumes that session's pending
+          // close exactly like a closing status would, so
+          // the unconfirmed-close count cannot wedge on an
+          // errored session. What must never happen here
+          // is a sessionEnded side effect for the closing
+          // session.
+          _consumePendingClose();
+          if (_benignCloseErrorCodes.contains(code) &&
+              !error.permanent) {
+            // Consumed as the close; see the note above.
+            return;
+          }
+        }
+        if (_benignCloseErrorCodes.contains(code) &&
+            !error.permanent) {
+          // A routine outcome, not a failure (see
+          // _benignCloseErrorCodes): the session simply
+          // ended without speech. Its sessionEnded flow
+          // (the status that follows) drives the app's
+          // relisten; nothing is reported as an error.
+          return;
+        }
         if (!_errorController.isClosed) {
           _errorController.add(
             '$code|permanent=${error.permanent}',
           );
         }
-      },
-      onStatus: (String status) {
+    }
+
+    void onStatus(String status) {
+        if (regEpoch != _engineEpoch) return;
         if (status == 'done' || status == 'notListening') {
-          // Order matters (project-lead): FIRST record the
-          // close progress for the serialization barrier;
-          // THEN report the session end, stamped with the
-          // generation snapshot taken NOW (no mutable
-          // session-id field is read) and only if a session
-          // was actually listening; the listening flag is
-          // cleared LAST, never before the decision.
-          _closeStatusSeen = true;
-          _noteCloseProgress();
+          if (_pendingCloses > 0) {
+            // A close the app initiated is still
+            // unconfirmed: this status CONFIRMS it. It is
+            // consumed by the closing session ONLY -- it
+            // never ends a live session, is never stamped
+            // with a live session's id, and never reaches
+            // the sessionEnded stream. (Previously this
+            // status could be attributed to whatever
+            // session happened to be live when it landed.)
+            _consumePendingClose();
+            return;
+          }
+          // No close is pending: a session ended on its
+          // own (silence timeout, final result). Report
+          // the end, stamped with the generation snapshot
+          // taken NOW (no mutable session-id field is
+          // read) and only if a session was actually
+          // listening; the listening flag is cleared
+          // LAST, never before the decision.
           final bool wasListening = _listening;
           if (wasListening) {
             mingtuVoiceLog('语音识别会话结束（status=$status）');
@@ -350,13 +632,41 @@ class SystemVoiceInput implements VoiceInput {
           }
           _listening = false;
         }
-      },
-    );
+    }
+
+    final bool ok =
+        await speech.initialize(onError: onError, onStatus: onStatus);
+    // The plugin's initialize() is a one-shot latch: once
+    // it has succeeded it returns the cached result and
+    // does NOT re-register the listeners it was passed.
+    // Left to the latch, a later registration -- a watchdog
+    // restart's new epoch, or a fresh adapter instance --
+    // would never receive a single status or error, and
+    // every pending close would wedge until the watchdog
+    // fired. The listener fields are public, so register
+    // the SAME closures directly as well: whatever the
+    // latch did, the plugin's single listener now points
+    // at THIS registration, and any older registration is
+    // replaced (its epoch guard would reject it anyway).
+    // Best effort: a recogniser double that rejects the
+    // assignment keeps the listeners it captured from
+    // initialize() above, and initialization must not
+    // fail over it.
+    try {
+      speech.errorListener = onError;
+      speech.statusListener = onStatus;
+    } catch (_) {
+      // See the note above.
+    }
+    return ok;
   }
 
   Future<bool> initialize() async {
     try {
+      final bool constructed = _speech == null;
       final stt.SpeechToText speech = _speech ??= stt.SpeechToText();
+      _engineSpeech = speech;
+      if (constructed) _engineIsPluginInstance = true;
       final bool ok =
           await _doInitialize(speech).timeout(const Duration(seconds: 3));
       _available = ok;
@@ -397,23 +707,49 @@ class SystemVoiceInput implements VoiceInput {
   Future<bool> startListening() async {
     final stt.SpeechToText? speech = _speech;
     if (!_available || _listening || speech == null) return false;
-    // Serialization: never overlap the previous session.
+    // Unconfirmed-close rule: a new session may open
+    // ONLY once every initiated close has been confirmed
+    // by its closing status. The wait has NO timeout
+    // release: guessing from a clock is exactly how an
+    // old session's tail got attributed to a new one. If
+    // the closes never confirm, the watchdog restart
+    // resolves the wait instead.
     await awaitSessionClosed();
-    if (_listening) return false;
+    if (_listening || _engineRestarting) return false;
+    if (!identical(speech, _engineSpeech)) return false;
     // A new generation opens. The result closure stamps
     // events with it, but the stamp is informational only:
     // acceptance is decided at event time by the _genOpen
     // gate, because the plugin's single listener can route
     // an old session's late result through this closure.
     final int sessionId = ++_generation;
+    final int epoch = _engineEpoch;
+    // Generation-handoff race: if a restart bumps the
+    // epoch while this attempt's platform listen is in
+    // flight, the resting plugin instance's _initWorked
+    // latch is already consumed by the restart's
+    // re-initialize, so THIS attempt's initialize() call
+    // short-circuits and its listen() never runs. The
+    // attempt must fail closed in that case, not hang.
+    final Completer<void> barrier = Completer<void>();
+    _startBarrier = barrier;
     _genOpen = sessionId;
-    _sessionOpen = true;
-    _stopReturned = false;
-    _closeStatusSeen = false;
-    _closeCompleter = null;
+    // Mark listening BEFORE the platform call: the
+    // session counts as live from the moment its open is
+    // issued, so a stop/cancel that lands while the start
+    // is still in flight (the push-to-talk starting
+    // window) is a REAL close of this session -- it opens
+    // its pending close and calls the platform -- rather
+    // than a no-op that would leave the engine listening
+    // with nobody tracking it.
+    _listening = true;
     try {
-      await speech.listen(
+      await Future.any(<Future<void>>[
+        speech.listen(
         onResult: (SpeechRecognitionResult result) {
+          // A result from before an engine restart belongs
+          // to a dead engine generation: dropped at entry.
+          if (epoch != _engineEpoch) return;
           if (result.recognizedWords.isEmpty) return;
           // Generation gate: once this generation's stop or
           // cancel has been initiated (_genOpen moved on or
@@ -431,13 +767,26 @@ class SystemVoiceInput implements VoiceInput {
           pauseFor: const Duration(seconds: 3),
           localeId: 'zh_CN',
           partialResults: true,
-          cancelOnError: true,
+            cancelOnError: true,
+          ),
         ),
-      );
+        barrier.future,
+      ]);
+      if (identical(_startBarrier, barrier)) _startBarrier = null;
+      if (epoch != _engineEpoch) {
+        // The engine restarted under this attempt: the
+        // session never really opened. Do NOT touch
+        // adapter state here: the restart's own writes
+        // own the new epoch now, and this attempt's tail
+        // must not clear them (its _listening/_genOpen
+        // writes would land after the restart's).
+        return false;
+      }
       _listening = true;
       return true;
     } catch (e) {
-      _sessionOpen = false;
+      if (_genOpen == sessionId) _genOpen = 0;
+      _listening = false;
       _detail = 'NOT_CONFIGURED（开始识别失败：${asrErrorText(_asrFailureCode(e))}）';
       return false;
     }
@@ -447,7 +796,17 @@ class SystemVoiceInput implements VoiceInput {
   /// they propagate so the caller knows the microphone may still
   /// be open. [_listening] is cleared either way (finally), because
   /// after a stop attempt the session state is no longer trusted.
+  ///
+  /// A stop with NO live session is a no-op: it does NOT
+  /// open a pending close. Speech paths call stop()
+  /// defensively before speaking; if every such call
+  /// opened a pending close, the count would be charged
+  /// for sessions that never existed and the next listen
+  /// would wait for closing statuses nobody will send.
+  /// Exactly one pending close is opened per session that
+  /// was actually live, at its first stop/cancel.
   Future<void> stopListening() async {
+    if (!_listening) return;
     // Close this generation's gate FIRST: from this moment
     // its results are ignored, even while the platform
     // stop is still in flight -- UNLESS the app opened the
@@ -455,12 +814,15 @@ class SystemVoiceInput implements VoiceInput {
     // (a push-to-talk release whose final may still be in
     // flight; see acceptStoppingResults).
     if (!acceptStoppingResults) _genOpen = 0;
+    // This stop opens one unconfirmed close: until the
+    // platform's closing status lands, no new session may
+    // open and the status belongs to THIS session only.
+    _pendingCloses++;
+    _armCloseWatchdog();
     try {
       await _speech?.stop();
     } finally {
       _listening = false;
-      _stopReturned = true;
-      _noteCloseProgress();
     }
   }
 
@@ -470,20 +832,36 @@ class SystemVoiceInput implements VoiceInput {
   /// session must never produce an executable result. Like
   /// stop(), cancel counts toward the full-close barrier.
   Future<void> cancelListening() async {
+    if (!_listening) return;
     _genOpen = 0;
+    // A cancel closes the session too: one unconfirmed
+    // close, same rule as stop().
+    _pendingCloses++;
+    _armCloseWatchdog();
     try {
       await _speech?.cancel();
     } finally {
       _listening = false;
-      _stopReturned = true;
-      _noteCloseProgress();
     }
   }
 
   void dispose() {
+    engineDisposed = true;
+    _engineWatchdog?.cancel();
+    _engineWatchdog = null;
+    _engineRetryTimer?.cancel();
+    _engineRetryTimer = null;
+    // A wait on an unconfirmed close must not hang past
+    // disposal: release it (the owner is gone; nothing
+    // will listen again on this input).
+    final Completer<void>? c = _closeCompleter;
+    _closeCompleter = null;
+    if (c != null && !c.isCompleted) c.complete();
     _controller.close();
     _partialController.close();
     _errorController.close();
+    _engineController.close();
+    _sessionEndController.close();
   }
 }
 

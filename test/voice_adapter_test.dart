@@ -87,6 +87,8 @@ class FakeTts extends FlutterTts {
 class FakeStt implements stt.SpeechToText {
   stt.SpeechErrorListener? capturedOnError;
   stt.SpeechStatusListener? capturedOnStatus;
+  int initializeCalls = 0;
+  int cancelCalls = 0;
 
   /// The onResult listener of EVERY listen() call, in call
   /// order. The adapter registers a fresh closure per
@@ -109,9 +111,15 @@ class FakeStt implements stt.SpeechToText {
     Duration finalTimeout = const Duration(seconds: 2),
     List<stt.SpeechConfigOption>? options,
   }) async {
+    initializeCalls++;
     capturedOnError = onError;
     capturedOnStatus = onStatus;
     return initResult;
+  }
+
+  @override
+  Future<void> cancel() async {
+    cancelCalls++;
   }
 
   @override
@@ -321,6 +329,9 @@ void main() {
       final Future<void> ended = input.sessionEnded.first;
       expect(await input.startListening(), isTrue);
       expect(input.isListening, isTrue);
+      // A session that ends on its own (silence) delivers
+      // its status with NO stop pending: it is a natural
+      // end and reaches the sessionEnded stream.
       fake.capturedOnStatus!('done');
       await ended.timeout(const Duration(seconds: 1));
       expect(input.isListening, isFalse);
@@ -355,8 +366,13 @@ void main() {
       final fake = FakeStt()..stopError = Exception('mic stuck');
       final input = SystemVoiceInput(fake);
       await input.initialize();
+      // A live session first: a stop with no live session
+      // is a no-op (it opens no pending close), so the
+      // propagation contract applies to a real close.
+      expect(await input.startListening(), isTrue);
       await expectLater(input.stopListening(), throwsException);
       expect(input.isListening, isFalse);
+      expect(input.pendingCloses, 1);
     });
   });
 
@@ -380,6 +396,13 @@ void main() {
       // _pauseListeningForSpeech).
       await input.stopListening();
       expect(input.isListening, isFalse);
+      // The platform confirms the close with its status;
+      // only then may a later session open (unconfirmed-
+      // close rule). FakeStt delivers no statuses on its
+      // own, so the test delivers it through the captured
+      // status listener, exactly as the platform would.
+      sttFake.capturedOnStatus!('notListening');
+      expect(input.pendingCloses, 0);
 
       // 3) Speech runs; a “停下” during it delivers stop() to
       // the engine while the utterance is still in flight.
@@ -434,6 +457,9 @@ void main() {
       await sequence;
       expect(input.isListening, isFalse);
       expect(speakStarted, isTrue);
+      // Confirm the close so the resume below may open.
+      sttFake.capturedOnStatus!('notListening');
+      expect(input.pendingCloses, 0);
       // The recorded order is the proof: speak ran strictly
       // AFTER the microphone stop completed.
       expect(order, <String>['stop-released', 'speak']);
@@ -466,29 +492,34 @@ void main() {
             ran = true;
           });
       expect(ran, isTrue);
+      // The failed stop still opened a pending close; the
+      // platform's status confirms it (the recogniser did
+      // close, only the acknowledgement failed).
+      sttFake.capturedOnStatus!('notListening');
+      expect(input.pendingCloses, 0);
     });
   });
-  group('generation gate via the plugin channel', () {
-    // PLUGIN-LAYER REWRITE (this round): the previous
-    // version of this group invoked FakeStt's captured
-    // per-listen onResult closures DIRECTLY to deliver
-    // "late" results. Production no longer distinguishes
-    // sessions by closure-captured ids, and the real
-    // plugin keeps ONE result listener (a new listen
-    // replaces it), so direct closure invocation proves
-    // nothing about production. This group therefore uses
-    // the REAL plugin (SystemVoiceInput's default
-    // SpeechToText) behind a MethodChannel platform fake,
-    // and every result/status is delivered exactly the
-    // way a platform delivers it: textRecognition /
-    // notifyStatus platform->Dart calls on
+  group('unconfirmed-close rule via the plugin channel', () {
+    // PLUGIN-LAYER REWRITE (this round): platform events
+    // carry NO session identity, so the adapter never
+    // guesses one from a timeout. It counts unconfirmed
+    // closes instead: a new listen may start ONLY once
+    // every initiated stop/cancel has been confirmed by
+    // its closing status -- there is no 800 ms release
+    // anymore. This group uses the REAL plugin
+    // (SystemVoiceInput's default SpeechToText) behind a
+    // MethodChannel platform fake, and every result and
+    // status is delivered exactly the way a platform
+    // delivers it: textRecognition / notifyStatus
+    // platform->Dart calls on
     // plugin.csdcorp.com/speech_to_text, routed by the
     // plugin's single listener.
     //
     // The plugin's initialize() short-circuits process-
     // wide after its first success, so this file gets
-    // exactly ONE channel-driven adapter test; it walks
-    // three generations end to end.
+    // exactly ONE channel-driven adapter walk; the
+    // watchdog-restart walk lives in its own group below
+    // and reuses this walk's engine (see there).
     const String sttChannel = 'plugin.csdcorp.com/speech_to_text';
 
     Future<void> deliverPlatform(String method, Object? arg) async {
@@ -511,10 +542,9 @@ void main() {
         });
 
     test(
-        'late results between generations are dropped at '
-        'the adapter gate; statuses are handled in close '
-        'order; a status delayed past the barrier bound is '
-        'attributed to the live generation', () async {
+        'a closing status is consumed by the closing '
+        'session only; the next listen waits -- past the '
+        'old 800 ms bound -- until it lands', () async {
       TestWidgetsFlutterBinding.ensureInitialized();
       final List<String> platformCalls = <String>[];
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -569,44 +599,37 @@ void main() {
       expect(finals.single.text, '第一句完整');
 
       // --- Stop generation 1. Its closing status has not
-      // arrived: the session is CLOSING (sessionOpen).
+      // arrived: one close is UNCONFIRMED.
       await input.stopListening();
+      expect(input.pendingCloses, 1);
       expect(input.sessionOpen, isTrue);
       expect(input.isListening, isFalse);
 
       // A late result of generation 1, delivered through
       // the channel NOW (between generations): the
-      // adapter's generation gate is closed, so it is
-      // dropped IN THE ADAPTER -- transcripts never emit
-      // it. (Delivered while generation 2 is live it
-      // would be indistinguishable from generation 2's
-      // own result: the single-listener limitation the
-      // serialization barrier exists to keep unreachable
-      // in the app flow.)
+      // adapter's generation gate is closed (no stopping
+      // window is open), so it is dropped IN THE ADAPTER
+      // -- transcripts never emit it.
       await deliverPlatform(
           'textRecognition', resultJson('迟到的旧结果', 2));
       await Future<void>.delayed(Duration.zero);
       expect(finals, hasLength(1));
       expect(partials, hasLength(1));
 
-      // The closing status arrives between generations:
-      // close progress is recorded FIRST (the session is
-      // now fully closed), and because no session is live
-      // at this moment, NO sessionEnded is emitted for it
-      // -- a stale end can never be mistaken for a later
-      // session's end.
+      // The closing status arrives: it is CONSUMED by
+      // generation 1's pending close -- the count drops
+      // to zero and NO sessionEnded is emitted for it.
       await deliverPlatform('notifyStatus', 'notListening');
       await Future<void>.delayed(Duration.zero);
+      expect(input.pendingCloses, 0);
       expect(input.sessionOpen, isFalse);
       expect(ends, isEmpty);
 
-      // --- Generation 2: the barrier is already satisfied
-      // by the delivered status, so the start does NOT
-      // wait out the 800 ms bound.
+      // --- Generation 2 opens at once (nothing pending).
       final Stopwatch sw2 = Stopwatch()..start();
       expect(await input.startListening(), isTrue);
       expect(sw2.elapsedMilliseconds, lessThan(700),
-          reason: 'a closed barrier must not wait');
+          reason: 'a confirmed close must not wait');
       final int gen2 = input.currentSessionId;
       expect(gen2, greaterThan(gen1));
       await deliverPlatform(
@@ -615,42 +638,123 @@ void main() {
       expect(finals.last.sessionId, gen2);
       expect(finals.last.text, '第二句');
 
-      // --- Generation 2 stops; its status is WITHHELD, so
-      // generation 3's start must wait out the barrier's
-      // 800 ms bound before proceeding.
+      // --- Generation 2 stops; its status is WITHHELD.
+      // Generation 3's start must now wait -- and keep
+      // waiting PAST the old 800 ms release: there is no
+      // timeout guess anymore.
       await input.stopListening();
-      expect(input.sessionOpen, isTrue);
-      final Stopwatch sw3 = Stopwatch()..start();
-      expect(await input.startListening(), isTrue);
-      expect(sw3.elapsedMilliseconds, greaterThanOrEqualTo(700),
-          reason: 'an unclosed session must hold the next '
-              'listen to the barrier bound');
-      final int gen3 = input.currentSessionId;
-      expect(gen3, greaterThan(gen2));
-      expect(input.isListening, isTrue);
+      expect(input.pendingCloses, 1);
+      bool gen3Started = false;
+      final Future<bool> gen3 = input.startListening().then((bool v) {
+        gen3Started = true;
+        return v;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      expect(gen3Started, isFalse,
+          reason: 'an unconfirmed close never releases a '
+              'new listen, not even after 1.2 s');
+      expect(input.isListening, isFalse);
+      expect(platformCalls.where((String c) => c == 'listen'),
+          hasLength(2),
+          reason: 'no third listen reached the platform');
 
-      // NOW generation 2's withheld closing status
-      // arrives, while generation 3 is live. The platform
-      // status carries no generation, so the adapter
-      // attributes it to the LIVE generation: sessionEnded
-      // is emitted stamped gen3 and isListening clears.
-      // This is the pinned, known limitation of the
-      // single status listener -- it can only occur when
-      // a platform delays a closing status past the
-      // 800 ms barrier bound, and it is recorded here as
-      // observed behaviour for the reviewers, not as a
-      // guarantee.
+      // The withheld status finally lands at ~1.2 s: it
+      // is consumed by generation 2's close. It does NOT
+      // end generation 3 (which has not even opened yet)
+      // and it emits NO sessionEnded.
       await deliverPlatform('notifyStatus', 'notListening');
       await Future<void>.delayed(Duration.zero);
-      expect(ends, hasLength(1));
-      expect(ends.single.sessionId, gen3);
-      expect(ends.single.status, 'notListening');
-      expect(input.isListening, isFalse);
+      expect(input.pendingCloses, 0);
+      expect(ends, isEmpty);
+
+      // Only NOW does generation 3 open.
+      expect(await gen3, isTrue);
+      expect(gen3Started, isTrue);
+      final int gen3Id = input.currentSessionId;
+      expect(gen3Id, greaterThan(gen2));
+      expect(input.isListening, isTrue);
+      await deliverPlatform(
+          'textRecognition', resultJson('第三句', 2));
+      await Future<void>.delayed(Duration.zero);
+      expect(finals.last.sessionId, gen3Id);
+      expect(finals.last.text, '第三句');
+      // The late status never produced a session end.
+      expect(ends, isEmpty);
 
       await input.stopListening();
       expect(platformCalls, contains('listen'));
     });
   });
+
+  group('engine watchdog restart (injected recogniser)', () {
+    test(
+        'closes unconfirmed for 3 s prod one cancel; '
+        'still unconfirmed 1 s later the engine restarts: '
+        'count zeroed, epoch bumped, restarted emitted',
+        () async {
+      final FakeStt fake = FakeStt();
+      final SystemVoiceInput input = SystemVoiceInput(fake);
+      addTearDown(input.dispose);
+      expect(await input.initialize(), isTrue);
+      final int epoch0 = input.engineEpoch;
+      // The injected recogniser IS the engine object the
+      // adapter registered against -- the precondition
+      // for its in-place re-initialize on restart.
+      expect(identical(input.engineInstanceForTest, fake), isTrue);
+      final Future<String> restarted = input.engineEvents.first;
+
+      expect(await input.startListening(), isTrue);
+      await input.stopListening();
+      expect(input.pendingCloses, 1);
+      // The closing status NEVER arrives (FakeStt
+      // delivers none on its own and this test delivers
+      // none either).
+      // At ~3 s the watchdog prods the engine with ONE
+      // cancel -- which must NOT itself open a pending
+      // close.
+      await Future<void>.delayed(const Duration(milliseconds: 3300));
+      expect(fake.cancelCalls, 1,
+          reason: 'exactly one watchdog cancel prod');
+      expect(input.pendingCloses, 1,
+          reason: 'the prod is not a new close');
+      // At ~4 s the engine is force-restarted: the
+      // injected recogniser is re-initialized in place
+      // (its initialize count grows), the epoch bumps,
+      // the count is forgiven, and 'restarted' is
+      // emitted.
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      expect(await restarted.timeout(const Duration(seconds: 2)),
+          'restarted');
+      expect(input.pendingCloses, 0);
+      expect(input.engineEpoch, epoch0 + 1);
+      // The restart re-initialized the engine: with an
+      // injected recogniser that is observable as the SAME
+      // object still being the registered engine, under
+      // the bumped epoch (its listener registrations were
+      // re-made by the initialize call inside the
+      // restart).
+      expect(identical(input.engineInstanceForTest, fake), isTrue);
+      expect(input.isAvailable, isTrue);
+      expect(input.isListening, isFalse);
+
+      // A status delivered NOW belongs to no session:
+      // the count stays at zero (never negative) and no
+      // sessionEnded is emitted for it.
+      final List<AsrStatusEvent> ends = <AsrStatusEvent>[];
+      final StreamSubscription<AsrStatusEvent> sub =
+          input.sessionEnded.listen(ends.add);
+      fake.capturedOnStatus!('notListening');
+      await Future<void>.delayed(Duration.zero);
+      expect(input.pendingCloses, 0);
+      expect(ends, isEmpty);
+      await sub.cancel();
+
+      // And the restarted engine can listen again.
+      expect(await input.startListening(), isTrue);
+      expect(input.isListening, isTrue);
+    });
+  });
+
   group('ASR error non-leak: raw platform strings never surface', () {
     test(
         'an errorMsg carrying a synthetic token and URL collapses '

@@ -102,6 +102,8 @@ class MingtuHomePage extends StatefulWidget {
   State<MingtuHomePage> createState() => _MingtuHomePageState();
 }
 
+
+
 /// Push-to-talk press states. See the state fields on
 /// _MingtuHomePageState for the transition contract.
 enum _PttState { idle, prompting, starting, listening, stopping }
@@ -212,10 +214,56 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   AmapWalkingClient _amapClient = AmapWalkingClient(proxyBaseUrl: '');
   CurrentLocationProvider _locationProvider =
       const UnavailableCurrentLocation();
+  /// The voice input whose ASR event streams this page is
+  /// currently subscribed to. Subscriptions are (re)made
+  /// whenever the input OBJECT changes: the startup flow
+  /// first wires the unavailable placeholder and later
+  /// swaps in the real input -- a swap that skipped
+  /// re-subscription would leave every event listener
+  /// bound to the dead placeholder forever.
+  VoiceInput? _subscribedVoiceInput;
+
+  /// Cancel callbacks for the ASR event subscriptions,
+  /// keyed to the input object they were made on (see
+  /// [_subscribedVoiceInput]): invoking them cancels every
+  /// subscription of that wiring round.
+  List<void Function()> _asrSubCancels = <void Function()>[];
+
+  /// The adapter's current engineEvents stream object.
+  /// A broadcast stream getter can mint a NEW stream
+  /// object per access; identity of THIS object is what
+  /// decides whether the engine subscription needs
+  /// re-making (see [_ensureEngineSubscription]).
+  Stream<String>? _subscribedEngineEvents;
+
+  /// Last engine epoch this page has accounted for; a
+  /// restart that fired while no engine listener was live
+  /// is replayed from the epoch bump (see
+  /// [_ensureEngineSubscription]). Null until the first
+  /// check: the first observation only establishes the
+  /// baseline (a restart that predates any subscription
+  /// cannot be distinguished from the initial state, and
+  /// announcing it at startup would be wrong).
+  int? _engineEpochSeen;
+
+  /// Set by [_ensureAsrCloseConfirmed] while it confirms
+  /// the automatic session's close: during that window a
+  /// sessionEnded or error event belongs to the closing
+  /// session and must not touch live bookkeeping.
+  bool _asrConfirmingClose = false;
+
   StreamSubscription<AsrResultEvent>? _transcriptSub;
   StreamSubscription<AsrResultEvent>? _partialSub;
   StreamSubscription<String>? _asrErrorSub;
+
+  /// Session id of the last SUCCESSFULLY started listen;
+  /// kept for transcript/status validation. The error
+  /// stream uses a separate LIVE-session id below, because
+  /// a started session that fails before any event must
+  /// not leave a stale id behind.
+  int _asrLiveSessionId = 0;
   StreamSubscription<AsrStatusEvent>? _asrSessionSub;
+  StreamSubscription<String>? _asrEngineSub;
   bool _yoloErrorAnnounced = false;
 
   // Step 2 voice navigation flow state.
@@ -258,6 +306,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // it is not announced again (no retry/announce loop).
   bool _ttsFailed = false;
   bool _asrErrorAnnounced = false;
+
+  /// True while the last-started listening session has not
+  /// yet been closed by an app-initiated stop/cancel. The
+  /// adapter's error stream is stamped with a mutable
+  /// session tag, so a transient error from a session that
+  /// is already being closed can arrive stamped as the
+  /// CURRENT session; the app therefore suppresses errors
+  /// itself while such a close is in flight (they belong
+  /// to the closing session, whose outcome the stop already
+  /// decided) and counts them for the session that caused
+  /// them.
+  bool _asrCloseInFlight = false;
   String _voiceText = '语音：未初始化（演示文本播报）。';
   String _amapText = '高德真实路线：未请求。';
   String _yoloText = 'YOLO：未接入。';
@@ -295,6 +355,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// barrier); when the close completes it enters the
   /// prompt step if still held.
   bool _pttDeferredByClose = false;
+
+  /// The current press already spoke its one-time
+  /// close-wait notice ('请稍等'): a press waits out an
+  /// unconfirmed close exactly once, never repeatedly.
+  bool _pttCloseWaitAnnounced = false;
 
   /// This press began during a P0 announcement: it waits
   /// (vibration only -- no cue, no ASR) and enters
@@ -888,8 +953,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!mounted) return false;
     if (asrOk && asr != null) {
       _voiceInput = asr;
+      _subscribedVoiceInput = asr;
+      _asrSubCancels.add(() => _transcriptSub?.cancel());
       _transcriptSub = asr.transcripts.listen((AsrResultEvent event) {
         if (!mounted) return;
+        if (_asrConfirmingClose) {
+          // A result of the session whose close is being
+          // confirmed: it belongs to that closing session
+          // and is never cached or executed for a new one.
+          return;
+        }
         if (event.sessionId != _asrSessionId) {
           // A late final from an older session: dropped,
           // never executed, never cached.
@@ -937,8 +1010,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         _handleVoiceCommand(text);
       });
+      _asrSubCancels.add(() => _partialSub?.cancel());
       _partialSub = asr.partials.listen((AsrResultEvent event) {
         if (!mounted) return;
+        if (_asrConfirmingClose) return;
         if (event.sessionId != _asrSessionId) return;
         if (_pttSessionVoided) return;
         // Partials are only ever the push-to-talk fallback
@@ -955,15 +1030,64 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // ASR runtime errors surface through the adapter's error
       // stream (previously they only rewrote an unwatched status
       // string and the listen loop retried into the failure).
+      _asrSubCancels.add(() => _asrSessionSub?.cancel());
       _asrSessionSub = asr.sessionEnded.listen((AsrStatusEvent event) {
         if (!mounted) return;
+        if (_asrConfirmingClose) {
+          // This end belongs to the session whose close
+          // the press path is confirming: it is consumed
+          // as that close, never as a live session end.
+          return;
+        }
         // A status event from an older session must not
         // drive the current session's bookkeeping.
         if (event.sessionId != _asrSessionId) return;
+        // In push-to-talk mode a platform status event
+        // must NEVER restart listening: automatic
+        // listening is started by the app's explicit logic
+        // only (finish-speech, press completion). The
+        // adapter already guarantees an initiated close's
+        // status never reaches this stream; this guard is
+        // the app-side second line.
+        if (_pttState != _PttState.idle || _pushToTalkHeld) return;
         _onAsrSessionEnded();
       });
+      _asrSubCancels.add(() => _asrEngineSub?.cancel());
+      _subscribedEngineEvents = asr.engineEvents;
+      _asrEngineSub = asr.engineEvents.listen((String event) {
+        if (!mounted) return;
+        if (event != 'restarted') return;
+        // The recognition engine was force-restarted by
+        // the adapter watchdog: handled by the shared
+        // restart path (also used when a restart is
+        // detected via its epoch bump after the fact).
+        _onEngineRestarted();
+      });
+      _asrSubCancels.add(() => _asrErrorSub?.cancel());
       _asrErrorSub = asr.errors.listen((String error) {
-        if (mounted) _handleAsrError(error);
+        if (!mounted) return;
+        if (_asrConfirmingClose) {
+          // Belongs to the closing session (see the
+          // sessionEnded guard above).
+          return;
+        }
+        // The error stream's session tag is the adapter's
+        // CURRENT session id at error time. An error from
+        // a session that has already been superseded --
+        // including one still closing when its successor
+        // started -- must not poison the successor: only
+        // an error stamped with the LIVE session's id, or
+        // arriving while that session's close is in
+        // flight, is acted on. The adapter already drops
+        // errors from closed generations where it can;
+        // this is the app-side second line.
+        final int stamp = asr.currentSessionId;
+        if (stamp != _asrLiveSessionId && !_asrCloseInFlight) {
+          mingtuVoiceLog(
+              '已作废会话的识别错误按关闭处理：${error.split('|').first}');
+          return;
+        }
+        _handleAsrError(error);
       });
     }
     // P0 startup plan (pure logic in core/voice_startup.dart): the
@@ -1139,6 +1263,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttNoContentTimer?.cancel();
     _asrErrorSub?.cancel();
     _asrSessionSub?.cancel();
+    _asrEngineSub?.cancel();
+    for (final void Function() cancelSub in _asrSubCancels) {
+      cancelSub();
+    }
+    _asrSubCancels = <void Function()>[];
+    _subscribedEngineEvents = null;
+    // The input object outlives this State (it is never
+    // disposed here): mark it disposed so a pending
+    // engine watchdog cannot restart the recogniser --
+    // or leak its timers -- past this page's lifetime.
+    if (_voiceInput is SystemVoiceInput) {
+      (_voiceInput as SystemVoiceInput).engineDisposed = true;
+    }
     _gpsSub?.cancel();
     _voiceController.dispose();
     super.dispose();
@@ -1851,6 +1988,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttDeferredByP0 = false;
     _pttSessionVoided = false;
     _pttDeferredByClose = false;
+    _pttCloseWaitAnnounced = false;
     _pttCachedText = null;
     _pttCachedIsFinal = false;
     _pushToTalkHeld = true;
@@ -1867,20 +2005,42 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _logMsg('按住说话：危险播报进行中，先等待播报结束。');
       return;
     }
-    if (_voiceInput is SystemVoiceInput &&
-        (_voiceInput as SystemVoiceInput).sessionOpen) {
-      // Serialization barrier: the previous recognition
-      // session has not fully closed (its stop/cancel is
-      // still awaiting the closing status). The press only
-      // vibrated; it waits here and enters prompting once
-      // the close completes, if still held. Until then no
-      // cue is spoken and no new listen can start, so a
-      // late result of the old session can never be
-      // mistaken for this press's input.
+    final int pendingNow = _voiceInput is SystemVoiceInput
+        ? (_voiceInput as SystemVoiceInput).pendingCloses
+        : 0;
+    if (pendingNow > 0) {
+      // Unconfirmed-close rule: the previous recognition
+      // session's stop/cancel has not been confirmed by
+      // its closing outcome, so NO new session may open --
+      // there is no timeout release anymore. The press
+      // vibrated and speaks its one-time wait notice; it
+      // waits here and enters prompting once every close
+      // is confirmed, if still held. Until then no cue
+      // ('请说') is spoken and no listen can start, so a
+      // late result or status of the old session can
+      // never be mistaken for this press's input.
+      // The confirmation wait itself first drives the
+      // close to completion (see _ensureAsrCloseConfirmed):
+      // for a session the app itself stopped, the closing
+      // outcome is delivered as part of confirming, not
+      // merely awaited.
       _pttDeferredByClose = true;
-      _logMsg('按住说话：等待上一个识别会话完全关闭。');
-      final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
-      unawaited(input.awaitSessionClosed().then((_) {
+      _logMsg('按住说话：等待上一个识别会话关闭确认。');
+      _announcePttCloseWait();
+      if (_autoListenWasActive) {
+        // The closing session IS the automatic session
+        // this press borrowed the microphone from: mark
+        // it stopped NOW, so the wait notice's own speech
+        // path cannot mistake a stopped session for a
+        // live one and stop it a second time. (A second
+        // stop is a no-op in the adapter precisely so
+        // this stays harmless, but the stop must not be
+        // issued in the first place: on the platform it
+        // arms the recogniser's final-result timer for a
+        // session that is already closing.)
+        _autoListenWasActive = false;
+      }
+      unawaited(_ensureAsrCloseConfirmed().then((_) {
         if (!mounted) return;
         _maybeEnterPttAfterClose();
       }));
@@ -1900,7 +2060,69 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _pttState = _PttState.idle;
       return;
     }
+    // The close this press waited on is confirmed: the
+    // press proceeds as an ordinary press into the
+    // prompt step. Anything that becomes unconfirmed
+    // from here on is gated where the session opens, by
+    // the adapter's close barrier in startListening.
     unawaited(_pttPromptStep(_pttSession));
+  }
+
+  /// The one-time wait notice of a press blocked by an
+  /// unconfirmed close. Spoken DIRECTLY through the voice
+  /// output (like the '请说' cue), never through the
+  /// scheduler: a scheduler finish would consult the
+  /// automatic loop mid-press. The close itself guarantees
+  /// the microphone is shut (or shutting) before the
+  /// notice can be heard -- a notice spoken here is never
+  /// recorded by the session being closed.
+  void _announcePttCloseWait() {
+    if (_pttCloseWaitAnnounced) return;
+    _pttCloseWaitAnnounced = true;
+    if (!_voiceOutput.isAvailable || _ttsFailed) return;
+    setState(() {
+      _currentPrompt = '请稍等';
+    });
+    unawaited(() async {
+      try {
+        await speakAfterClosingMic(
+          input: _voiceInput is SystemVoiceInput
+              ? _voiceInput as SystemVoiceInput
+              : null,
+          speak: () => _voiceOutput.speak('请稍等'),
+        );
+      } catch (e) {
+        if (mounted) _handleTtsFailure(e);
+      }
+    }());
+  }
+
+  /// The engine was force-restarted while a press was
+  /// live: wind the press up WITHOUT continuing it (no
+  /// cue, no session -- the notice asks the user to press
+  /// again). A press in stopping treats the restart as
+  /// its completion point with no text.
+  void _finishPttAfterEngineRestart() {
+    _autoListenWasActive = false;
+    if (_pttState == _PttState.idle) return;
+    if (_pttState == _PttState.stopping) {
+      _pttNoContentTimer?.cancel();
+      _pttState = _PttState.idle;
+      _setPttStoppingWindow(false);
+      _pttCachedText = null;
+      _pttCachedIsFinal = false;
+      _pushToTalkHeld = false;
+      _pttPendingStop = false;
+      return;
+    }
+    _pttState = _PttState.idle;
+    _pushToTalkHeld = false;
+    _pttPendingStop = false;
+    _pttDeferredByP0 = false;
+    _pttDeferredByClose = false;
+    _pttSessionVoided = false;
+    _pttCachedText = null;
+    _pttCachedIsFinal = false;
   }
 
   /// prompting: hand the microphone over, clear non-P0
@@ -1909,6 +2131,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// release recorded meanwhile is honoured by the
   /// sequence itself, never by state flags racing it.
   Future<void> _pttPromptStep(int sid) async {
+    // A press that STARTED while a close was unconfirmed
+    // never reaches this step (it waits in
+    // _pushToTalkStart's wait branch). A close that
+    // becomes unconfirmed DURING the prompt step (the
+    // speech path stopping the automatic session for an
+    // announcement, this step's own mic hand-over) does
+    // not block the cue: the cue is speech, not a new
+    // session. The one place a session opens --
+    // _startListening below -- is gated by the adapter's
+    // own unbounded close barrier, which is the
+    // enforcement of the unconfirmed-close rule.
     if (_autoListenWasActive) {
       await _stopListeningInternal();
     }
@@ -1991,6 +2224,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       case _PttState.prompting:
         if (_pttDeferredByClose) {
           _pttDeferredByClose = false;
+          _pttCloseWaitAnnounced = false;
           _pttState = _PttState.idle;
           _pushToTalkHeld = false;
           return;
@@ -2266,6 +2500,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return false;
     }
     if (!pushToTalk) _autoListenEnabled = true;
+    await _rewireAsrSubscriptionsIfInputChanged();
+    _ensureEngineSubscription();
     final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
     final bool started = await input.startListening();
     if (started) {
@@ -2273,6 +2509,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // adapter minted for THIS listen call; result and
       // status events are validated against it.
       _asrSessionId = input.currentSessionId;
+      _asrLiveSessionId = input.currentSessionId;
     }
     if (!mounted) return started;
     setState(() {
@@ -2303,12 +2540,115 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// _stopListening button path, which deliberately switches
   /// the loop off). Used by push-to-talk, which borrows the
   /// microphone and hands it back.
+  /// Re-wire the ASR event subscriptions when the input
+  /// object was swapped underneath this page (e.g. by an
+  /// engine restart that replaced it): cancel every
+  /// subscription made on the old object and re-subscribe
+  /// on the current one by re-running the startup wiring
+  /// for the input only. When the input is unchanged this
+  /// is a no-op.
+  /// Confirm the automatic session's close before a press
+  /// proceeds. The unconfirmed-close rule forbids opening
+  /// a new session while a close is unconfirmed, and the
+  /// close is confirmed by the session's own closing
+  /// outcome (its terminal error or closing status), which
+  /// the adapter consumes. If the automatic loop left a
+  /// session stopped-but-unconfirmed, the press path
+  /// confirms it HERE -- by waiting for the adapter's
+  /// close future -- instead of entering the indefinite
+  /// wait branch: the confirmation is an event the
+  /// platform owes us for a session WE stopped, and the
+  /// watchdog ladder remains the backstop if it never
+  /// arrives. While confirming, session events belong to
+  /// the closing session.
+  Future<void> _ensureAsrCloseConfirmed() async {
+    if (_voiceInput is! SystemVoiceInput) return;
+    final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
+    if (input.pendingCloses == 0) return;
+    _asrConfirmingClose = true;
+    try {
+      await input.confirmSessionClose();
+    } finally {
+      _asrConfirmingClose = false;
+    }
+  }
+
+  Future<void> _rewireAsrSubscriptionsIfInputChanged() async {
+    if (identical(_voiceInput, _subscribedVoiceInput)) return;
+    if (_voiceInput is! SystemVoiceInput) return;
+    for (final void Function() cancelSub in _asrSubCancels) {
+      cancelSub();
+    }
+    _asrSubCancels = <void Function()>[];
+    _subscribedEngineEvents = null;
+    await _initStartupModules();
+  }
+
+  /// Ensure the engine-restart notification has a live
+  /// listener. The adapter publishes 'restarted' on a
+  /// broadcast stream: an event fired while NO listener is
+  /// attached is lost forever. A restart can also replace
+  /// the stream object (a fresh controller), which orphans
+  /// a subscription made on the old object. Both cases are
+  /// healed here, at the one place every listen attempt
+  /// passes through: if the current input's engineEvents
+  /// stream is not the object the live subscription was
+  /// made on, cancel and re-subscribe on the current one.
+  /// When a restart ALREADY fired while unsubscribed, its
+  /// event is gone -- but the restart is also visible as a
+  /// bumped engine epoch, so the missed notification is
+  /// replayed locally exactly once per epoch.
+  void _ensureEngineSubscription() {
+    if (_voiceInput is! SystemVoiceInput) return;
+    final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
+    final Stream<String> current = input.engineEvents;
+    if (!identical(current, _subscribedEngineEvents)) {
+      _asrEngineSub?.cancel();
+      _subscribedEngineEvents = current;
+      _asrEngineSub = current.listen((String event) {
+        if (!mounted) return;
+        if (event != 'restarted') return;
+        _onEngineRestarted();
+      });
+      _asrSubCancels.add(() => _asrEngineSub?.cancel());
+    }
+    final int? seenEpoch = _engineEpochSeen;
+    if (seenEpoch == null) {
+      _engineEpochSeen = input.engineEpoch;
+    } else if (input.engineEpoch > seenEpoch) {
+      _engineEpochSeen = input.engineEpoch;
+      if (mounted) {
+        // The restart fired while this page had no live
+        // listener on the (then-new) stream: deliver its
+        // notification now, once.
+        _onEngineRestarted();
+      }
+    }
+  }
+
+  /// The engine was force-restarted by the adapter
+  /// watchdog: every session from before the restart is
+  /// void. Any live press is wound up (never continued
+  /// into prompting) and the fixed notice is spoken.
+  void _onEngineRestarted() {
+    _finishPttAfterEngineRestart();
+    _say(_request(
+      id: 'asr-restarted-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'asr-restarted-${DateTime.now().millisecondsSinceEpoch}',
+      text: '语音已重启，请重新按住说话',
+      kind: SpeechKind.alert,
+    ));
+  }
+
   Future<void> _stopListeningInternal() async {
     if (_voiceInput is SystemVoiceInput) {
+      _asrCloseInFlight = true;
       try {
         await (_voiceInput as SystemVoiceInput).stopListening();
       } catch (e) {
         _logMsg('停止语音识别失败，麦克风可能仍在监听：$e');
+      } finally {
+        _asrCloseInFlight = false;
       }
     }
   }

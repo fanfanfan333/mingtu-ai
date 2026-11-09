@@ -68,16 +68,25 @@ class RecordingVoiceChannels {
   /// exactly as before.
   Completer<dynamic>? cancelGate;
 
-  /// Serialization barrier (production, this round): the
-  /// adapter considers a session fully closed only once
-  /// its stop()/cancel() has returned AND the closing
-  /// status (notListening/done) has been received. A real
-  /// platform always delivers that status, so by DEFAULT
-  /// this fake answers every stop/cancel with an automatic
-  /// notListening status on a microtask. Tests that need a
-  /// session stuck in "closing" set this to false and
-  /// deliver the status by hand via deliverCloseStatus().
+  /// Unconfirmed-close rule (production, this round):
+  /// the adapter considers a session closed only once
+  /// its closing status (notListening/done) has been
+  /// received, and no new listen may start before that.
+  /// This fake queues one closing status per session-
+  /// ending stop/cancel; tests deliver them via
+  /// deliverAutoCloseStatus()/deliverCloseStatus().
+  /// Tests that need a session stuck in "closing" set
+  /// this to false and deliver the status by hand.
   bool autoCloseStatus = true;
+
+  /// Set by the watchdog-restart scenario: the platform
+  /// cancel that follows is the adapter watchdog's prod,
+  /// not a session close. A real recogniser answers a
+  /// cancel issued while a session is already closing by
+  /// closing THAT session (one status); it does not open
+  /// a second close. While this is set, a cancel queues
+  /// no additional closing status.
+  bool nextCancelIsWatchdogProd = false;
 
   /// Test-side bookkeeping: how many sessions have been
   /// fully closed so far. The automatic closing status is
@@ -93,6 +102,16 @@ class RecordingVoiceChannels {
   /// ends downstream.
   int unclosedSessions = 0;
   int pendingCloseStatuses = 0;
+
+  /// True once any session has been opened on this fake
+  /// platform: from then on an 'initialize' call is the
+  /// adapter's close-confirmation re-registration, and the
+  /// platform answers it by delivering the oldest queued
+  /// closing outcome (the stopped session's terminal
+  /// no-match error, then its closing status) -- exactly
+  /// what a real recogniser reports when its listeners
+  /// are (re)registered after a stop.
+  bool platformSessionSeen = false;
 
   void install() {
     final TestDefaultBinaryMessenger messenger =
@@ -125,9 +144,20 @@ class RecordingVoiceChannels {
         switch (call.method) {
           case 'initialize':
             events.add('asr.initialize');
+            if (identical(this, activeVoiceHarness) &&
+                platformSessionSeen &&
+                pendingCloseStatuses > 0) {
+              // Close-confirmation flush: deliver the
+              // queued closing outcome asynchronously, the
+              // way the platform posts it to the channel.
+              Future<void>(() async {
+                await deliverAutoCloseStatus();
+              });
+            }
             return asrInitResult;
           case 'listen':
             events.add('asr.listen');
+            platformSessionSeen = true;
             unclosedSessions++;
             if (asrListenThrows) {
               throw PlatformException(
@@ -146,7 +176,11 @@ class RecordingVoiceChannels {
             return null;
           case 'cancel':
             events.add('asr.cancel');
-            noteSessionStopped();
+            if (nextCancelIsWatchdogProd) {
+              nextCancelIsWatchdogProd = false;
+            } else {
+              noteSessionStopped();
+            }
             final Completer<dynamic>? cg = cancelGate;
             if (cg != null) return cg.future;
             return null;
@@ -249,10 +283,39 @@ class RecordingVoiceChannels {
     await deliverCloseStatus();
   }
 
+  /// Deliver ALL queued closing statuses: a session that
+  /// was stopped and then re-listened before its status
+  /// landed leaves TWO statuses queued (one per close),
+  /// and the adapter's pending-close count needs both.
+  Future<void> deliverAllCloseStatuses() async {
+    while (pendingCloseStatuses > 0) {
+      await deliverAutoCloseStatus();
+    }
+  }
+
   /// Deliver the closing status (notListening) the way
   /// the platform does: a notifyStatus platform->Dart call
   /// on the plugin channel.
   Future<void> deliverCloseStatus() async {
+    // A real recogniser closing a stopped session first
+    // reports the session's terminal outcome: with no
+    // final result pending that is a no-match error,
+    // which the plugin forwards to the app's error
+    // listener (its _userEnded suppression only covers
+    // the notListening state, and stop() leaves the
+    // recogniser "listening" until the status lands).
+    // The adapter treats a benign close outcome as the
+    // close confirmation. The closing status itself
+    // follows, exactly as on a real device.
+    final ByteData outcome = const StandardMethodCodec()
+        .encodeMethodCall(const MethodCall('notifyError',
+            '{"errorMsg":"error_no_match","permanent":false}'));
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+      'plugin.csdcorp.com/speech_to_text',
+      outcome,
+      (ByteData? _) {},
+    );
     final ByteData data = const StandardMethodCodec()
         .encodeMethodCall(const MethodCall('notifyStatus', 'notListening'));
     await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -290,15 +353,28 @@ class RecordingVoiceChannels {
       speakQueue.map((MapEntry<String, Completer<dynamic>> e) => e.key).toList();
 }
 
+/// Rebind the harness to the app instance THIS test
+/// just created. The speech plugin is a process-wide
+/// singleton whose initialize() latch is one-shot per
+/// process: after the first test, later app instances'
+/// adapters never reach the platform initialize again,
+/// so their close confirmations must be driven through
+/// this harness directly (the drivers deliver the
+/// closing outcomes on the channel, which is where the
+/// platform would put them). Each test installs a FRESH
+/// harness, so the binding is (re)made here, per test.
+RecordingVoiceChannels? activeVoiceHarness;
+
 Future<void> settleRecordedApp(
     WidgetTester tester, RecordingVoiceChannels h) async {
+  activeVoiceHarness = h;
   await tester.pumpWidget(const MingtuApp());
   await tester.pump();
   int quietRounds = 0;
   int lastEventCount = -1;
   for (int round = 0; round < 64; round++) {
     await tester.pump(const Duration(milliseconds: 250));
-    await h.deliverAutoCloseStatus();
+    await h.deliverAllCloseStatuses();
     await tester.pump();
     if (h.pendingSpeaks().isEmpty && h.events.length == lastEventCount) {
       quietRounds++;
@@ -366,7 +442,7 @@ Future<void> drainVoice(WidgetTester tester, RecordingVoiceChannels h,
     {int rounds = 14}) async {
   for (int i = 0; i < rounds; i++) {
     h.completeAllSpeaks();
-    await h.deliverAutoCloseStatus();
+    await h.deliverAllCloseStatuses();
     await tester.pump(const Duration(milliseconds: 200));
   }
 }
@@ -392,7 +468,15 @@ Future<void> shutdownVoice(
     }
   }
   await drainVoice(tester, h, rounds: 6);
-  await tester.pump(const Duration(seconds: 3));
+  // Settle ANY engine watchdog ladder the drains armed:
+  // a close whose status was still in flight when the
+  // drains ended arms the adapter's 3 s watchdog; if it
+  // prods during these pumps it arms a 1 s retry timer
+  // that must also fire (into the engineDisposed guard
+  // after teardown below) rather than leak past the test.
+  await tester.pump(const Duration(seconds: 5));
+  await h.deliverAllCloseStatuses();
+  await tester.pump(const Duration(seconds: 2));
   h.completeAllSpeaks();
   await tester.pump(const Duration(milliseconds: 100));
   // Detach the tree NOW, while this test's mock stream
@@ -432,7 +516,7 @@ Future<TestGesture> pressUntilPttListening(
   expect(h.completeSpeak('请说'), isTrue,
       reason: 'cue spoken: ${h.events}');
   for (int i = 0; i < 40; i++) {
-    await h.deliverAutoCloseStatus();
+    await h.deliverAllCloseStatuses();
     await tester.runAsync(
         () => Future<void>.delayed(const Duration(milliseconds: 50)));
     await tester.pump(const Duration(milliseconds: 50));
@@ -497,6 +581,20 @@ Future<TestGesture> startPttGesture(WidgetTester tester) async {
 /// further can happen and the pumps simply settle).
 Future<TestGesture> pressPtt(WidgetTester tester,
     [RecordingVoiceChannels? h]) async {
+  if (h != null) {
+    // The platform delivers a stopped session's closing
+    // outcome on its own, promptly: anything still queued
+    // from this test's setup (a manual stop tap, a
+    // scheduler speak's mic-close) is delivered BEFORE
+    // the finger lands, so the press starts from the
+    // state the real device would present. A test that
+    // deliberately withholds the outcome (autoCloseStatus
+    // = false) is unaffected: delivery is a no-op then,
+    // and the press waits -- that case is driven through
+    // startPttGesture directly.
+    await h.deliverAllCloseStatuses();
+    await tester.pump();
+  }
   final TestGesture g = await startPttGesture(tester);
   if (h != null) {
     for (int i = 0; i < 10; i++) {
@@ -1232,21 +1330,38 @@ void main() {
           reason: '${h.events}');
       h.events.clear();
 
-      // Press while the old session is not fully closed.
-      // (The whole unclosed window below is a few hundred
-      // milliseconds of real time -- inside the barrier's
-      // 800 ms bound, so the press cannot slip through on
-      // the bound either.)
+      // Press while the old session's close is still
+      // UNCONFIRMED. There is no timeout release: the
+      // press only vibrates and speaks its one-time wait
+      // notice, and cannot slip through however long the
+      // close takes.
       final TestGesture gesture = await startPttGesture(tester);
       await tester.pump(const Duration(milliseconds: 100));
-      expect(h.events, <String>['vibrate'], reason: '${h.events}');
+      expect(h.events.first, 'vibrate', reason: '${h.events}');
+      expect(h.count('vibrate'), 1, reason: '${h.events}');
+      expect(h.events, contains('tts.speak:请稍等'),
+          reason: '${h.events}');
+      expect(h.count('tts.speak:请稍等'), 1,
+          reason: 'the wait notice is spoken once per press: '
+              '${h.events}');
       expect(h.count('asr.listen'), 0, reason: '${h.events}');
       expect(h.events, isNot(contains('tts.speak:请说')),
           reason: '${h.events}');
+      // The wait notice finishes; it is never recorded
+      // (the closing session is shut by the stop that
+      // opened the pending close, and the notice is
+      // spoken directly, outside any session).
+      expect(h.completeSpeak('请稍等'), isTrue);
 
       // A late final of the OLD session arrives while the
-      // press waits: it must not be treated as the press's
-      // input (its command reply never appears).
+      // press waits -- later than the old 800 ms barrier
+      // bound would have allowed a new session to open
+      // under (the press has already waited past it in
+      // real time by the drivers above): it still belongs
+      // to the old session and must not be treated as the
+      // press's input (its command reply never appears),
+      // and no new session exists for it to be attributed
+      // to.
       final String helpText = voiceCommandHelpText();
       await deliverFinalResult(tester, '帮助');
       await tester.pump(const Duration(milliseconds: 100));
@@ -1632,6 +1747,94 @@ void main() {
         expect(text, isNot(contains('安全')),
             reason: 'spoken text must never use the word: $text');
       }
+    });
+  });
+
+  group('engine watchdog restart (app level)', () {
+    testWidgets(
+        'a close unconfirmed past 3 s prods one cancel; '
+        'still unconfirmed 1 s later the engine restarts '
+        'and the app speaks the restart notice',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      // A live automatic session exists (the last ASR
+      // event is a listen).
+      final List<String> asrEvents = h.events
+          .where((String e) => e.startsWith('asr.'))
+          .toList();
+      expect(
+        asrEvents.isNotEmpty && asrEvents.last == 'asr.listen',
+        isTrue,
+        reason: 'precondition, a live auto session: ${h.events}',
+      );
+
+      // Wedge the close: from now on no closing status
+      // is ever delivered automatically, and the manual
+      // stop below opens an unconfirmed close.
+      h.autoCloseStatus = false;
+      final int cancelsBefore = h.count('asr.cancel');
+      await tapPanelText(tester, '停止语音识别');
+      for (int i = 0; i < 20 && h.pendingCloseStatuses < 1; i++) {
+        await tester.pump(const Duration(milliseconds: 25));
+      }
+      expect(h.pendingCloseStatuses, greaterThanOrEqualTo(1),
+          reason: '${h.events}');
+      h.events.clear();
+
+      // The next cancel on the channel will be the
+      // adapter watchdog's prod: the recogniser closes
+      // the already-closing session for it, so it queues
+      // no second closing status.
+      h.nextCancelIsWatchdogProd = true;
+
+      // ~3 s pass with the close still unconfirmed:
+      // exactly one prod cancel. The adapter's watchdog
+      // Timer runs on the widget test's fake clock, so
+      // the fake clock is advanced past the same 3 s
+      // alongside the real-time wait.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 3400)));
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pump();
+      expect(h.count('asr.cancel'), cancelsBefore + 1,
+          reason: 'one watchdog prod: ${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:语音已重启，请重新按住说话')),
+        reason: 'the restart has not happened yet: ${h.events}',
+      );
+
+      // ~1 s more (fake clock advanced alongside, as
+      // above): the engine restarts and the app speaks
+      // the fixed restart notice.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 1400)));
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      await pumpUntilSpeak(tester, h, '语音已重启，请重新按住说话');
+      expect(h.count('tts.speak:语音已重启，请重新按住说话'), 1,
+          reason: '${h.events}');
+      expect(h.completeSpeak('语音已重启，请重新按住说话'), isTrue);
+
+      // The pending closes are forgiven: the close of
+      // the notice's own mic-stop confirms nothing (it is
+      // a no-op in the adapter), and normal operation
+      // resumes -- a fresh press runs its full cycle.
+      h.autoCloseStatus = true;
+      await drainVoice(tester, h, rounds: 6);
+      h.events.clear();
+      final TestGesture gesture = await pressUntilPttListening(tester, h);
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+      await holdPastThreshold(tester);
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 100));
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
     });
   });
 
