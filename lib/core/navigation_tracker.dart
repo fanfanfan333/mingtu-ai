@@ -232,3 +232,18 @@ class NavigationTracker {
     return events;
   }
 }
+
+/// Which straight-segment confirmation counts right now
+/// (Codex re-test of f951240): while a live tracker exists,
+/// ONLY its current step decides -- a stale confirmation
+/// recorded by another flow (e.g. the demo navigation's
+/// manual confirm) must never bypass the tracker. Without a
+/// live tracker the caller's own confirmation applies.
+bool straightSegmentConfirmedNow({
+  required NavigationTracker? liveNav,
+  required bool fallbackConfirmed,
+}) {
+  final NavigationTracker? nav = liveNav;
+  if (nav != null) return nav.currentSegmentIsStraight;
+  return fallbackConfirmed;
+}

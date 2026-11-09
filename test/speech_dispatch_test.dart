@@ -102,11 +102,16 @@ void main() {
       expect(s.submit(req('dg', SpeechKind.danger), t0), isTrue);
       expect(s.active!.id, 'dg');
       expect(s.interruptedLog, contains('st'));
-      // Production wiring: a danger submission also clears
-      // the straight clock via pauseStraight.
+      // Production wiring: a danger submission enters the
+      // unified pause state, which clears the straight clock
+      // via pauseStraight and anchors the nav version. The
+      // behaviour itself (danger preempts, TTS stop is really
+      // issued) is covered by production-path widget tests in
+      // test/codex_f951240_fix_test.dart.
       final String mainDart = File('lib/main.dart').readAsStringSync();
       expect(mainDart, contains('_scheduler.pauseStraight()'));
-      expect(mainDart, contains('_versionAtInterrupt = _navVersion'));
+      expect(mainDart, contains('_pauseStraightForRisk();'));
+      expect(mainDart, contains('_straightPausedNavVersion = _navVersion'));
     });
 
     test(
@@ -163,11 +168,14 @@ void main() {
             riskActive: false),
         isTrue,
       );
-      // Production wiring: the post-danger re-check runs when
-      // a danger prompt finishes.
+      // Production wiring (Codex re-test of f951240): the
+      // resume re-check now runs on EVERY speech completion
+      // through the unified _recheckStraightResume, and the
+      // confirmation it consults is the tracker-governed
+      // production rule.
       final String mainDart = File('lib/main.dart').readAsStringSync();
-      expect(mainDart, contains('finishedKind == SpeechKind.danger'));
-      expect(mainDart, contains('_liveNav?.currentSegmentIsStraight'));
+      expect(mainDart, contains('_recheckStraightResume();'));
+      expect(mainDart, contains('straightSegmentConfirmedNow('));
     });
 
     test('7.7-6 when a turn state appears, the straight cycle stops', () {

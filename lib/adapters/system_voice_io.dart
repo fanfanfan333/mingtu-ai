@@ -22,6 +22,7 @@ library;
 
 import 'dart:async';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
@@ -133,7 +134,7 @@ class SystemVoiceOutput implements VoiceOutput {
       return false;
     } catch (e) {
       _available = false;
-      _detail = 'NOT_CONFIGURED（系统语音合成不可用：$e）';
+      _detail = 'NOT_CONFIGURED（系统语音合成不可用：平台调用异常）';
       mingtuVoiceLog('语音合成初始化失败：平台调用异常');
       return false;
     }
@@ -165,7 +166,7 @@ class SystemVoiceOutput implements VoiceOutput {
     } catch (e) {
       _available = false;
       _chineseVerified = false;
-      _detail = 'NOT_CONFIGURED（系统语音合成失败：$e）';
+      _detail = 'NOT_CONFIGURED（系统语音合成失败：平台调用异常）';
       rethrow;
     }
   }
@@ -188,6 +189,18 @@ class SystemVoiceOutput implements VoiceOutput {
 /// before use. [startListening] opens one short session (max 10 s,
 /// stops on ~3 s silence); final results are added to [transcripts].
 /// Partial results are ignored so one utterance is parsed once.
+/// Classify a recognition failure into the fixed ASR error
+/// vocabulary WITHOUT retaining the raw exception text: only
+/// a PlatformException's code is read (and it still passes
+/// the exact-match whitelist in asr_errors.dart); every other
+/// exception collapses to error_unknown. Raw platform strings
+/// can embed tokens or URLs and must never reach the status,
+/// the UI or the logs (Codex re-test of f951240).
+String _asrFailureCode(Object e) {
+  if (e is PlatformException) return asrErrorCode(e.code);
+  return 'error_unknown';
+}
+
 class SystemVoiceInput implements VoiceInput {
   // Created lazily inside initialize(), for the same reason as
   // SystemVoiceOutput (see above).
@@ -276,7 +289,7 @@ class SystemVoiceInput implements VoiceInput {
       return false;
     } catch (e) {
       _available = false;
-      _detail = 'NOT_CONFIGURED（系统语音识别不可用：$e）';
+      _detail = 'NOT_CONFIGURED（系统语音识别不可用：${asrErrorText(_asrFailureCode(e))}）';
       return false;
     }
   }
@@ -313,7 +326,7 @@ class SystemVoiceInput implements VoiceInput {
       _listening = true;
       return true;
     } catch (e) {
-      _detail = 'NOT_CONFIGURED（开始识别失败：$e）';
+      _detail = 'NOT_CONFIGURED（开始识别失败：${asrErrorText(_asrFailureCode(e))}）';
       return false;
     }
   }

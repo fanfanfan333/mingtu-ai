@@ -196,7 +196,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   NavigationTracker? _liveNav;
   RerouteBudget? _tripRerouteBudget;
   Future<void>? _pendingPreemptStop;
-  String _versionAtInterrupt = 'nav-v0';
+  // The ONE persistent straight-pause state (Codex re-test
+  // of f951240): entered via _pauseStraightForRisk (danger
+  // prompts, YOLO risk onset), left only via
+  // _recheckStraightResume. The nav version at pause time is
+  // anchored here; a resume is valid only against it.
+  bool _straightPausedByRisk = false;
+  String _straightPausedNavVersion = 'nav-v0';
   StreamSubscription<LocationResult>? _gpsSub;
   String _liveNavDestName = '';
   double? _liveNavRemainingM;
@@ -390,6 +396,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
     _liveNavDestName = destinationName;
     _liveNavRemainingM = _liveNav!.remainingM;
+    // A stale demo-flow straight confirmation must not leak
+    // into the live trip: while the tracker exists it alone
+    // governs straight confirmation (see the getter).
+    _straightConfirmed = false;
     _amapSpeaker = AmapStepSpeaker(result.steps);
     _gpsSub?.cancel();
     _gpsSub = _locationProvider.positions().listen(
@@ -538,6 +548,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _gpsSub = null;
     _liveNav = null;
     _liveNavRemainingM = null;
+    _straightPausedByRisk = false;
     _stopStraightTimer();
   }
 
@@ -648,6 +659,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
     });
     if (plan.speechUsable) {
+      if (!asrOk) {
+        // ASR failed at startup while TTS works (Codex
+        // re-test of f951240): the greeting below already
+        // CARRIES the failure (plan.spokenText is the ASR-down
+        // greeting), and it is paired with a vibration -- the
+        // same cue the runtime ASR-error path uses -- so the
+        // user feels the state as well as hears it.
+        HapticFeedback.vibrate();
+        _logMsg('语音识别启动失败：已振动提示，问候语中将播报识别不可用。');
+      }
       // Hands-free entry (v0.7): greet by voice first; listening
       // starts only after the greeting finishes (see _finishSpeech),
       // so the microphone never hears the app's own voice as a
@@ -838,15 +859,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   bool _say(SpeechRequest request) {
     final DateTime now = DateTime.now();
+    // Capture what is active BEFORE anything else: a danger
+    // submission first pauses straight guidance, and
+    // pauseStraight() itself interrupts an active straight
+    // prompt. The physical preemption stop below is keyed on
+    // the request that was active when this call began --
+    // capturing it after the pause made the stop unreachable
+    // for exactly the case it exists for (Codex re-test of
+    // f951240: the straight utterance kept playing under the
+    // danger prompt because the pause had already cleared it).
+    final SpeechRequest? activeBefore = _scheduler.active;
+    final int interruptedBefore = _scheduler.interruptedLog.length;
     if (request.kind == SpeechKind.danger) {
       // A danger prompt kills any active straight prompt and
       // clears its 3-second clock: after the danger, straight
-      // guidance resumes only via the re-check in
-      // _finishSpeech (never a catch-up replay).
-      _scheduler.pauseStraight();
-      _versionAtInterrupt = _navVersion;
+      // guidance resumes only via the unified re-check
+      // (_recheckStraightResume), never a catch-up replay.
+      _pauseStraightForRisk();
     }
-    final SpeechRequest? activeBefore = _scheduler.active;
     final bool accepted = _scheduler.submit(request, now);
     if (accepted) _publishSpeech(request);
     setState(() {
@@ -865,7 +895,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (accepted && _scheduler.active?.id == request.id) {
       if (activeBefore != null &&
           activeBefore.id != request.id &&
-          _scheduler.interruptedLog.contains(activeBefore.id)) {
+          _scheduler.interruptedLog.length > interruptedBefore &&
+          _scheduler.interruptedLog
+              .sublist(interruptedBefore)
+              .contains(activeBefore.id)) {
         // Physical preemption (danger over a navigation
         // prompt): the scheduler swapped the active request,
         // but the interrupted utterance is still coming out
@@ -884,30 +917,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// it too, through the same real-or-simulated path.
   void _finishSpeech(String id) {
     if (_scheduler.active?.id == id) {
-      final SpeechKind? finishedKind = _scheduler.active?.kind;
       _scheduler.completeActive();
       final SpeechRequest? next = _scheduler.promoteNext(
         DateTime.now(),
-        straightSegmentConfirmed: _straightConfirmed,
+        straightSegmentConfirmed: _straightSegmentConfirmedNow,
         riskActive: _riskActive,
       );
+      // Unified resume re-check (Codex re-test of f951240):
+      // it runs on EVERY completion -- not only when a danger
+      // prompt finishes with an empty queue -- and also when
+      // the risk state clears (_onYoloDetections) and when
+      // the user says 继续. It re-checks risk and navigation
+      // state at this moment and restarts the 3 s clock from
+      // now; missed straight prompts are never replayed.
+      _recheckStraightResume();
       if (next == null) {
-        if (finishedKind == SpeechKind.danger) {
-          // Post-danger re-check (unified dispatch spec):
-          // straight guidance resumes only if the segment is
-          // still confirmed straight, no risk is active, and
-          // the navigation version has not moved since the
-          // interruption. resumeStraight restarts the 3 s
-          // clock from now -- missed prompts are not replayed.
-          _scheduler.resumeStraight(
-            now: DateTime.now(),
-            straightSegmentConfirmed: _straightConfirmed ||
-                (_liveNav?.currentSegmentIsStraight ?? false),
-            riskActive: _riskActive,
-            currentNavigationVersion: _navVersion,
-            straightNavigationVersion: _versionAtInterrupt,
-          );
-        }
         // Speech is done and nothing is queued: the turn-taking
         // loop may open the microphone now (v0.7).
         _maybeStartListeningAfterSpeech();
@@ -1036,6 +1060,56 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     });
   }
 
+  /// The straight-segment confirmation that counts RIGHT
+  /// NOW (Codex re-test of f951240): while a live navigation
+  /// tracker exists, ONLY its current step decides -- a stale
+  /// confirmation recorded by the demo flow must never bypass
+  /// it. The rule itself is the production function
+  /// [straightSegmentConfirmedNow] in the tracker module.
+  bool get _straightSegmentConfirmedNow => straightSegmentConfirmedNow(
+        liveNav: _liveNav,
+        fallbackConfirmed: _straightConfirmed,
+      );
+
+  /// Enter the ONE persistent straight-pause state: the
+  /// active straight prompt is interrupted and its 3 s clock
+  /// cleared, and the navigation version is anchored (first
+  /// entry wins -- a second danger during the same pause must
+  /// not move the anchor the resume will be checked against).
+  void _pauseStraightForRisk() {
+    _scheduler.pauseStraight();
+    if (_straightPausedByRisk) return;
+    _straightPausedByRisk = true;
+    _straightPausedNavVersion = _navVersion;
+  }
+
+  /// Leave the pause state, but only after re-checking at
+  /// THIS moment: no risk active, the CURRENT segment
+  /// confirmed straight (tracker-governed during live nav),
+  /// and the navigation version unchanged since the pause.
+  /// During live nav a version change re-anchors instead of
+  /// wedging the pause forever: the old segment's pause
+  /// premise no longer exists, and the new segment is
+  /// re-validated on its own state (spec 7.7 item 7).
+  /// resumeStraight restarts the 3 s clock from now, so
+  /// prompts never overlap and missed ones are not replayed.
+  void _recheckStraightResume() {
+    if (!_straightPausedByRisk) return;
+    if (_liveNav != null && _navVersion != _straightPausedNavVersion) {
+      _straightPausedNavVersion = _navVersion;
+    }
+    final bool resumed = _scheduler.resumeStraight(
+      now: DateTime.now(),
+      straightSegmentConfirmed: _straightSegmentConfirmedNow,
+      riskActive: _riskActive,
+      currentNavigationVersion: _navVersion,
+      straightNavigationVersion: _straightPausedNavVersion,
+    );
+    if (resumed) {
+      _straightPausedByRisk = false;
+    }
+  }
+
   void _startStraightTimer() {
     _straightTimer?.cancel();
     _straightTimer = Timer.periodic(
@@ -1053,9 +1127,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!mounted) {
       return;
     }
-    final bool straightOk =
-        _straightConfirmed || (_liveNav?.currentSegmentIsStraight ?? false);
-    if (_tasks.state != TaskState.navigating || !straightOk || _riskActive) {
+    if (_tasks.state != TaskState.navigating ||
+        _straightPausedByRisk ||
+        !_straightSegmentConfirmedNow ||
+        _riskActive) {
       return;
     }
     final DateTime now = DateTime.now();
@@ -1450,20 +1525,28 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             e.isNewTrack && _yoloObstacleLabels.containsKey(e.label))
         .toList();
     if (newObstacles.isNotEmpty &&
-        !_yoloRiskActive &&
         (_tasks.state == TaskState.navigating ||
             _tasks.state == TaskState.avoidingObstacle)) {
-      _yoloRiskActive = true;
-      if (_tasks.state == TaskState.navigating) {
-        _tasks.transitionTo(TaskState.avoidingObstacle,
-            trigger: 'yolo-obstacle');
-        _stopStraightTimer();
-        _scheduler.pauseStraight();
+      // Risk onset (only the FIRST obstacle flips the state
+      // and enters the unified straight pause). The danger
+      // SPEECH below is deliberately NOT gated on
+      // _yoloRiskActive (Codex re-test of f951240): a NEW
+      // danger that appears while another risk is already
+      // active must still be announced immediately -- only
+      // the per-category cooldown debounces repeats.
+      if (!_yoloRiskActive) {
+        _yoloRiskActive = true;
+        if (_tasks.state == TaskState.navigating) {
+          _tasks.transitionTo(TaskState.avoidingObstacle,
+              trigger: 'yolo-obstacle');
+          _stopStraightTimer();
+        }
+        _pauseStraightForRisk();
+        setState(() {
+          _riskActive = true;
+          _straightConfirmed = false;
+        });
       }
-      setState(() {
-        _riskActive = true;
-        _straightConfirmed = false;
-      });
       final String names = newObstacles
           .map((PerceptionEvent e) => _yoloObstacleLabels[e.label] ?? e.label)
           .join('、');
@@ -1510,6 +1593,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _riskActive = false;
         _straightConfirmed = false;
       });
+      // Risk cleared: run the unified resume re-check NOW,
+      // not at some later speech completion, and restart the
+      // straight timer so the re-armed 3 s cadence can
+      // actually fire. The tick stays gated regardless: in
+      // the demo flow on the user's own re-confirmation
+      // （继续）, in live nav on the tracker's current step.
+      _recheckStraightResume();
+      if (_tasks.state == TaskState.navigating) {
+        _startStraightTimer();
+      }
       _say(_request(
         id: 'yolo-cleared-${now.millisecondsSinceEpoch}',
         eventId: 'yolo-cleared-${now.millisecondsSinceEpoch}',
@@ -1600,7 +1693,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   void _manualStraight() {
     if (_tasks.state != TaskState.navigating ||
-        !_straightConfirmed ||
+        !_straightSegmentConfirmedNow ||
         _riskActive) {
       _logMsg('当前不是可直行状态：请确认正在导航、直行路段已确认且无风险。');
       return;
@@ -1650,6 +1743,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     if (_riskActive) {
       _logMsg('仍有风险事件未解除，不能恢复直行。');
+      return;
+    }
+    if (_liveNav != null) {
+      // Live trip (Codex re-test of f951240): the user cannot
+      // "confirm" a segment -- the tracker's current step
+      // decides, via the unified re-check. Resume only when
+      // it passes; say so when it does.
+      _recheckStraightResume();
+      if (_straightPausedByRisk) {
+        _logMsg('当前路段未经跟踪器确认直行，未恢复直行节奏。');
+        return;
+      }
+      _startStraightTimer();
+      _logMsg('直行恢复：已按跟踪器当前路段重新检查，3 秒计时器已重启。');
+      _say(_request(
+        id: 'straight-resumed-live-${DateTime.now().millisecondsSinceEpoch}',
+        eventId:
+            'straight-resumed-live-${DateTime.now().millisecondsSinceEpoch}',
+        text: '已重新确认直线路段，继续直走。',
+        kind: SpeechKind.info,
+      ));
       return;
     }
     final DateTime now = DateTime.now();
@@ -2806,6 +2920,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                   ? () => _onYoloDetections(const <Detection>[
                         Detection(
                             label: 'person', confidence: 0.9, cx: 0.5, cy: 0.5),
+                      ])
+                  : null,
+            ),
+            _demoButton(
+              label: '模拟 YOLO 检测：前方车辆（演示，无摄像头）',
+              semanticsLabel: '模拟 YOLO 检测前方车辆',
+              // Enabled while avoiding an obstacle too: a NEW
+              // danger must be announced even when a risk is
+              // already active (Codex re-test of f951240), and
+              // this button exercises that production path.
+              onPressed: state == TaskState.navigating ||
+                      state == TaskState.avoidingObstacle
+                  ? () => _onYoloDetections(const <Detection>[
+                        Detection(
+                            label: 'car', confidence: 0.9, cx: 0.5, cy: 0.5),
                       ])
                   : null,
             ),
