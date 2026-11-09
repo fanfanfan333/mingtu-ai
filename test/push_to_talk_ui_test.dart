@@ -55,6 +55,12 @@ class RecordingVoiceChannels {
   bool asrInitResult = true;
   bool asrListenThrows = false;
 
+  /// When set, the platform's answer to listen() stays in
+  /// flight until the completer completes -- a slow engine
+  /// start. Null (the default) answers immediately, exactly
+  /// as before.
+  Completer<dynamic>? listenGate;
+
   void install() {
     final TestDefaultBinaryMessenger messenger =
         TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
@@ -95,6 +101,8 @@ class RecordingVoiceChannels {
                 message: 'synthetic listen failure fixture',
               );
             }
+            final Completer<dynamic>? gate = listenGate;
+            if (gate != null) return gate.future;
             return true;
           case 'stop':
             events.add('asr.stop');
@@ -577,7 +585,8 @@ void main() {
     });
 
     testWidgets(
-        'a press never interrupts a playing P0 danger prompt',
+        'a press during a P0 danger prompt only vibrates, '
+        'then enters once the danger finishes',
         (WidgetTester tester) async {
       final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
@@ -600,17 +609,20 @@ void main() {
       expect(dangerIdx, greaterThanOrEqualTo(0),
           reason: '${h.events}');
 
-      // Press: the cue still speaks, but NO physical stop
-      // may be issued against the danger utterance.
+      // Press while the P0 prompt plays (state machine,
+      // Codex re-test of c104dc7): the press is DEFERRED --
+      // vibration only. The cue is NOT spoken over the
+      // danger prompt, no session starts, and no physical
+      // stop is issued against the danger utterance: the
+      // P0 announcement is never interrupted.
       final TestGesture gesture = await pressPtt(tester);
-      expect(h.events, contains('tts.speak:请说'),
+      final List<String> duringP0 = h.events.sublist(dangerIdx + 1);
+      expect(duringP0, contains('vibrate'), reason: '${h.events}');
+      expect(duringP0, isNot(contains('tts.speak:请说')),
           reason: '${h.events}');
-      expect(h.events.sublist(dangerIdx + 1), isNot(contains('tts.stop')),
+      expect(h.count('asr.listen'), 0, reason: '${h.events}');
+      expect(duringP0, isNot(contains('tts.stop')),
           reason: '${h.events}');
-      expect(h.completeSpeak('请说'), isTrue);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
-      expect(h.count('asr.listen'), 1, reason: '${h.events}');
       // The danger prompt is STILL playing: not cancelled,
       // not completed early.
       expect(
@@ -620,18 +632,39 @@ void main() {
         reason: '${h.events}',
       );
 
+      // Keep holding in REAL time past the production
+      // 1.5 s just-started-P0 recency window, so that when
+      // the danger completes, the deferred press can enter
+      // prompting right away (in fake time nothing else
+      // speaks meanwhile, so the held danger stays the
+      // active prompt throughout the wait).
       await holdPastThreshold(tester);
-      await gesture.up();
-      await tester.pump();
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 1300)));
 
-      // Now let the danger prompt finish: its completion is
-      // a NORMAL finish (the app must not log it as an
-      // ignored late completion of a cancelled prompt), and
-      // the release's no-content notice follows it.
+      // The danger prompt finishes NORMALLY (never
+      // cancelled): the still-held deferred press now
+      // enters prompting -- the cue is spoken, and
+      // completing it opens the session.
       expect(h.completeSpeak('前方有机动车，请停下。'), isTrue);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
       expect(find.textContaining('已取消播报的迟到完成'), findsNothing);
+      await pumpUntilSpeak(tester, h, '请说');
+      expect(h.completeSpeak('请说'), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+
+      // Release: the session stops, and with nothing
+      // recognised the fixed no-content notice follows
+      // once the post-release grace has run out.
+      await gesture.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.stop'), greaterThanOrEqualTo(1),
+          reason: '${h.events}');
+      await tester.pump(const Duration(seconds: 2));
       await pumpUntilSpeak(tester, h, '没有听清，请按住按钮再说一次。');
 
       final Finder stopNav = find.widgetWithText(ElevatedButton, '停下');

@@ -207,6 +207,8 @@ class SystemVoiceInput implements VoiceInput {
   stt.SpeechToText? _speech;
   final StreamController<String> _controller =
       StreamController<String>.broadcast();
+  final StreamController<String> _partialController =
+      StreamController<String>.broadcast();
   final StreamController<String> _errorController =
       StreamController<String>.broadcast();
   final StreamController<void> _sessionEndController =
@@ -305,21 +307,31 @@ class SystemVoiceInput implements VoiceInput {
 
   bool get isListening => _listening;
 
+  /// Partial (non-final) recognition results. The
+  /// push-to-talk state machine caches the latest partial
+  /// of a held press as its fallback text (used only when
+  /// the session produced no final); automatic sessions
+  /// ignore this stream entirely.
+  Stream<String> get partials => _partialController.stream;
+
   Future<bool> startListening() async {
     final stt.SpeechToText? speech = _speech;
     if (!_available || _listening || speech == null) return false;
     try {
       await speech.listen(
         onResult: (SpeechRecognitionResult result) {
-          if (result.finalResult && result.recognizedWords.isNotEmpty) {
+          if (result.recognizedWords.isEmpty) return;
+          if (result.finalResult) {
             _controller.add(result.recognizedWords);
+          } else {
+            _partialController.add(result.recognizedWords);
           }
         },
         listenOptions: stt.SpeechListenOptions(
           listenFor: const Duration(seconds: 10),
           pauseFor: const Duration(seconds: 3),
           localeId: 'zh_CN',
-          partialResults: false,
+          partialResults: true,
           cancelOnError: true,
         ),
       );
@@ -345,6 +357,7 @@ class SystemVoiceInput implements VoiceInput {
 
   void dispose() {
     _controller.close();
+    _partialController.close();
     _errorController.close();
   }
 }

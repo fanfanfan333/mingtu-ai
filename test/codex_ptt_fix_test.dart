@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -8,6 +9,7 @@ import 'package:mingtu_ai/adapters/current_location.dart';
 import 'package:mingtu_ai/config/verified_locations.dart';
 import 'package:mingtu_ai/core/navigation_tracker.dart';
 import 'package:mingtu_ai/core/real_navigation.dart';
+import 'package:mingtu_ai/core/voice_commands.dart';
 import 'package:mingtu_ai/core/voice_startup.dart';
 import 'package:mingtu_ai/main.dart';
 import 'package:mingtu_ai/modules/map_navigation.dart';
@@ -47,6 +49,12 @@ class RecordingVoiceChannels {
       <MapEntry<String, Completer<dynamic>>>[];
   bool asrInitResult = true;
   bool asrListenThrows = false;
+
+  /// When set, the platform's answer to listen() stays in
+  /// flight until the completer completes -- a slow engine
+  /// start. Null (the default) answers immediately, exactly
+  /// as before.
+  Completer<dynamic>? listenGate;
 
   void install() {
     final TestDefaultBinaryMessenger messenger =
@@ -88,6 +96,8 @@ class RecordingVoiceChannels {
                 message: 'synthetic listen failure fixture',
               );
             }
+            final Completer<dynamic>? gate = listenGate;
+            if (gate != null) return gate.future;
             return true;
           case 'stop':
             events.add('asr.stop');
@@ -205,6 +215,47 @@ Future<void> tapPanelText(WidgetTester tester, String text) async {
   await tester.pump(const Duration(milliseconds: 50));
   await tester.pump(const Duration(milliseconds: 50));
 }
+
+Future<void> holdPastThreshold(WidgetTester tester) async {
+  // DateTime.now() is real in widget tests: a >300 ms hold
+  // needs a real wait (fake pumps do not move it).
+  await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 380)));
+}
+
+/// Deliver a recognition result the way the platform does:
+/// a textRecognition platform->Dart call on the plugin
+/// channel, carrying the plugin's JSON. The resultType
+/// values follow the plugin's own ResultType enum
+/// (speech_to_text 7.5.0, speech_recognition_result.dart):
+/// 0 = partial, 1 = intermediate, 2 = finalResult. The
+/// adapter routes final results to its transcripts stream
+/// and non-final ones to its partials stream.
+Future<void> deliverRecognition(
+    WidgetTester tester, String words, int resultType) async {
+  final String json = jsonEncode(<String, Object?>{
+    'alternates': <Map<String, Object?>>[
+      <String, Object?>{'recognizedWords': words, 'confidence': 0.95},
+    ],
+    'resultType': resultType,
+  });
+  final ByteData data = const StandardMethodCodec()
+      .encodeMethodCall(MethodCall('textRecognition', json));
+  await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .handlePlatformMessage(
+    'plugin.csdcorp.com/speech_to_text',
+    data,
+    (ByteData? _) {},
+  );
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 50));
+}
+
+Future<void> deliverFinalResult(WidgetTester tester, String words) =>
+    deliverRecognition(tester, words, 2);
+
+Future<void> deliverPartialResult(WidgetTester tester, String words) =>
+    deliverRecognition(tester, words, 0);
 
 Future<void> drainVoice(WidgetTester tester, RecordingVoiceChannels h,
     {int rounds = 14}) async {
@@ -405,6 +456,389 @@ void main() {
     });
   });
 
+  group('ptt state machine races (Codex re-test of c104dc7)', () {
+    testWidgets(
+        'R1: a release during the gated listen() start is '
+        'honoured the moment the start returns',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      // The startup kickoff's permission answer resolves
+      // on the real event loop and can land late; flush it
+      // (and drain its fixed alert) up front so it cannot
+      // speak in the middle of the race.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.events.clear();
+
+      // Gate the platform's listen answer: the start stays
+      // in flight (state: starting) until this test lets
+      // it return.
+      h.listenGate = Completer<dynamic>();
+      final TestGesture gesture = await pressPtt(tester);
+      expect(h.completeSpeak('请说'), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      // The start was ISSUED but the platform has not
+      // answered: no session yet, and no stop either.
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+      expect(h.count('asr.stop'), 0, reason: '${h.events}');
+
+      // A result arriving inside the starting window is a
+      // stale callback: it is dropped, never executed.
+      await deliverFinalResult(tester, '你好');
+      expect(
+        h.events.where((String e) => e.startsWith('tts.speak:')).length,
+        1, // the cue only
+        reason: '${h.events}',
+      );
+
+      // Release inside the window: the stop is only
+      // RECORDED (pendingStop) -- a session whose start
+      // has not returned cannot be stopped yet.
+      await gesture.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.stop'), 0, reason: '${h.events}');
+
+      // The start returns: the sequence stops the session
+      // it just opened immediately, and answers with the
+      // too-short notice -- never the no-content one.
+      h.listenGate!.complete(true);
+      h.listenGate = null;
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      await pumpUntilSpeak(tester, h, '请按住说话');
+      final int listenIdx = h.events.indexOf('asr.listen');
+      final int stopIdx = h.events.indexOf('asr.stop');
+      expect(stopIdx, greaterThan(listenIdx), reason: '${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+      // The stale final from the starting window was never
+      // submitted: no command processing happened at all.
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没听清。${voiceCommandHelpText()}')),
+        reason: '${h.events}',
+      );
+
+      // The recogniser is not stuck listening: a fresh
+      // press runs a complete normal cycle (second listen,
+      // second stop, no-content notice after the grace).
+      h.events.clear();
+      final TestGesture gesture2 = await pressPtt(tester);
+      expect(h.completeSpeak('请说'), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+      await holdPastThreshold(tester);
+      await gesture2.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.stop'), 1, reason: '${h.events}');
+      await tester.pump(const Duration(seconds: 2));
+      await pumpUntilSpeak(tester, h, '没有听清，请按住按钮再说一次。');
+
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'R2: a final arriving while held is cached and '
+        'submitted exactly once after the release',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      // The startup kickoff's permission answer resolves
+      // on the real event loop and can land late; flush it
+      // (and drain its fixed alert) up front so it cannot
+      // speak in the middle of the race.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.events.clear();
+
+      final TestGesture gesture = await pressPtt(tester);
+      expect(h.completeSpeak('请说'), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+
+      await holdPastThreshold(tester);
+      // The final arrives WHILE HELD: it must only be
+      // cached. '你好' parses as an unknown command whose
+      // processing would speak the not-heard reply; none
+      // of that may happen before the release.
+      await deliverFinalResult(tester, '你好');
+      await tester.pump(const Duration(milliseconds: 100));
+      final String unknownReply = '没听清。${voiceCommandHelpText()}';
+      expect(h.events, isNot(contains('tts.speak:$unknownReply')),
+          reason: '${h.events}');
+      expect(
+        h.events.where((String e) => e.startsWith('tts.speak:')).length,
+        1, // the cue only
+        reason: '${h.events}',
+      );
+
+      // Release: the session stops, and only then is the
+      // cached final submitted -- exactly once.
+      await gesture.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      final int stopIdx = h.events.lastIndexOf('asr.stop');
+      final int replyIdx = h.events.indexOf('tts.speak:$unknownReply');
+      expect(stopIdx, greaterThanOrEqualTo(0), reason: '${h.events}');
+      expect(replyIdx, greaterThan(stopIdx), reason: '${h.events}');
+      expect(h.count('tts.speak:$unknownReply'), 1,
+          reason: '${h.events}');
+
+      // A valid result suppresses the no-content notice,
+      // even well past the post-release grace.
+      await tester.pump(const Duration(seconds: 3));
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+      expect(h.count('tts.speak:$unknownReply'), 1,
+          reason: '${h.events}');
+
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'R2 variant: with only a partial cached, the '
+        'post-stop final wins over the partial',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      // The startup kickoff's permission answer resolves
+      // on the real event loop and can land late; flush it
+      // (and drain its fixed alert) up front so it cannot
+      // speak in the middle of the race.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.events.clear();
+
+      final TestGesture gesture = await pressPtt(tester);
+      expect(h.completeSpeak('请说'), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+
+      await holdPastThreshold(tester);
+      // A partial only: cached as the fallback, never
+      // executed while held.
+      await deliverPartialResult(tester, '你好');
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(
+        h.events.where((String e) => e.startsWith('tts.speak:')).length,
+        1, // the cue only
+        reason: '${h.events}',
+      );
+
+      // Release: the session stops and the grace window
+      // opens. (Fake time between here and the final
+      // delivery stays far below the 1.5 s grace -- and
+      // below the plugin's own 2 s final-conversion timer,
+      // so the partial is not promoted by the plugin.)
+      await gesture.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.stop'), greaterThanOrEqualTo(1),
+          reason: '${h.events}');
+
+      // The engine's post-stop final arrives inside the
+      // grace. The word pair is chosen so the two texts
+      // are distinguishable by their processing: the
+      // partial '你好' would be answered with the
+      // unknown-command reply, while the final '帮助' is
+      // answered with the bare help text.
+      await deliverFinalResult(tester, '帮助');
+      await tester.pump(const Duration(milliseconds: 100));
+      final String helpText = voiceCommandHelpText();
+      final String unknownReply = '没听清。$helpText';
+      expect(h.events, contains('tts.speak:$helpText'),
+          reason: '${h.events}');
+      expect(h.count('tts.speak:$helpText'), 1, reason: '${h.events}');
+      expect(h.events, isNot(contains('tts.speak:$unknownReply')),
+          reason: '${h.events}');
+
+      // And the no-content notice never follows.
+      await tester.pump(const Duration(seconds: 3));
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'R3: pressed during a P0 danger prompt, the press '
+        'defers and enters once the danger finishes',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      // The startup kickoff's permission answer resolves
+      // on the real event loop and can land late; flush it
+      // (and drain its fixed alert) up front so it cannot
+      // speak in the middle of the race.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+
+      // Drive the demo navigation, then trigger the
+      // vehicle danger and keep it PLAYING.
+      await tapPanelText(tester, '语音开始（演示输入：带我去图书馆）');
+      await tapPanelText(tester, '理解并规划路线');
+      await tapPanelText(tester, '开始导航（直行节奏启动）');
+      await drainVoice(tester, h, rounds: 6);
+      h.events.clear();
+      await tapPanelText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
+      await pumpUntilSpeak(tester, h, '前方有机动车，请停下。');
+      final int dangerIdx = h.events.indexOf('tts.speak:前方有机动车，请停下。');
+      expect(dangerIdx, greaterThanOrEqualTo(0),
+          reason: '${h.events}');
+
+      // Press while the P0 prompt plays: vibration only.
+      // No cue is spoken over the danger prompt, no
+      // session starts, no stop is issued against it.
+      final TestGesture gesture = await pressPtt(tester);
+      final List<String> duringP0 = h.events.sublist(dangerIdx + 1);
+      expect(duringP0, contains('vibrate'), reason: '${h.events}');
+      expect(duringP0, isNot(contains('tts.speak:请说')),
+          reason: '${h.events}');
+      expect(h.count('asr.listen'), 0, reason: '${h.events}');
+      expect(duringP0, isNot(contains('tts.stop')),
+          reason: '${h.events}');
+      expect(
+        h.speakQueue.any((MapEntry<String, Completer<dynamic>> e) =>
+            e.key == '前方有机动车，请停下。' && !e.value.isCompleted),
+        isTrue,
+        reason: '${h.events}',
+      );
+
+      // Keep holding in REAL time past the production
+      // 1.5 s just-started-P0 recency window, so the
+      // deferred press can enter prompting the moment the
+      // danger completes.
+      await holdPastThreshold(tester);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 1300)));
+
+      // The danger finishes NORMALLY: the still-held
+      // press now enters prompting on its own.
+      expect(h.completeSpeak('前方有机动车，请停下。'), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      await pumpUntilSpeak(tester, h, '请说');
+      expect(h.completeSpeak('请说'), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+
+      // Release: the session stops; with nothing
+      // recognised, the fixed no-content notice follows
+      // after the post-release grace.
+      await gesture.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.stop'), greaterThanOrEqualTo(1),
+          reason: '${h.events}');
+      await tester.pump(const Duration(seconds: 2));
+      await pumpUntilSpeak(tester, h, '没有听清，请按住按钮再说一次。');
+
+      final Finder stopNav = find.widgetWithText(ElevatedButton, '停下');
+      await tester.ensureVisible(stopNav);
+      await tester.pump();
+      await tester.tap(stopNav);
+      await tester.pump();
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'R3 variant: a deferred press released before the '
+        'P0 prompt ends is cancelled silently',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      // The startup kickoff's permission answer resolves
+      // on the real event loop and can land late; flush it
+      // (and drain its fixed alert) up front so it cannot
+      // speak in the middle of the race.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+
+      await tapPanelText(tester, '语音开始（演示输入：带我去图书馆）');
+      await tapPanelText(tester, '理解并规划路线');
+      await tapPanelText(tester, '开始导航（直行节奏启动）');
+      await drainVoice(tester, h, rounds: 6);
+      h.events.clear();
+      await tapPanelText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
+      await pumpUntilSpeak(tester, h, '前方有机动车，请停下。');
+
+      // Press during the P0 prompt: vibration only.
+      final TestGesture gesture = await pressPtt(tester);
+      expect(h.events, contains('vibrate'), reason: '${h.events}');
+      expect(h.events, isNot(contains('tts.speak:请说')),
+          reason: '${h.events}');
+      expect(h.count('asr.listen'), 0, reason: '${h.events}');
+
+      // Release BEFORE the danger finishes: the deferred
+      // press is cancelled quietly.
+      await gesture.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      // The danger now finishes normally -- and nothing
+      // about the dead press may appear afterwards: no
+      // cue, no session, no PTT notice of any kind.
+      expect(h.completeSpeak('前方有机动车，请停下。'), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(seconds: 2));
+      expect(h.events, isNot(contains('tts.speak:请说')),
+          reason: '${h.events}');
+      expect(h.count('asr.listen'), 0, reason: '${h.events}');
+      expect(h.events, isNot(contains('tts.speak:请按住说话')),
+          reason: '${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+
+      final Finder stopNav = find.widgetWithText(ElevatedButton, '停下');
+      await tester.ensureVisible(stopNav);
+      await tester.pump();
+      await tester.tap(stopNav);
+      await tester.pump();
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+  });
+
   group('spoken corpus for the forbidden-word sweep', () {
     testWidgets(
         'collect: greeting, demo navigation, dangers and '
@@ -429,6 +863,15 @@ void main() {
 
       // Push-to-talk: a too-short press and a no-content
       // press contribute the cue and both fixed notices.
+      // The vehicle danger above finished only moments ago
+      // in REAL time, and a press inside the production
+      // 1.5 s just-finished-P0 window is DEFERRED by the
+      // state machine's P0 gate (no cue at all) instead of
+      // speaking the cue -- so let the window lapse first,
+      // the same wait a real user pressing after the
+      // announcement has ended would experience.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 1700)));
       TestGesture gesture = await pressPtt(tester);
       await gesture.up();
       await tester.pump();
@@ -444,6 +887,11 @@ void main() {
           () => Future<void>.delayed(const Duration(milliseconds: 380)));
       await gesture.up();
       await tester.pump();
+      // The no-content notice now fires only after the
+      // post-release 1.5 s grace for a late final has run
+      // out: advance the fake clock past it before the
+      // notice can be collected.
+      await tester.pump(const Duration(seconds: 2));
       await drainVoice(tester, h, rounds: 5);
 
       spokenCorpus.addAll(h.spokenTexts());

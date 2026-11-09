@@ -102,6 +102,10 @@ class MingtuHomePage extends StatefulWidget {
   State<MingtuHomePage> createState() => _MingtuHomePageState();
 }
 
+/// Push-to-talk press states. See the state fields on
+/// _MingtuHomePageState for the transition contract.
+enum _PttState { idle, prompting, starting, listening, stopping }
+
 class _MingtuHomePageState extends State<MingtuHomePage>
     with WidgetsBindingObserver {
   TaskManager _tasks = TaskManager();
@@ -209,6 +213,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   CurrentLocationProvider _locationProvider =
       const UnavailableCurrentLocation();
   StreamSubscription<String>? _transcriptSub;
+  StreamSubscription<String>? _partialSub;
   StreamSubscription<String>? _asrErrorSub;
   StreamSubscription<void>? _asrSessionSub;
   bool _yoloErrorAnnounced = false;
@@ -264,31 +269,51 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// but the guard keeps the contract explicit).
   bool _pushToTalkHeld = false;
 
-  /// True while the push-to-talk press sequence is running
-  /// (cue spoken directly, then the session starts). A
-  /// release that lands mid-sequence cancels the pending
-  /// session start instead of leaving the microphone open.
-  bool _pushToTalkStarting = false;
+  /// Explicit push-to-talk state machine (project-lead
+  /// design, Codex re-test of c104dc7): every press owns a
+  /// unique [_pttSession] id; [_pttState] moves
+  /// idle -> prompting -> starting -> listening ->
+  /// stopping -> idle. Async callbacks validate their
+  /// session id first -- a stale session's callback is
+  /// always dropped. A release during prompting/starting
+  /// only records [_pttPendingStop]; the sequence itself
+  /// performs the stop when its current await returns, so
+  /// no release window can leak an open microphone.
+  _PttState _pttState = _PttState.idle;
+  int _pttSession = 0;
+  bool _pttPendingStop = false;
 
-  /// True when THIS press owns the listening session: the
-  /// automatic session (if any) was stopped for the press
-  /// and must not be mistaken for the push-to-talk session,
-  /// and releasing the button stops exactly this session.
-  bool _pushToTalkSession = false;
+  /// This press began during a P0 announcement: it waits
+  /// (vibration only -- no cue, no ASR) and enters
+  /// prompting when the P0 prompt finishes, IF the button
+  /// is still held then.
+  bool _pttDeferredByP0 = false;
 
-  /// Whether any transcript arrived during the current
-  /// push-to-talk session; releasing with none (too short,
-  /// or nothing recognised) gets the fixed no-content
-  /// notice instead of silence.
-  bool _pushToTalkHeard = false;
+  /// The latest recognition text cached during the current
+  /// press (finals and partials alike): never executed
+  /// while held, submitted once after the release.
+  String? _pttCachedText;
 
-  /// When the current press began (for the under-300ms
-  /// too-short rule), and whether the AUTOMATIC session was
-  /// the one listening when the press began. The press stops
-  /// that session first; on release the automatic loop
-  /// resumes only if it was actually running before --
-  /// push-to-talk must not invent auto-listen state.
+  /// Whether [_pttCachedText] is a final result (a later
+  /// partial must not overwrite a cached final).
+  bool _pttCachedIsFinal = false;
+
+  /// After a release with only a partial cached, the press
+  /// completes when the engine's final arrives (the stop
+  /// makes it deliver) or a 1.5 s grace timer expires.
+  bool _pttAwaitFinal = false;
+
+  /// Waits for a post-release final result before the
+  /// no-content notice may fire (1.5 s).
+  Timer? _pttNoContentTimer;
+
+  /// When the current press began (the under-300ms rule).
   DateTime? _pushToTalkPressedAt;
+
+  /// Whether the AUTOMATIC session was the one listening
+  /// when the press began: it was stopped for the press,
+  /// and after the press the loop resumes only if it was
+  /// actually running before.
   bool _autoListenWasActive = false;
 
   /// The ownership lease for the live view, held while it is
@@ -320,6 +345,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// utterance actually played; compared against
   /// _lastSpokenText by the push-to-talk interruption rules.
   String _lastP0SpokenText = '';
+
+  /// The scheduler id of that P0 utterance; the scheduler's
+  /// interrupted/cancelled logs carry ids, so the P0 gate
+  /// can recognise a just-interrupted P0 playback.
+  String _lastP0RequestId = '';
 
   /// When a physical stop was last issued inside an
   /// utterance's first moments; see _trackedSpeak.
@@ -845,7 +875,28 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _voiceInput = asr;
       _transcriptSub = asr.transcripts.listen((String text) {
         if (!mounted) return;
-        if (_pushToTalkSession) _pushToTalkHeard = true;
+        if (_pttState == _PttState.listening) {
+          // Cache only: while the button is held nothing is
+          // executed. The release path submits the cached
+          // text exactly once.
+          _pttCachedText = text;
+          _pttCachedIsFinal = true;
+          return;
+        }
+        if (_pttState == _PttState.stopping) {
+          // The post-release final the release path is
+          // waiting for: completing the press happens in
+          // _onPttFinalArrived, not here.
+          if (_pttAwaitFinal) _onPttFinalArrived(text);
+          return;
+        }
+        if (_pttState != _PttState.idle) {
+          // A transcript in prompting/starting cannot belong
+          // to this press (its session has not opened): it is
+          // a stale callback from an earlier session and is
+          // dropped, never executed.
+          return;
+        }
         // While the destination question is open, an utterance
         // that is not a known command IS the answer. A real
         // command (停下 / 求助 / 去图书馆 ...) supersedes the
@@ -858,6 +909,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _awaitingDestination = false;
         }
         _handleVoiceCommand(text);
+      });
+      _partialSub = asr.partials.listen((String text) {
+        if (!mounted) return;
+        // Partials are only ever the push-to-talk fallback
+        // cache; automatic sessions never act on them.
+        if (_pttState == _PttState.listening) {
+          // A partial refreshes the fallback cache, but a
+          // final already cached for this press outranks
+          // any later partial.
+          if (!_pttCachedIsFinal) _pttCachedText = text;
+        } else if (_pttState == _PttState.stopping && _pttAwaitFinal) {
+          _pttCachedText = text;
+          _pttCachedIsFinal = true;
+        }
       });
       // ASR runtime errors surface through the adapter's error
       // stream (previously they only rewrote an unwatched status
@@ -988,7 +1053,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // Push-to-talk owns the microphone while held: the
     // automatic loop must never start a second, overlapping
     // session (Codex re-test of Step C).
-    if (_pushToTalkHeld || _pushToTalkStarting || _pushToTalkSession) {
+    if (_pushToTalkHeld || _pttState != _PttState.idle) {
       return;
     }
     // After a runtime TTS failure the loop stays off: speech state
@@ -1017,7 +1082,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// or queued (that path restarts via _finishSpeech) and
   /// when the loop was deliberately switched off.
   void _onAsrSessionEnded() {
-    if (_pushToTalkHeld || _pushToTalkStarting || _pushToTalkSession) {
+    if (_pushToTalkHeld || _pttState != _PttState.idle) {
       return;
     }
     if (!_autoListenEnabled || _ttsFailed) return;
@@ -1038,6 +1103,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _hazardScanTimer?.cancel();
     _orientation.dispose();
     _transcriptSub?.cancel();
+    _partialSub?.cancel();
+    _pttNoContentTimer?.cancel();
     _asrErrorSub?.cancel();
     _asrSessionSub?.cancel();
     _gpsSub?.cancel();
@@ -1170,8 +1237,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _recheckStraightResume();
       }
       if (next == null) {
-        // Speech is done and nothing is queued: the turn-taking
-        // loop may open the microphone now (v0.7).
+        // A press deferred by the P0 prompt that just
+        // finished enters prompting now (still held only);
+        // otherwise the turn-taking loop may open the
+        // microphone (v0.7).
+        _maybeEnterPttAfterP0();
         _maybeStartListeningAfterSpeech();
         return;
       }
@@ -1179,6 +1249,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _currentPrompt = next.text;
         _lastSpokenText = next.text;
       });
+      if (finished.kind == SpeechKind.danger ||
+          finished.kind == SpeechKind.emergency) {
+        _maybeEnterPttAfterP0();
+      }
       _speakActive(next);
     }
   }
@@ -1250,6 +1324,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (request.kind == SpeechKind.danger ||
         request.kind == SpeechKind.emergency) {
       _lastP0SpokenText = request.text;
+      _lastP0RequestId = request.id;
     }
     final DateTime myStart = _lastSpeechStartedAt!;
     final Future<void> playback = _voiceOutput.speak(request.text);
@@ -1685,6 +1760,37 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
+  /// True while a P0 (danger/emergency) announcement is
+  /// audibly playing. Three layers of evidence, strongest
+  /// first: a P0 request is the scheduler's active entry
+  /// or queued; a P0 entry was interrupted/cancelled a
+  /// moment ago (its playback can outlive the entry); the
+  /// most recent utterance started within the last 1.5 s
+  /// and IS the most recent P0 text. Used to refuse
+  /// push-to-talk presses during danger announcements.
+  bool get _p0SpeechPlaying {
+    if (_dangerPending) return true;
+    final List<String> interrupted = _scheduler.interruptedLog;
+    final List<String> cancelled = _scheduler.cancelledLog;
+    bool recentP0(List<String> log) {
+      for (int i = log.length - 1; i >= 0 && i >= log.length - 4; i--) {
+        if (log[i] == _lastP0RequestId) return true;
+      }
+      return false;
+    }
+
+    if (_lastP0RequestId.isNotEmpty &&
+        (recentP0(interrupted) || recentP0(cancelled))) {
+      return true;
+    }
+    final DateTime? startedAt = _lastSpeechStartedAt;
+    return startedAt != null &&
+        _lastP0SpokenText.isNotEmpty &&
+        _lastSpokenText == _lastP0SpokenText &&
+        DateTime.now().difference(startedAt) <
+            const Duration(milliseconds: 1500);
+  }
+
   /// Push-to-talk press sequence (Step C, ordering fixed
   /// by the Codex re-test, refined per the project lead):
   ///   1. vibrate;
@@ -1706,27 +1812,53 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// failure vibrates and speaks the fixed ASR-unavailable
   /// notice like every other ASR failure path.
   void _pushToTalkStart() {
-    if (_pushToTalkHeld) return;
+    if (_pttState != _PttState.idle) return;
+    final int sid = ++_pttSession;
+    _pttState = _PttState.prompting;
+    _pttPendingStop = false;
+    _pttDeferredByP0 = false;
+    _pttCachedText = null;
+    _pttCachedIsFinal = false;
+    _pttAwaitFinal = false;
     _pushToTalkHeld = true;
-    _pushToTalkStarting = true;
-    _pushToTalkHeard = false;
     _pushToTalkPressedAt = DateTime.now();
     _autoListenWasActive = _voiceInput is SystemVoiceInput &&
         (_voiceInput as SystemVoiceInput).isListening;
     HapticFeedback.vibrate();
-    unawaited(_pushToTalkSequence());
+    if (_p0SpeechPlaying) {
+      // P0 gate: during a danger/emergency announcement
+      // the press only vibrates -- no cue, no ASR. It waits
+      // in prompting; _finishSpeech enters the prompt step
+      // when the P0 prompt completes, if still held.
+      _pttDeferredByP0 = true;
+      _logMsg('按住说话：危险播报进行中，先等待播报结束。');
+      return;
+    }
+    unawaited(_pttPromptStep(sid));
   }
 
-  Future<void> _pushToTalkSequence() async {
-    // (2a) The automatic session yields the microphone.
+  /// prompting: hand the microphone over, clear non-P0
+  /// speech, speak the cue and await it. Every await is
+  /// followed by a session + pendingStop re-check: a
+  /// release recorded meanwhile is honoured by the
+  /// sequence itself, never by state flags racing it.
+  Future<void> _pttPromptStep(int sid) async {
     if (_autoListenWasActive) {
       await _stopListeningInternal();
     }
-    // (2b) A playing non-P0 utterance is interrupted; a P0
-    // danger/emergency prompt is left playing untouched.
     await _interruptSpeechForPushToTalk();
-    if (!mounted) return;
-    // (3) The cue, directly and awaited.
+    if (!mounted || sid != _pttSession) return;
+    if (_pttPendingStop) {
+      _pttFinishTooShort(sid);
+      return;
+    }
+    if (_p0SpeechPlaying) {
+      // A P0 announcement began mid-prompt: defer the
+      // same way as a press that started during one.
+      _pttDeferredByP0 = true;
+      _logMsg('按住说话：危险播报已开始，先等待播报结束。');
+      return;
+    }
     if (_voiceOutput.isAvailable && !_ttsFailed) {
       setState(() {
         _currentPrompt = '请说';
@@ -1742,64 +1874,174 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (mounted) _handleTtsFailure(e);
       }
     }
-    if (!mounted) return;
-    _pushToTalkStarting = false;
-    if (!_pushToTalkHeld) {
-      // Released while the sequence still ran: too short.
+    if (!mounted || sid != _pttSession) return;
+    if (_pttPendingStop) {
+      _pttFinishTooShort(sid);
+      return;
+    }
+    _pttState = _PttState.starting;
+    final bool started = await _startListening(pushToTalk: true);
+    if (!mounted || sid != _pttSession) return;
+    if (!started) {
+      // The failure was already announced by _startListening
+      // (vibration + fixed notice). The press is over either
+      // way; a pending release adds nothing.
+      _pttState = _PttState.idle;
+      _pushToTalkHeld = false;
+      _pttPendingStop = false;
+      _restoreAutoListenAfterPushToTalk();
+      return;
+    }
+    if (_pttPendingStop) {
+      // Released during the starting window: stop the
+      // session just opened, immediately.
+      _pttState = _PttState.stopping;
+      await _stopListeningInternal();
+      if (!mounted || sid != _pttSession) return;
+      _pttState = _PttState.idle;
+      _pttPendingStop = false;
       _announcePushToTalkTooShort();
       return;
     }
-    // (4) The session starts only now.
-    final bool started = await _startListening(pushToTalk: true);
-    if (!mounted) return;
-    if (started) {
-      _pushToTalkSession = true;
-    } else if (_pushToTalkHeld) {
-      // The failure was already announced by _startListening
-      // (vibration + fixed notice). The press is over.
-      _pushToTalkHeld = false;
-      _restoreAutoListenAfterPushToTalk();
+    _pttState = _PttState.listening;
+  }
+
+  /// The press ended inside prompting with nothing heard:
+  /// back to idle with the too-short notice.
+  void _pttFinishTooShort(int sid) {
+    _pttState = _PttState.idle;
+    _pttPendingStop = false;
+    _announcePushToTalkTooShort();
+  }
+
+  /// Release of the push-to-talk button.
+  Future<void> _pushToTalkEnd() async {
+    switch (_pttState) {
+      case _PttState.idle:
+        return;
+      case _PttState.prompting:
+        if (_pttDeferredByP0) {
+          // A deferred press released before the P0 prompt
+          // finished: cancel quietly; the finish hook must
+          // not start a press nobody holds anymore.
+          _pttDeferredByP0 = false;
+          _pttState = _PttState.idle;
+          _pushToTalkHeld = false;
+          return;
+        }
+        // The sequence sees the flag after its current
+        // await and finishes the press itself.
+        _pttPendingStop = true;
+        _pushToTalkHeld = false;
+        return;
+      case _PttState.starting:
+        // listen() has not answered yet: record the stop;
+        // the sequence stops the session the moment the
+        // start returns.
+        _pttPendingStop = true;
+        _pushToTalkHeld = false;
+        return;
+      case _PttState.listening:
+        _pushToTalkHeld = false;
+        await _pttReleaseFromListening();
+        return;
+      case _PttState.stopping:
+        return;
     }
   }
 
-  /// Release of the push-to-talk button: stop the session
-  /// owned by this press and let the final result arrive
-  /// through the transcript subscription. No content at
-  /// all (or a press under 300 ms) gets the fixed notices,
-  /// never silence. The automatic loop then resumes ONLY
-  /// if it was running before the press, through the
-  /// ordinary turn-taking conditions.
-  Future<void> _pushToTalkEnd() async {
-    if (!_pushToTalkHeld) return;
-    _pushToTalkHeld = false;
+  /// Release while listening: stop the session, then
+  /// complete the press exactly once -- a cached final is
+  /// submitted immediately; a cached partial waits for the
+  /// engine's post-stop final (grace 1.5 s); nothing cached
+  /// waits the same grace for a late final before the
+  /// no-content notice may fire.
+  Future<void> _pttReleaseFromListening() async {
+    final int sid = _pttSession;
     final DateTime? pressedAt = _pushToTalkPressedAt;
     _pushToTalkPressedAt = null;
     final bool tooShort = pressedAt == null ||
         DateTime.now().difference(pressedAt) <
             const Duration(milliseconds: 300);
-    if (_pushToTalkStarting) {
-      // The sequence notices the release and answers with
-      // the too-short notice; nothing starts here.
-      return;
-    }
-    if (!_pushToTalkSession) return;
-    _pushToTalkSession = false;
+    _pttState = _PttState.stopping;
+    await _stopListeningInternal();
+    if (!mounted || sid != _pttSession) return;
     if (tooShort) {
-      await _stopListeningInternal();
-      if (!mounted) return;
+      _pttState = _PttState.idle;
+      _pttCachedText = null;
+      _pttCachedIsFinal = false;
       _announcePushToTalkTooShort();
       return;
     }
-    await _stopListeningInternal();
-    if (!mounted) return;
-    if (!_pushToTalkHeard) {
-      _announcePushToTalkNoContent();
+    if (_pttCachedIsFinal && _pttCachedText != null) {
+      final String text = _pttCachedText!;
+      _pttState = _PttState.idle;
+      _pttCachedText = null;
+      _pttCachedIsFinal = false;
+      _processPushToTalkFinal(text);
+      _restoreAutoListenAfterPushToTalk();
       return;
     }
-    // Content was submitted and handled quietly (a command
-    // that speaks for itself reopens the loop through its
-    // own finish-speech anyway): hand the microphone back.
+    // Only a partial (or nothing) so far: the stop makes
+    // the engine deliver its final -- wait for it briefly.
+    _pttAwaitFinal = true;
+    final String? partial = _pttCachedText;
+    _pttNoContentTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
+        return;
+      }
+      _pttAwaitFinal = false;
+      _pttState = _PttState.idle;
+      _pttCachedText = null;
+      _pttCachedIsFinal = false;
+      if (partial != null) {
+        _processPushToTalkFinal(partial);
+        _restoreAutoListenAfterPushToTalk();
+      } else {
+        _announcePushToTalkNoContent();
+      }
+    });
+  }
+
+  /// The engine's final arrived inside the post-release
+  /// grace window: it wins over any cached partial.
+  void _onPttFinalArrived(String text) {
+    _pttNoContentTimer?.cancel();
+    _pttAwaitFinal = false;
+    _pttState = _PttState.idle;
+    _pttCachedText = null;
+    _pttCachedIsFinal = false;
+    _processPushToTalkFinal(text);
     _restoreAutoListenAfterPushToTalk();
+  }
+
+  /// Called from _finishSpeech: a deferred press whose P0
+  /// prompt just completed enters prompting, if the button
+  /// is still held and the press is still the live one.
+  void _maybeEnterPttAfterP0() {
+    if (_pttState != _PttState.prompting || !_pttDeferredByP0) return;
+    if (!_pushToTalkHeld) {
+      _pttDeferredByP0 = false;
+      _pttState = _PttState.idle;
+      return;
+    }
+    _pttDeferredByP0 = false;
+    unawaited(_pttPromptStep(_pttSession));
+  }
+
+  /// Process the released press's submitted text: the same
+  /// routing the transcript subscription applies to
+  /// automatic sessions (destination answer while the
+  /// question is open, otherwise the command handler).
+  void _processPushToTalkFinal(String text) {
+    if (_awaitingDestination) {
+      if (parseVoiceCommand(text) == VoiceCommand.unknown) {
+        _answerDestination(text);
+        return;
+      }
+      _awaitingDestination = false;
+    }
+    _handleVoiceCommand(text);
   }
 
   /// Stop the currently playing utterance for a press --
@@ -1815,6 +2057,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// non-P0 playback is stopped physically, recent P0
   /// playback is left completely alone.
   Future<void> _interruptSpeechForPushToTalk() async {
+    // A queued P0 prompt is about to play: clearing the
+    // queue for a cue would kill it. Leave everything.
+    if (_scheduler.queue.any((SpeechRequest r) =>
+        r.kind == SpeechKind.danger || r.kind == SpeechKind.emergency)) {
+      return;
+    }
     final SpeechRequest? active = _scheduler.active;
     if (active != null) {
       if (active.kind == SpeechKind.danger ||
