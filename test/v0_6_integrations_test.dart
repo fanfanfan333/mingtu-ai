@@ -120,7 +120,8 @@ void main() {
     expect(result.error, isNot(contains('key=')));
   });
 
-  test('amap status 0 returns the provider info, not a route', () async {
+  test('amap status 0 returns a fixed generic error, not a route '
+      'and NOT the provider free-text info', () async {
     final AmapWalkingClient client = AmapWalkingClient(
       proxyBaseUrl: 'https://proxy.example.test',
       sender: (Uri url) async => jsonEncode(<String, Object>{
@@ -133,7 +134,10 @@ void main() {
       to: parseLonLat('116.401,39.9009')!,
     );
     expect(result.ok, isFalse);
-    expect(result.error, contains('INVALID_USER_KEY'));
+    // Structured-output rule (both route modes): upstream free
+    // text is never copied into results or announcements.
+    expect(result.error, contains('失败状态'));
+    expect(result.error, isNot(contains('INVALID_USER_KEY')));
   });
 
   test('yolo result mapping uses the normalised box centre', () {

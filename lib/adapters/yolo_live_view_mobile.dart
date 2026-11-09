@@ -13,6 +13,8 @@
 /// for the same routing decision and for lifecycle release.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/widgets.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 
@@ -26,6 +28,16 @@ final YOLOViewController sharedYoloViewController = YOLOViewController();
 /// Whether the YOLO live view is currently mounted (and thus
 /// owns the device camera).
 bool yoloLiveViewMounted = false;
+
+Completer<void>? _yoloDisposeCompleter;
+
+/// Completes when the live view has ACTUALLY unmounted (its
+/// State.dispose ran) after having been mounted. The camera
+/// owner's YOLO release waits on this: the logical lock is not
+/// freed until the physical view teardown finished. A fresh
+/// completer is created at every mount.
+Future<void> get yoloLiveViewDisposed =>
+    (_yoloDisposeCompleter ??= Completer<void>()).future;
 
 Widget buildYoloLiveView({
   required String modelPath,
@@ -63,11 +75,16 @@ class _YoloLiveViewHostState extends State<_YoloLiveViewHost> {
   void initState() {
     super.initState();
     yoloLiveViewMounted = true;
+    _yoloDisposeCompleter = Completer<void>();
   }
 
   @override
   void dispose() {
     yoloLiveViewMounted = false;
+    final Completer<void>? completer = _yoloDisposeCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
+    }
     super.dispose();
   }
 

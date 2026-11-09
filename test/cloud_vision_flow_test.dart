@@ -319,7 +319,7 @@ void main() {
       'routed source refuses a still while the arbiter is held '
       'by another use: no double-open', () async {
     final CameraOwnership ownership = CameraOwnership();
-    expect(ownership.tryAcquire(CameraUse.yoloLive), isTrue);
+    expect(await ownership.tryAcquire(CameraUse.yoloLive), isNotNull);
     final FakeFrameSource single =
         FakeFrameSource(CameraFrameCapture.ok(_fakeImage(8)));
     final RoutedCameraFrameSource routed = RoutedCameraFrameSource(
@@ -334,5 +334,31 @@ void main() {
     expect(capture.ok, isFalse);
     expect(capture.failure, CameraFrameFailure.unavailable);
     expect(single.calls, 0); // camera was never opened twice
+  });
+
+  test(
+      'a capture that THROWS after cancellation announces '
+      'nothing: the catch checks cancellation first', () async {
+    final CloudVisionCancellation token = CloudVisionCancellation();
+    int sends = 0;
+    final CameraFrameSource throwing = _FuncFrameSource(() async {
+      token.cancel(); // backgrounded mid-capture
+      throw StateError('camera died');
+    });
+    final OnDemandCloudVision flow = OnDemandCloudVision(
+      client: _client(sender: (Uri u, String b) async {
+        sends += 1;
+        return _visionOkBody();
+      }),
+      frameSource: throwing,
+    );
+    final List<String> heard = <String>[];
+    final CloudVisionFlowOutcome outcome =
+        await flow.run(announce: heard.add, now: now, cancellation: token);
+    expect(outcome.cancelled, isTrue);
+    expect(sends, 0);
+    // Only the starting announcement (made before cancellation);
+    // the exception branch added NOTHING.
+    expect(heard, <String>[cloudVisionStartingSpeech]);
   });
 }

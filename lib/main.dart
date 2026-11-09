@@ -172,6 +172,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   String _amapText = '高德真实路线：未请求。';
   String _yoloText = 'YOLO：未接入。';
   bool _yoloLiveOpen = false;
+
+  /// The ownership lease for the live view, held while it is
+  /// open; only this lease can release the camera, and the
+  /// release waits for the view to actually unmount.
+  CameraLease? _yoloLease;
   double? _yoloLatencyMs;
   // v0.7 voice-first additions.
   AmapStepSpeaker? _amapSpeaker;
@@ -212,14 +217,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached) {
-      _visionRuns.cancelActive();
-      _cameraOwnership.cancelAllAndRelease();
       if (_yoloLiveOpen && mounted) {
         setState(() {
           _closeYoloLiveView();
         });
         _logMsg('应用进入后台：已关闭 YOLO 实时摄像头并取消进行中的云端视觉识别。');
       }
+      _visionRuns.cancelActive();
+      _cameraOwnership.cancelAllAndRelease();
     }
   }
 
@@ -378,6 +383,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _closeYoloLiveView();
     _visionRuns.cancelActive();
     _cameraOwnership.cancelAllAndRelease();
     _straightTimer?.cancel();
@@ -725,9 +731,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       ));
       return;
     }
+    // Announce the current route mode first (演示直连 / 代理 /
+    // 未配置): a blind user must know which path a route would
+    // come from before any attempt is made.
+    _say(_request(
+      id: 'route-mode-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'route-mode-${DateTime.now().millisecondsSinceEpoch}',
+      text: amapRouteModeSpeech(selectAmapRouteMode(
+        demoKey: AppConfig.amapDemoKey,
+        proxyUrl: AppConfig.routeProxyUrl,
+      )),
+      kind: SpeechKind.info,
+    ));
     final RealNavigationStarter starter = RealNavigationStarter(
       locationProvider: const GeolocatorCurrentLocation(),
-      client: AmapWalkingClient(proxyBaseUrl: AppConfig.routeProxyUrl),
+      client: AmapWalkingClient(
+        proxyBaseUrl: AppConfig.routeProxyUrl,
+        demoKey: AppConfig.amapDemoKey,
+      ),
     );
     final RealNavigationOutcome outcome = await starter.start(destinationName);
     if (!mounted) return;
@@ -1018,11 +1039,43 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  /// Open the YOLO live view under the shared arbiter. The
+  /// acquire first waits for any pending physical release; when
+  /// the camera is busy (or the wait times out) the view does NOT
+  /// open and the user hears exactly that.
+  Future<void> _openYoloLive() async {
+    final CameraLease? lease =
+        await _cameraOwnership.tryAcquire(CameraUse.yoloLive);
+    if (lease == null) {
+      _logMsg('摄像头忙：YOLO 实时视图未打开。');
+      _say(_request(
+        id: 'camera-busy-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'camera-busy-${DateTime.now().millisecondsSinceEpoch}',
+        text: cameraBusySpeech,
+        kind: SpeechKind.alert,
+      ));
+      return;
+    }
+    _yoloLease = lease;
+    if (!mounted) return;
+    setState(() {
+      _yoloLiveOpen = true;
+    });
+  }
+
   /// Close the YOLO live view and hand the camera back to the
-  /// shared arbiter. Safe to call when the view is not open.
+  /// shared arbiter. The release is asynchronous: the lock frees
+  /// only after the view has actually unmounted
+  /// (yoloLiveViewDisposed). Safe to call when not open.
   void _closeYoloLiveView() {
     _yoloLiveOpen = false;
-    _cameraOwnership.release(CameraUse.yoloLive);
+    final CameraLease? lease = _yoloLease;
+    _yoloLease = null;
+    if (lease != null) {
+      unawaited(
+        _cameraOwnership.release(lease, waitFor: yoloLiveViewDisposed),
+      );
+    }
   }
 
   void _startNavigating() {
@@ -1034,18 +1087,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     setState(() {
       _straightConfirmed = true;
       _straightNavVersion = _navVersion;
-      // v0.7: navigation starts the camera too -- a blind user must
-      // not have to find and tap a button to turn perception on.
-      // On web this shows the phone-only stub text. The shared
-      // arbiter is acquired first: if a one-shot capture holds
-      // the camera, the live view does NOT open (no double-open)
-      // and navigation proceeds without it.
-      if (_cameraOwnership.tryAcquire(CameraUse.yoloLive)) {
-        _yoloLiveOpen = true;
-      } else {
-        _logMsg('开始导航：摄像头正被占用，YOLO 实时视图未打开（不双开摄像头）。');
-      }
     });
+    // v0.7: navigation starts the camera too -- a blind user must
+    // not have to find and tap a button to turn perception on.
+    // On web this shows the phone-only stub text. The open goes
+    // through the shared arbiter (async, waits for any pending
+    // physical release): if the camera is busy the view simply
+    // does not open and navigation proceeds without it.
+    unawaited(_openYoloLive());
     _startStraightTimer();
     _logMsg('开始导航：直行路段已确认，3 秒直行节奏已启动。');
     final DateTime now = DateTime.now();
@@ -2238,12 +2287,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                   setState(() {
                     _closeYoloLiveView();
                   });
-                } else if (_cameraOwnership.tryAcquire(CameraUse.yoloLive)) {
-                  setState(() {
-                    _yoloLiveOpen = true;
-                  });
                 } else {
-                  _logMsg('摄像头正被占用，YOLO 实时视图未打开（不双开摄像头）。');
+                  unawaited(_openYoloLive());
                 }
               },
             ),

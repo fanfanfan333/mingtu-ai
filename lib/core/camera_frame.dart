@@ -15,6 +15,8 @@
 ///   leaves the device.
 library;
 
+import 'dart:async';
+
 import 'dart:typed_data';
 
 import 'cloud_vision.dart';
@@ -94,44 +96,113 @@ class CloudVisionCancellation {
 /// What the device camera is being used for right now.
 enum CameraUse { yoloLive, singleShot }
 
-/// The app's single camera arbiter: ONE owner for the whole app,
+/// A unique ownership lease for the device camera. [CameraOwnership]
+/// hands out exactly one live lease at a time; ONLY the holder of
+/// the current lease can release it (see
+/// [CameraOwnership.release]) -- a stale holder finishing late
+/// (an old capture's finally block) cannot free a newer owner's
+/// lock. [generation] makes leases distinguishable in logs/tests.
+class CameraLease {
+  final CameraUse use;
+  final int generation;
+  bool _releaseStarted = false;
+  Future<void>? _physicalRelease;
+
+  CameraLease._(this.use, this.generation);
+
+  bool get releaseStarted => _releaseStarted;
+}
+
+/// The app's single camera arbiter: ONE lease for the whole app,
 /// shared by the YOLO live view and the one-shot still capture,
 /// so the two can never hold the camera at the same time.
 ///
-/// Ownership rules:
-/// - [tryAcquire] succeeds only when the camera is free or
-///   already held for the SAME use; a different use is refused.
-/// - [release] only frees the camera for its current use.
-/// - Every in-flight cancellable camera request registers its
-///   token here; [cancelAllAndRelease] (app backgrounded /
-///   disposed) cancels ALL of them and frees the camera -- not
-///   just whichever token happens to be newest.
+/// Release is ASYNCHRONOUS and physical: [release] waits for the
+/// underlying teardown (camera controller dispose, or the YOLO
+/// view actually unmounting) before the lock is considered free,
+/// and [tryAcquire] first waits for any pending release --
+/// refusing (null) when that wait times out, so a caller can
+/// announce "摄像头忙，请稍后再试" instead of double-opening.
+/// After the app returns from background the same rule applies:
+/// the next acquire still waits for the release that the
+/// backgrounding started.
 class CameraOwnership {
-  CameraUse? _current;
+  CameraLease? _current;
+  int _nextGeneration = 0;
+  Completer<void>? _releaseCompleter;
   final Set<CloudVisionCancellation> _cancellations =
       <CloudVisionCancellation>{};
 
-  CameraUse? get current => _current;
+  CameraUse? get currentUse => _current?.use;
+  CameraLease? get currentLease => _current;
   bool get isHeld => _current != null;
-  bool isHeldBy(CameraUse use) => _current == use;
+  bool get isReleasePending => _releaseCompleter != null;
+  bool isHeldBy(CameraUse use) => _current?.use == use;
   int get activeCancellations => _cancellations.length;
 
-  bool tryAcquire(CameraUse use) {
-    if (_current == use) {
-      // The live view is a persistent holder: acquiring it again
-      // (navigation start + manual toggle) is idempotent. A
-      // one-shot capture is an exclusive operation: a second
-      // acquire while one is in flight is REFUSED, so two
-      // captures can never overlap.
-      return use == CameraUse.yoloLive;
+  /// Try to take the camera for [use]. Waits for a pending
+  /// physical release first (up to [timeout]); returns null when
+  /// the wait times out or another use holds the camera. The
+  /// YOLO live view is a persistent holder: re-acquiring it while
+  /// it is held (and not releasing) returns the SAME lease. A
+  /// one-shot capture is exclusive: while one is in flight, a
+  /// second acquire is refused.
+  Future<CameraLease?> tryAcquire(
+    CameraUse use, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final Completer<void>? pending = _releaseCompleter;
+    if (pending != null) {
+      try {
+        await pending.future.timeout(timeout);
+      } on TimeoutException {
+        return null;
+      }
     }
-    if (_current != null) return false;
-    _current = use;
-    return true;
+    final CameraLease? current = _current;
+    if (current != null) {
+      if (current.use == use &&
+          use == CameraUse.yoloLive &&
+          !current._releaseStarted) {
+        return current;
+      }
+      return null;
+    }
+    return _current = CameraLease._(use, ++_nextGeneration);
   }
 
-  void release(CameraUse use) {
-    if (_current == use) _current = null;
+  /// Record the future that completes when [lease]'s physical
+  /// operation (e.g. an in-flight capture incl. its controller
+  /// dispose) has fully finished, so a later [release] can wait
+  /// for the hardware to actually be free.
+  void trackPhysicalRelease(CameraLease lease, Future<void> physical) {
+    if (identical(_current, lease) && !lease._releaseStarted) {
+      lease._physicalRelease = physical;
+    }
+  }
+
+  /// Release [lease], waiting for the physical teardown
+  /// ([waitFor] when given, else the tracked physical release)
+  /// BEFORE the lock frees. Only the current lease can release:
+  /// a stale lease (an old operation finishing after a newer
+  /// owner took over) releases nothing. Idempotent per lease.
+  Future<void> release(CameraLease lease, {Future<void>? waitFor}) async {
+    if (!identical(_current, lease) || lease._releaseStarted) return;
+    lease._releaseStarted = true;
+    final Completer<void> completer = Completer<void>();
+    _releaseCompleter = completer;
+    final Future<void>? physical = waitFor ?? lease._physicalRelease;
+    if (physical != null) {
+      try {
+        await physical;
+      } catch (_) {
+        // A failed teardown still ends the release: the lock
+        // must not jam shut forever.
+      }
+    }
+    if (identical(_current, lease)) _current = null;
+    if (identical(_releaseCompleter, completer)) _releaseCompleter = null;
+    completer.complete();
   }
 
   void registerCancellation(CloudVisionCancellation token) {
@@ -142,17 +213,25 @@ class CameraOwnership {
     _cancellations.remove(token);
   }
 
-  /// Cancel every registered in-flight request and free the
-  /// camera. Called when the app goes to background or is
-  /// disposed: nothing camera-related may survive that.
+  /// Cancel every registered in-flight request and START
+  /// releasing the camera (the physical release completes
+  /// asynchronously; the next [tryAcquire] waits for it).
+  /// Called when the app goes to background or is disposed:
+  /// nothing camera-related may survive that.
   void cancelAllAndRelease() {
     for (final CloudVisionCancellation token in _cancellations) {
       token.cancel();
     }
     _cancellations.clear();
-    _current = null;
+    final CameraLease? current = _current;
+    if (current != null) {
+      release(current);
+    }
   }
 }
+
+/// The spoken text for a refused camera acquisition.
+const String cameraBusySpeech = '摄像头忙，请稍后再试。';
 
 /// Owns the cancellation token of the ONE cloud-vision run that
 /// may be active at a time. [begin] returns null when a run is
@@ -186,10 +265,10 @@ class VisionRunManager {
 /// while the YOLO live view is running (it holds the camera via
 /// [CameraOwnership]), the frame comes from THAT view's capture
 /// (its most recent live frame) via [yoloSource]; otherwise a
-/// dedicated one-shot still is taken via [singleShotSource],
-/// which must first acquire [CameraUse.singleShot] ownership
-/// and releases it afterwards. Exactly one source is used per
-/// trigger -- the two never run together.
+/// dedicated one-shot still is taken via [singleShotSource]
+/// under a [CameraUse.singleShot] lease, released (physically)
+/// afterwards. Exactly one source is used per trigger -- the two
+/// never run together.
 class RoutedCameraFrameSource implements CameraFrameSource {
   final bool Function() yoloLiveActive;
   final CameraFrameSource yoloSource;
@@ -208,16 +287,35 @@ class RoutedCameraFrameSource implements CameraFrameSource {
     if (yoloLiveActive()) {
       return yoloSource.captureSingleFrame();
     }
-    if (!ownership.tryAcquire(CameraUse.singleShot)) {
+    final CameraLease? lease = await ownership.tryAcquire(CameraUse.singleShot);
+    if (lease == null) {
       return CameraFrameCapture.failed(
         CameraFrameFailure.unavailable,
-        detail: '摄像头正被其他功能占用。',
+        detail: cameraBusySpeech,
       );
     }
+    Future<CameraFrameCapture> operation;
     try {
-      return await singleShotSource.captureSingleFrame();
+      operation = singleShotSource.captureSingleFrame();
+    } catch (e) {
+      operation = Future<CameraFrameCapture>.value(
+        CameraFrameCapture.failed(
+          CameraFrameFailure.failure,
+          detail: '拍照失败：$e',
+        ),
+      );
+    }
+    // The capture future completes only after the source's own
+    // controller dispose (mobile impl), so tracking it makes a
+    // later release wait for the hardware to be truly free.
+    ownership.trackPhysicalRelease(
+      lease,
+      operation.then((_) {}, onError: (_) {}),
+    );
+    try {
+      return await operation;
     } finally {
-      ownership.release(CameraUse.singleShot);
+      await ownership.release(lease);
     }
   }
 }

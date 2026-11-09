@@ -9,21 +9,30 @@
 ///     --dart-define=MINGTU_LLM_MODEL_ID=... \
 ///     --dart-define=MINGTU_DASHSCOPE_API_KEY=...
 ///
-/// Amap key rule (navigation P0, changed): the Amap Web Service key
-/// must NEVER be in the app -- not in source, not in the APK, not
-/// via --dart-define (dart-define values are compiled into the app
-/// binary and are extractable from a public APK). The key lives
-/// only in the route proxy's server-side environment (see
-/// server/amap_proxy.py); the app only knows the proxy base URL,
-/// which is not a secret. The old MINGTU_AMAP_KEY /
-/// MINGTU_AMAP_FROM / MINGTU_AMAP_TO dart-define channels are
-/// removed: real-route origins now come from the on-device GPS
-/// adapter (adapters/current_location.dart) and destinations only
-/// from config/verified_locations.dart (human-verified, GCJ-02).
-/// Without a proxy URL the app reports NOT_CONFIGURED and never
-/// invents a route. YOLO model path defaults to the official
-/// model id 'yolo11n' (the plugin downloads it on the phone); an
-/// asset path such as 'assets/models/custom.tflite' also works.
+/// Amap key rule: the PRODUCTION Amap Web Service key must never
+/// be in the app -- it lives only in the route proxy's server-side
+/// environment (see server/amap_proxy.py); the app then only
+/// knows the proxy base URL, which is not a secret.
+///
+/// DEMO EXCEPTION (explicit user decision, 2026-11-09): the demo
+/// build may inject a DISPOSABLE demo key via
+/// --dart-define=MINGTU_AMAP_KEY for a direct-connection demo
+/// mode (see adapters/amap_client.dart). dart-define values are
+/// compiled into the app binary and ARE extractable from the
+/// APK, so this is only acceptable because the key is a
+/// throwaway: the user MUST regenerate/revoke it after the demo.
+/// The value itself is never committed to this repository, never
+/// printed and never logged (the client never surfaces request
+/// URLs, which carry it). The old MINGTU_AMAP_FROM /
+/// MINGTU_AMAP_TO dart-define channels stay removed: real-route
+/// origins come from the on-device GPS adapter
+/// (adapters/current_location.dart) and destinations only from
+/// config/verified_locations.dart (human-verified, GCJ-02).
+/// Without a demo key or a proxy URL the app reports
+/// NOT_CONFIGURED and never invents a route. YOLO model path
+/// defaults to the official model id 'yolo11n' (the plugin
+/// downloads it on the phone); an asset path such as
+/// 'assets/models/custom.tflite' also works.
 ///
 /// The DashScope key is only for the Bailian client
 /// (lib/adapters/bailian_client.dart). It is never committed, never
@@ -42,6 +51,13 @@ class AppConfig {
   /// unavailable -- the app announces exactly that.
   static const String routeProxyUrl =
       String.fromEnvironment('MINGTU_ROUTE_PROXY_URL');
+
+  /// Disposable DEMO key for the direct-connection demo mode
+  /// (see the demo exception above). Injected ONLY at build time
+  /// via --dart-define=MINGTU_AMAP_KEY; the value is never in
+  /// this repository and must be regenerated/revoked after the
+  /// demo. Empty = no demo mode (proxy or unconfigured).
+  static const String amapDemoKey = String.fromEnvironment('MINGTU_AMAP_KEY');
   static const String yoloModelPath =
       String.fromEnvironment('MINGTU_YOLO_MODEL_PATH', defaultValue: 'yolo11n');
   static const String llmModelId =
@@ -50,10 +66,14 @@ class AppConfig {
       String.fromEnvironment('MINGTU_DASHSCOPE_API_KEY');
 
   static bool get hasRouteProxy => routeProxyUrl.isNotEmpty;
+  static bool get hasAmapDemoKey => amapDemoKey.isNotEmpty;
   static bool get hasYoloModelPath => yoloModelPath.isNotEmpty;
   static bool get hasLlmModelId => llmModelId.isNotEmpty;
   static bool get hasDashscopeKey => dashscopeApiKey.isNotEmpty;
 
+  static String get amapDemoKeyStatus => hasAmapDemoKey
+      ? '演示直连 Key 已注入（构建时参数，值未显示；演示后必须作废/重新生成）'
+      : '未注入演示 Key（直连演示模式不可用，走代理或未配置）';
   static String get routeProxyStatus => hasRouteProxy
       ? '已配置路线代理地址（仅地址，非密钥；未验证代理真实可用）'
       : 'NOT_CONFIGURED（路线代理未部署或未配置地址，真实路线不可用，不会伪造路线）';

@@ -108,6 +108,13 @@ class OnDemandCloudVision {
       try {
         capture = await frameSource.captureSingleFrame();
       } catch (e) {
+        // Cancellation is checked FIRST in every failure branch:
+        // a run cancelled while the camera was working (app
+        // backgrounded / disposed) must not announce anything
+        // any more -- its user has moved on.
+        if (cancellation?.isCancelled ?? false) {
+          return _cancelled(announcements);
+        }
         say(cameraFrameFailureSpeech(CameraFrameFailure.failure));
         return CloudVisionFlowOutcome(
           CloudVisionResult.failed(
@@ -123,6 +130,19 @@ class OnDemandCloudVision {
       if (!capture.ok) {
         final CameraFrameFailure failure =
             capture.failure ?? CameraFrameFailure.failure;
+        if (capture.detail == cameraBusySpeech) {
+          // The camera arbiter refused (another use holds it or
+          // a physical release is still pending): say exactly
+          // that, so the user knows to retry in a moment.
+          say(cameraBusySpeech);
+          return CloudVisionFlowOutcome(
+            CloudVisionResult.failed(
+              CloudVisionFailure.noImage,
+              detail: capture.detail,
+            ),
+            announcements,
+          );
+        }
         say(cameraFrameFailureSpeech(failure));
         return CloudVisionFlowOutcome(
           CloudVisionResult.failed(
