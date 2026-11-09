@@ -167,7 +167,7 @@ class FcVisionGuardTest(unittest.TestCase):
 
 class EnvWiringTest(unittest.TestCase):
     def test_key_env_name_is_the_fc_name(self):
-        source = open(amap_proxy.__file__, encoding="utf-8").read()
+        source = open(amap_proxy.CORE_FILE, encoding="utf-8").read()
         self.assertIn('os.environ.get("MINGTU_DASHSCOPE_API_KEY"', source)
         self.assertNotIn('os.environ.get("DASHSCOPE_API_KEY"', source)
         self.assertIn('os.environ.get("MINGTU_VISION_TOKEN"', source)

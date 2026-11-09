@@ -109,9 +109,13 @@ that the route service is not deployed and does not navigate.
 ## Cloud vision on Function Compute (2026-11-09)
 
 `/vision` is deployed to Alibaba Cloud Function Compute as an
-HTTP-trigger function: `index.py` re-exports `handler` from
-`amap_proxy.py` (configure the function handler as
-`index.handler`). The FC handler adds the anti-abuse guard
+HTTP-trigger function. The deployable package is the
+self-contained `fc/` directory (`fc/index.py` re-exports
+`handler` from `fc/amap_proxy.py`; Python standard library
+only; configure the function handler as `index.handler`).
+Package it with `fc/build_zip.sh` -> `mingtu-fc.zip`. The
+standalone server in this directory loads the same
+implementation through the `amap_proxy.py` shim. The FC handler adds the anti-abuse guard
 chain in front of the same structured pipeline: the demo token
 (`MINGTU_VISION_TOKEN`, header `X-Mingtu-Vision-Token`,
 constant-time compare, fail closed when unset on the server),
