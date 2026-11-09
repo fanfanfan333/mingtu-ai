@@ -9,7 +9,10 @@ the key and forwards to Amap's /v3/direction/walking.
 
 Contract:
     GET /walking?origin=lon,lat&destination=lon,lat
-    -> the Amap response body, verbatim, content-type JSON.
+    -> a response REBUILT from whitelisted fields only (status,
+    sanitised info, first path's distance/duration/steps). The
+    upstream body is never passed through: if it echoes the key
+    anywhere, the echo cannot reach the client.
     Invalid/missing coordinates -> 400 {"error": "..."} (no upstream call).
     Any other path -> 404.
 
@@ -20,7 +23,9 @@ Contract:
     The proxy forwards to the Beijing DashScope compatible
     endpoint with the server-side DashScope key as a Bearer token,
     clamps max_tokens to 256 and forces "enable_thinking": false.
-    -> the upstream response body, verbatim.
+    -> a response REBUILT from whitelisted fields only (first
+    choice's message role/content, secret-stripped). Upstream
+    errors become a generic 502; upstream text never crosses.
     No DashScope key configured on the server -> 503 (no call).
     Oversize body (> 3 MB) -> 413 (no call).
 
@@ -100,6 +105,110 @@ def build_upstream_url(base, origin, destination, key):
     return base + "?" + query
 
 
+def _strip_secrets(value, secrets):
+    """Remove any secret substring from a string value. Applied to
+    every whitelisted field as defence in depth: even if an
+    upstream response echoes a key inside a kept field, the value
+    that reaches the client has the key removed."""
+    if not isinstance(value, str):
+        return value
+    for secret in secrets:
+        if secret:
+            value = value.replace(secret, "")
+    return value
+
+
+def whitelist_walking_body(raw_body, secrets):
+    """Rebuild the /walking response from whitelisted fields ONLY.
+
+    The upstream body is never passed through (Codex re-test
+    finding): an upstream that echoes the key -- in a debug field,
+    a URL, or an error string -- must not leak it to the client.
+    The app consumes exactly: status, info (on failure, sanitised),
+    route.paths[0].distance/duration and each step's
+    instruction/road/polyline/distance/duration. Anything else is
+    dropped. Returns the response bytes, or None when the upstream
+    body is not the expected JSON shape (-> generic 502).
+    """
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    out = {"status": str(payload.get("status", "0"))}
+    if out["status"] != "1":
+        info = payload.get("info")
+        out["info"] = (
+            _strip_secrets(info, secrets)
+            if isinstance(info, str)
+            else "upstream error"
+        )
+        return json.dumps(out).encode("utf-8")
+    route = payload.get("route")
+    paths = route.get("paths") if isinstance(route, dict) else None
+    if not isinstance(paths, list) or not paths or not isinstance(paths[0], dict):
+        return None
+    first = paths[0]
+    steps = []
+    raw_steps = first.get("steps")
+    if isinstance(raw_steps, list):
+        for step in raw_steps:
+            if not isinstance(step, dict):
+                continue
+            kept = {}
+            for field in ("instruction", "road", "polyline", "distance", "duration"):
+                if field in step:
+                    kept[field] = _strip_secrets(step[field], secrets)
+            steps.append(kept)
+    out["route"] = {
+        "paths": [
+            {
+                "distance": _strip_secrets(first.get("distance"), secrets),
+                "duration": _strip_secrets(first.get("duration"), secrets),
+                "steps": steps,
+            }
+        ]
+    }
+    return json.dumps(out).encode("utf-8")
+
+
+def whitelist_vision_body(raw_body, secrets):
+    """Rebuild the /vision response from whitelisted fields ONLY:
+    the first choice's message role + content (secret-stripped).
+    An upstream error object or unexpected shape -> None (the
+    handler answers a generic 502; upstream text never crosses)."""
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("error") is not None:
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    out = {
+        "choices": [
+            {
+                "message": {
+                    "role": message.get("role", "assistant"),
+                    "content": _strip_secrets(content, secrets),
+                }
+            }
+        ]
+    }
+    return json.dumps(out).encode("utf-8")
+
+
 def fetch_upstream(url, timeout=10):
     """GET the upstream and return (status, body-bytes). Isolated
     so tests can substitute a fake without any network."""
@@ -172,7 +281,14 @@ class WalkingHandler(BaseHTTPRequestHandler):
         except Exception:  # upstream failure: no detail (may embed URL)
             self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
             return
-        self._send_json(200, body)
+        # NEVER pass the upstream body through: rebuild from the
+        # whitelist so an echoed key (or any extra field) cannot
+        # reach the client.
+        cleaned = whitelist_walking_body(body, [self.api_key])
+        if cleaned is None:
+            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
+            return
+        self._send_json(200, cleaned)
 
     def do_POST(self):  # noqa: N802 - stdlib name
         parsed = urllib.parse.urlparse(self.path)
@@ -229,7 +345,13 @@ class WalkingHandler(BaseHTTPRequestHandler):
         except Exception:  # no detail: errors may embed headers
             self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
             return
-        self._send_json(200, resp_body)
+        # Whitelist rebuild, same rule as /walking: the upstream
+        # body itself never crosses to the client.
+        cleaned = whitelist_vision_body(resp_body, [self.dashscope_key])
+        if cleaned is None:
+            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
+            return
+        self._send_json(200, cleaned)
 
 
 def make_server(

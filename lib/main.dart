@@ -438,8 +438,23 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   void _speakActive(SpeechRequest request) {
     if (_voiceOutput.isAvailable) {
       _voiceOutput.speak(request.text).then((_) {
-        if (mounted) _finishSpeech(request.id);
+        // Stop-race guard (Codex re-test): a request the user has
+        // since cancelled (pause/cancel -> cancelAll) may complete
+        // late; its completion must not drive _finishSpeech (which
+        // could reopen the microphone or promote stale state).
+        if (!mounted) return;
+        if (_scheduler.cancelledLog.contains(request.id)) {
+          _logMsg('已取消播报的迟到完成回调已忽略（${request.id}）。');
+          return;
+        }
+        _finishSpeech(request.id);
       }).catchError((Object e) {
+        // Same guard for the error path: a cancelled utterance
+        // failing late is not a new TTS failure.
+        if (_scheduler.cancelledLog.contains(request.id)) {
+          _logMsg('已取消播报的迟到失败回调已忽略（${request.id}）：$e');
+          return null;
+        }
         if (mounted) _handleTtsFailure(e);
         return null;
       });
@@ -811,6 +826,42 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     setState(() {
       _voiceText = '语音：TTS：${_voiceOutput.status}；ASR：${_voiceInput.status}。';
     });
+  }
+
+  /// Stop-then-confirm sequencer (Codex re-test race fix).
+  ///
+  /// The bug: pause/cancel called cancelAll() and the async
+  /// _stopTtsPlayback() WITHOUT awaiting it, then immediately
+  /// submitted the confirmation prompt -- so the engine stop could
+  /// land after the confirmation started and cut it off, or the
+  /// confirmation was swallowed by the still-flushing queue.
+  ///
+  /// The fix: cancel the old requests first, then AWAIT the stop
+  /// (bounded by a timeout so a hung engine cannot block the
+  /// confirmation forever; a timeout is logged honestly), and
+  /// only then submit the confirmation. Adapter-layer ordering is
+  /// covered by test/voice_adapter_test.dart; physical interruption
+  /// on a real device is NOT verified.
+  Future<void> _stopSpeechThenConfirm({
+    required String idPrefix,
+    required String confirmText,
+  }) async {
+    final List<String> cancelled = _scheduler.cancelAll();
+    if (cancelled.isNotEmpty) {
+      _logMsg('已取消 ${cancelled.length} 条待播报提示。');
+    }
+    try {
+      await _stopTtsPlayback().timeout(const Duration(milliseconds: 800));
+    } on TimeoutException {
+      _logMsg('停止播报 800 毫秒内未完成，先播报确认；旧声音可能短暂残留。');
+    }
+    if (!mounted) return;
+    _say(_request(
+      id: '$idPrefix-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: '$idPrefix-${DateTime.now().millisecondsSinceEpoch}',
+      text: confirmText,
+      kind: SpeechKind.info,
+    ));
   }
 
   /// COCO classes that can be in a blind user's path, with their
@@ -1600,16 +1651,15 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
           // playback -- not only the straight prompt. The
           // confirmation below is submitted after this, so it is
           // not cancelled itself.
-          _scheduler.cancelAll();
-          _stopTtsPlayback();
           setState(() {
             _straightConfirmed = false;
           });
-          _say(_request(
-            id: 'voice-pause-${DateTime.now().millisecondsSinceEpoch}',
-            eventId: 'voice-pause-${DateTime.now().millisecondsSinceEpoch}',
-            text: '已暂停导航，直行提醒已停止。说继续可以恢复，但要重新确认直行路段。',
-            kind: SpeechKind.info,
+          // Sequenced: cancel old speech, WAIT for the engine stop
+          // (or timeout), then speak the confirmation -- see
+          // _stopSpeechThenConfirm.
+          unawaited(_stopSpeechThenConfirm(
+            idPrefix: 'voice-pause',
+            confirmText: '已暂停导航，直行提醒已停止。说继续可以恢复，但要重新确认直行路段。',
           ));
         } else {
           _say(_request(
@@ -1657,15 +1707,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
           _tasks.transitionTo(TaskState.cancelled, trigger: 'voice-cancel');
           _stopStraightTimer();
           _scheduler.pauseStraight();
-          // P0: same stop semantics as pause -- cancel all pending
-          // navigation speech and stop actual playback first.
-          _scheduler.cancelAll();
-          _stopTtsPlayback();
-          _say(_request(
-            id: 'voice-cancel-${DateTime.now().millisecondsSinceEpoch}',
-            eventId: 'voice-cancel-${DateTime.now().millisecondsSinceEpoch}',
-            text: '任务已取消，直行提醒已停止。',
-            kind: SpeechKind.info,
+          // P0 + re-test: same sequenced stop semantics as pause.
+          unawaited(_stopSpeechThenConfirm(
+            idPrefix: 'voice-cancel',
+            confirmText: '任务已取消，直行提醒已停止。',
           ));
         } else {
           _say(_request(

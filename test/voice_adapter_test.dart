@@ -23,6 +23,8 @@ class FakeTts extends FlutterTts {
   Object? speakError;
   Object? stopError;
   Completer<dynamic>? speakGate;
+  Completer<dynamic>? stopGate;
+  final List<String> callLog = <String>[];
   bool speakInFlight = false;
   int stopCalls = 0;
   bool stopCalledWhileSpeakInFlight = false;
@@ -55,6 +57,7 @@ class FakeTts extends FlutterTts {
 
   @override
   Future<dynamic> speak(String text, {bool focus = false}) async {
+    callLog.add('speak:$text');
     speakInFlight = true;
     if (speakGate != null) await speakGate!.future;
     speakInFlight = false;
@@ -64,8 +67,10 @@ class FakeTts extends FlutterTts {
 
   @override
   Future<dynamic> stop() async {
+    callLog.add('stop');
     stopCalls += 1;
     stopCalledWhileSpeakInFlight = speakInFlight;
+    if (stopGate != null) await stopGate!.future;
     if (stopError != null) throw stopError!;
     return stopResult;
   }
@@ -192,6 +197,47 @@ void main() {
       gate.complete(1);
       await speaking; // completes without error after the stop
       expect(out.isAvailable, isTrue);
+    });
+
+    test('stop-then-confirm ordering: the confirmation speak is '
+        'only submitted after stop COMPLETES (sequencer contract)',
+        () async {
+      // Mirrors main's _stopSpeechThenConfirm at the adapter
+      // level: cancel old speech, await stop, then speak the
+      // confirmation. Before the fix the confirmation was
+      // submitted while the stop was still in flight.
+      final fake = FakeTts();
+      final speakGate = Completer<dynamic>();
+      final stopGate = Completer<dynamic>();
+      fake.speakGate = speakGate;
+      fake.stopGate = stopGate;
+      final out = SystemVoiceOutput(fake);
+      await out.initialize();
+
+      final Future<void> oldSpeak = out.speak('导航提示');
+      await Future<void>.delayed(Duration.zero);
+      expect(fake.callLog, <String>['speak:导航提示']);
+
+      bool confirmSubmitted = false;
+      final Future<void> sequencer = () async {
+        await out.stop();
+        confirmSubmitted = true;
+        await out.speak('已暂停导航');
+      }();
+      await Future<void>.delayed(Duration.zero);
+      // Stop has been CALLED but has not completed: the
+      // confirmation must not have been submitted yet.
+      expect(fake.callLog, <String>['speak:导航提示', 'stop']);
+      expect(confirmSubmitted, isFalse);
+
+      stopGate.complete(1);
+      speakGate.complete(1);
+      await sequencer;
+      await oldSpeak;
+      expect(
+        fake.callLog,
+        <String>['speak:导航提示', 'stop', 'speak:已暂停导航'],
+      );
     });
 
     test('an in-flight speak that then reports failure still fails '
