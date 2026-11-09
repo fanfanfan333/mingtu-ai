@@ -57,11 +57,17 @@ class CapturingPoster:
         return 200, VISION_OK
 
 
-def _post(port, path, body_bytes):
+VISION_TOKEN = "fixture-vision-token"
+
+
+def _post(port, path, body_bytes, token=VISION_TOKEN):
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["X-Mingtu-Vision-Token"] = token
     req = urllib.request.Request(
         "http://127.0.0.1:%d%s" % (port, path),
         data=body_bytes,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -101,6 +107,7 @@ class VisionProxyTest(unittest.TestCase):
             AMAP_FIXTURE_KEY,
             dashscope_key=DASH_FIXTURE_KEY,
             poster=self.poster,
+            vision_token=VISION_TOKEN,
         )
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever)
@@ -155,7 +162,8 @@ class VisionProxyTest(unittest.TestCase):
 
     def test_missing_dashscope_key_503_without_upstream_call(self):
         server = amap_proxy.make_server(
-            0, AMAP_FIXTURE_KEY, dashscope_key="", poster=self.poster
+            0, AMAP_FIXTURE_KEY, dashscope_key="", poster=self.poster,
+            vision_token=VISION_TOKEN,
         )
         port = server.server_address[1]
         t = threading.Thread(target=server.serve_forever)

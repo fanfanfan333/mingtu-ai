@@ -266,6 +266,11 @@ enum CloudVisionFailure {
 
   /// A recognition is already in flight (single-flight guard).
   busy,
+
+  /// The vision service refused or is unavailable: wrong or
+  /// missing demo token, rate cap reached, or the function is
+  /// not configured server-side. Announced as 识图暂时不可用.
+  unavailable,
 }
 
 class CloudVisionResult {
@@ -295,7 +300,7 @@ class CloudVisionResult {
     if (ok) return visionSceneSpeechText(scene!);
     switch (failure) {
       case CloudVisionFailure.notConfigured:
-        return '云端视觉未配置：路线代理还没有部署，云端视觉不可用，'
+        return '识图未配置：云端识图代理地址还没有配置，'
             '已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.rateLimited:
         return '云端视觉调用太频繁，这次已跳过，继续用本地检测。提醒：$cloudVisionDisclaimer';
@@ -315,6 +320,8 @@ class CloudVisionResult {
         return '云端视觉识别不确定，已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.busy:
         return '正在识别，请稍候。';
+      case CloudVisionFailure.unavailable:
+        return '识图暂时不可用，已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case null:
         return '云端视觉不可用，已降级为本地检测。提醒：$cloudVisionDisclaimer';
     }

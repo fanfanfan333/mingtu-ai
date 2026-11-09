@@ -36,7 +36,7 @@ class FakeFrameSource implements CameraFrameSource {
 }
 
 CloudVisionClient _client({
-  required Future<String> Function(Uri, String) sender,
+  required Future<String> Function(Uri, String, Map<String, String>) sender,
   VisionRateLimiter? limiter,
   Duration? timeout,
 }) {
@@ -88,7 +88,7 @@ void main() {
     final CloudVisionFlowOutcome outcome = await runFlow(flow, heard);
     expect(frames.calls, 0);
     expect(heard, hasLength(1));
-    expect(heard.single, contains('云端视觉未配置'));
+    expect(heard.single, contains('识图未配置'));
     expect(heard.single, contains(cloudVisionDisclaimer));
     expect(outcome.visionResult.failure, CloudVisionFailure.notConfigured);
   });
@@ -100,7 +100,8 @@ void main() {
         FakeFrameSource(CameraFrameCapture.ok(_fakeImage(10)));
     final OnDemandCloudVision flow = OnDemandCloudVision(
       client: _client(
-        sender: (Uri u, String b) async => fail('must not send'),
+        sender: (Uri u, String b, Map<String, String> h) async =>
+            fail('must not send'),
         limiter: limiter,
       ),
       frameSource: frames,
@@ -121,7 +122,7 @@ void main() {
       CameraFrameCapture.failed(CameraFrameFailure.permissionDenied),
     );
     final OnDemandCloudVision flow = OnDemandCloudVision(
-      client: _client(sender: (Uri u, String b) async {
+      client: _client(sender: (Uri u, String b, Map<String, String> h) async {
         sends += 1;
         return _visionOkBody();
       }),
@@ -146,7 +147,8 @@ void main() {
     );
     final OnDemandCloudVision flow = OnDemandCloudVision(
       client: _client(
-        sender: (Uri u, String b) async => fail('must not send'),
+        sender: (Uri u, String b, Map<String, String> h) async =>
+            fail('must not send'),
       ),
       frameSource: frames,
     );
@@ -164,7 +166,7 @@ void main() {
     final FakeFrameSource frames =
         FakeFrameSource(CameraFrameCapture.ok(_fakeImage(64)));
     final OnDemandCloudVision flow = OnDemandCloudVision(
-      client: _client(sender: (Uri u, String b) async {
+      client: _client(sender: (Uri u, String b, Map<String, String> h) async {
         sends += 1;
         return _visionOkBody();
       }),
@@ -187,7 +189,8 @@ void main() {
         FakeFrameSource(CameraFrameCapture.ok(_fakeImage(64)));
     final OnDemandCloudVision flow = OnDemandCloudVision(
       client: _client(
-        sender: (Uri u, String b) => Completer<String>().future,
+        sender: (Uri u, String b, Map<String, String> h) =>
+            Completer<String>().future,
         timeout: const Duration(milliseconds: 60),
       ),
       frameSource: frames,
@@ -218,7 +221,9 @@ void main() {
       CameraFrameCapture.failed(CameraFrameFailure.unavailable),
     );
     final OnDemandCloudVision flow = OnDemandCloudVision(
-      client: _client(sender: (Uri u, String b) async => _visionOkBody()),
+      client: _client(
+          sender: (Uri u, String b, Map<String, String> h) async =>
+              _visionOkBody()),
       frameSource: frames,
     );
     final List<String> heard1 = <String>[];
@@ -246,7 +251,9 @@ void main() {
       return gate.future;
     });
     final OnDemandCloudVision flow = OnDemandCloudVision(
-      client: _client(sender: (Uri u, String b) async => _visionOkBody()),
+      client: _client(
+          sender: (Uri u, String b, Map<String, String> h) async =>
+              _visionOkBody()),
       frameSource: slow,
     );
     final List<String> heard1 = <String>[];
@@ -276,7 +283,7 @@ void main() {
       return CameraFrameCapture.ok(_fakeImage(32));
     });
     final OnDemandCloudVision flow = OnDemandCloudVision(
-      client: _client(sender: (Uri u, String b) async {
+      client: _client(sender: (Uri u, String b, Map<String, String> h) async {
         sends += 1;
         return _visionOkBody();
       }),
@@ -346,7 +353,7 @@ void main() {
       throw StateError('camera died');
     });
     final OnDemandCloudVision flow = OnDemandCloudVision(
-      client: _client(sender: (Uri u, String b) async {
+      client: _client(sender: (Uri u, String b, Map<String, String> h) async {
         sends += 1;
         return _visionOkBody();
       }),

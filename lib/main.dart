@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
-import 'adapters/bailian_client.dart';
 import 'adapters/camera_frame_source.dart';
 import 'adapters/cloud_vision_client.dart';
 import 'adapters/cloud_vision_flow.dart';
@@ -125,8 +124,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // Cloud vision assist (low frequency): one client for the app's
   // lifetime so its rate limiter spans taps. Configured only with
   // the proxy base URL -- there is no key on this device.
-  final CloudVisionClient _cloudVisionClient =
-      CloudVisionClient(proxyBaseUrl: AppConfig.routeProxyUrl);
+  final CloudVisionClient _cloudVisionClient = CloudVisionClient(
+    proxyBaseUrl: AppConfig.visionProxyUrl,
+    demoToken: AppConfig.visionDemoToken,
+  );
   // On-demand single-frame camera source (production wiring):
   // one explicit trigger captures exactly one still frame via the
   // camera plugin and disposes the controller immediately -- no
@@ -1609,64 +1610,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         '已用 0 元（无真实调用）。');
   }
 
-  /// One explicit, user-tapped real Bailian call. This is the ONLY
-  /// place in the demo UI that can spend anything: the gateway
-  /// decision-only button above never calls the network. If the key
-  /// is missing, this reports NOT_CONFIGURED and sends nothing. The
-  /// key itself is never shown or logged here.
-  Future<void> _llmRealCall() async {
-    if (!AppConfig.hasLlmModelId) {
-      setState(() {
-        _llmText = 'NOT_CONFIGURED：未提供 LLM 模型 ID，未调用云端。';
-      });
-      return;
-    }
-    if (!AppConfig.hasDashscopeKey) {
-      setState(() {
-        _llmText = 'NOT_CONFIGURED：未提供百炼 Key '
-            '（--dart-define=MINGTU_DASHSCOPE_API_KEY），未调用云端。';
-      });
-      return;
-    }
-    _gateway ??= LlmGateway(
-      modelId: AppConfig.llmModelId,
-      budgetCapRmb: 100.0,
-    );
-    final LlmDecision decision = _gateway!.requestOnDemand(
-      type: LlmCallType.textPlanning,
-      reason: '用户主动点按：百炼真实调用测试',
-      localAttempted: true,
-      localInsufficient: true,
-      estimatedCostRmb: 0.001,
-      input: const <String, Object?>{'demo': true},
-    );
-    if (!decision.allowed) {
-      setState(() {
-        _llmText = '百炼调用被网关拒绝：${decision.reason}，未产生费用。';
-      });
-      return;
-    }
-    setState(() {
-      _llmText = '百炼调用中（网关已批准，等待本机网络返回）……';
-    });
-    final BailianClient client = BailianClient(
-      apiKey: AppConfig.dashscopeApiKey,
-      modelId: AppConfig.llmModelId,
-    );
-    final BailianResult result = await client.callText(
-      gateway: _gateway!,
-      decision: decision,
-      prompt: '请用一句话说明：图书馆服务台标识通常包含哪些信息？',
-    );
-    setState(() {
-      _llmText = result.ok
-          ? '百炼返回：${result.text}'
-          : '百炼调用失败（${result.status}）：${result.error}';
-    });
-    _logMsg('百炼真实调用：status=${result.status}，'
-        '网关已用估算费用已记账，未记录 Key。');
-  }
-
   /// Low-frequency cloud vision ASSIST, triggered ONLY by the
   /// user (voice "看看前面" or the on-screen button). Local YOLO
   /// stays primary: this never runs on its own, never streams or
@@ -2180,7 +2123,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             Text('配置状态：地图：${AppConfig.routeProxyStatus}；'
                 'YOLO：${AppConfig.yoloStatus}；'
                 '云端模型：${AppConfig.llmStatus}；'
-                '百炼：${AppConfig.bailianStatus}。'),
+                '云端识图：${AppConfig.visionProxyStatus}。'),
             const SizedBox(height: 8),
             // v0.6 real-integration status: TTS/ASR/YOLO/Amap report
             // their own availability; "已接入" only appears when the
@@ -2499,11 +2442,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
               label: '云端网关演示（只返回决策，无真实调用）',
               semanticsLabel: '云端网关演示',
               onPressed: _llmDemo,
-            ),
-            _demoButton(
-              label: '百炼真实调用（需本机 Key，点按才产生费用）',
-              semanticsLabel: '百炼真实调用',
-              onPressed: _llmRealCall,
             ),
             _demoButton(
               label: '云端视觉辅助（低频，经代理，本地检测仍为主）',

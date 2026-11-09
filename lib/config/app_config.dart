@@ -7,7 +7,8 @@
 ///   flutter run --dart-define=MINGTU_ROUTE_PROXY_URL=https://your-server \
 ///     --dart-define=MINGTU_YOLO_MODEL_PATH=yolo11n \
 ///     --dart-define=MINGTU_LLM_MODEL_ID=... \
-///     --dart-define=MINGTU_DASHSCOPE_API_KEY=...
+///     --dart-define=MINGTU_VISION_PROXY_URL=https://your-fc-endpoint \
+///     --dart-define=MINGTU_VISION_TOKEN=<demo token, build time only>
 ///
 /// Amap key rule: the PRODUCTION Amap Web Service key must never
 /// be in the app -- it lives only in the route proxy's server-side
@@ -34,11 +35,14 @@
 /// downloads it on the phone); an asset path such as
 /// 'assets/models/custom.tflite' also works.
 ///
-/// The DashScope key is only for the Bailian client
-/// (lib/adapters/bailian_client.dart). It is never committed, never
-/// logged and never sent to Muse: the user supplies it on their own
-/// machine at run time, and it only authenticates to their own Bailian
-/// account (a student voucher/credit is account-level there).
+/// Bailian (DashScope) has NO client-side key channel at all
+/// (user decision, 2026-11-09): the former client dart-define
+/// key channel and the direct client were REMOVED. The Bailian
+/// key exists only in the server function's environment on
+/// Alibaba Cloud Function Compute (see server/DEPLOY_FC.md);
+/// the app sends frames to that function's HTTPS URL with a
+/// disposable demo token (also build-time injected, revocable
+/// after the demo) -- never with a Bailian key.
 ///
 /// If a value is not supplied, the corresponding capability reports
 /// NOT_CONFIGURED and the app must NOT fake a route, a detection or a
@@ -62,14 +66,29 @@ class AppConfig {
       String.fromEnvironment('MINGTU_YOLO_MODEL_PATH', defaultValue: 'yolo11n');
   static const String llmModelId =
       String.fromEnvironment('MINGTU_LLM_MODEL_ID');
-  static const String dashscopeApiKey =
-      String.fromEnvironment('MINGTU_DASHSCOPE_API_KEY');
+
+  /// HTTPS base URL of the cloud-vision function (Alibaba
+  /// Cloud Function Compute; the Bailian key lives only in that
+  /// function's server environment). MUST be https: the client
+  /// refuses anything else. Empty = vision not configured.
+  static const String visionProxyUrl =
+      String.fromEnvironment('MINGTU_VISION_PROXY_URL');
+
+  /// Disposable demo token for the vision function, injected
+  /// ONLY at build time via --dart-define=MINGTU_VISION_TOKEN.
+  /// It is NOT a Bailian key; the server checks it before
+  /// spending anything, and the user revokes/rotates it after
+  /// the demo. Never committed, never printed, never logged.
+  static const String visionDemoToken =
+      String.fromEnvironment('MINGTU_VISION_TOKEN');
 
   static bool get hasRouteProxy => routeProxyUrl.isNotEmpty;
   static bool get hasAmapDemoKey => amapDemoKey.isNotEmpty;
   static bool get hasYoloModelPath => yoloModelPath.isNotEmpty;
   static bool get hasLlmModelId => llmModelId.isNotEmpty;
-  static bool get hasDashscopeKey => dashscopeApiKey.isNotEmpty;
+  static bool get hasVisionProxy => visionProxyUrl.isNotEmpty;
+  static bool get visionProxyIsHttps => visionProxyUrl.startsWith('https://');
+  static bool get hasVisionDemoToken => visionDemoToken.isNotEmpty;
 
   static String get amapDemoKeyStatus => hasAmapDemoKey
       ? '演示直连 Key 已注入（构建时参数，值未显示；演示后必须作废/重新生成）'
@@ -83,7 +102,10 @@ class AppConfig {
   static String get llmStatus => hasLlmModelId
       ? '已配置模型 ID（值未显示，云端仅按需调用，网关只返回决策）'
       : 'NOT_CONFIGURED（未提供 LLM 模型 ID，不会调用云端）';
-  static String get bailianStatus => hasDashscopeKey
-      ? '百炼 Key 已配置（值未显示，只在网关批准时由本机调用，未验证真实百炼接入）'
-      : 'NOT_CONFIGURED（未提供百炼 Key，百炼客户端不会调用云端）';
+  static String get visionProxyStatus => !hasVisionProxy
+      ? 'NOT_CONFIGURED（未提供识图代理地址，云端识图不可用，客户端无百炼密钥）'
+      : (!visionProxyIsHttps
+          ? '配置无效（识图代理地址不是 https，已拒绝使用）'
+          : '已配置识图代理（HTTPS，地址非密钥；百炼密钥只在服务器函数环境中）'
+              '${hasVisionDemoToken ? '；演示令牌已注入（值未显示，演示后作废）' : '；未注入演示令牌，代理将拒绝调用'}');
 }

@@ -83,8 +83,10 @@ Required environment on the server:
 
 Optional:
 
-- `DASHSCOPE_API_KEY` — DashScope key for `/vision`, same
-  handling. Without it `/vision` answers 503 and the app degrades
+- `MINGTU_DASHSCOPE_API_KEY` — DashScope key for `/vision`,
+  same handling. (Renamed 2026-11-09 for the Function Compute
+  deployment; see DEPLOY_FC.md.) Without it `/vision` answers
+  503 and the app degrades
   to local detection; `/walking` is unaffected.
 - `PORT` — listen port (default 8080).
 - `AMAP_UPSTREAM_BASE` / `DASHSCOPE_UPSTREAM_BASE` — upstream
@@ -102,3 +104,22 @@ App side: build/run the app with
 `--dart-define=MINGTU_ROUTE_PROXY_URL=https://your-proxy-host`
 (a URL is not a secret). Without it the app honestly announces
 that the route service is not deployed and does not navigate.
+
+
+## Cloud vision on Function Compute (2026-11-09)
+
+`/vision` is deployed to Alibaba Cloud Function Compute as an
+HTTP-trigger function: `index.py` re-exports `handler` from
+`amap_proxy.py` (configure the function handler as
+`index.handler`). The FC handler adds the anti-abuse guard
+chain in front of the same structured pipeline: the demo token
+(`MINGTU_VISION_TOKEN`, header `X-Mingtu-Vision-Token`,
+constant-time compare, fail closed when unset on the server),
+per-minute / per-day caps (`MINGTU_VISION_PER_MINUTE`,
+`MINGTU_VISION_PER_DAY`; in-memory per instance — an abuse
+brake, not an exact quota), the body-size cap and the output
+cap. Rejections are structured JSON (`unauthorized` /
+`rate_limited` / `vision_not_configured`) and the app announces
+"识图暂时不可用". Step-by-step deployment: see `DEPLOY_FC.md`.
+The standalone server in this directory applies the same
+guards to `/vision`; `/walking` is unchanged.

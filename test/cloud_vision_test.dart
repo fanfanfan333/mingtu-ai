@@ -27,7 +27,8 @@ CloudVisionClient _client({
 }) =>
     CloudVisionClient(
       proxyBaseUrl: proxy,
-      sender: sender ?? (Uri url, String body) async => _okBody,
+      sender: sender ??
+          (Uri url, String body, Map<String, String> headers) async => _okBody,
       downsampler: downsampler ?? (Uint8List b, int d) async => b,
       limiter: limiter,
     );
@@ -97,7 +98,7 @@ void main() {
       bool called = false;
       final client = _client(
         proxy: '',
-        sender: (Uri url, String body) async {
+        sender: (Uri url, String body, Map<String, String> headers) async {
           called = true;
           return _okBody;
         },
@@ -112,7 +113,8 @@ void main() {
         () async {
       Uri? seenUrl;
       String? seenBody;
-      final client = _client(sender: (Uri url, String body) async {
+      final client = _client(
+          sender: (Uri url, String body, Map<String, String> headers) async {
         seenUrl = url;
         seenBody = body;
         return _okBody;
@@ -143,7 +145,7 @@ void main() {
 
     test('unparsed structured body -> uncertain, spoken as such', () async {
       final client = _client(
-        sender: (Uri url, String body) async =>
+        sender: (Uri url, String body, Map<String, String> headers) async =>
             '{"scene":"不确定","obstacles":[],"parsed":false}',
       );
       final result = await client.describe(imageBytes: _fakeImage(10));
@@ -155,7 +157,7 @@ void main() {
         'unknown enums are dropped client-side too: an obstacle '
         'typed 安全通道 cannot be spoken', () async {
       final client = _client(
-        sender: (Uri url, String body) async =>
+        sender: (Uri url, String body, Map<String, String> headers) async =>
             '{"scene":"室外","parsed":true,"obstacles":['
             '{"type":"安全通道","direction":"正前方","proximity":"较近",'
             '"confidence":0.99}]}',
@@ -171,7 +173,8 @@ void main() {
     test('second call inside the interval is rate-limited, no resend',
         () async {
       int calls = 0;
-      final client = _client(sender: (Uri url, String body) async {
+      final client = _client(
+          sender: (Uri url, String body, Map<String, String> headers) async {
         calls += 1;
         return _okBody;
       });
@@ -190,7 +193,7 @@ void main() {
         () async {
       bool called = false;
       final client = _client(
-        sender: (Uri url, String body) async {
+        sender: (Uri url, String body, Map<String, String> headers) async {
           called = true;
           return _okBody;
         },
@@ -207,7 +210,7 @@ void main() {
         'timeout announcement, not silence', () async {
       final client = CloudVisionClient(
         proxyBaseUrl: 'https://proxy.example.test',
-        sender: (Uri url, String body) =>
+        sender: (Uri url, String body, Map<String, String> headers) =>
             Completer<String>().future, // never completes
         downsampler: (Uint8List b, int d) async => b,
         requestTimeout: const Duration(milliseconds: 60),
@@ -220,7 +223,7 @@ void main() {
 
     test('transport failure -> network degrade, announced', () async {
       final client = _client(
-        sender: (Uri url, String body) async =>
+        sender: (Uri url, String body, Map<String, String> headers) async =>
             throw Exception('socket closed'),
       );
       final result = await client.describe(imageBytes: _fakeImage(10));
@@ -231,7 +234,7 @@ void main() {
 
     test('upstream error object -> upstream degrade', () async {
       final client = _client(
-        sender: (Uri url, String body) async =>
+        sender: (Uri url, String body, Map<String, String> headers) async =>
             '{"error":{"message":"model not found"}}',
       );
       final result = await client.describe(imageBytes: _fakeImage(10));
@@ -240,7 +243,8 @@ void main() {
 
     test('body without the parsed flag -> uncertain degrade', () async {
       final client = _client(
-        sender: (Uri url, String body) async => '{"unexpected":true}',
+        sender: (Uri url, String body, Map<String, String> headers) async =>
+            '{"unexpected":true}',
       );
       final result = await client.describe(imageBytes: _fakeImage(10));
       expect(result.failure, CloudVisionFailure.uncertain);

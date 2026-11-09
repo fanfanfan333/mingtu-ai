@@ -29,27 +29,52 @@ import 'dart:ui' as ui;
 
 import '../core/cloud_vision.dart';
 
-/// POSTs [body] to [url] and returns the raw response body. No
-/// Authorization header exists on the client side -- there is no
-/// key here to send.
-typedef VisionSender = Future<String> Function(Uri url, String body);
+/// POSTs [body] to [url] with [headers] and returns the raw
+/// response body for ANY HTTP status: the proxy answers guard
+/// rejections (401/429/503) with structured JSON error bodies,
+/// and the client maps those codes itself. There is NO Bailian
+/// key on the client side -- the only credential-shaped header
+/// is the disposable demo token.
+typedef VisionSender = Future<String> Function(
+  Uri url,
+  String body,
+  Map<String, String> headers,
+);
 
-Future<String> _defaultSender(Uri url, String body) async {
+Future<String> _defaultSender(
+  Uri url,
+  String body,
+  Map<String, String> headers,
+) async {
   final HttpClient client = HttpClient();
   try {
     final HttpClientRequest request = await client.postUrl(url);
     request.headers.contentType = ContentType.json;
+    headers.forEach(request.headers.set);
     request.write(body);
     final HttpClientResponse response = await request.close();
-    final String responseBody = await response.transform(utf8.decoder).join();
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw HttpException('Vision proxy HTTP ${response.statusCode}', uri: url);
-    }
+    final String responseBody =
+        await response.transform(utf8.decoder).join();
     return responseBody;
   } finally {
     client.close();
   }
 }
+
+/// Header that carries the disposable demo token to the vision
+/// function. The token is not a Bailian key; the server checks
+/// it before spending anything and it is revoked after the demo.
+const String visionTokenHeader = 'X-Mingtu-Vision-Token';
+
+/// Structured proxy error codes that mean "vision is
+/// unavailable right now" (token rejected, rate cap reached,
+/// or the function itself is not configured server-side) --
+/// announced to the user as 识图暂时不可用.
+const Set<String> visionUnavailableErrorCodes = <String>{
+  'unauthorized',
+  'rate_limited',
+  'vision_not_configured',
+};
 
 /// Downsamples encoded image [bytes] so the longest edge is at
 /// most [maxDimension], re-encoding as PNG.
@@ -86,8 +111,13 @@ Future<Uint8List> codecDownsampler(Uint8List bytes, int maxDimension) async {
 }
 
 class CloudVisionClient {
-  /// Base URL of the project proxy (same one as the route proxy).
+  /// Base URL of the vision function (Alibaba Cloud Function
+  /// Compute). MUST be https -- anything else is refused.
   final String proxyBaseUrl;
+
+  /// Disposable demo token sent as [visionTokenHeader]. Empty
+  /// means no token is sent and the server will refuse.
+  final String demoToken;
   final VisionSender sender;
   final ImageDownsampler downsampler;
   final VisionRateLimiter limiter;
@@ -98,6 +128,7 @@ class CloudVisionClient {
 
   CloudVisionClient({
     required this.proxyBaseUrl,
+    this.demoToken = '',
     VisionSender? sender,
     ImageDownsampler? downsampler,
     VisionRateLimiter? limiter,
@@ -106,7 +137,12 @@ class CloudVisionClient {
         downsampler = downsampler ?? codecDownsampler,
         limiter = limiter ?? VisionRateLimiter();
 
-  bool get isConfigured => proxyBaseUrl.isNotEmpty;
+  /// True only for a non-empty HTTPS base URL. An http:// (or
+  /// otherwise non-https) address is refused outright.
+  bool get isConfigured =>
+      proxyBaseUrl.isNotEmpty && proxyBaseUrl.startsWith('https://');
+
+  bool get hasProxyUrl => proxyBaseUrl.isNotEmpty;
 
   /// Reserve the rate-limit slot for a call at [now], BEFORE
   /// any camera is opened: a refused reservation means no frame
@@ -122,8 +158,14 @@ class CloudVisionClient {
     required Uint8List imageBytes,
     String prompt = cloudVisionPrompt,
   }) async {
-    if (!isConfigured) {
+    if (!hasProxyUrl) {
       return CloudVisionResult.failed(CloudVisionFailure.notConfigured);
+    }
+    if (!isConfigured) {
+      return CloudVisionResult.failed(
+        CloudVisionFailure.notConfigured,
+        detail: '识图代理地址不是 https，已拒绝使用。',
+      );
     }
     final Uint8List small;
     try {
@@ -144,9 +186,12 @@ class CloudVisionClient {
     final String body = jsonEncode(
       buildVisionRequestBody(imageBase64: base64Encode(small), prompt: prompt),
     );
+    final Map<String, String> headers = demoToken.isEmpty
+        ? const <String, String>{}
+        : <String, String>{visionTokenHeader: demoToken};
     final String responseBody;
     try {
-      responseBody = await sender(url, body).timeout(requestTimeout);
+      responseBody = await sender(url, body, headers).timeout(requestTimeout);
     } on TimeoutException {
       return CloudVisionResult.failed(
         CloudVisionFailure.timeout,
@@ -167,10 +212,18 @@ class CloudVisionClient {
     if (decoded is! Map<String, Object?>) {
       return CloudVisionResult.failed(CloudVisionFailure.badResponse);
     }
-    if (decoded['error'] != null) {
+    final Object? errorCode = decoded['error'];
+    if (errorCode != null) {
+      if (errorCode is String &&
+          visionUnavailableErrorCodes.contains(errorCode)) {
+        return CloudVisionResult.failed(
+          CloudVisionFailure.unavailable,
+          detail: errorCode,
+        );
+      }
       return CloudVisionResult.failed(
         CloudVisionFailure.upstream,
-        detail: '${decoded['error']}',
+        detail: '$errorCode',
       );
     }
     return _parseStructured(decoded);
@@ -184,8 +237,14 @@ class CloudVisionClient {
     String prompt = cloudVisionPrompt,
     DateTime? now,
   }) async {
-    if (!isConfigured) {
+    if (!hasProxyUrl) {
       return CloudVisionResult.failed(CloudVisionFailure.notConfigured);
+    }
+    if (!isConfigured) {
+      return CloudVisionResult.failed(
+        CloudVisionFailure.notConfigured,
+        detail: '识图代理地址不是 https，已拒绝使用。',
+      );
     }
     if (!tryReserve(now)) {
       return CloudVisionResult.failed(CloudVisionFailure.rateLimited);

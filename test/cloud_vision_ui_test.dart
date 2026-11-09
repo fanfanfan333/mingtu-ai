@@ -19,7 +19,7 @@ void main() {
     await tester.tap(button);
     await tester.pump();
 
-    expect(find.textContaining('云端视觉未配置'), findsWidgets);
+    expect(find.textContaining('识图未配置'), findsWidgets);
     expect(find.textContaining('已降级为本地检测'), findsWidgets);
 
     for (int i = 0; i < 16; i++) {

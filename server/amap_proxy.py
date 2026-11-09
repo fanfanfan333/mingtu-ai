@@ -33,7 +33,8 @@ Environment:
     AMAP_WEB_KEY       (required) Amap Web Service key. Read from
                        the environment only; never logged, never
                        echoed, never returned to clients.
-    DASHSCOPE_API_KEY  (optional) DashScope key for /vision, same
+    MINGTU_DASHSCOPE_API_KEY  (optional) DashScope key for
+                       /vision, same
                        handling: environment only, never logged,
                        never returned. Without it /vision answers
                        503 and the app degrades to local detection.
@@ -74,10 +75,14 @@ is indistinguishable from data -- real keys are high-entropy
 tokens and the upstream is the key's own provider.
 """
 
+import base64
 import json
 import os
 import re
+import hmac
 import socket
+import threading
+import time
 import sys
 import unicodedata
 import urllib.parse
@@ -514,6 +519,236 @@ def post_upstream(url, body_bytes, api_key, timeout=VISION_UPSTREAM_TIMEOUT_S):
         return resp.status, resp.read()
 
 
+# ------------------------------------------------------------------
+# Cloud vision guards (anti-abuse) + shared vision handling.
+#
+# The vision endpoint is deployed on Alibaba Cloud Function
+# Compute (see DEPLOY_FC.md) and, locally, by the standalone
+# server below. Both transports share the same guard chain:
+#   1. a demo token (header X-Mingtu-Vision-Token) checked with
+#      a constant-time compare against MINGTU_VISION_TOKEN --
+#      fail closed when the server has no token configured;
+#   2. per-minute / per-day call caps (in-memory, per instance:
+#      a best-effort brake, not a billing guarantee);
+#   3. the request-body size cap (VISION_MAX_BODY_BYTES);
+#   4. the server-side output cap (VISION_MAX_TOKENS) and the
+#      pinned model/prompt, applied in handle_vision_body.
+# Errors are structured JSON codes; no error body, log line or
+# exception ever contains the demo token or the DashScope key.
+# ------------------------------------------------------------------
+
+VISION_TOKEN_HEADER = "x-mingtu-vision-token"
+VISION_PER_MINUTE_DEFAULT = 10
+VISION_PER_DAY_DEFAULT = 100
+
+
+class VisionRateLimiter:
+    """Fixed-window per-minute and per-day call caps.
+
+    In-memory and per process instance: on Function Compute
+    each instance counts separately, so treat the caps as an
+    abuse brake, not an exact quota. The clock is injectable
+    for tests.
+    """
+
+    def __init__(self, per_minute=VISION_PER_MINUTE_DEFAULT,
+                 per_day=VISION_PER_DAY_DEFAULT, clock=None):
+        self.per_minute = max(1, int(per_minute))
+        self.per_day = max(1, int(per_day))
+        self._clock = clock or time.time
+        self._lock = threading.Lock()
+        self._minute_window = None
+        self._minute_count = 0
+        self._day_window = None
+        self._day_count = 0
+
+    def allow(self):
+        now = self._clock()
+        minute = int(now // 60)
+        day = int(now // 86400)
+        with self._lock:
+            if self._minute_window != minute:
+                self._minute_window = minute
+                self._minute_count = 0
+            if self._day_window != day:
+                self._day_window = day
+                self._day_count = 0
+            if (self._minute_count >= self.per_minute
+                    or self._day_count >= self.per_day):
+                return False
+            self._minute_count += 1
+            self._day_count += 1
+            return True
+
+
+def vision_reject_reason(token, expected_token, limiter):
+    """Guard chain steps 1-2. Returns (status, error_code) to
+    reject, or None to proceed. A rate slot is consumed only by
+    an authorised call."""
+    if not expected_token:
+        return 503, "vision_not_configured"
+    if not token or not hmac.compare_digest(token, expected_token):
+        return 401, "unauthorized"
+    if limiter is not None and not limiter.allow():
+        return 429, "rate_limited"
+    return None
+
+
+def handle_vision_body(raw, *, dashscope_key, vision_upstream,
+                       poster, amap_key=""):
+    """Parse, pin, clamp, forward and whitelist one /vision
+    request body. Returns (status, body_bytes). Pure with
+    respect to transport: shared by the standalone HTTP server
+    and the Function Compute handler."""
+    if not raw:
+        return 400, json.dumps({"error": "empty body"}).encode()
+    if len(raw) > VISION_MAX_BODY_BYTES:
+        return 413, json.dumps({"error": "body too large"}).encode()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return 400, json.dumps({"error": "invalid json"}).encode()
+    if not isinstance(payload, dict) or payload.get("model") != VISION_MODEL:
+        return 400, json.dumps({"error": "model not allowed"}).encode()
+    if not isinstance(payload.get("messages"), list):
+        return 400, json.dumps({"error": "messages required"}).encode()
+    if not dashscope_key:
+        return 503, json.dumps({"error": "vision not configured"}).encode()
+    # Pin the instruction server-side: any text part the client
+    # sent is replaced with the JSON-only prompt.
+    for message in payload["messages"]:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["text"] = VISION_PROMPT
+    # Clamp the output budget and disable thinking server-side.
+    requested = payload.get("max_tokens")
+    if not isinstance(requested, int) or requested <= 0:
+        requested = VISION_MAX_TOKENS
+    payload["max_tokens"] = min(requested, VISION_MAX_TOKENS)
+    payload["enable_thinking"] = False
+    body = json.dumps(payload).encode("utf-8")
+    try:
+        _status, resp_body = poster(vision_upstream, body, dashscope_key)
+    except (TimeoutError, socket.timeout):
+        return 504, json.dumps({"error": "upstream timeout"}).encode()
+    except Exception:  # no detail: errors may embed headers
+        return 502, json.dumps({"error": "upstream failure"}).encode()
+    cleaned = whitelist_vision_body(resp_body, [amap_key, dashscope_key])
+    if cleaned is None:
+        return 502, json.dumps({"error": "upstream failure"}).encode()
+    return 200, cleaned
+
+
+# ------------------------------------------------------------------
+# Alibaba Cloud Function Compute entry (HTTP trigger, built-in
+# Python runtime). FC maps the HTTP request into an `event`
+# JSON object (headers / queryParameters / body /
+# isBase64Encoded) and expects a dict with statusCode /
+# headers / body back -- see DEPLOY_FC.md for the official
+# documentation links. The function is vision-only; walking
+# keeps the standalone server (or the client's direct demo
+# mode). Environment (FC console function configuration):
+#   MINGTU_DASHSCOPE_API_KEY  the DashScope key (required)
+#   MINGTU_VISION_TOKEN       the demo token clients must send
+#   MINGTU_VISION_PER_MINUTE  optional cap (default 10)
+#   MINGTU_VISION_PER_DAY     optional cap (default 100)
+# ------------------------------------------------------------------
+
+_FC_LIMITER = None
+
+
+def _env_positive_int(name, default):
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _fc_limiter():
+    global _FC_LIMITER
+    if _FC_LIMITER is None:
+        _FC_LIMITER = VisionRateLimiter(
+            _env_positive_int(
+                "MINGTU_VISION_PER_MINUTE", VISION_PER_MINUTE_DEFAULT),
+            _env_positive_int(
+                "MINGTU_VISION_PER_DAY", VISION_PER_DAY_DEFAULT),
+        )
+    return _FC_LIMITER
+
+
+def fc_handle_event(event, *, dashscope_key=None, expected_token=None,
+                    vision_upstream=None, poster=None, limiter=None):
+    """Handle one FC HTTP-trigger event. The keyword overrides
+    exist for tests; production reads the FC environment."""
+    if dashscope_key is None:
+        dashscope_key = os.environ.get("MINGTU_DASHSCOPE_API_KEY", "")
+    if expected_token is None:
+        expected_token = os.environ.get("MINGTU_VISION_TOKEN", "")
+    if vision_upstream is None:
+        vision_upstream = os.environ.get(
+            "DASHSCOPE_UPSTREAM_BASE", VISION_UPSTREAM_DEFAULT)
+    if poster is None:
+        poster = post_upstream
+    if limiter is None:
+        limiter = _fc_limiter()
+    if isinstance(event, (bytes, bytearray)):
+        event = json.loads(event.decode("utf-8"))
+    if isinstance(event, str):
+        event = json.loads(event)
+    if not isinstance(event, dict):
+        return _fc_response(400, {"error": "invalid event"})
+    headers = event.get("headers") or {}
+    lowered = {str(k).lower(): str(v) for k, v in headers.items()}
+    path = event.get("rawPath") or event.get("path") or ""
+    raw_body = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        try:
+            body_bytes = base64.b64decode(raw_body)
+        except Exception:
+            return _fc_response(400, {"error": "invalid body encoding"})
+    else:
+        body_bytes = (raw_body.encode("utf-8")
+                      if isinstance(raw_body, str) else bytes(raw_body))
+    if "vision" not in path:
+        return _fc_response(404, {"error": "not found"})
+    reject = vision_reject_reason(
+        lowered.get(VISION_TOKEN_HEADER), expected_token, limiter)
+    if reject is not None:
+        status, code = reject
+        return _fc_response(status, {"error": code})
+    status, body = handle_vision_body(
+        body_bytes,
+        dashscope_key=dashscope_key,
+        vision_upstream=vision_upstream,
+        poster=poster,
+    )
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json; charset=utf-8"},
+        "isBase64Encoded": False,
+        "body": body.decode("utf-8"),
+    }
+
+
+def _fc_response(status, payload):
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json; charset=utf-8"},
+        "isBase64Encoded": False,
+        "body": json.dumps(payload),
+    }
+
+
+def handler(event, context):
+    """FC HTTP-trigger handler (configure as index.handler)."""
+    return fc_handle_event(event)
+
+
 class WalkingHandler(BaseHTTPRequestHandler):
     # Injected by make_server: api_key, upstream_base, fetcher,
     # dashscope_key, vision_upstream, poster.
@@ -523,6 +758,8 @@ class WalkingHandler(BaseHTTPRequestHandler):
     dashscope_key = ""
     vision_upstream = VISION_UPSTREAM_DEFAULT
     poster = staticmethod(post_upstream)
+    vision_token = ""
+    vision_limiter = None
 
     def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
         # Deliberately path-only: BaseHTTPRequestHandler's default
@@ -576,10 +813,18 @@ class WalkingHandler(BaseHTTPRequestHandler):
         if parsed.path != "/vision":
             self._send_json(404, json.dumps({"error": "not found"}).encode())
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            self._send_json(400, json.dumps({"error": "empty body"}).encode())
+        # Guard chain first (token, then rate cap): rejected
+        # calls never read or forward a body.
+        reject = vision_reject_reason(
+            self.headers.get("X-Mingtu-Vision-Token"),
+            self.vision_token,
+            self.vision_limiter,
+        )
+        if reject is not None:
+            status, code = reject
+            self._send_json(status, json.dumps({"error": code}).encode())
             return
+        length = int(self.headers.get("Content-Length") or 0)
         if length > VISION_MAX_BODY_BYTES:
             # Drain and discard before answering, so the client is
             # not cut off mid-send; the payload is never used.
@@ -591,67 +836,15 @@ class WalkingHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
             self._send_json(413, json.dumps({"error": "body too large"}).encode())
             return
-        raw = self.rfile.read(length)
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except Exception:
-            self._send_json(400, json.dumps({"error": "invalid json"}).encode())
-            return
-        if not isinstance(payload, dict) or payload.get("model") != VISION_MODEL:
-            # The model is pinned server-side: the exact lowercase
-            # id or nothing. An uppercase variant would 404
-            # upstream; other models are out of scope and budget.
-            self._send_json(400, json.dumps({"error": "model not allowed"}).encode())
-            return
-        if not isinstance(payload.get("messages"), list):
-            self._send_json(400, json.dumps({"error": "messages required"}).encode())
-            return
-        if not self.dashscope_key:
-            self._send_json(
-                503, json.dumps({"error": "vision not configured"}).encode()
-            )
-            return
-        # Pin the instruction server-side: any text part the
-        # client sent is replaced with the JSON-only prompt, so
-        # the model is asked for enum JSON no matter what the
-        # client (or a tampered client) requested.
-        for message in payload["messages"]:
-            if not isinstance(message, dict):
-                continue
-            content = message.get("content")
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        part["text"] = VISION_PROMPT
-        # Clamp the output budget and disable thinking server-side
-        # too -- a client asking for more does not get more.
-        requested = payload.get("max_tokens")
-        if not isinstance(requested, int) or requested <= 0:
-            requested = VISION_MAX_TOKENS
-        payload["max_tokens"] = min(requested, VISION_MAX_TOKENS)
-        payload["enable_thinking"] = False
-        body = json.dumps(payload).encode("utf-8")
-        try:
-            _status, resp_body = self.poster(
-                self.vision_upstream, body, self.dashscope_key
-            )
-        except (TimeoutError, socket.timeout):
-            # Explicit-timeout path: fixed body, no upstream detail.
-            self._send_json(504, json.dumps({"error": "upstream timeout"}).encode())
-            return
-        except Exception:  # no detail: errors may embed headers
-            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
-            return
-        # Whitelist rebuild, same rule as /walking: the upstream
-        # body itself never crosses to the client.
-        cleaned = whitelist_vision_body(
-            resp_body, [self.api_key, self.dashscope_key]
+        raw = self.rfile.read(length) if length > 0 else b""
+        status, body = handle_vision_body(
+            raw,
+            dashscope_key=self.dashscope_key,
+            vision_upstream=self.vision_upstream,
+            poster=self.poster,
+            amap_key=self.api_key or "",
         )
-        if cleaned is None:
-            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
-            return
-        self._send_json(200, cleaned)
-
+        self._send_json(status, body)
 
 def make_server(
     port,
@@ -661,6 +854,8 @@ def make_server(
     dashscope_key="",
     vision_upstream=VISION_UPSTREAM_DEFAULT,
     poster=None,
+    vision_token="",
+    vision_limiter=None,
 ):
     handler = type(
         "BoundWalkingHandler",
@@ -672,6 +867,8 @@ def make_server(
             "dashscope_key": dashscope_key,
             "vision_upstream": vision_upstream,
             "poster": staticmethod(poster or post_upstream),
+            "vision_token": vision_token,
+            "vision_limiter": vision_limiter,
         },
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -687,7 +884,7 @@ def main():
     upstream = os.environ.get("AMAP_UPSTREAM_BASE", UPSTREAM_DEFAULT)
     # Optional: without it the /vision endpoint answers 503 and
     # the app degrades to local detection; /walking is unaffected.
-    dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "")
+    dashscope_key = os.environ.get("MINGTU_DASHSCOPE_API_KEY", "")
     vision_upstream = os.environ.get(
         "DASHSCOPE_UPSTREAM_BASE", VISION_UPSTREAM_DEFAULT
     )
@@ -697,6 +894,13 @@ def main():
         upstream,
         dashscope_key=dashscope_key,
         vision_upstream=vision_upstream,
+        vision_token=os.environ.get("MINGTU_VISION_TOKEN", ""),
+        vision_limiter=VisionRateLimiter(
+            _env_positive_int(
+                "MINGTU_VISION_PER_MINUTE", VISION_PER_MINUTE_DEFAULT),
+            _env_positive_int(
+                "MINGTU_VISION_PER_DAY", VISION_PER_DAY_DEFAULT),
+        ),
     )
     sys.stderr.write("amap proxy listening on port %d\n" % port)
     server.serve_forever()

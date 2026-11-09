@@ -1,7 +1,5 @@
-import 'package:mingtu_ai/adapters/bailian_client.dart';
 import 'package:mingtu_ai/adapters/voice_io.dart';
 import 'package:mingtu_ai/core/contracts.dart';
-import 'package:mingtu_ai/core/llm_gateway.dart';
 import 'package:mingtu_ai/core/risk_engine.dart';
 import 'package:mingtu_ai/core/speech_scheduler.dart';
 import 'package:mingtu_ai/core/task_manager.dart';
@@ -117,31 +115,6 @@ void main() {
     // v0.7: the alternative is now the turn-taking loop (greeting +
     // listen again after each prompt), not just in-app voice control.
     expect(wakeWordStatus, contains('轮流对话'));
-  });
-
-  test('bailian vision sends nothing and returns NOT_CONFIGURED', () async {
-    var sent = 0;
-    final client = BailianClient(
-      apiKey: 'test-key',
-      modelId: 'qwen3-vl-flash',
-      sender: (_, __, ___) async {
-        sent++;
-        return '{}';
-      },
-    );
-    final gateway = LlmGateway(modelId: 'qwen3-vl-flash', budgetCapRmb: 100);
-    final decision = gateway.requestOnDemand(
-      type: LlmCallType.textPlanning,
-      reason: 'test vision',
-      localAttempted: true,
-      localInsufficient: true,
-      estimatedCostRmb: 0.001,
-      input: const {},
-    );
-    final result =
-        await client.callVision(gateway: gateway, decision: decision);
-    expect(result.status, 'NOT_CONFIGURED');
-    expect(sent, 0);
   });
 
   test('learning backlog records only and never applies a rule', () {

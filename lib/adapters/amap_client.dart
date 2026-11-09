@@ -39,7 +39,7 @@
 ///   at all and reports NOT_CONFIGURED; coordinates are never
 ///   invented.
 /// - The default transport uses dart:io HttpClient (same pattern as
-///   BailianClient). Tests inject a fake [AmapSender] so no test ever
+///   the vision client). Tests inject a fake [AmapSender] so no test ever
 ///   makes a real call.
 library;
 
@@ -50,18 +50,35 @@ import 'dart:io';
 import '../core/route_scoring.dart';
 import '../modules/map_navigation.dart';
 
-/// Sends one GET and returns the raw response body. URLs here go to
-/// the project's own proxy and carry no credential.
+/// Sends one GET and returns the raw response body.
 typedef AmapSender = Future<String> Function(Uri url);
 
-Future<String> _defaultSender(Uri url) async {
+/// A URL that is safe to embed in an error or a log line:
+/// scheme, host, port and path only. In direct demo mode the
+/// request URL's QUERY carries the demo key, so the full URL
+/// must never appear in an exception or a log.
+Uri redactUrlForError(Uri url) => Uri(
+      scheme: url.scheme,
+      host: url.host,
+      port: url.hasPort ? url.port : null,
+      path: url.path,
+    );
+
+/// The default transport. On a non-2xx status it throws an
+/// [HttpException] whose uri is REDACTED via [redactUrlForError]
+/// (host + path only, no query): the exception's toString() can
+/// therefore never contain the demo key.
+Future<String> amapHttpSender(Uri url) async {
   final HttpClient client = HttpClient();
   try {
     final HttpClientRequest request = await client.getUrl(url);
     final HttpClientResponse response = await request.close();
     final String body = await response.transform(utf8.decoder).join();
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw HttpException('Amap HTTP ${response.statusCode}', uri: url);
+      throw HttpException(
+        'Amap HTTP ${response.statusCode}',
+        uri: redactUrlForError(url),
+      );
     }
     return body;
   } finally {
@@ -318,7 +335,7 @@ class AmapWalkingClient {
     AmapSender? sender,
     this.requestTimeout = const Duration(seconds: 10),
   })  : mode = selectAmapRouteMode(demoKey: demoKey, proxyUrl: proxyBaseUrl),
-        sender = sender ?? _defaultSender;
+        sender = sender ?? amapHttpSender;
 
   bool get isConfigured => mode != AmapRouteMode.unconfigured;
 

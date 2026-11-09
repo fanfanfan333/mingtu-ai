@@ -186,4 +186,49 @@ void main() {
       expect(called, isFalse);
     });
   });
+
+  /// The default sender's error hygiene (supplement, 2026-11-09):
+  /// a non-2xx in direct mode must never put the demo key into an
+  /// exception or a log line. Uses a LOCAL test server and a
+  /// synthetic key -- no real Amap call.
+  group('default sender exception hygiene', () {
+    test('redactUrlForError keeps host+path and drops the query', () {
+      final Uri redacted = redactUrlForError(Uri.parse(
+          'https://restapi.amap.com/v3/direction/walking?key=synthetic-key&origin=1,2'));
+      expect(redacted.host, 'restapi.amap.com');
+      expect(redacted.path, '/v3/direction/walking');
+      expect(redacted.query, isEmpty);
+      expect(redacted.toString(), isNot(contains('synthetic-key')));
+    });
+
+    test(
+        'a non-2xx from a local server throws an HttpException '
+        'whose toString() contains no key', () async {
+      final HttpServer server =
+          await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      server.listen((HttpRequest request) {
+        request.response.statusCode = 500;
+        request.response.write('boom');
+        request.response.close();
+      });
+      try {
+        final Uri url =
+            Uri.parse('http://127.0.0.1:${server.port}/v3/direction/walking'
+                '?key=synthetic-demo-key&origin=116.4,39.9');
+        Object? caught;
+        try {
+          await amapHttpSender(url);
+        } catch (e) {
+          caught = e;
+        }
+        expect(caught, isA<HttpException>());
+        final String text = caught.toString();
+        expect(text, isNot(contains('synthetic-demo-key')));
+        expect(text, isNot(contains('key=')));
+        expect(text, contains('/v3/direction/walking'));
+      } finally {
+        await server.close(force: true);
+      }
+    });
+  });
 }

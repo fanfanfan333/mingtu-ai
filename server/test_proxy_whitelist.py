@@ -38,11 +38,17 @@ def _get(port, path):
         return e.code, e.read()
 
 
-def _post(port, path, body_bytes):
+VISION_TOKEN = "fixture-vision-token"
+
+
+def _post(port, path, body_bytes, token=VISION_TOKEN):
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["X-Mingtu-Vision-Token"] = token
     req = urllib.request.Request(
         "http://127.0.0.1:%d%s" % (port, path),
         data=body_bytes,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -63,6 +69,7 @@ class _Server:
             fetcher=fetcher,
             dashscope_key=DASH_KEY,
             poster=poster,
+            vision_token=VISION_TOKEN,
         )
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever)
