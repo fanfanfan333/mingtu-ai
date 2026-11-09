@@ -1,0 +1,100 @@
+import 'dart:io';
+
+import 'package:test/test.dart';
+
+/// Regression test for the Android submission build failure:
+///
+/// `flutter build apk --debug` failed in `processDebugMainManifest` with
+/// "not well-formed (invalid token): line 5, column 48" because the comment
+/// at the top of `android/app/src/main/AndroidManifest.xml` contained the
+/// sequence `--` twice ("no GPS code yet -- the Amap ..." and
+/// "--dart-define"). The XML specification forbids `--` inside a comment
+/// body, so the manifest was not legal XML at all.
+///
+/// Dart core ships no XML parser, so this test pins the exact invariant
+/// that broke the build: no XML comment in any shipped AndroidManifest.xml
+/// may contain `--` in its body, comment delimiters must be balanced, and
+/// (for the main manifest) the referenced launcher icon resource must
+/// exist so AAPT resource linking cannot fail on a missing mipmap.
+void main() {
+  const manifestPaths = <String>[
+    'android/app/src/main/AndroidManifest.xml',
+    'android/app/src/debug/AndroidManifest.xml',
+    'android/app/src/profile/AndroidManifest.xml',
+  ];
+
+  for (final path in manifestPaths) {
+    group(path, () {
+      late String content;
+
+      setUpAll(() {
+        final file = File(path);
+        expect(file.existsSync(), isTrue,
+            reason: '$path must exist (run tests from the project root)');
+        content = file.readAsStringSync();
+      });
+
+      test('has balanced comment delimiters and no "--" inside comments',
+          () {
+        var cursor = 0;
+        var comments = 0;
+        while (true) {
+          final open = content.indexOf('<!--', cursor);
+          if (open == -1) break;
+          final close = content.indexOf('-->', open + 4);
+          expect(close, isNot(-1),
+              reason: 'unterminated XML comment starting at offset $open');
+          final body = content.substring(open + 4, close);
+          expect(body.contains('--'), isFalse,
+              reason:
+                  'XML comments must not contain "--" (invalid token in '
+                  'the Android manifest merger). Comment body: $body');
+          comments++;
+          cursor = close + 3;
+        }
+        expect(comments, greaterThan(0),
+            reason: 'expected at least one comment to actually be checked');
+      });
+
+      test('has no stray "--" outside comments either', () {
+        // Strip every well-formed comment, then any remaining "--" would
+        // be inside markup or text, which is likewise not legal here.
+        final stripped = content.replaceAll(
+            RegExp(r'<!--.*?-->', dotAll: true), '');
+        expect(stripped.contains('--'), isFalse,
+            reason: 'unexpected "--" outside an XML comment');
+      });
+    });
+  }
+
+  test('main manifest launcher icon resource exists', () {
+    final mainManifest =
+        File('android/app/src/main/AndroidManifest.xml').readAsStringSync();
+    final iconMatch =
+        RegExp(r'android:icon="@mipmap/([A-Za-z0-9_]+)"').firstMatch(
+            mainManifest);
+    expect(iconMatch, isNotNull,
+        reason: 'main manifest must declare a mipmap launcher icon');
+    final iconName = iconMatch!.group(1)!;
+    const resDir = 'android/app/src/main/res';
+    final candidates = <String>[
+      // Density-specific raster icons (any one bucket satisfies AAPT).
+      for (final density in const [
+        'mdpi',
+        'hdpi',
+        'xhdpi',
+        'xxhdpi',
+        'xxxhdpi',
+      ])
+        '$resDir/mipmap-$density/$iconName.png',
+      // Adaptive icon (API 26+) defined entirely in XML.
+      '$resDir/mipmap-anydpi-v26/$iconName.xml',
+    ];
+    final found = candidates.where((p) => File(p).existsSync()).toList();
+    expect(found, isNotEmpty,
+        reason:
+            '@mipmap/$iconName is referenced by the manifest but no icon '
+            'resource exists; AAPT linking fails without one. Looked for: '
+            '${candidates.join(', ')}');
+  });
+}

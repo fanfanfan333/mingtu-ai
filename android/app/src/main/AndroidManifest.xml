@@ -2,8 +2,8 @@
     <!-- v0.6 real integrations (Android only; see docs/REAL_INTEGRATIONS_V06.md):
          INTERNET for Amap walking routes + Bailian; RECORD_AUDIO for
          speech_to_text; CAMERA for the YOLO live view; location for a
-         future GPS provider (no GPS code yet -- the Amap route still
-         needs coordinates supplied by --dart-define). -->
+         future GPS provider (no GPS code yet; the Amap route still
+         needs coordinates supplied via dart-define). -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
