@@ -318,4 +318,34 @@ void main() {
       expect(mainDart, contains('SpeechKind.alert'));
     });
   });
+  group('reroute failure wiring (Codex re-test of 926901c)', () {
+    // Source-slice assertions, the same technique as the
+    // unconditional-stop assert elsewhere in this suite: the
+    // reroute-failure branch cannot be exercised end-to-end
+    // without a live GPS/Amap session, so its invariants are
+    // pinned on the production function body.
+    final String mainDart = File('lib/main.dart').readAsStringSync();
+    final int fnStart = mainDart.indexOf('_rerouteLiveNavigation() async');
+    final int failStart = mainDart.indexOf('if (!outcome.ready)', fnStart);
+    final int failEnd = mainDart.indexOf('return;', failStart);
+    final String failureBranch = mainDart.substring(failStart, failEnd);
+
+    test('the failure branch speaks the fixed retry notice', () {
+      expect(fnStart, greaterThanOrEqualTo(0));
+      expect(failStart, greaterThan(fnStart));
+      expect(failureBranch, contains('路线重新规划失败，请停下稍候，正在重试。'));
+      expect(failureBranch, contains('_rerouteFailureAnnounced'));
+    });
+
+    test(
+        'the failure branch never resumes against the old '
+        'tracker', () {
+      expect(failureBranch, isNot(contains('_recheckStraightResume()')));
+      expect(failureBranch, isNot(contains('_rerouting = false')));
+      // The retry mechanism itself stays: the off-route
+      // streak is re-armed so a later event can retry the
+      // re-plan under the trip budget.
+      expect(failureBranch, contains('resetOffRouteStreak()'));
+    });
+  });
 }

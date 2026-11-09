@@ -224,6 +224,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // tracker stays installed for the failure fallback but
   // must not be read for straight confirmation.
   bool _rerouting = false;
+  // The reroute-failure notice is spoken ONCE per off-route
+  // episode (Codex re-test of 926901c): retries under the
+  // trip budget stay silent after the first failure. Reset
+  // whenever a route is successfully installed (a new trip,
+  // or a re-plan that finally succeeds).
+  bool _rerouteFailureAnnounced = false;
   StreamSubscription<LocationResult>? _gpsSub;
   String _liveNavDestName = '';
   double? _liveNavRemainingM;
@@ -412,6 +418,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// subscribe to the (once-converted) position stream.
   void _beginLiveNavigation(
       RealNavigationOutcome outcome, String destinationName) {
+    // A route was just installed: any earlier reroute-failure
+    // notice belongs to a finished episode.
+    _rerouteFailureAnnounced = false;
     final AmapWalkingResult result = outcome.route!;
     final List<String> texts = <String>[];
     final AmapStepSpeaker collector = AmapStepSpeaker(result.steps);
@@ -441,10 +450,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         );
     // Live straight prompts: the shared 3 s tick reads its
     // confirmation from the tracker while live nav runs.
-    if (_pacing.state == StraightPacingState.suspendedForReroute) {
-      // A re-plan just installed the NEW tracker: straight
+    if (_pacing.isPaused) {
+      // A re-plan just installed the NEW tracker (or a fresh
+      // trip is starting over a stale pause): straight
       // guidance resumes only through the unified re-check
-      // against THIS tracker, never the replaced one.
+      // against THIS tracker, never the replaced one. The
+      // check is the machine's pause state, not the reported
+      // state value: with both pause reasons set the reported
+      // state names only one of them, and a risk hold alone
+      // must take this branch too -- begin() must never arm
+      // the timer across an unreleased pause.
       _rerouting = false;
       _recheckStraightResume();
       if (!_pacing.canTick) _stopStraightTimer();
@@ -483,11 +498,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     for (final NavEvent e in events) {
       _handleNavEvent(e);
     }
-    if (_pacing.state == StraightPacingState.suspendedForReroute &&
-        !_rerouting) {
+    if (_pacing.isPaused && !_rerouting) {
       // A re-planned route whose first segment was not
       // straight stays suspended; a later fix may reach a
       // straight segment, judged by the NEW tracker only.
+      // (isPaused, not the reported state: a risk hold that
+      // landed during the re-plan keeps BOTH reasons set, and
+      // this re-check must still run so each reason is judged
+      // against the new tracker.)
       _recheckStraightResume();
     }
   }
@@ -558,7 +576,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   /// Re-plan from the current position after an off-route
   /// event (already throttled by the tracker). Failure keeps
-  /// the old tracker running and is announced honestly.
+  /// BOTH the suspension and the in-flight flag: the old
+  /// tracker stays installed as position source but is never
+  /// read for straight confirmation, and a later off-route
+  /// event retries the re-plan under the trip budget.
   Future<void> _rerouteLiveNavigation() async {
     // Suspend straight guidance for the whole re-plan. The
     // old tracker stays installed ONLY as the failure
@@ -574,22 +595,26 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final RealNavigationOutcome outcome = await starter.start(_liveNavDestName);
     if (!mounted || _liveNav == null) return;
     if (!outcome.ready) {
-      // Re-arm: the user is still off route, and a later
-      // off-route event must be able to retry the re-plan
-      // (subject to the trip budget) instead of the failure
-      // ending all retries.
-      _rerouting = false;
+      // Re-arm the RETRY only: the user is still off route,
+      // and a later off-route event must be able to retry the
+      // re-plan (subject to the trip budget) instead of the
+      // failure ending all retries.
       _liveNav?.resetOffRouteStreak();
-      // The re-plan failed, so the still-installed tracker
-      // is the operative one again: the suspension ends via
-      // the same unified re-check as every other resume.
-      _recheckStraightResume();
-      _say(_request(
-        id: 'nav-reroute-failed',
-        eventId: 'nav-reroute-failed',
-        text: '重新规划失败：${outcome.failureAnnouncement}',
-        kind: SpeechKind.alert,
-      ));
+      // Codex re-test of 926901c: on failure the suspension
+      // and the in-flight flag BOTH stay set. The old tracker
+      // must never release straight guidance for a route the
+      // user has already left: no re-check runs here, straight
+      // pacing stays paused, and only a successful re-plan
+      // (installing a NEW tracker) can release it.
+      if (!_rerouteFailureAnnounced) {
+        _rerouteFailureAnnounced = true;
+        _say(_request(
+          id: 'nav-reroute-failed',
+          eventId: 'nav-reroute-failed',
+          text: '路线重新规划失败，请停下稍候，正在重试。',
+          kind: SpeechKind.alert,
+        ));
+      }
       return;
     }
     _beginLiveNavigation(outcome, _liveNavDestName);
