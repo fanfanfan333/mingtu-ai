@@ -17,15 +17,15 @@ const String _amapOkBody = '''
         "duration": "150",
         "steps": [
           {
-            "instruction": "向北步行80米",
-            "road": "校园路",
+            "action": "直行",
+            "orientation": "北",
             "polyline": "116.400000,39.900000;116.400100,39.900800",
             "distance": "80",
             "duration": "60"
           },
           {
-            "instruction": "向东步行106米到达目的地",
-            "road": "",
+            "action": "左转",
+            "orientation": "东",
             "polyline": "116.400100,39.900800;116.401000,39.900900",
             "distance": "106",
             "duration": "90"
@@ -75,7 +75,8 @@ void main() {
     expect(result.distanceM, 186);
     expect(result.durationS, 150);
     expect(result.steps.length, 2);
-    expect(result.steps.first.instruction, '向北步行80米');
+    expect(result.steps.first.action, '直行');
+    expect(result.steps.first.orientation, '北');
     expect(result.polyline.length, 4);
     // The real route is still UNKNOWN accessibility by construction:
     // Amap gives no blind-path data, so it must never score as safe.
@@ -157,7 +158,8 @@ void main() {
     expect(clamped.cy, 0.0);
   });
 
-  test('unavailable yolo detector returns no detections, never fakes', () async {
+  test('unavailable yolo detector returns no detections, never fakes',
+      () async {
     final YoloDetector detector = UnavailableYoloDetector();
     expect(detector.isAvailable, isFalse);
     expect(await detector.detectImage(<int>[1, 2, 3]), isEmpty);

@@ -99,6 +99,8 @@ class WalkingWhitelistTest(unittest.TestCase):
                                 {
                                     "instruction": "向北步行80米",
                                     "road": "校园路",
+                                    "action": "直行",
+                                    "orientation": "北",
                                     "polyline": "116.4,39.9;116.4001,39.9008",
                                     "distance": "80",
                                     "duration": "60",
@@ -130,10 +132,19 @@ class WalkingWhitelistTest(unittest.TestCase):
         # distance/duration are coerced to NUMBERS by the whitelist.
         self.assertEqual(path["distance"], 186)
         self.assertEqual(path["duration"], 150)
-        self.assertEqual(path["steps"][0]["instruction"], "向北步行80米")
-        self.assertNotIn("extra", path["steps"][0])
+        step = path["steps"][0]
+        # Only the ENUM fields survive; the upstream free-text
+        # instruction/road are NOT forwarded at all (the client
+        # generates the spoken prompt from action/orientation).
+        self.assertEqual(step["action"], "直行")
+        self.assertEqual(step["orientation"], "北")
+        self.assertNotIn("instruction", step)
+        self.assertNotIn("road", step)
+        self.assertNotIn("向北步行80米", text)
+        self.assertNotIn("校园路", text)
+        self.assertNotIn("extra", step)
 
-    def test_key_echoed_inside_a_kept_field_is_stripped(self):
+    def test_key_echoed_inside_enum_field_is_dropped(self):
         body = json.dumps(
             {
                 "status": "1",
@@ -145,7 +156,8 @@ class WalkingWhitelistTest(unittest.TestCase):
                             "steps": [
                                 {
                                     "instruction": "前行" + AMAP_KEY + "十米",
-                                    "road": "",
+                                    "action": "左转" + AMAP_KEY,
+                                    "orientation": "东",
                                     "polyline": "",
                                     "distance": "10",
                                     "duration": "5",
@@ -162,11 +174,102 @@ class WalkingWhitelistTest(unittest.TestCase):
         finally:
             srv.close()
         self.assertEqual(status, 200)
-        self.assertNotIn(AMAP_KEY, resp.decode())
-        out = json.loads(resp)
-        self.assertEqual(
-            out["route"]["paths"][0]["steps"][0]["instruction"], "前行十米"
-        )
+        self.assertNotIn(AMAP_KEY.lower(), resp.decode().lower())
+        step = json.loads(resp)["route"]["paths"][0]["steps"][0]
+        # A polluted action is not in the enum -> dropped to "".
+        self.assertEqual(step["action"], "")
+        self.assertEqual(step["orientation"], "东")
+
+    def test_coordinate_shaped_key_cannot_echo_through_polyline(self):
+        # The synthetic key IS a coordinate pair. Parsing alone
+        # would re-emit it; the raw-string secret strip must kill
+        # the pair before parsing, and the surviving pair stays.
+        coord_key = "116.400000,39.900000"
+        body = json.dumps(
+            {
+                "status": "1",
+                "route": {
+                    "paths": [
+                        {
+                            "distance": "10",
+                            "duration": "5",
+                            "steps": [
+                                {
+                                    "action": "直行",
+                                    "orientation": "北",
+                                    "polyline": coord_key
+                                    + ";116.401000,39.900900",
+                                    "distance": "10",
+                                    "duration": "5",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        ).encode()
+        logs = io.StringIO()
+        with redirect_stderr(logs):
+            server = amap_proxy.make_server(
+                0, coord_key, fetcher=lambda url: (200, body)
+            )
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever)
+            t.daemon = True
+            t.start()
+            try:
+                status, resp = _get(port, WALK)
+            finally:
+                server.shutdown()
+                server.server_close()
+        self.assertEqual(status, 200)
+        self.assertNotIn(coord_key, resp.decode())
+        step = json.loads(resp)["route"]["paths"][0]["steps"][0]
+        self.assertEqual(step["polyline"], "116.401000,39.900900")
+
+    def test_polyline_precision_and_point_cap(self):
+        many = ";".join("116.4%03d,39.9" % i for i in range(600))
+        body = json.dumps(
+            {
+                "status": "1",
+                "route": {
+                    "paths": [
+                        {
+                            "distance": "10",
+                            "duration": "5",
+                            "steps": [
+                                {
+                                    "action": "直行",
+                                    "orientation": "北",
+                                    # 7 decimals -> illegal; exponent
+                                    # notation -> illegal; valid pair ok.
+                                    "polyline": "116.4000001,39.900000;"
+                                    "1.164e2,39.9;116.400100,39.900800",
+                                    "distance": "10",
+                                    "duration": "5",
+                                },
+                                {
+                                    "action": "直行",
+                                    "orientation": "北",
+                                    "polyline": many,
+                                    "distance": "10",
+                                    "duration": "5",
+                                },
+                            ],
+                        }
+                    ]
+                },
+            }
+        ).encode()
+        srv = _Server(fetcher=lambda url: (200, body))
+        try:
+            status, resp = _get(srv.port, WALK)
+        finally:
+            srv.close()
+        self.assertEqual(status, 200)
+        steps = json.loads(resp)["route"]["paths"][0]["steps"]
+        self.assertEqual(steps[0]["polyline"], "116.400100,39.900800")
+        self.assertEqual(len(steps[1]["polyline"].split(";")), 500)
 
     def test_failure_info_is_a_fixed_enum_and_nothing_else_crosses(self):
         body = json.dumps(
@@ -218,8 +321,8 @@ class WalkingWhitelistTest(unittest.TestCase):
                             "duration": "150",
                             "steps": [
                                 {
-                                    "instruction": [AMAP_KEY],  # not a string
-                                    "road": {"name": AMAP_KEY},  # not a string
+                                    "action": ["左转"],  # not a string
+                                    "orientation": {"dir": "东"},  # not a string
                                     "polyline": "116.4,39.9;garbage;999,999;"
                                     + AMAP_KEY
                                     + ";116.401,39.9009",
@@ -227,8 +330,8 @@ class WalkingWhitelistTest(unittest.TestCase):
                                     "duration": -5,
                                 },
                                 {
-                                    "instruction": "长" * 500,  # caps at 200
-                                    "road": "校园路",
+                                    "action": "左转",
+                                    "orientation": "东",
                                     "polyline": "116.4,39.9",
                                     "distance": "80",
                                     "duration": "60",
@@ -245,20 +348,22 @@ class WalkingWhitelistTest(unittest.TestCase):
         finally:
             srv.close()
         self.assertEqual(status, 200)
-        self.assertNotIn(AMAP_KEY, resp.decode())
+        self.assertNotIn(AMAP_KEY.lower(), resp.decode().lower())
         out = json.loads(resp)
         path = out["route"]["paths"][0]
         self.assertEqual(path["distance"], 10_000_000)
         step = path["steps"][0]
-        self.assertEqual(step["instruction"], "")
-        self.assertEqual(step["road"], "")
+        self.assertEqual(step["action"], "")
+        self.assertEqual(step["orientation"], "")
         self.assertEqual(step["distance"], 0)  # junk string -> 0
         self.assertEqual(step["duration"], 0)  # negative -> 0
         # Only the two valid coordinate pairs survive, normalised.
         self.assertEqual(
             step["polyline"], "116.400000,39.900000;116.401000,39.900900"
         )
-        self.assertEqual(len(path["steps"][1]["instruction"]), 200)
+        # A clean enum pair passes through as enums.
+        self.assertEqual(path["steps"][1]["action"], "左转")
+        self.assertEqual(path["steps"][1]["orientation"], "东")
 
     def test_non_json_upstream_body_becomes_generic_502(self):
         srv = _Server(
@@ -314,6 +419,38 @@ class VisionWhitelistTest(unittest.TestCase):
         out = json.loads(resp)
         self.assertEqual(
             out["choices"][0]["message"]["content"], "桌上有一本书。"
+        )
+
+    def test_vision_keys_stripped_case_insensitively_and_cross_key(self):
+        # Both server keys, in mixed letter cases, inside the one
+        # surviving free-text field: neither may cross in ANY case.
+        dash_variant = "FiXtUrE-DaShScOpE-KeY"
+        amap_variant = "FIXTURE-AMAP-KEY"
+        evil = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "前段" + dash_variant + "中段"
+                            + amap_variant + "后段",
+                        }
+                    }
+                ]
+            }
+        ).encode()
+        srv = _Server(poster=lambda url, body, key: (200, evil))
+        try:
+            status, resp = _post(srv.port, "/vision", VISION_BODY)
+        finally:
+            srv.close()
+        self.assertEqual(status, 200)
+        text = resp.decode()
+        self.assertNotIn(DASH_KEY.lower(), text.lower())
+        self.assertNotIn(AMAP_KEY.lower(), text.lower())
+        out = json.loads(resp)
+        self.assertEqual(
+            out["choices"][0]["message"]["content"], "前段中段后段"
         )
 
     def test_vision_role_is_forced_to_fixed_enum(self):

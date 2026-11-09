@@ -5,7 +5,13 @@
 /// (server/amap_proxy.py), which holds the key in its server-side
 /// environment and forwards to the Amap Web Service walking API:
 ///   GET {proxyBaseUrl}/walking?origin=lon,lat&destination=lon,lat
-/// The proxy answers with the Amap JSON body verbatim. Coordinates
+/// The proxy answers with a response REBUILT from whitelisted
+/// fields: per step it forwards only the ENUM fields action /
+/// orientation, the numeric distance / duration and a validated
+/// polyline. The upstream free-text instruction is never forwarded,
+/// so the spoken prompt below is generated locally from enums --
+/// no upstream sentence can reach the user's ears verbatim.
+/// Coordinates
 /// are "lon,lat" (longitude first) and GCJ-02 end to end: origins
 /// come from the GPS adapter already converted (see
 /// core/coordinate_convert.dart), destinations from
@@ -49,21 +55,81 @@ Future<String> _defaultSender(Uri url) async {
   }
 }
 
-/// One walking step from Amap: a spoken instruction, the road name,
-/// the step polyline and its distance / duration.
+/// The step actions the proxy may forward (fixed enum; anything
+/// else was already dropped server-side, and is dropped again
+/// here -- a rogue response cannot smuggle free text in through
+/// the action field).
+const Set<String> amapStepActions = <String>{
+  '左转',
+  '右转',
+  '向左前方',
+  '向右前方',
+  '向左后方',
+  '向右后方',
+  '直行',
+  '靠左',
+  '靠右',
+  '通过路口',
+  '调头',
+  '到达',
+};
+
+/// The step orientations (compass directions) the proxy may
+/// forward, same fixed-enum rule.
+const Set<String> amapStepOrientations = <String>{
+  '东',
+  '南',
+  '西',
+  '北',
+  '东北',
+  '东南',
+  '西北',
+  '西南',
+};
+
+/// One walking step from Amap, reduced to enum + numeric fields:
+/// an [action] (e.g. 左转）, an [orientation] (e.g. 东）, the step
+/// polyline and its distance / duration. There is deliberately NO
+/// free-text instruction: the spoken prompt is generated from the
+/// enums by [AmapStepSpeaker], never copied from the provider.
 class AmapStep {
-  final String instruction;
-  final String road;
+  final String action;
+  final String orientation;
   final List<GeoPoint> polyline;
   final double distanceM;
   final double durationS;
   const AmapStep({
-    required this.instruction,
-    required this.road,
+    required this.action,
+    required this.orientation,
     required this.polyline,
     required this.distanceM,
     required this.durationS,
   });
+}
+
+String _enumField(Object? value, Set<String> allowed) =>
+    value is String && allowed.contains(value) ? value : '';
+
+/// Generate the spoken Chinese prompt for one step from its ENUM
+/// fields + distance. This is the only place step speech text is
+/// produced, and it can only ever combine fixed enum words with a
+/// number -- upstream free text has no path into it.
+String amapStepSpeechText({
+  required String action,
+  required String orientation,
+  required double distanceM,
+}) {
+  final String direction = orientation.isEmpty ? '' : '朝$orientation方向';
+  final String act;
+  if (action == '到达') {
+    act = '前方到达目的地附近';
+  } else if (action.isEmpty) {
+    act = '继续前行';
+  } else {
+    act = action;
+  }
+  final String head = direction.isEmpty ? act : '$direction$act';
+  return '$head，约 ${distanceM.toStringAsFixed(0)} 米';
 }
 
 class AmapWalkingResult {
@@ -141,15 +207,13 @@ class AmapStepSpeaker {
   int get remaining => steps.length - _index;
   bool get isDone => _index >= steps.length;
 
-  /// The next step's spoken text, or null when all steps are spoken.
+  /// The next step's spoken text, generated from the step's enum
+  /// fields, or null when all steps are spoken.
   String? nextStepText() {
     if (isDone) return null;
     final AmapStep step = steps[_index];
     _index += 1;
-    final String road = step.road.isEmpty ? '' : '，${step.road}';
-    final String instruction =
-        step.instruction.isEmpty ? '继续向前' : step.instruction;
-    return '$instruction$road，约 ${step.distanceM.toStringAsFixed(0)} 米。'
+    return '${amapStepSpeechText(action: step.action, orientation: step.orientation, distanceM: step.distanceM)}。'
         '（第 $_index 段，共 ${steps.length} 段）';
   }
 
@@ -196,7 +260,8 @@ class AmapWalkingClient {
     final String base = proxyBaseUrl.endsWith('/')
         ? proxyBaseUrl.substring(0, proxyBaseUrl.length - 1)
         : proxyBaseUrl;
-    final Uri url = Uri.parse('$base/walking').replace(queryParameters: <String, String>{
+    final Uri url =
+        Uri.parse('$base/walking').replace(queryParameters: <String, String>{
       'origin':
           '${from.longitude!.toStringAsFixed(6)},${from.latitude!.toStringAsFixed(6)}',
       'destination':
@@ -213,9 +278,8 @@ class AmapWalkingClient {
         );
       }
       if (decoded['status'] != '1') {
-        final String info = decoded['info'] is String
-            ? decoded['info'] as String
-            : '未知';
+        final String info =
+            decoded['info'] is String ? decoded['info'] as String : '未知';
         return AmapWalkingResult(
           status: 'ERROR',
           error: '高德返回 status=${decoded['status']}，info=$info。',
@@ -247,9 +311,8 @@ class AmapWalkingClient {
               : <GeoPoint>[];
           polyline.addAll(stepLine);
           steps.add(AmapStep(
-            instruction:
-                raw['instruction'] is String ? raw['instruction'] as String : '',
-            road: raw['road'] is String ? raw['road'] as String : '',
+            action: _enumField(raw['action'], amapStepActions),
+            orientation: _enumField(raw['orientation'], amapStepOrientations),
             polyline: stepLine,
             distanceM: _asDouble(raw['distance']),
             durationS: _asDouble(raw['duration']),

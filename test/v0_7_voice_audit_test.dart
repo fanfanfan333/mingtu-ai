@@ -4,7 +4,8 @@ import 'package:mingtu_ai/core/health_monitor.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test('health announcement speaks Chinese service names, never English ids', () {
+  test('health announcement speaks Chinese service names, never English ids',
+      () {
     final HealthMonitor health = HealthMonitor();
     health.report('map_navigation', ServiceHealthStatus.degraded, '桩路线');
     health.report('voice_output', ServiceHealthStatus.unavailable, '无 TTS');
@@ -32,15 +33,15 @@ void main() {
   test('amap step speaker reads steps in order, then stops honestly', () {
     final AmapStepSpeaker speaker = AmapStepSpeaker(<AmapStep>[
       const AmapStep(
-        instruction: '向北步行80米',
-        road: '校园路',
+        action: '直行',
+        orientation: '北',
         polyline: [],
         distanceM: 80,
         durationS: 60,
       ),
       const AmapStep(
-        instruction: '向东步行106米到达目的地',
-        road: '',
+        action: '左转',
+        orientation: '东',
         polyline: [],
         distanceM: 106,
         durationS: 90,
@@ -48,17 +49,20 @@ void main() {
     ]);
     expect(speaker.remaining, 2);
     final String? first = speaker.nextStepText();
-    expect(first, contains('向北步行80米'));
-    expect(first, contains('校园路'));
+    // Speech is GENERATED from the enum fields (direction +
+    // action + distance), never copied from provider free text.
+    expect(first, contains('朝北方向直行'));
+    expect(first, contains('约 80 米'));
     expect(first, contains('第 1 段，共 2 段'));
     final String? second = speaker.nextStepText();
-    expect(second, contains('向东步行106米到达目的地'));
+    expect(second, contains('朝东方向左转'));
+    expect(second, contains('约 106 米'));
     expect(second, contains('第 2 段，共 2 段'));
     expect(speaker.isDone, isTrue);
     expect(speaker.nextStepText(), isNull);
     speaker.reset();
     expect(speaker.isDone, isFalse);
-    expect(speaker.nextStepText(), contains('向北步行80米'));
+    expect(speaker.nextStepText(), contains('朝北方向直行'));
   });
 
   test('amap step speaker with no steps says nothing to invent', () {

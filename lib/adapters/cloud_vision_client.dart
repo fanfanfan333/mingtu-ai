@@ -102,6 +102,12 @@ class CloudVisionClient {
 
   bool get isConfigured => proxyBaseUrl.isNotEmpty;
 
+  /// Would a call started at [now] pass configuration + rate
+  /// limiting? Peek only -- the slot is taken inside [describe].
+  /// Lets the on-demand flow refuse BEFORE capturing a frame.
+  bool canStartNow(DateTime? now) =>
+      isConfigured && limiter.isAvailable(now ?? DateTime.now());
+
   /// Describe one frame. [now] is injectable for tests.
   Future<CloudVisionResult> describe({
     required Uint8List imageBytes,

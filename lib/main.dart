@@ -5,13 +5,16 @@ import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
 import 'adapters/bailian_client.dart';
+import 'adapters/camera_frame_source.dart';
 import 'adapters/cloud_vision_client.dart';
+import 'adapters/cloud_vision_flow.dart';
 import 'adapters/current_location.dart';
 import 'adapters/system_voice_io.dart';
 import 'adapters/voice_io.dart';
 import 'adapters/yolo_detector.dart';
 import 'adapters/yolo_live_view.dart';
 import 'config/app_config.dart';
+import 'core/camera_frame.dart';
 import 'core/event_bus.dart';
 import 'core/cloud_vision.dart';
 import 'core/health_monitor.dart';
@@ -80,8 +83,7 @@ class MingtuHomePage extends StatefulWidget {
 class _MingtuHomePageState extends State<MingtuHomePage> {
   TaskManager _tasks = TaskManager();
   SpeechScheduler _scheduler = SpeechScheduler();
-  MapNavigationService _mapService =
-      MapNavigationService(StubMapProvider());
+  MapNavigationService _mapService = MapNavigationService(StubMapProvider());
   late RoutePlanningSkill _routeSkill = RoutePlanningSkill(_mapService);
   final EnvironmentAnalysisSkill _envSkill = EnvironmentAnalysisSkill();
   final DestinationFindingSkill _destSkill = DestinationFindingSkill();
@@ -124,11 +126,18 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
   // the proxy base URL -- there is no key on this device.
   final CloudVisionClient _cloudVisionClient =
       CloudVisionClient(proxyBaseUrl: AppConfig.routeProxyUrl);
-  // The latest camera frame, when a frame source is wired to
-  // Dart. Today the YOLO live view keeps frames inside the plugin
-  // view, so this stays null and the assist honestly reports
-  // "没有可用画面" instead of inventing an image.
-  Uint8List? _latestFrameBytes;
+  // On-demand single-frame camera source (production wiring):
+  // one explicit trigger captures exactly one still frame via the
+  // camera plugin and disposes the controller immediately -- no
+  // streaming upload, no recording. On web it reports unavailable.
+  final CameraFrameSource _frameSource = createCameraFrameSource();
+  // The sequenced flow: configured/rate-limit checks BEFORE the
+  // camera opens, "正在识别" announced first, then one frame, then
+  // one rate-limited describe call. Every step is spoken.
+  late final OnDemandCloudVision _cloudVisionFlow = OnDemandCloudVision(
+    client: _cloudVisionClient,
+    frameSource: _frameSource,
+  );
   String _perceptionText = '尚未模拟感知帧。';
   // v0.6 real integrations. Defaults are the unavailable fallbacks;
   // _initRealIntegrations replaces them only when the phone's own
@@ -215,9 +224,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     if (plan.speechUsable) _voiceOutput = tts;
     _health.report(
       'voice_output',
-      plan.speechUsable
-          ? ServiceHealthStatus.ok
-          : ServiceHealthStatus.degraded,
+      plan.speechUsable ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
       '${tts.status}｜${plan.summary}',
     );
     _health.report(
@@ -379,7 +386,10 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         source: 'speech_scheduler',
         dataVersion: 0,
         expiresAt: request.expiresAt,
-        payload: <String, Object?>{'text': request.text, 'kind': request.kind.name},
+        payload: <String, Object?>{
+          'text': request.text,
+          'kind': request.kind.name
+        },
       ),
       now,
     );
@@ -564,9 +574,11 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
     // stub and there is no camera in this run. v0.6: voice_output is
     // only degraded when no real TTS engine is reachable -- when the
     // phone's engine is up, reporting it degraded would be a lie.
-    _health.report('map_navigation', ServiceHealthStatus.degraded, '演示桩路线，非真实高德数据。');
+    _health.report(
+        'map_navigation', ServiceHealthStatus.degraded, '演示桩路线，非真实高德数据。');
     if (!_voiceOutput.isAvailable) {
-      _health.report('voice_output', ServiceHealthStatus.degraded, '演示文本播报，非真实系统 TTS。');
+      _health.report(
+          'voice_output', ServiceHealthStatus.degraded, '演示文本播报，非真实系统 TTS。');
     }
     _health.report('camera', ServiceHealthStatus.unavailable, '演示中无真实摄像头。');
     _recording.start('demo-recording', DateTime.now());
@@ -613,8 +625,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       return;
     }
     _tasks.transitionTo(TaskState.planning, trigger: 'plan-route');
-    final RoutePlanResult result =
-        _routeSkill.plan('校园起点（占位）', '图书馆（占位）');
+    final RoutePlanResult result = _routeSkill.plan('校园起点（占位）', '图书馆（占位）');
     setState(() {
       if (result.best == null) {
         _routeText = '无可用路线（演示占位数据）。';
@@ -914,8 +925,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         _straightConfirmed = false;
       });
       final String names = newObstacles
-          .map((PerceptionEvent e) =>
-              _yoloObstacleLabels[e.label] ?? e.label)
+          .map((PerceptionEvent e) => _yoloObstacleLabels[e.label] ?? e.label)
           .join('、');
       _say(_request(
         id: 'yolo-obstacle-${now.millisecondsSinceEpoch}',
@@ -1109,8 +1119,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         sideSpaceConfirmed: false,
       ),
     );
-    final RiskAssessment assessment =
-        _envSkill.analyse(event, now).assessment;
+    final RiskAssessment assessment = _envSkill.analyse(event, now).assessment;
     _backlog.record(
       'obstacle-uncertain-demo',
       'uncertain-side-space',
@@ -1188,8 +1197,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         confirmedSafeSide: StepDirection.right,
       ),
     );
-    final RiskAssessment assessment =
-        _envSkill.analyse(event, now).assessment;
+    final RiskAssessment assessment = _envSkill.analyse(event, now).assessment;
     setState(() {
       _perceptionText =
           '感知帧（演示）：移动事件 ${events.length} 条，跟踪目标 ${_perception.tracks.length} 个。';
@@ -1256,7 +1264,8 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       DateTime.now(),
     );
     setState(() {
-      _trafficText = '${assessment.speechText}（允许过马路：${assessment.allowsCrossing}，学习记录 ${_backlog.count} 条，只记录不改规则。）';
+      _trafficText =
+          '${assessment.speechText}（允许过马路：${assessment.allowsCrossing}，学习记录 ${_backlog.count} 条，只记录不改规则。）';
     });
     _logMsg('路口信息（替代原过街决策）：只提示，不放行。');
     _say(_request(
@@ -1281,8 +1290,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       20.0,
     );
     int steps = 1;
-    while (!_mapService.shouldSwitchToDestinationApproach(nav) &&
-        steps < 30) {
+    while (!_mapService.shouldSwitchToDestinationApproach(nav) && steps < 30) {
       nav = _mapService.provider.updateLocation(const GeoPoint(), 20.0);
       steps += 1;
     }
@@ -1396,8 +1404,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       _logMsg('请先完成全部室内步骤，再验证任务。');
       return;
     }
-    _tasks.transitionTo(TaskState.waitingConfirmation,
-        trigger: 'verify-task');
+    _tasks.transitionTo(TaskState.waitingConfirmation, trigger: 'verify-task');
     _recording.stopPendingConsent(DateTime.now());
     setState(() {
       _recordingText = '录像已停止，等待你的保留/删除选择（本地演示会话）。';
@@ -1540,39 +1547,43 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         '网关已用估算费用已记账，未记录 Key。');
   }
 
-  /// Low-frequency cloud vision ASSIST (user-tapped only). Local
-  /// YOLO stays primary: this never runs on its own, never feeds
-  /// the risk engine, and its spoken result is framed as an
-  /// unverified description. Every failure path announces the
-  /// degradation to local detection in Chinese. The DashScope key
-  /// exists only in the proxy's server environment; this device
-  /// sends one downsampled frame to the proxy and nothing else.
+  /// Low-frequency cloud vision ASSIST, triggered ONLY by the
+  /// user (voice "看看前面" or the on-screen button). Local YOLO
+  /// stays primary: this never runs on its own, never streams or
+  /// records, never feeds the risk engine, and its spoken result
+  /// is framed as an unverified description with the disclaimer.
+  /// The flow announces every stage in Chinese -- starting,
+  /// result, timeout/failure degradation, and a camera-permission
+  /// denial -- so no path is silent. The DashScope key exists
+  /// only in the proxy's server environment; this device sends
+  /// one downsampled frame to the proxy and nothing else.
   Future<void> _runCloudVisionAssist() async {
-    final Uint8List? frame = _latestFrameBytes;
-    final CloudVisionResult result;
-    if (frame == null) {
-      result = _cloudVisionClient.isConfigured
-          ? CloudVisionResult.failed(CloudVisionFailure.noImage)
-          : CloudVisionResult.failed(CloudVisionFailure.notConfigured);
-    } else {
-      result = await _cloudVisionClient.describe(imageBytes: frame);
-    }
+    int seq = 0;
+    final CloudVisionFlowOutcome outcome = await _cloudVisionFlow.run(
+      announce: (String text) {
+        if (!mounted) return;
+        seq += 1;
+        setState(() {
+          _cloudVisionText = '云端视觉辅助：$text';
+        });
+        _say(_request(
+          id: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}-$seq',
+          eventId: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}-$seq',
+          text: text,
+          kind: SpeechKind.info,
+        ));
+      },
+    );
     if (!mounted) return;
+    final CloudVisionResult result = outcome.visionResult;
     _health.report(
       'cloud_vision',
       result.ok ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
-      result.ok ? '云端视觉辅助返回一次描述（未验证）。' : result.speechText,
+      outcome.announcements.isEmpty
+          ? result.speechText
+          : outcome.announcements.last,
     );
-    setState(() {
-      _cloudVisionText = '云端视觉辅助：${result.speechText}';
-    });
     _logMsg('云端视觉辅助：ok=${result.ok}，failure=${result.failure}。');
-    _say(_request(
-      id: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}',
-      eventId: 'cloud-vision-${DateTime.now().millisecondsSinceEpoch}',
-      text: result.speechText,
-      kind: SpeechKind.info,
-    ));
   }
 
   // v0.5: every state has a Chinese name. A blind user hearing the
@@ -1741,13 +1752,13 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
       case VoiceCommand.status:
         // v0.5: status must include the route, not only the state
         // name, so a blind user knows where they are in the journey.
-        final String routePart = _routeText == '尚未规划路线。'
-            ? ''
-            : '路线：$_routeText';
+        final String routePart =
+            _routeText == '尚未规划路线。' ? '' : '路线：$_routeText';
         _say(_request(
           id: 'voice-status-${DateTime.now().millisecondsSinceEpoch}',
           eventId: 'voice-status-${DateTime.now().millisecondsSinceEpoch}',
-          text: '当前状态：${_stateText(_tasks.state)}。当前提示：$_currentPrompt。$routePart',
+          text:
+              '当前状态：${_stateText(_tasks.state)}。当前提示：$_currentPrompt。$routePart',
           kind: SpeechKind.info,
         ));
         return;
@@ -1766,19 +1777,24 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
         } else {
           _say(_request(
             id: 'voice-confirm-no-${DateTime.now().millisecondsSinceEpoch}',
-            eventId: 'voice-confirm-no-${DateTime.now().millisecondsSinceEpoch}',
+            eventId:
+                'voice-confirm-no-${DateTime.now().millisecondsSinceEpoch}',
             text: '当前没有室内步骤可以确认，也没有未播报的高德路段。',
             kind: SpeechKind.info,
           ));
         }
         return;
+      case VoiceCommand.cloudVision:
+        // Explicit trigger only: one frame, one low-frequency
+        // cloud description, all stages spoken (see
+        // _runCloudVisionAssist). Never runs in the background.
+        unawaited(_runCloudVisionAssist());
+        return;
       case VoiceCommand.environment:
         _say(_request(
           id: 'voice-env-${DateTime.now().millisecondsSinceEpoch}',
           eventId: 'voice-env-${DateTime.now().millisecondsSinceEpoch}',
-          text: _riskActive
-              ? '前方情况：$_obstacleText'
-              : '前方情况：$_perceptionText',
+          text: _riskActive ? '前方情况：$_obstacleText' : '前方情况：$_perceptionText',
           kind: SpeechKind.info,
         ));
         return;
@@ -2069,7 +2085,8 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             const SizedBox(height: 8),
             Text('路口：$_trafficText'),
             const SizedBox(height: 8),
-            Text('Skill 注册：${_registry.list().length} 个（车站、医院完整挂号未注册；路口只提示不放行；相册导出 NOT_CONFIGURED）。'),
+            Text(
+                'Skill 注册：${_registry.list().length} 个（车站、医院完整挂号未注册；路口只提示不放行；相册导出 NOT_CONFIGURED）。'),
             const SizedBox(height: 24),
             const Text('语音控制（盲人优先：不用看屏幕点步骤也能控制）',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
@@ -2127,10 +2144,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
               onPressed: state == TaskState.navigating
                   ? () => _onYoloDetections(const <Detection>[
                         Detection(
-                            label: 'person',
-                            confidence: 0.9,
-                            cx: 0.5,
-                            cy: 0.5),
+                            label: 'person', confidence: 0.9, cx: 0.5, cy: 0.5),
                       ])
                   : null,
             ),
@@ -2212,8 +2226,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             _demoButton(
               label: '理解并规划路线',
               semanticsLabel: '理解并规划路线',
-              onPressed:
-                  state == TaskState.understanding ? _planRoute : null,
+              onPressed: state == TaskState.understanding ? _planRoute : null,
             ),
             _demoButton(
               label: '开始导航（直行节奏启动）',
@@ -2232,8 +2245,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             _demoButton(
               label: '前方转弯（暂停直行）',
               semanticsLabel: '前方转弯',
-              onPressed:
-                  state == TaskState.navigating ? _turn : null,
+              onPressed: state == TaskState.navigating ? _turn : null,
             ),
             _demoButton(
               label: '重新确认直行路段并恢复',
@@ -2253,8 +2265,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             _demoButton(
               label: '障碍已移开，重新评估并恢复直行',
               semanticsLabel: '障碍已移开，恢复直行',
-              onPressed: state == TaskState.avoidingObstacle &&
-                      _riskActive
+              onPressed: state == TaskState.avoidingObstacle && _riskActive
                   ? _obstacleUncertainResolved
                   : null,
             ),
@@ -2274,8 +2285,7 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             _demoButton(
               label: '路口信息提示（只提示，不放行）',
               semanticsLabel: '路口信息提示',
-              onPressed:
-                  state == TaskState.navigating ? _trafficInfo : null,
+              onPressed: state == TaskState.navigating ? _trafficInfo : null,
             ),
             _demoButton(
               label: '模拟行进至接近目的地',
@@ -2286,9 +2296,8 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             _demoButton(
               label: '寻找入口（先看占位，再看演示已核验候选）',
               semanticsLabel: '寻找入口',
-              onPressed: state == TaskState.findingEntrance
-                  ? _findEntrance
-                  : null,
+              onPressed:
+                  state == TaskState.findingEntrance ? _findEntrance : null,
             ),
             _demoButton(
               label: '进入室内引导',
@@ -2299,16 +2308,15 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             _demoButton(
               label: '室内步骤：用演示证据推进',
               semanticsLabel: '室内步骤推进',
-              onPressed:
-                  state == TaskState.indoorGuidance ? _indoorStep : null,
+              onPressed: state == TaskState.indoorGuidance ? _indoorStep : null,
             ),
             _demoButton(
               label: '验证任务（室内全部完成才可）',
               semanticsLabel: '验证任务',
-              onPressed: state == TaskState.indoorGuidance &&
-                      _indoor.isCompleted
-                  ? _taskVerify
-                  : null,
+              onPressed:
+                  state == TaskState.indoorGuidance && _indoor.isCompleted
+                      ? _taskVerify
+                      : null,
             ),
             _demoButton(
               label: '确认任务完成',
@@ -2320,18 +2328,18 @@ class _MingtuHomePageState extends State<MingtuHomePage> {
             _demoButton(
               label: '保留录像（本地）',
               semanticsLabel: '保留录像',
-              onPressed: _recording.current?.status ==
-                      RecordingStatus.pendingConsent
-                  ? _recordingSave
-                  : null,
+              onPressed:
+                  _recording.current?.status == RecordingStatus.pendingConsent
+                      ? _recordingSave
+                      : null,
             ),
             _demoButton(
               label: '删除录像（本地）',
               semanticsLabel: '删除录像',
-              onPressed: _recording.current?.status ==
-                      RecordingStatus.pendingConsent
-                  ? _recordingDelete
-                  : null,
+              onPressed:
+                  _recording.current?.status == RecordingStatus.pendingConsent
+                      ? _recordingDelete
+                      : null,
             ),
             _demoButton(
               label: '云端网关演示（只返回决策，无真实调用）',

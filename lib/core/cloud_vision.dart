@@ -40,6 +40,18 @@ const Duration cloudVisionMinInterval = Duration(seconds: 20);
 /// never left hanging in silence.
 const Duration cloudVisionRequestTimeout = Duration(seconds: 15);
 
+/// The disclaimer spoken with EVERY cloud-vision announcement
+/// (starting, result, failure): the description is a low-frequency
+/// reference only and never a basis for deciding it is safe to
+/// walk. The exact wording is the product requirement.
+const String cloudVisionDisclaimer = '仅供参考，请以盲杖和环境声音为准。';
+
+/// Spoken when an on-demand capture starts, so the user is never
+/// left in silence while the single frame is captured, shrunk and
+/// sent: Chinese, states what is happening, carries the disclaimer.
+const String cloudVisionStartingSpeech =
+    '正在识别前方画面，请稍等。提醒：$cloudVisionDisclaimer';
+
 /// The prompt sent with every frame. It asks for a plain scene
 /// description and explicitly forbids walking-safety judgements.
 const String cloudVisionPrompt = '请用简短中文描述这张图片里的场景和主要物体，'
@@ -61,6 +73,15 @@ class VisionRateLimiter {
     if (last != null && now.difference(last) < minInterval) return false;
     _lastCallAt = now;
     return true;
+  }
+
+  /// Peek without taking the slot: would a call at [now] be
+  /// allowed? The on-demand flow uses this BEFORE opening the
+  /// camera, so a rate-limited request never captures a frame it
+  /// would only throw away.
+  bool isAvailable(DateTime now) {
+    final DateTime? last = _lastCallAt;
+    return last == null || now.difference(last) >= minInterval;
   }
 
   void reset() {
@@ -167,29 +188,29 @@ class CloudVisionResult {
   String get speechText {
     if (ok) {
       return '云端视觉辅助描述：$description '
-          '提醒：这只是低频辅助描述，未经验证，不能当作道路安全判断，'
-          '请继续以本地检测和盲杖为准。';
+          '提醒：$cloudVisionDisclaimer'
+          '这只是低频辅助描述，未经验证，不能当作道路安全判断。';
     }
     switch (failure) {
       case CloudVisionFailure.notConfigured:
         return '云端视觉未配置：路线代理还没有部署，云端视觉不可用，'
-            '已降级为本地检测。';
+            '已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.rateLimited:
-        return '云端视觉调用太频繁，这次已跳过，继续用本地检测。';
+        return '云端视觉调用太频繁，这次已跳过，继续用本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.imageTooLarge:
-        return '图片太大，云端视觉已跳过，继续用本地检测。';
+        return '图片太大，云端视觉已跳过，继续用本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.noImage:
-        return '当前没有可用的摄像头画面，云端视觉未执行，继续用本地检测。';
+        return '当前没有可用的摄像头画面，云端视觉未执行，继续用本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.network:
-        return '云端视觉网络失败，已降级为本地检测。';
+        return '云端视觉网络失败，已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.timeout:
-        return '云端视觉请求超时，已降级为本地检测。';
+        return '云端视觉请求超时，已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.upstream:
-        return '云端视觉服务出错，已降级为本地检测。';
+        return '云端视觉服务出错，已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case CloudVisionFailure.badResponse:
-        return '云端视觉返回无法理解，已降级为本地检测。';
+        return '云端视觉返回无法理解，已降级为本地检测。提醒：$cloudVisionDisclaimer';
       case null:
-        return '云端视觉不可用，已降级为本地检测。';
+        return '云端视觉不可用，已降级为本地检测。提醒：$cloudVisionDisclaimer';
     }
   }
 }

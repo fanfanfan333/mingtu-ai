@@ -26,13 +26,22 @@ enum VoiceCommand {
   // the recording -- all by voice, not by finding a button on screen.
   confirmStep,
   environment,
+  // On-demand cloud vision: "看看前面" captures ONE frame and asks
+  // the cloud to describe it (low frequency, spoken disclaimer).
+  // It is an explicit trigger only -- never a background action.
+  cloudVision,
   saveRecording,
   deleteRecording,
   unknown,
 }
 
 VoiceCommand parseVoiceCommand(String raw) {
-  final String text = raw.trim().replaceAll('小途', '').replaceAll('，', '').replaceAll(',', '').trim();
+  final String text = raw
+      .trim()
+      .replaceAll('小途', '')
+      .replaceAll('，', '')
+      .replaceAll(',', '')
+      .trim();
   if (text.isEmpty) return VoiceCommand.unknown;
   if (text.contains('需要帮助') || text.contains('救命') || text.contains('紧急')) {
     return VoiceCommand.emergency;
@@ -73,6 +82,15 @@ VoiceCommand parseVoiceCommand(String raw) {
       text.contains('下一步')) {
     return VoiceCommand.confirmStep;
   }
+  if (text.contains('看看前面') ||
+      text.contains('看一下前面') ||
+      text.contains('看看前方') ||
+      text.contains('看一下前方') ||
+      text.contains('看看周围') ||
+      text.contains('看一下周围') ||
+      text.contains('看一下前面有什么')) {
+    return VoiceCommand.cloudVision;
+  }
   if (text.contains('前面有什么') ||
       text.contains('周围有什么') ||
       text.contains('附近有什么') ||
@@ -88,6 +106,5 @@ VoiceCommand parseVoiceCommand(String raw) {
   return VoiceCommand.unknown;
 }
 
-String voiceCommandHelpText() =>
-    '你可以说：带我去图书馆、停下、暂停、继续、取消、再说一遍、'
-    '现在到哪了、前面有什么、确认、保存录像、删除录像、我需要帮助。';
+String voiceCommandHelpText() => '你可以说：带我去图书馆、停下、暂停、继续、取消、再说一遍、'
+    '现在到哪了、前面有什么、看看前面、确认、保存录像、删除录像、我需要帮助。';

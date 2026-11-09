@@ -20,15 +20,15 @@ const String _amapOkBody = '''
         "duration": "150",
         "steps": [
           {
-            "instruction": "向北步行80米",
-            "road": "校园路",
+            "action": "直行",
+            "orientation": "北",
             "polyline": "116.400000,39.900000;116.400100,39.900800",
             "distance": "80",
             "duration": "60"
           },
           {
-            "instruction": "向东步行106米到达目的地",
-            "road": "",
+            "action": "左转",
+            "orientation": "东",
             "polyline": "116.400100,39.900800;116.401000,39.900900",
             "distance": "106",
             "duration": "90"
@@ -103,7 +103,8 @@ void main() {
       expect(wgs84ToGcj02(empty).hasCoordinates, isFalse);
     });
 
-    test('converting twice drifts materially -- why the adapter '
+    test(
+        'converting twice drifts materially -- why the adapter '
         'must convert exactly once', () {
       const GeoPoint wgs = GeoPoint(latitude: 39.915, longitude: 116.404);
       final GeoPoint once = wgs84ToGcj02(wgs);
@@ -113,8 +114,7 @@ void main() {
   });
 
   group('verified destination registry', () {
-    test('the shipped registry is EMPTY (no field verification yet)',
-        () {
+    test('the shipped registry is EMPTY (no field verification yet)', () {
       expect(verifiedLocations, isEmpty);
       expect(findVerifiedLocation('图书馆'), isNull);
     });
@@ -135,11 +135,10 @@ void main() {
   });
 
   group('RealNavigationStarter failure matrix', () {
-    test('unverified destination: announced, location never queried',
-        () async {
+    test('unverified destination: announced, location never queried', () async {
       final loc = FakeLocation(_goodFix());
-      final outcome = await _starter(location: loc, registry: const [])
-          .start('图书馆');
+      final outcome =
+          await _starter(location: loc, registry: const []).start('图书馆');
       expect(outcome.ready, isFalse);
       expect(outcome.failure, RealNavigationFailure.destinationNotConfigured);
       expect(loc.called, isFalse);
@@ -147,8 +146,7 @@ void main() {
       expect(outcome.failureAnnouncement, contains('导航未启动'));
     });
 
-    test('proxy not deployed: announced before any location fix',
-        () async {
+    test('proxy not deployed: announced before any location fix', () async {
       final loc = FakeLocation(_goodFix());
       final outcome = await _starter(location: loc, proxy: '').start('图书馆');
       expect(outcome.failure, RealNavigationFailure.proxyNotConfigured);
@@ -211,8 +209,7 @@ void main() {
       expect(outcome.failure, RealNavigationFailure.locationTooInaccurate);
     });
 
-    test('route transport failure -> routeFetchFailed, not ready',
-        () async {
+    test('route transport failure -> routeFetchFailed, not ready', () async {
       final outcome = await _starter(
         location: FakeLocation(_goodFix()),
         sender: (Uri url) async => throw Exception('network down'),
@@ -224,7 +221,8 @@ void main() {
   });
 
   group('RealNavigationStarter success path', () {
-    test('ready: GCJ-02 endpoints go to the proxy exactly as given '
+    test(
+        'ready: GCJ-02 endpoints go to the proxy exactly as given '
         '(no double conversion anywhere)', () async {
       Uri? seen;
       final outcome = await _starter(
@@ -243,7 +241,8 @@ void main() {
       expect(seen!.queryParameters.containsKey('key'), isFalse);
     });
 
-    test('ready announcement keeps the not-a-safe-route warning and '
+    test(
+        'ready announcement keeps the not-a-safe-route warning and '
         'the manual-step honesty', () {
       final String text = realRouteReadyAnnouncement(
         destinationName: '图书馆',
@@ -258,15 +257,15 @@ void main() {
     test('steps advance ONLY manually through the speaker', () {
       final speaker = AmapStepSpeaker(const [
         AmapStep(
-          instruction: '向北步行80米',
-          road: '校园路',
+          action: '直行',
+          orientation: '北',
           polyline: <GeoPoint>[],
           distanceM: 80,
           durationS: 60,
         ),
         AmapStep(
-          instruction: '向东步行106米到达目的地',
-          road: '',
+          action: '左转',
+          orientation: '东',
           polyline: <GeoPoint>[],
           distanceM: 106,
           durationS: 90,
