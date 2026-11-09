@@ -196,6 +196,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   NavigationTracker? _liveNav;
   RerouteBudget? _tripRerouteBudget;
   Future<void>? _pendingPreemptStop;
+  String _versionAtInterrupt = 'nav-v0';
   StreamSubscription<LocationResult>? _gpsSub;
   String _liveNavDestName = '';
   double? _liveNavRemainingM;
@@ -395,6 +396,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _onLiveNavFix,
           onError: (Object e) => mingtuVoiceLog('定位流出错，实时导航提示暂停'),
         );
+    // Live straight prompts: the shared 3 s tick reads its
+    // confirmation from the tracker while live nav runs.
+    _startStraightTimer();
     _logMsg('实时导航已开始：GPS 跟踪中（转向/偏航/到达自动播报）。');
   }
 
@@ -534,6 +538,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _gpsSub = null;
     _liveNav = null;
     _liveNavRemainingM = null;
+    _stopStraightTimer();
   }
 
   /// The single announcement site for startup failures: every
@@ -833,6 +838,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   bool _say(SpeechRequest request) {
     final DateTime now = DateTime.now();
+    if (request.kind == SpeechKind.danger) {
+      // A danger prompt kills any active straight prompt and
+      // clears its 3-second clock: after the danger, straight
+      // guidance resumes only via the re-check in
+      // _finishSpeech (never a catch-up replay).
+      _scheduler.pauseStraight();
+      _versionAtInterrupt = _navVersion;
+    }
     final SpeechRequest? activeBefore = _scheduler.active;
     final bool accepted = _scheduler.submit(request, now);
     if (accepted) _publishSpeech(request);
@@ -871,6 +884,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// it too, through the same real-or-simulated path.
   void _finishSpeech(String id) {
     if (_scheduler.active?.id == id) {
+      final SpeechKind? finishedKind = _scheduler.active?.kind;
       _scheduler.completeActive();
       final SpeechRequest? next = _scheduler.promoteNext(
         DateTime.now(),
@@ -878,6 +892,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         riskActive: _riskActive,
       );
       if (next == null) {
+        if (finishedKind == SpeechKind.danger) {
+          // Post-danger re-check (unified dispatch spec):
+          // straight guidance resumes only if the segment is
+          // still confirmed straight, no risk is active, and
+          // the navigation version has not moved since the
+          // interruption. resumeStraight restarts the 3 s
+          // clock from now -- missed prompts are not replayed.
+          _scheduler.resumeStraight(
+            now: DateTime.now(),
+            straightSegmentConfirmed: _straightConfirmed ||
+                (_liveNav?.currentSegmentIsStraight ?? false),
+            riskActive: _riskActive,
+            currentNavigationVersion: _navVersion,
+            straightNavigationVersion: _versionAtInterrupt,
+          );
+        }
         // Speech is done and nothing is queued: the turn-taking
         // loop may open the microphone now (v0.7).
         _maybeStartListeningAfterSpeech();
@@ -1023,9 +1053,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!mounted) {
       return;
     }
-    if (_tasks.state != TaskState.navigating ||
-        !_straightConfirmed ||
-        _riskActive) {
+    final bool straightOk =
+        _straightConfirmed || (_liveNav?.currentSegmentIsStraight ?? false);
+    if (_tasks.state != TaskState.navigating || !straightOk || _riskActive) {
       return;
     }
     final DateTime now = DateTime.now();

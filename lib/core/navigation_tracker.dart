@@ -154,6 +154,14 @@ class NavigationTracker {
 
   int get rerouteCount => budget.count;
 
+  /// Whether the step the user is currently on is a straight
+  /// segment (Amap action 直行): the live-navigation source
+  /// for the speech scheduler's straight-prompt gate.
+  bool get currentSegmentIsStraight =>
+      steps.isNotEmpty &&
+      currentStepIndex < steps.length &&
+      steps[currentStepIndex].action == '直行';
+
   List<NavEvent> onFix(NavFix fix) {
     final List<NavEvent> events = <NavEvent>[];
     if (arrived) return events;
