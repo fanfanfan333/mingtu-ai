@@ -186,8 +186,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // Cloud-vision cycle merging + 429 backoff (hazard scans).
   final VisionCycleCoordinator _visionCycle = VisionCycleCoordinator();
   final VisionRateBackoff _visionBackoff = VisionRateBackoff();
-  final CloudVisionDowngradeGate _visionDowngrade =
-      CloudVisionDowngradeGate();
+  final CloudVisionDowngradeGate _visionDowngrade = CloudVisionDowngradeGate();
   Timer? _hazardScanTimer;
   GeoPoint? _lastFixPoint;
   GeoPoint? _scanAnchorPoint;
@@ -243,6 +242,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   String _amapText = '高德真实路线：未请求。';
   String _yoloText = 'YOLO：未接入。';
   bool _yoloLiveOpen = false;
+
+  /// Step C push-to-talk: true while the big button is held.
+  /// Guards one physical press from firing the start callback
+  /// twice (long-press start is delivered once per gesture,
+  /// but the guard keeps the contract explicit).
+  bool _pushToTalkHeld = false;
 
   /// The ownership lease for the live view, held while it is
   /// open; only this lease can release the camera, and the
@@ -1453,6 +1458,41 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// v0.6: one short ASR session (max 10 s). Recognised text flows
   /// through the transcript subscription into _handleVoiceCommand.
   /// Not continuous listening: the session stops on silence.
+  /// Step C push-to-talk, press start: haptic confirmation
+  /// plus the spoken cue. The prompt goes through the normal
+  /// scheduler, so when voice output itself is unavailable it
+  /// follows the existing honest fallback (status text, no
+  /// simulated success).
+  void _pushToTalkStart() {
+    if (_pushToTalkHeld) return;
+    _pushToTalkHeld = true;
+    HapticFeedback.vibrate();
+    _say(_request(
+      id: 'push-to-talk-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'push-to-talk-${DateTime.now().millisecondsSinceEpoch}',
+      text: '请说',
+      kind: SpeechKind.info,
+    ));
+  }
+
+  /// Step C push-to-talk, release: start recognition through
+  /// the EXISTING path -- _startListening already handles an
+  /// unavailable recogniser (logs it, no fake success), the
+  /// auto-listen flag and the startup failure announcements.
+  /// Coexists with the automatic continuous relisten loop,
+  /// which is untouched.
+  void _pushToTalkEnd() {
+    if (!_pushToTalkHeld) return;
+    _pushToTalkHeld = false;
+    if (_voiceInput.isAvailable &&
+        _voiceInput is SystemVoiceInput &&
+        (_voiceInput as SystemVoiceInput).isListening) {
+      _logMsg('按住说话：识别已在进行中，本次松开不重复启动。');
+      return;
+    }
+    unawaited(_startListening());
+  }
+
   Future<void> _startListening() async {
     if (!_voiceInput.isAvailable) {
       _logMsg('语音识别不可用：${_voiceInput.status}');
@@ -3003,447 +3043,551 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final TaskState state = _tasks.state;
     return Scaffold(
       appBar: AppBar(title: const Text('明途 AI v0.7（演示原型）')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            // Step 2 voice-first layout: the camera view and
-            // ONE large status line lead the page (this is what
-            // a sighted companion watches); the detailed demo
-            // panel remains below for review. TalkBack reads
-            // the status through the live region.
-            Semantics(
-              liveRegion: true,
-              label: '当前状态',
-              child: Text(
-                _bigStatusText(),
-                style:
-                    const TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
-              ),
-            ),
-            const SizedBox(height: 12),
-            if (_yoloLiveOpen)
-              SizedBox(
-                height: 320,
-                child: YoloLiveView(
-                  modelPath: AppConfig.yoloModelPath,
-                  onDetections: _onYoloDetections,
-                  onLatencyMs: (double ms) {
-                    setState(() {
-                      _yoloLatencyMs = ms;
-                    });
-                  },
-                  onError: (Object error) {
-                    // Classified, never raw: a CAMERA
-                    // PERMISSION denial and a MODEL LOAD
-                    // failure get DIFFERENT announcements --
-                    // the remedies differ (open system
-                    // settings vs fix the bundled model). One
-                    // shared sentence for both was a Codex
-                    // re-test finding.
-                    final YoloViewErrorKind errorKind =
-                        classifyYoloViewError(error);
-                    mingtuVoiceLog('YOLO 实时视图出错类别：${errorKind.name}');
-                    _logMsg('YOLO 实时视图出错：${yoloViewErrorStatus(errorKind)}。');
-                    setState(() {
-                      _yoloText = yoloViewErrorStatus(errorKind);
-                    });
-                    if (!_yoloErrorAnnounced) {
-                      _yoloErrorAnnounced = true;
-                      _health.report(
-                        'yolo',
-                        ServiceHealthStatus.unavailable,
-                        yoloViewErrorStatus(errorKind),
-                      );
-                      _say(_request(
-                        id: 'yolo-view-error',
-                        eventId: 'yolo-view-error',
-                        text: yoloViewErrorSpeech(errorKind),
-                        kind: SpeechKind.alert,
-                      ));
-                    }
-                  },
-                ),
-              ),
-            Row(
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          // Step C layout (blind-first): a fixed top zone --
+          // the big status line plus the camera area filling
+          // the upper part of the screen -- then the very
+          // large push-to-talk button, then the original demo
+          // panel in its own scroll region below, so every
+          // review control stays reachable.
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Expanded(
-                  child: SizedBox(
-                    height: 64,
-                    child: ElevatedButton(
-                      onPressed: () => _handleVoiceCommand('停下'),
-                      child: const Text('停下', style: TextStyle(fontSize: 22)),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: SizedBox(
-                    height: 64,
-                    child: ElevatedButton(
-                      onPressed: () => _askDestination(),
-                      child:
-                          const Text('重新问目的地', style: TextStyle(fontSize: 22)),
-                    ),
+                // Step 2 voice-first layout: the camera view and
+                // ONE large status line lead the page (this is what
+                // a sighted companion watches); the detailed demo
+                // panel remains below for review. TalkBack reads
+                // the status through the live region.
+                Semantics(
+                  liveRegion: true,
+                  label: '当前状态',
+                  child: Text(
+                    _bigStatusText(),
+                    style: const TextStyle(
+                        fontSize: 30, fontWeight: FontWeight.bold),
                   ),
                 ),
               ],
             ),
-            const SizedBox(height: 16),
-            const Text(
-              '明途 AI：面向视障人士的校园出行辅助演示原型。',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              '语音是主要交互方式；本页面是演示辅助界面，'
-              '供有视力的评审查看当前状态和当前提示。'
-              '当前在网页 / 虚拟机中运行的是模拟流程，'
-              '不是真实传感器导航，不能用于真实道路，'
-              '也不能替代盲杖、导盲犬或专业定向行走训练，'
-              '也未经过真实道路验证。',
-            ),
-            const SizedBox(height: 12),
-            Text('配置状态：地图：${AppConfig.routeProxyStatus}；'
-                'YOLO：${AppConfig.yoloStatus}；'
-                '云端模型：${AppConfig.llmStatus}；'
-                '云端识图：${AppConfig.visionProxyStatus}。'),
-            const SizedBox(height: 8),
-            // v0.6 real-integration status: TTS/ASR/YOLO/Amap report
-            // their own availability; "已接入" only appears when the
-            // phone's engine actually answered at startup.
-            Text(_voiceText),
-            const SizedBox(height: 8),
-            Text(_amapText),
-            const SizedBox(height: 8),
-            Text(_yoloText),
-            const SizedBox(height: 8),
-            // Refactor phase 1 health display: only reports services
-            // that actually reported. Empty means "no degradation
-            // reported", never "everything is healthy".
-            Text(_health.announcementText().isEmpty
-                ? '系统健康：暂无已上报的降级（演示中仅紧急流程会主动上报本地服务状态，未上报的服务不伪造健康）。'
-                : '系统健康：${_health.announcementText()}'),
-            const SizedBox(height: 12),
-            Semantics(
-              label: '当前任务状态',
-              // v0.5: show the Chinese state name, never the English
-              // enum name, so a screen reader reads it correctly.
-              child: Text('当前任务状态：${_stateText(state)}'),
-            ),
-            const SizedBox(height: 8),
-            Semantics(
-              liveRegion: true,
-              label: '当前提示',
-              child: Text(
-                '当前提示：$_currentPrompt',
-                style: const TextStyle(fontSize: 20),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text('路线：$_routeText'),
-            const SizedBox(height: 8),
-            Text('障碍：$_obstacleText'),
-            const SizedBox(height: 8),
-            Text('入口：$_entranceText'),
-            const SizedBox(height: 8),
-            Text('室内：$_indoorText'),
-            const SizedBox(height: 8),
-            Text('紧急求助：$_emergencyText'),
-            const SizedBox(height: 8),
-            Text('录像：$_recordingText'),
-            const SizedBox(height: 8),
-            Text('云端网关：$_llmText'),
-            Text(_cloudVisionText),
-            const SizedBox(height: 8),
-            Text('感知：$_perceptionText'),
-            const SizedBox(height: 8),
-            const SizedBox(height: 8),
-            Text('路口：$_trafficText'),
-            const SizedBox(height: 8),
-            Text(
-                'Skill 注册：${_registry.list().length} 个（车站完整服务未注册；路口只提示不放行；相册导出 NOT_CONFIGURED）。'),
-            const SizedBox(height: 24),
-            const Text('语音控制（盲人优先：不用看屏幕点步骤也能控制）',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            const Text(
-              'v0.6：真机上点“开始语音识别”就是系统语音识别（单次最长 10 秒），'
-              '识别结果按语音指令解析执行；下面这个输入框是演示代替，'
-              '在网页 / 没有语音引擎时用。'
-              '也可以直接点下面的暂停、继续、再说一遍、现在到哪了。',
-            ),
-            const SizedBox(height: 8),
-            Semantics(
-              label: '语音指令输入，演示用，代替真实语音识别',
-              child: TextField(
-                controller: _voiceController,
-                decoration: const InputDecoration(
-                  hintText: '例如：暂停、继续、再说一遍、现在到哪了、我需要帮助',
-                  border: OutlineInputBorder(),
+          ),
+          const SizedBox(height: 12),
+          // Camera area: fills the upper part of the screen.
+          // While the live view is open it hosts YoloLiveView;
+          // otherwise a placeholder of the same size explains
+          // the state and offers the EXISTING open flow
+          // (_openYoloLive) -- no parallel camera path.
+          SizedBox(
+            height: MediaQuery.of(context).size.height * 0.38,
+            child: _yoloLiveOpen
+                ? YoloLiveView(
+                    modelPath: AppConfig.yoloModelPath,
+                    onDetections: _onYoloDetections,
+                    onLatencyMs: (double ms) {
+                      setState(() {
+                        _yoloLatencyMs = ms;
+                      });
+                    },
+                    onError: (Object error) {
+                      // Classified, never raw: a CAMERA
+                      // PERMISSION denial and a MODEL LOAD
+                      // failure get DIFFERENT announcements --
+                      // the remedies differ (open system
+                      // settings vs fix the bundled model). One
+                      // shared sentence for both was a Codex
+                      // re-test finding.
+                      final YoloViewErrorKind errorKind =
+                          classifyYoloViewError(error);
+                      mingtuVoiceLog('YOLO 实时视图出错类别：${errorKind.name}');
+                      _logMsg('YOLO 实时视图出错：${yoloViewErrorStatus(errorKind)}。');
+                      setState(() {
+                        _yoloText = yoloViewErrorStatus(errorKind);
+                      });
+                      if (!_yoloErrorAnnounced) {
+                        _yoloErrorAnnounced = true;
+                        _health.report(
+                          'yolo',
+                          ServiceHealthStatus.unavailable,
+                          yoloViewErrorStatus(errorKind),
+                        );
+                        _say(_request(
+                          id: 'yolo-view-error',
+                          eventId: 'yolo-view-error',
+                          text: yoloViewErrorSpeech(errorKind),
+                          kind: SpeechKind.alert,
+                        ));
+                      }
+                    },
+                  )
+                : Container(
+                    color: Colors.black12,
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: <Widget>[
+                        const Text(
+                          '摄像头未开启',
+                          style: TextStyle(
+                              fontSize: 24, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 4),
+                        const Text('导航开始时会自动开启；也可以点下面按钮开启。'),
+                        const SizedBox(height: 8),
+                        ElevatedButton(
+                          onPressed: () => unawaited(_openYoloLive()),
+                          child: const Text('打开摄像头（YOLO 实时检测）',
+                              style: TextStyle(fontSize: 20)),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 12),
+          // Step C: the one very large push-to-talk button.
+          // Hold: vibrate + speak the cue. Release: start
+          // recognition through the existing _startListening
+          // path. The button is never disabled: with no
+          // recogniser the release still produces the existing
+          // logged feedback instead of dead silence.
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Semantics(
+              button: true,
+              container: true,
+              label: '按住说话按钮，按住后说话，松开结束',
+              child: GestureDetector(
+                onLongPressStart: (_) => _pushToTalkStart(),
+                onLongPressEnd: (_) => _pushToTalkEnd(),
+                child: Container(
+                  height: 132,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.primaryContainer,
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: const Text(
+                    '按住说话',
+                    style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold),
+                  ),
                 ),
               ),
             ),
-            const SizedBox(height: 12),
-            _demoButton(
-              label: '开始语音识别（真机，单次最长 10 秒）',
-              semanticsLabel: '开始语音识别',
-              onPressed: _voiceInput.isAvailable ? _startListening : null,
-            ),
-            _demoButton(
-              label: '停止语音识别',
-              semanticsLabel: '停止语音识别',
-              onPressed: _voiceInput.isAvailable ? _stopListening : null,
-            ),
-            _demoButton(
-              label: '发送语音指令（演示）',
-              semanticsLabel: '发送语音指令',
-              onPressed: () => _handleVoiceCommand(_voiceController.text),
-            ),
-            _demoButton(
-              label: '高德真实路线（真实导航：需已核验目的地与路线代理）',
-              semanticsLabel: '高德真实路线',
-              onPressed: _fetchAmapRoute,
-            ),
-            _demoButton(
-              label: _yoloLiveOpen ? '关闭 YOLO 实时摄像头' : '打开 YOLO 实时摄像头（真机）',
-              semanticsLabel: '打开或关闭 YOLO 实时摄像头',
-              onPressed: () {
-                if (_yoloLiveOpen) {
-                  setState(() {
-                    _closeYoloLiveView();
-                  });
-                } else {
-                  unawaited(_openYoloLive());
-                }
-              },
-            ),
-            _demoButton(
-              label: '模拟 YOLO 检测：前方行人（演示，无摄像头）',
-              semanticsLabel: '模拟 YOLO 检测前方行人',
-              onPressed: state == TaskState.navigating
-                  ? () => _onYoloDetections(const <Detection>[
-                        Detection(
-                            label: 'person', confidence: 0.9, cx: 0.5, cy: 0.5),
-                      ])
-                  : null,
-            ),
-            _demoButton(
-              label: '模拟 YOLO 检测：前方车辆（演示，无摄像头）',
-              semanticsLabel: '模拟 YOLO 检测前方车辆',
-              // Enabled while avoiding an obstacle too: a NEW
-              // danger must be announced even when a risk is
-              // already active (Codex re-test of f951240), and
-              // this button exercises that production path.
-              onPressed: state == TaskState.navigating ||
-                      state == TaskState.avoidingObstacle
-                  ? () => _onYoloDetections(const <Detection>[
-                        Detection(
-                            label: 'car', confidence: 0.9, cx: 0.5, cy: 0.5),
-                      ])
-                  : null,
-            ),
-            _demoButton(
-              label: '模拟 YOLO：连续 3 帧前方无障碍（演示）',
-              semanticsLabel: '模拟 YOLO 前方无障碍',
-              onPressed: state == TaskState.avoidingObstacle
-                  ? () {
-                      for (int i = 0; i < 3; i++) {
-                        _onYoloDetections(const <Detection>[]);
+          ),
+          const SizedBox(height: 16),
+          // The original demo panel, unchanged, in its own
+          // scroll region under the button.
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: SizedBox(
+                          height: 64,
+                          child: ElevatedButton(
+                            onPressed: () => _handleVoiceCommand('停下'),
+                            child: const Text('停下',
+                                style: TextStyle(fontSize: 22)),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: SizedBox(
+                          height: 64,
+                          child: ElevatedButton(
+                            onPressed: () => _askDestination(),
+                            child: const Text('重新问目的地',
+                                style: TextStyle(fontSize: 22)),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    '明途 AI：面向视障人士的校园出行辅助演示原型。',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    '语音是主要交互方式；本页面是演示辅助界面，'
+                    '供有视力的评审查看当前状态和当前提示。'
+                    '当前在网页 / 虚拟机中运行的是模拟流程，'
+                    '不是真实传感器导航，不能用于真实道路，'
+                    '也不能替代盲杖、导盲犬或专业定向行走训练，'
+                    '也未经过真实道路验证。',
+                  ),
+                  const SizedBox(height: 12),
+                  Text('配置状态：地图：${AppConfig.routeProxyStatus}；'
+                      'YOLO：${AppConfig.yoloStatus}；'
+                      '云端模型：${AppConfig.llmStatus}；'
+                      '云端识图：${AppConfig.visionProxyStatus}。'),
+                  const SizedBox(height: 8),
+                  // v0.6 real-integration status: TTS/ASR/YOLO/Amap report
+                  // their own availability; "已接入" only appears when the
+                  // phone's engine actually answered at startup.
+                  Text(_voiceText),
+                  const SizedBox(height: 8),
+                  Text(_amapText),
+                  const SizedBox(height: 8),
+                  Text(_yoloText),
+                  const SizedBox(height: 8),
+                  // Refactor phase 1 health display: only reports services
+                  // that actually reported. Empty means "no degradation
+                  // reported", never "everything is healthy".
+                  Text(_health.announcementText().isEmpty
+                      ? '系统健康：暂无已上报的降级（演示中仅紧急流程会主动上报本地服务状态，未上报的服务不伪造健康）。'
+                      : '系统健康：${_health.announcementText()}'),
+                  const SizedBox(height: 12),
+                  Semantics(
+                    label: '当前任务状态',
+                    // v0.5: show the Chinese state name, never the English
+                    // enum name, so a screen reader reads it correctly.
+                    child: Text('当前任务状态：${_stateText(state)}'),
+                  ),
+                  const SizedBox(height: 8),
+                  Semantics(
+                    liveRegion: true,
+                    label: '当前提示',
+                    child: Text(
+                      '当前提示：$_currentPrompt',
+                      style: const TextStyle(fontSize: 20),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text('路线：$_routeText'),
+                  const SizedBox(height: 8),
+                  Text('障碍：$_obstacleText'),
+                  const SizedBox(height: 8),
+                  Text('入口：$_entranceText'),
+                  const SizedBox(height: 8),
+                  Text('室内：$_indoorText'),
+                  const SizedBox(height: 8),
+                  Text('紧急求助：$_emergencyText'),
+                  const SizedBox(height: 8),
+                  Text('录像：$_recordingText'),
+                  const SizedBox(height: 8),
+                  Text('云端网关：$_llmText'),
+                  Text(_cloudVisionText),
+                  const SizedBox(height: 8),
+                  Text('感知：$_perceptionText'),
+                  const SizedBox(height: 8),
+                  const SizedBox(height: 8),
+                  Text('路口：$_trafficText'),
+                  const SizedBox(height: 8),
+                  Text(
+                      'Skill 注册：${_registry.list().length} 个（车站完整服务未注册；路口只提示不放行；相册导出 NOT_CONFIGURED）。'),
+                  const SizedBox(height: 24),
+                  const Text('语音控制（盲人优先：不用看屏幕点步骤也能控制）',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'v0.6：真机上点“开始语音识别”就是系统语音识别（单次最长 10 秒），'
+                    '识别结果按语音指令解析执行；下面这个输入框是演示代替，'
+                    '在网页 / 没有语音引擎时用。'
+                    '也可以直接点下面的暂停、继续、再说一遍、现在到哪了。',
+                  ),
+                  const SizedBox(height: 8),
+                  Semantics(
+                    label: '语音指令输入，演示用，代替真实语音识别',
+                    child: TextField(
+                      controller: _voiceController,
+                      decoration: const InputDecoration(
+                        hintText: '例如：暂停、继续、再说一遍、现在到哪了、我需要帮助',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _demoButton(
+                    label: '开始语音识别（真机，单次最长 10 秒）',
+                    semanticsLabel: '开始语音识别',
+                    onPressed: _voiceInput.isAvailable ? _startListening : null,
+                  ),
+                  _demoButton(
+                    label: '停止语音识别',
+                    semanticsLabel: '停止语音识别',
+                    onPressed: _voiceInput.isAvailable ? _stopListening : null,
+                  ),
+                  _demoButton(
+                    label: '发送语音指令（演示）',
+                    semanticsLabel: '发送语音指令',
+                    onPressed: () => _handleVoiceCommand(_voiceController.text),
+                  ),
+                  _demoButton(
+                    label: '高德真实路线（真实导航：需已核验目的地与路线代理）',
+                    semanticsLabel: '高德真实路线',
+                    onPressed: _fetchAmapRoute,
+                  ),
+                  _demoButton(
+                    label:
+                        _yoloLiveOpen ? '关闭 YOLO 实时摄像头' : '打开 YOLO 实时摄像头（真机）',
+                    semanticsLabel: '打开或关闭 YOLO 实时摄像头',
+                    onPressed: () {
+                      if (_yoloLiveOpen) {
+                        setState(() {
+                          _closeYoloLiveView();
+                        });
+                      } else {
+                        unawaited(_openYoloLive());
                       }
-                    }
-                  : null,
-            ),
-            _demoButton(
-              label: '暂停导航（语音）',
-              semanticsLabel: '暂停导航',
-              onPressed: _tasks.canTransitionTo(TaskState.paused)
-                  ? () => _handleVoiceCommand('暂停')
-                  : null,
-            ),
-            _demoButton(
-              label: '继续导航（语音，需重新确认直行）',
-              semanticsLabel: '继续导航',
-              onPressed: _tasks.state == TaskState.paused
-                  ? () => _handleVoiceCommand('继续')
-                  : null,
-            ),
-            _demoButton(
-              label: '再说一遍',
-              semanticsLabel: '再说一遍',
-              onPressed: () => _handleVoiceCommand('再说一遍'),
-            ),
-            _demoButton(
-              label: '现在到哪了',
-              semanticsLabel: '现在到哪了',
-              onPressed: () => _handleVoiceCommand('现在到哪了'),
-            ),
-            _demoButton(
-              label: '取消任务（语音）',
-              semanticsLabel: '取消任务',
-              onPressed: _tasks.canTransitionTo(TaskState.cancelled)
-                  ? () => _handleVoiceCommand('取消')
-                  : null,
-            ),
-            const SizedBox(height: 24),
-            const Text('演示步骤（按顺序点按）',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            _demoButton(
-              label: '语音开始（演示输入：带我去图书馆）',
-              semanticsLabel: '语音开始，演示输入带我去图书馆',
-              onPressed: state == TaskState.idle ? _startVoice : null,
-            ),
-            _demoButton(
-              label: '理解并规划路线',
-              semanticsLabel: '理解并规划路线',
-              onPressed: state == TaskState.understanding ? _planRoute : null,
-            ),
-            _demoButton(
-              label: '开始导航（直行节奏启动）',
-              semanticsLabel: '开始导航',
-              onPressed: state == TaskState.planning ? _startNavigating : null,
-            ),
-            _demoButton(
-              label: '直行提示（手动，3 秒间隔内不重复）',
-              semanticsLabel: '直行提示',
-              onPressed: state == TaskState.navigating &&
-                      _straightConfirmed &&
-                      !_riskActive
-                  ? _manualStraight
-                  : null,
-            ),
-            _demoButton(
-              label: '前方转弯（暂停直行）',
-              semanticsLabel: '前方转弯',
-              onPressed: state == TaskState.navigating ? _turn : null,
-            ),
-            _demoButton(
-              label: '重新确认直行路段并恢复',
-              semanticsLabel: '重新确认直行路段并恢复',
-              onPressed: state == TaskState.navigating &&
-                      !_straightConfirmed &&
-                      !_riskActive
-                  ? _reconfirmStraight
-                  : null,
-            ),
-            _demoButton(
-              label: '模拟障碍：侧方未确认（应停下，不给步数）',
-              semanticsLabel: '模拟障碍，侧方未确认',
-              onPressed:
-                  state == TaskState.navigating ? _obstacleUncertain : null,
-            ),
-            _demoButton(
-              label: '障碍已移开，重新评估并恢复直行',
-              semanticsLabel: '障碍已移开，恢复直行',
-              onPressed: state == TaskState.avoidingObstacle && _riskActive
-                  ? _obstacleUncertainResolved
-                  : null,
-            ),
-            _demoButton(
-              label: '模拟障碍：侧方已确认（仅演示数据给一步）',
-              semanticsLabel: '模拟障碍，侧方已确认',
-              onPressed:
-                  state == TaskState.navigating ? _obstacleConfirmed : null,
-            ),
-            _demoButton(
-              label: '动作后重新感知，确认后恢复导航',
-              semanticsLabel: '动作后重新感知',
-              onPressed: state == TaskState.avoidingObstacle
-                  ? _obstacleConfirmedVerified
-                  : null,
-            ),
-            _demoButton(
-              label: '路口信息提示（只提示，不放行）',
-              semanticsLabel: '路口信息提示',
-              onPressed: state == TaskState.navigating ? _trafficInfo : null,
-            ),
-            _demoButton(
-              label: '模拟行进至接近目的地',
-              semanticsLabel: '模拟行进至接近目的地',
-              onPressed:
-                  state == TaskState.navigating ? _destinationApproach : null,
-            ),
-            _demoButton(
-              label: '寻找入口（先看占位，再看演示已核验候选）',
-              semanticsLabel: '寻找入口',
-              onPressed:
-                  state == TaskState.findingEntrance ? _findEntrance : null,
-            ),
-            _demoButton(
-              label: '进入室内引导',
-              semanticsLabel: '进入室内引导',
-              onPressed:
-                  state == TaskState.findingEntrance ? _enterIndoor : null,
-            ),
-            _demoButton(
-              label: '室内步骤：用演示证据推进',
-              semanticsLabel: '室内步骤推进',
-              onPressed: state == TaskState.indoorGuidance ? _indoorStep : null,
-            ),
-            _demoButton(
-              label: '验证任务（室内全部完成才可）',
-              semanticsLabel: '验证任务',
-              onPressed:
-                  state == TaskState.indoorGuidance && _indoor.isCompleted
-                      ? _taskVerify
-                      : null,
-            ),
-            _demoButton(
-              label: '确认任务完成',
-              semanticsLabel: '确认任务完成',
-              onPressed: state == TaskState.waitingConfirmation
-                  ? _confirmComplete
-                  : null,
-            ),
-            _demoButton(
-              label: '保留录像（本地）',
-              semanticsLabel: '保留录像',
-              onPressed:
-                  _recording.current?.status == RecordingStatus.pendingConsent
-                      ? _recordingSave
-                      : null,
-            ),
-            _demoButton(
-              label: '删除录像（本地）',
-              semanticsLabel: '删除录像',
-              onPressed:
-                  _recording.current?.status == RecordingStatus.pendingConsent
-                      ? _recordingDelete
-                      : null,
-            ),
-            _demoButton(
-              label: '云端网关演示（只返回决策，无真实调用）',
-              semanticsLabel: '云端网关演示',
-              onPressed: _llmDemo,
-            ),
-            _demoButton(
-              label: '云端视觉辅助（低频，经代理，本地检测仍为主）',
-              semanticsLabel: '云端视觉辅助',
-              onPressed: _triggerManualVision,
-            ),
-            _demoButton(
-              label: '紧急求助（本地，不依赖网络和大模型）',
-              semanticsLabel: '紧急求助',
-              onPressed: _triggerEmergency,
-            ),
-            _demoButton(
-              label: '重置演示',
-              semanticsLabel: '重置演示',
-              onPressed: _resetDemo,
-            ),
-            const SizedBox(height: 12),
-            const Text('演示日志（最新在前）',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            for (final String entry in _log.take(15))
-              Padding(
-                padding: const EdgeInsets.only(bottom: 4),
-                child: Text('• $entry'),
+                    },
+                  ),
+                  _demoButton(
+                    label: '模拟 YOLO 检测：前方行人（演示，无摄像头）',
+                    semanticsLabel: '模拟 YOLO 检测前方行人',
+                    onPressed: state == TaskState.navigating
+                        ? () => _onYoloDetections(const <Detection>[
+                              Detection(
+                                  label: 'person',
+                                  confidence: 0.9,
+                                  cx: 0.5,
+                                  cy: 0.5),
+                            ])
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '模拟 YOLO 检测：前方车辆（演示，无摄像头）',
+                    semanticsLabel: '模拟 YOLO 检测前方车辆',
+                    // Enabled while avoiding an obstacle too: a NEW
+                    // danger must be announced even when a risk is
+                    // already active (Codex re-test of f951240), and
+                    // this button exercises that production path.
+                    onPressed: state == TaskState.navigating ||
+                            state == TaskState.avoidingObstacle
+                        ? () => _onYoloDetections(const <Detection>[
+                              Detection(
+                                  label: 'car',
+                                  confidence: 0.9,
+                                  cx: 0.5,
+                                  cy: 0.5),
+                            ])
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '模拟 YOLO：连续 3 帧前方无障碍（演示）',
+                    semanticsLabel: '模拟 YOLO 前方无障碍',
+                    onPressed: state == TaskState.avoidingObstacle
+                        ? () {
+                            for (int i = 0; i < 3; i++) {
+                              _onYoloDetections(const <Detection>[]);
+                            }
+                          }
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '暂停导航（语音）',
+                    semanticsLabel: '暂停导航',
+                    onPressed: _tasks.canTransitionTo(TaskState.paused)
+                        ? () => _handleVoiceCommand('暂停')
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '继续导航（语音，需重新确认直行）',
+                    semanticsLabel: '继续导航',
+                    onPressed: _tasks.state == TaskState.paused
+                        ? () => _handleVoiceCommand('继续')
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '再说一遍',
+                    semanticsLabel: '再说一遍',
+                    onPressed: () => _handleVoiceCommand('再说一遍'),
+                  ),
+                  _demoButton(
+                    label: '现在到哪了',
+                    semanticsLabel: '现在到哪了',
+                    onPressed: () => _handleVoiceCommand('现在到哪了'),
+                  ),
+                  _demoButton(
+                    label: '取消任务（语音）',
+                    semanticsLabel: '取消任务',
+                    onPressed: _tasks.canTransitionTo(TaskState.cancelled)
+                        ? () => _handleVoiceCommand('取消')
+                        : null,
+                  ),
+                  const SizedBox(height: 24),
+                  const Text('演示步骤（按顺序点按）',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 12),
+                  _demoButton(
+                    label: '语音开始（演示输入：带我去图书馆）',
+                    semanticsLabel: '语音开始，演示输入带我去图书馆',
+                    onPressed: state == TaskState.idle ? _startVoice : null,
+                  ),
+                  _demoButton(
+                    label: '理解并规划路线',
+                    semanticsLabel: '理解并规划路线',
+                    onPressed:
+                        state == TaskState.understanding ? _planRoute : null,
+                  ),
+                  _demoButton(
+                    label: '开始导航（直行节奏启动）',
+                    semanticsLabel: '开始导航',
+                    onPressed:
+                        state == TaskState.planning ? _startNavigating : null,
+                  ),
+                  _demoButton(
+                    label: '直行提示（手动，3 秒间隔内不重复）',
+                    semanticsLabel: '直行提示',
+                    onPressed: state == TaskState.navigating &&
+                            _straightConfirmed &&
+                            !_riskActive
+                        ? _manualStraight
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '前方转弯（暂停直行）',
+                    semanticsLabel: '前方转弯',
+                    onPressed: state == TaskState.navigating ? _turn : null,
+                  ),
+                  _demoButton(
+                    label: '重新确认直行路段并恢复',
+                    semanticsLabel: '重新确认直行路段并恢复',
+                    onPressed: state == TaskState.navigating &&
+                            !_straightConfirmed &&
+                            !_riskActive
+                        ? _reconfirmStraight
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '模拟障碍：侧方未确认（应停下，不给步数）',
+                    semanticsLabel: '模拟障碍，侧方未确认',
+                    onPressed: state == TaskState.navigating
+                        ? _obstacleUncertain
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '障碍已移开，重新评估并恢复直行',
+                    semanticsLabel: '障碍已移开，恢复直行',
+                    onPressed:
+                        state == TaskState.avoidingObstacle && _riskActive
+                            ? _obstacleUncertainResolved
+                            : null,
+                  ),
+                  _demoButton(
+                    label: '模拟障碍：侧方已确认（仅演示数据给一步）',
+                    semanticsLabel: '模拟障碍，侧方已确认',
+                    onPressed: state == TaskState.navigating
+                        ? _obstacleConfirmed
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '动作后重新感知，确认后恢复导航',
+                    semanticsLabel: '动作后重新感知',
+                    onPressed: state == TaskState.avoidingObstacle
+                        ? _obstacleConfirmedVerified
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '路口信息提示（只提示，不放行）',
+                    semanticsLabel: '路口信息提示',
+                    onPressed:
+                        state == TaskState.navigating ? _trafficInfo : null,
+                  ),
+                  _demoButton(
+                    label: '模拟行进至接近目的地',
+                    semanticsLabel: '模拟行进至接近目的地',
+                    onPressed: state == TaskState.navigating
+                        ? _destinationApproach
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '寻找入口（先看占位，再看演示已核验候选）',
+                    semanticsLabel: '寻找入口',
+                    onPressed: state == TaskState.findingEntrance
+                        ? _findEntrance
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '进入室内引导',
+                    semanticsLabel: '进入室内引导',
+                    onPressed: state == TaskState.findingEntrance
+                        ? _enterIndoor
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '室内步骤：用演示证据推进',
+                    semanticsLabel: '室内步骤推进',
+                    onPressed:
+                        state == TaskState.indoorGuidance ? _indoorStep : null,
+                  ),
+                  _demoButton(
+                    label: '验证任务（室内全部完成才可）',
+                    semanticsLabel: '验证任务',
+                    onPressed:
+                        state == TaskState.indoorGuidance && _indoor.isCompleted
+                            ? _taskVerify
+                            : null,
+                  ),
+                  _demoButton(
+                    label: '确认任务完成',
+                    semanticsLabel: '确认任务完成',
+                    onPressed: state == TaskState.waitingConfirmation
+                        ? _confirmComplete
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '保留录像（本地）',
+                    semanticsLabel: '保留录像',
+                    onPressed: _recording.current?.status ==
+                            RecordingStatus.pendingConsent
+                        ? _recordingSave
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '删除录像（本地）',
+                    semanticsLabel: '删除录像',
+                    onPressed: _recording.current?.status ==
+                            RecordingStatus.pendingConsent
+                        ? _recordingDelete
+                        : null,
+                  ),
+                  _demoButton(
+                    label: '云端网关演示（只返回决策，无真实调用）',
+                    semanticsLabel: '云端网关演示',
+                    onPressed: _llmDemo,
+                  ),
+                  _demoButton(
+                    label: '云端视觉辅助（低频，经代理，本地检测仍为主）',
+                    semanticsLabel: '云端视觉辅助',
+                    onPressed: _triggerManualVision,
+                  ),
+                  _demoButton(
+                    label: '紧急求助（本地，不依赖网络和大模型）',
+                    semanticsLabel: '紧急求助',
+                    onPressed: _triggerEmergency,
+                  ),
+                  _demoButton(
+                    label: '重置演示',
+                    semanticsLabel: '重置演示',
+                    onPressed: _resetDemo,
+                  ),
+                  const SizedBox(height: 12),
+                  const Text('演示日志（最新在前）',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  for (final String entry in _log.take(15))
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Text('• $entry'),
+                    ),
+                ],
               ),
-          ],
-        ),
+            ),
+          ),
+        ],
       ),
     );
   }
