@@ -2055,8 +2055,8 @@ void main() {
   group('engine watchdog restart (app level)', () {
     testWidgets(
         'a close unconfirmed past 3 s prods one cancel; '
-        'still unconfirmed 1 s later the engine restarts '
-        'and the app speaks the restart notice',
+        'the engine restarts right after the prod and '
+        'the app speaks the restart notice',
         (WidgetTester tester) async {
       final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
@@ -2105,15 +2105,16 @@ void main() {
       await tester.pump();
       expect(h.count('asr.cancel'), cancelsBefore + 1,
           reason: 'one watchdog prod: ${h.events}');
-      expect(
-        h.events,
-        isNot(contains('tts.speak:语音已重启，请重新按住说话')),
-        reason: 'the restart has not happened yet: ${h.events}',
-      );
 
-      // ~1 s more (fake clock advanced alongside, as
-      // above): the engine restarts and the app speaks
-      // the fixed restart notice.
+      // Ladder semantics (this round): there is no
+      // second waiting step -- the restart follows the
+      // prod as soon as its future settles (here it
+      // settles at once) or the 1 s cap elapses, so by
+      // now the restart may already be in flight; the
+      // old "restart has not happened yet" observation
+      // is no longer a stable point. Settle the same
+      // extra window as before, then assert the fixed
+      // restart notice, exactly once.
       await tester.runAsync(
           () => Future<void>.delayed(const Duration(milliseconds: 1400)));
       await tester.pump(const Duration(seconds: 1));
@@ -2135,6 +2136,103 @@ void main() {
       await holdPastThreshold(tester);
       await gesture.up();
       await tester.pump(const Duration(milliseconds: 100));
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'a prod cancel whose future NEVER returns still '
+        'restarts the engine: the platform is really '
+        're-initialized (a second channel initialize), '
+        'the restart notice is spoken once, and a fresh '
+        'press listens and submits',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      final List<String> asrEvents = h.events
+          .where((String e) => e.startsWith('asr.'))
+          .toList();
+      expect(
+        asrEvents.isNotEmpty && asrEvents.last == 'asr.listen',
+        isTrue,
+        reason: 'precondition, a live auto session: ${h.events}',
+      );
+
+      // Wedge BOTH ways: no closing status is ever
+      // delivered, and every platform cancel hangs
+      // forever (its future never completes) -- the
+      // watchdog prod included.
+      h.autoCloseStatus = false;
+      h.cancelGate = Completer<dynamic>();
+      await tapPanelText(tester, '停止语音识别');
+      for (int i = 0; i < 20 && h.pendingCloseStatuses < 1; i++) {
+        await tester.pump(const Duration(milliseconds: 25));
+      }
+      expect(h.pendingCloseStatuses, greaterThanOrEqualTo(1),
+          reason: '${h.events}');
+      h.events.clear();
+      final int initAtWedge = h.count('asr.initialize');
+      h.nextCancelIsWatchdogProd = true;
+
+      // ~3 s pass (fake clock alongside real time, as
+      // in the sibling test): exactly one prod cancel,
+      // which hangs on the gate.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 3400)));
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pump();
+      expect(h.count('asr.cancel'), 1,
+          reason: 'one watchdog prod: ${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:语音已重启，请重新按住说话')),
+        reason: 'no restart before the prod cap: ${h.events}',
+      );
+
+      // The prod cap (1 s of fake time) elapses: despite
+      // the hanging cancel the engine restarts, and the
+      // restart REALLY re-initializes the platform -- a
+      // further initialize reaches the channel (the
+      // plugin singleton's Dart-side latch would have
+      // swallowed a plain initialize() call, which is
+      // why the adapter issues it on the channel).
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 1400)));
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      expect(h.count('asr.initialize'), initAtWedge + 1,
+          reason: 'the restart re-initialized the platform: '
+              '${h.events}');
+      await pumpUntilSpeak(tester, h, '语音已重启，请重新按住说话');
+      expect(h.count('tts.speak:语音已重启，请重新按住说话'), 1,
+          reason: '${h.events}');
+      expect(h.completeSpeak('语音已重启，请重新按住说话'), isTrue);
+
+      // Recovery: release the hanging cancels and
+      // restore automatic closing statuses; a fresh
+      // press runs its full cycle and its result is
+      // submitted exactly once.
+      h.cancelGate!.complete(null);
+      h.cancelGate = null;
+      h.autoCloseStatus = true;
+      await drainVoice(tester, h, rounds: 6);
+      h.events.clear();
+      final TestGesture gesture = await pressUntilPttListening(tester, h);
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+      await holdPastThreshold(tester);
+      await deliverFinalResult(tester, '你好');
+      await tester.pump(const Duration(milliseconds: 100));
+      await gesture.up();
+      await tester.pump();
+      final String unknownReply = '没听清。${voiceCommandHelpText()}';
+      await pumpUntilSpeak(tester, h, unknownReply);
+      expect(h.count('tts.speak:$unknownReply'), 1,
+          reason: '${h.events}');
+      expect(h.completeSpeak(unknownReply), isTrue);
       await drainVoice(tester, h);
       await shutdownVoice(tester, h);
     });

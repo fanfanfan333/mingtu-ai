@@ -1056,12 +1056,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _subscribedEngineEvents = asr.engineEvents;
       _asrEngineSub = asr.engineEvents.listen((String event) {
         if (!mounted) return;
-        if (event != 'restarted') return;
-        // The recognition engine was force-restarted by
-        // the adapter watchdog: handled by the shared
-        // restart path (also used when a restart is
-        // detected via its epoch bump after the fact).
-        _onEngineRestarted();
+        if (event == 'restarted') {
+          // The recognition engine was force-restarted by
+          // the adapter watchdog: handled by the shared
+          // restart path (also used when a restart is
+          // detected via its epoch bump after the fact).
+          _onEngineRestarted();
+        } else if (event == 'restart_failed') {
+          _onEngineRestartFailed();
+        }
       });
       _asrSubCancels.add(() => _asrErrorSub?.cancel());
       _asrErrorSub = asr.errors.listen((String error) {
@@ -2666,8 +2669,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _subscribedEngineEvents = current;
       _asrEngineSub = current.listen((String event) {
         if (!mounted) return;
-        if (event != 'restarted') return;
-        _onEngineRestarted();
+        if (event == 'restarted') {
+          _onEngineRestarted();
+        } else if (event == 'restart_failed') {
+          _onEngineRestartFailed();
+        }
       });
       _asrSubCancels.add(() => _asrEngineSub?.cancel());
     }
@@ -2679,8 +2685,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (mounted) {
         // The restart fired while this page had no live
         // listener on the (then-new) stream: deliver its
-        // notification now, once.
-        _onEngineRestarted();
+        // notification now, once -- the FAILURE handling
+        // when the missed restart's re-initialize failed,
+        // never the success notice.
+        if (input.lastRestartSucceeded) {
+          _onEngineRestarted();
+        } else {
+          _onEngineRestartFailed();
+        }
       }
     }
   }
@@ -2695,6 +2707,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       id: 'asr-restarted-${DateTime.now().millisecondsSinceEpoch}',
       eventId: 'asr-restarted-${DateTime.now().millisecondsSinceEpoch}',
       text: '语音已重启，请重新按住说话',
+      kind: SpeechKind.alert,
+    ));
+  }
+
+  /// The watchdog restart's platform re-initialize
+  /// FAILED: the live press is wound up exactly as for
+  /// a successful restart, but the user hears the fixed
+  /// recogniser-unavailable notice -- never the restart
+  /// notice. Nothing stays wedged: the adapter cleared
+  /// every close ledger before reporting the failure,
+  /// so the next press goes through the normal start
+  /// path (and its own failure handling) instead of
+  /// waiting forever.
+  void _onEngineRestartFailed() {
+    _finishPttAfterEngineRestart();
+    HapticFeedback.vibrate();
+    _say(_request(
+      id: 'asr-restart-failed-${DateTime.now().millisecondsSinceEpoch}',
+      eventId:
+          'asr-restart-failed-${DateTime.now().millisecondsSinceEpoch}',
+      text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
       kind: SpeechKind.alert,
     ));
   }

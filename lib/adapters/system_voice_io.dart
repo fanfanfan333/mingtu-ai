@@ -239,12 +239,16 @@ class SystemVoiceInput implements VoiceInput {
   SystemVoiceInput([stt.SpeechToText? speech]) : _speech = speech;
 
   /// Test-only override of the close-watchdog ladder
-  /// durations (3 s prod step, then 1 s restart step).
-  /// Null -- the production default -- keeps the ladder
-  /// at 3 s / 1 s. Tests set this to short real durations
-  /// so the watchdog scenarios run quickly AND
-  /// deterministically (polling assertions below, never a
-  /// single fixed sleep that must land inside a window).
+  /// durations: [prod] is the time an unconfirmed close
+  /// is left alone before the watchdog prods the engine
+  /// with one cancel (production 3 s); [restart] is the
+  /// cap on that prod cancel's future -- once it elapses
+  /// (or the cancel settles sooner) the engine restart
+  /// runs unconditionally (production 1 s). Tests set
+  /// this to short real durations so the watchdog
+  /// scenarios run quickly AND deterministically
+  /// (polling assertions below, never a single fixed
+  /// sleep that must land inside a window).
   ({Duration prod, Duration restart})? debugWatchdogLadder;
 
   /// Recognition errors, as they happen (Codex re-test finding).
@@ -346,11 +350,35 @@ class SystemVoiceInput implements VoiceInput {
   /// closing", now carried by the pending-close count.
   bool get sessionOpen => _pendingCloses > 0;
 
-  /// Engine-generation events. The only value today is
-  /// 'restarted': the watchdog force-restarted the
-  /// recognition engine because unconfirmed closes never
-  /// resolved, and every pre-restart session is void.
+  /// Engine-generation events. 'restarted': the watchdog
+  /// force-restarted the recognition engine because
+  /// unconfirmed closes never resolved, and every
+  /// pre-restart session is void. 'restart_failed': the
+  /// restart's platform re-initialize FAILED -- the
+  /// ledgers were still cleared (nothing stays wedged),
+  /// but recognition is unavailable until a later start
+  /// attempt succeeds again.
   Stream<String> get engineEvents => _engineController.stream;
+
+  /// Outcome of the most recent watchdog restart's
+  /// platform re-initialize (true also before any
+  /// restart). The app reads this when it detects a
+  /// restart only via the epoch bump -- the live event
+  /// was missed -- so a FAILED restart replays the
+  /// failure handling, never the success notice.
+  bool get lastRestartSucceeded => _lastRestartSucceeded;
+  bool _lastRestartSucceeded = true;
+
+  /// The plugin's platform channel, invoked DIRECTLY by
+  /// a watchdog restart: the plugin's Dart-side
+  /// initialize() latches after its first success and
+  /// never reaches the platform again, so a restart that
+  /// must really re-initialize the platform issues the
+  /// call itself (the platform-side initialize has no
+  /// latch; the plugin's channel handler and its Dart
+  /// callback registrations stay in place).
+  static const MethodChannel _pluginChannel =
+      MethodChannel('plugin.csdcorp.com/speech_to_text');
 
   /// An in-flight session-open attempt, abortable by an
   /// engine restart. See startListening for the
@@ -530,9 +558,12 @@ class SystemVoiceInput implements VoiceInput {
 
   /// The close watchdog (escalation ladder): while any
   /// close is unconfirmed, at 3 s the engine is prodded
-  /// with ONE cancel; if the count is still above zero
-  /// 1 s later, the engine is force-restarted. Real-time
-  /// timers: the deadline is wall-clock, not frame time.
+  /// with ONE cancel whose future is capped at 1 s; the
+  /// engine is then force-restarted UNCONDITIONALLY --
+  /// a cancel future that never completes (a wedged
+  /// platform) can no longer stall the ladder forever.
+  /// Real-time timers: the deadline is wall-clock, not
+  /// frame time.
   void _armCloseWatchdog() {
     _engineWatchdog?.cancel();
     _engineWatchdog =
@@ -547,31 +578,41 @@ class SystemVoiceInput implements VoiceInput {
     try {
       // A prod, NOT a new session close: it must not
       // raise the pending-close count, or the count could
-      // never reach zero through it.
-      await _speech?.cancel();
+      // never reach zero through it. The prod's future
+      // is CAPPED: a platform whose cancel() never
+      // completes must not stall the ladder -- on
+      // timeout (or error) the restart below still runs.
+      await _speech
+          ?.cancel()
+          .timeout(debugWatchdogLadder?.restart ??
+              const Duration(seconds: 1));
     } catch (_) {
-      // A failed prod does not change the ladder: the
-      // restart step below still runs.
+      // A failed or timed-out prod does not change the
+      // ladder: the restart step below still runs.
     }
     if (_pendingCloses == 0 || _engineRestarting) return;
     if (engineDisposed) return;
-    _engineRetryTimer?.cancel();
-    _engineRetryTimer =
-        Timer(debugWatchdogLadder?.restart ?? const Duration(seconds: 1),
-            () {
-      if (_pendingCloses == 0 || _engineRestarting) return;
-      if (engineDisposed) return;
-      unawaited(_restartEngine());
-    });
+    // No second waiting step: the restart follows the
+    // (capped) prod immediately, so from the prod's
+    // issue the restart is reached within the cap.
+    unawaited(_restartEngine());
   }
 
-  /// Force-restart the recognition engine: a fresh
-  /// SpeechToText instance (the process-wide singleton's
-  /// own initialize() short-circuits once it has
-  /// succeeded, so re-initializing the SAME instance
-  /// would never reach the platform), registrations
-  /// re-made under a bumped epoch, every pending close
-  /// forgiven, and the app notified via [engineEvents].
+  /// Force-restart the recognition engine: the current
+  /// generation is voided, registrations are re-made
+  /// under a bumped epoch with NEW onStatus/onError
+  /// closures (the epoch guard drops any callback of the
+  /// old registration), every close ledger is cleared,
+  /// and the platform is REALLY re-initialized: for a
+  /// plugin engine the initialize call is issued
+  /// directly on the plugin channel, because the
+  /// plugin's Dart-side initialize() latches after its
+  /// first success and would never reach the platform
+  /// again. The app is notified via [engineEvents]:
+  /// 'restarted' when the re-initialize succeeded,
+  /// 'restart_failed' when it failed -- the ledgers are
+  /// cleared either way, so no wait can wedge and the
+  /// next press retries through the normal start path.
   Future<void> _restartEngine() async {
     if (_engineRestarting) return;
     _engineRestarting = true;
@@ -610,6 +651,7 @@ class SystemVoiceInput implements VoiceInput {
     // clear this restart's _listening or re-stamp its
     // generation gate after the restart finished.
     await Future<void>.delayed(Duration.zero);
+    final bool pluginEngine = _engineIsPluginInstance;
     final stt.SpeechToText fresh =
         identical(_speech, _engineSpeech) && _engineIsPluginInstance
             ? stt.SpeechToText()
@@ -619,11 +661,12 @@ class SystemVoiceInput implements VoiceInput {
     _engineIsPluginInstance = true;
     bool ok = false;
     try {
-      ok = await _doInitialize(fresh, epoch)
+      ok = await _doInitialize(fresh, epoch, pluginEngine)
           .timeout(const Duration(seconds: 3));
     } catch (_) {
       ok = false;
     }
+    _lastRestartSucceeded = ok;
     _available = ok;
     _listening = false;
     _genOpen = 0;
@@ -641,7 +684,7 @@ class SystemVoiceInput implements VoiceInput {
     _closeCompleter = null;
     if (c != null && !c.isCompleted) c.complete();
     if (!_engineController.isClosed) {
-      _engineController.add('restarted');
+      _engineController.add(ok ? 'restarted' : 'restart_failed');
     }
   }
 
@@ -652,7 +695,7 @@ class SystemVoiceInput implements VoiceInput {
   }
 
   Future<bool> _doInitialize(stt.SpeechToText speech,
-      [int epoch = -1]) async {
+      [int epoch = -1, bool forcePlatformInitialize = false]) async {
     final int regEpoch = epoch < 0 ? _engineEpoch : epoch;
     void onError(SpeechRecognitionError error) {
         // Stale registration: a registration made before
@@ -768,7 +811,7 @@ class SystemVoiceInput implements VoiceInput {
         }
     }
 
-    final bool ok =
+    bool ok =
         await speech.initialize(onError: onError, onStatus: onStatus);
     // The plugin's initialize() is a one-shot latch: once
     // it has succeeded it returns the cached result and
@@ -791,6 +834,31 @@ class SystemVoiceInput implements VoiceInput {
       speech.statusListener = onStatus;
     } catch (_) {
       // See the note above.
+    }
+    if (forcePlatformInitialize) {
+      // Watchdog restart only: the initialize() above
+      // latched and never reached the platform (the
+      // plugin returns its cached success), so issue the
+      // platform initialize DIRECTLY on the channel --
+      // with the same arguments the plugin itself sends.
+      // The platform-side initialize has no latch: it
+      // re-runs and re-binds the channel callback
+      // handler, while the Dart-side registrations made
+      // just above (the plugin's platform callbacks and
+      // the public listener fields) keep pointing at
+      // THIS epoch's closures. The channel result is the
+      // restart's real outcome: a platform that does not
+      // answer true has NOT been re-initialized.
+      try {
+        final bool? platformOk =
+            await _pluginChannel.invokeMethod<bool>(
+          'initialize',
+          <String, Object>{'debugLogging': false},
+        );
+        ok = platformOk ?? false;
+      } catch (_) {
+        ok = false;
+      }
     }
     return ok;
   }

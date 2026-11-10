@@ -112,6 +112,7 @@ class FakeStt implements stt.SpeechToText {
   bool initResult = true;
   Object? stopError;
   Completer<void>? stopGate;
+  Completer<void>? cancelGate;
   int stopCalls = 0;
 
   @override
@@ -131,6 +132,7 @@ class FakeStt implements stt.SpeechToText {
   @override
   Future<void> cancel() async {
     cancelCalls++;
+    if (cancelGate != null) await cancelGate!.future;
   }
 
   @override
@@ -845,9 +847,9 @@ void main() {
 
   group('engine watchdog restart (injected recogniser)', () {
     test(
-        'closes unconfirmed for 3 s prod one cancel; '
-        'still unconfirmed 1 s later the engine restarts: '
-        'count zeroed, epoch bumped, restarted emitted',
+        'closes unconfirmed prod one cancel; the engine '
+        'restarts right after the capped prod: count '
+        'zeroed, epoch bumped, restarted emitted',
         () async {
       final FakeStt fake = FakeStt();
       final SystemVoiceInput input = SystemVoiceInput(fake);
@@ -884,10 +886,13 @@ void main() {
       }
       expect(fake.cancelCalls, 1,
           reason: 'exactly one watchdog cancel prod');
-      expect(input.pendingCloses, 1,
-          reason: 'the prod is not a new close');
-      expect(input.engineEpoch, epoch0,
-          reason: 'the restart step has not run yet');
+      // Ladder semantics (this round): there is no
+      // second waiting step anymore -- the restart
+      // follows the prod as soon as its future settles
+      // or the cap elapses, so the intermediate state
+      // (prod seen, restart not yet run) is not a stable
+      // observation point; the end state is asserted
+      // below instead.
       // After the restart step the engine is force-
       // restarted: the injected recogniser is re-
       // initialized in place (its initialize count
@@ -897,6 +902,10 @@ void main() {
           'restarted');
       expect(input.pendingCloses, 0);
       expect(input.engineEpoch, epoch0 + 1);
+      expect(fake.initializeCalls, 2,
+          reason: 'initial initialize + the restart '
+              're-initialize');
+      expect(input.lastRestartSucceeded, isTrue);
       // The restart re-initialized the engine: with an
       // injected recogniser that is observable as the SAME
       // object still being the registered engine, under
@@ -924,6 +933,89 @@ void main() {
       expect(input.isListening, isTrue);
       // Settle this session's own close so no watchdog
       // ladder is left armed past the test.
+      await input.stopListening();
+      (fake.statusListener ?? fake.capturedOnStatus)!('notListening');
+      expect(input.pendingCloses, 0);
+    });
+
+    test(
+        'a prod cancel whose future NEVER completes '
+        'cannot stall the ladder: the restart still runs '
+        'and really re-initializes the engine', () async {
+      final FakeStt fake = FakeStt();
+      // The platform cancel hangs forever (this
+      // completer is never completed) and no closing
+      // status is ever delivered.
+      fake.cancelGate = Completer<void>();
+      final SystemVoiceInput input = SystemVoiceInput(fake);
+      addTearDown(input.dispose);
+      input.debugWatchdogLadder = (
+        prod: const Duration(milliseconds: 250),
+        restart: const Duration(milliseconds: 150),
+      );
+      expect(await input.initialize(), isTrue);
+      expect(fake.initializeCalls, 1);
+      final int epoch0 = input.engineEpoch;
+      final Future<String> restarted = input.engineEvents.first;
+      expect(await input.startListening(), isTrue);
+      await input.stopListening();
+      expect(input.pendingCloses, 1);
+      // Prod at ~250 ms; its cancel never returns, so
+      // only the 150 ms cap on the prod future lets the
+      // ladder reach the restart at all.
+      expect(await restarted.timeout(const Duration(seconds: 5)),
+          'restarted');
+      expect(fake.cancelCalls, 1,
+          reason: 'exactly one watchdog cancel prod');
+      expect(fake.initializeCalls, 2,
+          reason: 'the restart really re-initialized');
+      expect(input.pendingCloses, 0);
+      expect(input.engineEpoch, epoch0 + 1);
+      expect(input.lastRestartSucceeded, isTrue);
+      expect(input.isAvailable, isTrue);
+      // The restarted engine can listen again.
+      expect(await input.startListening(), isTrue);
+      expect(input.isListening, isTrue);
+      await input.stopListening();
+      (fake.statusListener ?? fake.capturedOnStatus)!('notListening');
+      expect(input.pendingCloses, 0);
+    });
+
+    test(
+        'a restart whose re-initialize FAILS emits '
+        'restart_failed (never restarted), still clears '
+        'every ledger and does not wedge', () async {
+      final FakeStt fake = FakeStt();
+      final SystemVoiceInput input = SystemVoiceInput(fake);
+      addTearDown(input.dispose);
+      input.debugWatchdogLadder = (
+        prod: const Duration(milliseconds: 250),
+        restart: const Duration(milliseconds: 150),
+      );
+      expect(await input.initialize(), isTrue);
+      final List<String> engineLog = <String>[];
+      final StreamSubscription<String> sub =
+          input.engineEvents.listen(engineLog.add);
+      addTearDown(sub.cancel);
+      expect(await input.startListening(), isTrue);
+      await input.stopListening();
+      expect(input.pendingCloses, 1);
+      // The restart's re-initialize will fail.
+      fake.initResult = false;
+      for (int i = 0; i < 200 && engineLog.isEmpty; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      expect(engineLog, <String>['restart_failed']);
+      expect(input.pendingCloses, 0,
+          reason: 'ledgers are cleared even on failure');
+      expect(input.lastRestartSucceeded, isFalse);
+      expect(input.isAvailable, isFalse);
+      // Not wedged: a later initialize (the app's retry
+      // path) recovers the input and listening works.
+      fake.initResult = true;
+      expect(await input.initialize(), isTrue);
+      expect(await input.startListening(), isTrue);
+      expect(input.isListening, isTrue);
       await input.stopListening();
       (fake.statusListener ?? fake.capturedOnStatus)!('notListening');
       expect(input.pendingCloses, 0);
