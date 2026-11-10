@@ -357,71 +357,32 @@ class SystemVoiceInput implements VoiceInput {
   /// generation-handoff race this exists for.
   Completer<void>? _startBarrier;
 
-  // --- Stale-result / stale-status defences (this round) ---
+  // --- Stale-status defence (the close ledgers) ---
   //
   // The plugin keeps ONE result listener and ONE status
-  // listener: after a session has closed and a NEW one
-  // has opened, the old native session's delayed final
-  // is delivered through the NEW session's result closure
-  // (and the old session's delayed status through the
-  // current status listener). No session identity
-  // survives that routing, so the adapter defends the
-  // new session with two content/timing rules:
-  //
-  // (A) First-result gate: inside a session, until it has
-  //     produced ANY accepted result (partial or final),
-  //     a final that EITHER repeats the previous session's
-  //     last accepted text OR arrives within 300 ms of
-  //     the listen start is judged a leftover of the old
-  //     session and dropped. Known cost of this heuristic
-  //     (accepted by design): a genuinely new first final
-  //     that happens to repeat the previous session's
-  //     text within 300 ms is dropped too -- a repeat
-  //     counts for more than a guess.
-  // (B) Stale-status debt (_statusesOwed): every
-  //     stop/cancel records one debt; the next
-  //     done/notListening status repays ONE debt and is
-  //     consumed as an old close -- it never ends a live
-  //     session. A rule-A-dropped late final records one
-  //     further debt for its own old session (see the
-  //     drop site in startListening). A session's natural
-  //     end owes no debt: its own stop was never called,
-  //     so by then every earlier debt has been repaid by
-  //     an earlier status (each close's status arrives
-  //     before the next session can open, because the
-  //     pending-close barrier forbids opening one
-  //     earlier). Debt therefore reaches a live session
-  //     only when a status genuinely belongs to an older
-  //     session.
-
-  /// Leftover-final threshold (rule A): a first final
-  /// arriving sooner than this after the listen start is
-  /// treated as the old session's residue.
-  static const Duration _staleFinalWindow = Duration(milliseconds: 300);
-
-  /// When the live session's listen() was issued.
-  DateTime? _sessionStartedAt;
-
-  /// Whether the live session has accepted any result
-  /// (partial or final) yet; rule A applies only while
-  /// this is false.
-  bool _sessionAcceptedResult = false;
-
-  /// The last text accepted by the PREVIOUS session
-  /// (final preferred, else latest partial), retained
-  /// across sessions for rule A's repeat check.
-  String? _previousSessionLastText;
-
-  /// Whether the LIVE session has itself produced an
-  /// accepted final (used to prefer finals over partials
-  /// when the session's last text is snapshotted).
-  bool _sessionAcceptedFinal = false;
-
-  /// The live session's last accepted text.
-  String? _sessionLastText;
-
-
-
+  // listener, so a platform event carries no session
+  // identity. The adapter therefore never guesses WHICH
+  // session an event belongs to from its text or its
+  // timing (an earlier round's text-equality / 300 ms
+  // first-result gate misjudged genuine fast finals and
+  // repeated utterances, and is REMOVED): results are
+  // accepted as the live session's own unless their
+  // generation was voided (the _genOpen / epoch gates),
+  // and cross-session safety comes from ORDER instead --
+  // a session is settled only once its final has arrived
+  // or its cancel has been CONFIRMED closed, and no new
+  // listen opens while a close is unconfirmed
+  // (_pendingCloses). What remains here is the status
+  // side: _statusesOwed records, per stop/cancel, the
+  // closing status still owed by that close; an arriving
+  // done/notListening first repays one such debt and is
+  // consumed as that OLD close -- it never ends the live
+  // session. A session's natural end owes no debt: its
+  // own stop was never called, so by then every earlier
+  // debt has been repaid by an earlier status (each
+  // close's status arrives before the next session can
+  // open, because the pending-close barrier forbids
+  // opening one earlier).
 
   /// Pending closes whose count was consumed by the
   /// closing session's terminal ERROR rather than by its
@@ -442,18 +403,6 @@ class SystemVoiceInput implements VoiceInput {
   /// debt for them even when the count bookkeeping
   /// momentarily disagrees (see startListening).
   bool _sessionOpening = false;
-
-  /// Snapshot the ending session's last accepted text
-  /// into the cross-session slot (rule A), then reset the
-  /// per-session result bookkeeping.
-  void _snapshotSessionText() {
-    if (_sessionAcceptedResult) {
-      _previousSessionLastText = _sessionLastText;
-    }
-    _sessionAcceptedResult = false;
-    _sessionAcceptedFinal = false;
-    _sessionLastText = null;
-  }
 
   /// Statuses still owed to the adapter by sessions it
   /// stopped or cancelled (rule B, final form). The
@@ -482,14 +431,6 @@ class SystemVoiceInput implements VoiceInput {
   /// Decided from adapter-observable facts only, never
   /// from a clock.
   int _statusesOwed = 0;
-
-  /// Whether the LIVE session has already recorded its
-  /// one stale-status expectation for a rule-A-dropped
-  /// late final (see the drop site in startListening):
-  /// several dropped finals of the same old session
-  /// still predict only ONE late closing status, so the
-  /// expectation is recorded at most once per session.
-  bool _liveSessionStaleFinalDropped = false;
 
   /// Set by the result path when a result is accepted;
   /// cleared at the START of every stop/cancel. A stop
@@ -689,14 +630,8 @@ class SystemVoiceInput implements VoiceInput {
     _pendingCloses = 0;
     _closeErrorConsumed = 0;
     _statusesOwed = 0;
-    _liveSessionStaleFinalDropped = false;
     _resultArrivedSinceStopBegan = false;
     _sessionOpening = false;
-    _previousSessionLastText = null;
-    _sessionAcceptedResult = false;
-    _sessionAcceptedFinal = false;
-    _sessionLastText = null;
-    _sessionStartedAt = null;
     _engineRestarting = false;
     _detail = ok
         ? '系统语音识别已接入（引擎已重启，zh-CN，单次最长 10 秒，非持续监听）'
@@ -734,7 +669,6 @@ class SystemVoiceInput implements VoiceInput {
           // A permanent error blocks recognition until resolved;
           // claiming availability afterwards would be a lie.
           _available = false;
-          if (_listening) _snapshotSessionText();
           _listening = false;
         }
         if (_pendingCloses > 0) {
@@ -779,23 +713,31 @@ class SystemVoiceInput implements VoiceInput {
           if (_statusesOwed > 0 ||
               _closeErrorConsumed > 0 ||
               _sessionOpening) {
-            // Rule B: this status belongs to an OLD close:
-            // it repays the stop/cancel debt, or it is the
-            // closing status of a close whose count an
-            // error already consumed, or it arrives while
-            // a session is still OPENING (it cannot belong
-            // to the opening session). Either way it is
-            // consumed as that OLD session's close --
-            // confirmed like any closing status (it also
-            // settles a pending close when one is
-            // outstanding) -- and it NEVER ends the live
-            // session, never clears _listening and never
-            // emits sessionEnded for it. Counts are
-            // decremented only when positive.
-            if (_statusesOwed > 0) _statusesOwed--;
-            if (_closeErrorConsumed > 0) _closeErrorConsumed--;
-            if (_pendingCloses > 0) _consumePendingClose();
-            if (!_listening) _snapshotSessionText();
+            // This status belongs to an OLD close, and
+            // it repays ONE ledger only -- never two
+            // (letting one status settle two accounts
+            // would spend the LATE status's repayment
+            // early and leave a genuinely late old status
+            // with nothing to repay, free to fall into
+            // the natural-end branch and end the live
+            // session). Which account: the error marker
+            // first (that close's own status, following
+            // its error); else, while a close is still
+            // unconfirmed, THIS close's confirmation (the
+            // owed entry then survives for the same
+            // session's genuinely late duplicate status);
+            // else the owed debt itself (a late status
+            // with no close outstanding). Consumed here,
+            // a status NEVER ends the live session, never
+            // clears _listening and never emits
+            // sessionEnded for it.
+            if (_closeErrorConsumed > 0) {
+              _closeErrorConsumed--;
+            } else if (_pendingCloses > 0) {
+              _consumePendingClose();
+            } else if (_statusesOwed > 0) {
+              _statusesOwed--;
+            }
             return;
           }
           if (_pendingCloses > 0) {
@@ -823,7 +765,6 @@ class SystemVoiceInput implements VoiceInput {
             _emitSessionEnded(_generation, status);
           }
           _listening = false;
-          if (wasListening) _snapshotSessionText();
         }
     }
 
@@ -927,14 +868,6 @@ class SystemVoiceInput implements VoiceInput {
     final Completer<void> barrier = Completer<void>();
     _startBarrier = barrier;
     _genOpen = sessionId;
-    // Fresh first-result gate (rule A) for the new
-    // session; _previousSessionLastText deliberately
-    // survives from the session before.
-    _sessionStartedAt = DateTime.now();
-    _liveSessionStaleFinalDropped = false;
-    _sessionAcceptedResult = false;
-    _sessionAcceptedFinal = false;
-    _sessionLastText = null;
     // Mark listening BEFORE the platform call: the
     // session counts as live from the moment its open is
     // issued, so a stop/cancel that lands while the start
@@ -945,10 +878,8 @@ class SystemVoiceInput implements VoiceInput {
     // with nobody tracking it.
     _listening = true;
     _sessionOpening = true;
-    // This session's listen options and result closure,
-    // kept in locals so the rule-A drop site inside the
-    // closure can re-issue the SAME listen for the SAME
-    // session (see there).
+    // This session's listen options, shared by the
+    // platform call below.
     final stt.SpeechListenOptions listenOptions =
         stt.SpeechListenOptions(
       listenFor: const Duration(seconds: 10),
@@ -957,11 +888,10 @@ class SystemVoiceInput implements VoiceInput {
       partialResults: true,
       cancelOnError: true,
     );
-    stt.SpeechResultListener? resultListener;
     try {
       await Future.any(<Future<void>>[
         speech.listen(
-        onResult: resultListener = (SpeechRecognitionResult result) {
+        onResult: (SpeechRecognitionResult result) {
           // A result from before an engine restart belongs
           // to a dead engine generation: dropped at entry.
           if (epoch != _engineEpoch) return;
@@ -971,95 +901,17 @@ class SystemVoiceInput implements VoiceInput {
           // closed), its callbacks are ignored entirely.
           if (_genOpen != sessionId && !acceptStoppingResults) return;
           final String words = result.recognizedWords;
-          if (!_sessionAcceptedResult &&
-              result.finalResult &&
-              _genOpen == sessionId) {
-            // First-result gate (rule A): this final claims
-            // to be the new session's very first result,
-            // but the plugin routes an OLD session's late
-            // final through THIS closure too. If it repeats
-            // the previous session's last text, or it
-            // arrived within the stale window of the listen
-            // start, it is the old session's residue:
-            // dropped -- never streamed, never allowed to
-            // satisfy or alter this session's state.
-            // (Results of a session being stopped under
-            // the pass-through window skip the gate: they
-            // belong to the STOPPING session itself, by
-            // the accepted stopping-window rule.)
-            final DateTime? startedAt = _sessionStartedAt;
-            final bool repeatsPrevious =
-                _previousSessionLastText != null &&
-                    words == _previousSessionLastText;
-            final bool withinWindow = startedAt != null &&
-                DateTime.now().difference(startedAt) < _staleFinalWindow;
-            if (repeatsPrevious || withinWindow) {
-              // This final is observable proof that the
-              // OLD session's tail is still arriving --
-              // and a session's results precede its
-              // closing status (the order every confirmed
-              // close in this adapter follows, and the
-              // plugin's own final-then-status forwarding).
-              // That old session's closing status is
-              // therefore still in flight behind this
-              // final: record ONE owed status for it (at
-              // most one per live session -- repeated
-              // residue finals of the same old session
-              // predict the same single status), so when
-              // it lands it is consumed as the OLD close
-              // and never as this session's natural end.
-              // Without this, the stop that closed the
-              // old session recorded an owed status that
-              // its CONFIRMING status already repaid
-              // together with the pending close (one
-              // status, two ledgers), leaving nothing for
-              // this genuinely later status to repay.
-              if (!_liveSessionStaleFinalDropped) {
-                _liveSessionStaleFinalDropped = true;
-                _statusesOwed++;
-                // The plugin has ALSO consumed this final
-                // as the LIVE session's own final: once
-                // its latest result type is final, its
-                // result forwarding early-returns for
-                // every further result until the next
-                // listen() call (verified in the plugin
-                // source). Left alone, this session would
-                // report listening while its result
-                // channel is dead. Re-issue THIS
-                // session's listen -- same closure, same
-                // options, same generation: it resets
-                // only the plugin's result state; the
-                // adapter session, its id and its gate
-                // are unchanged. Fire-and-forget (the
-                // plugin applies the reset synchronously,
-                // before its platform await); a failure
-                // must not take the result path down, and
-                // the raw error never surfaces.
-                if (!engineDisposed && !_engineRestarting) {
-                  unawaited(speech
-                      .listen(
-                          onResult: resultListener,
-                          listenOptions: listenOptions)
-                      .catchError((Object _) {
-                    mingtuVoiceLog('语音识别：残留结果丢弃后重新下发监听失败');
-                  }));
-                }
-              }
-              mingtuVoiceLog('语音识别：丢弃疑似旧会话残留结果');
-              return;
-            }
-          }
-          // Accepted: record it for the gate bookkeeping
-          // (a final outranks partials as the session's
-          // last text) and stream it under this session.
-          _sessionAcceptedResult = true;
+          // No content or timing guesses (the text-
+          // equality / 300 ms first-result gate is
+          // REMOVED): a result that reaches this closure
+          // under a live generation IS this session's
+          // result. Cross-session residue is prevented
+          // by ORDER, not by judging results: the app
+          // settles a session (its final received, or
+          // its cancel confirmed closed) before any new
+          // listen may open, and voided generations are
+          // already rejected by the gate above.
           _resultArrivedSinceStopBegan = true;
-          if (result.finalResult) {
-            _sessionAcceptedFinal = true;
-            _sessionLastText = words;
-          } else if (!_sessionAcceptedFinal) {
-            _sessionLastText = words;
-          }
           if (result.finalResult) {
             _controller.add(AsrResultEvent(sessionId, words));
           } else {
@@ -1091,9 +943,6 @@ class SystemVoiceInput implements VoiceInput {
       if (_genOpen == sessionId) _genOpen = 0;
       _listening = false;
       _sessionOpening = false;
-      _sessionAcceptedResult = false;
-      _sessionAcceptedFinal = false;
-      _sessionLastText = null;
       _detail = 'NOT_CONFIGURED（开始识别失败：${asrErrorText(_asrFailureCode(e))}）';
       return false;
     }

@@ -2284,15 +2284,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _announcePushToTalkTooShort();
       return;
     }
+    // Settle-by-order release (this round): stop() opens
+    // a 1.5 s window (from the release) for THIS session's
+    // final. A final arriving anywhere in it -- stop still
+    // in flight or already returned -- is submitted at
+    // once by _onPttFinalInStopping. Only when the window
+    // expires WITHOUT a final does the press escalate to
+    // the cancel-confirm step (_pttFinalWaitExpired).
     _pttNoContentTimer = Timer(const Duration(milliseconds: 1500), () {
       if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
         return;
       }
-      if (_pttCachedText != null) {
-        _pttCompletePress(sid, _pttCachedText);
-      } else {
-        _pttCompletePress(sid, null);
-      }
+      unawaited(_pttFinalWaitExpired(sid));
     });
     await _stopListeningInternal();
     if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
@@ -2302,9 +2305,65 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // stop was already submitted by _onPttFinalInStopping
     // (state left stopping); reaching here with a cached
     // final means it was cached while held -- submit now.
-    // Otherwise the deadline above finishes the press.
+    // Otherwise the 1.5 s final-wait above is still
+    // running: it either receives the final (submitted by
+    // _onPttFinalInStopping) or escalates to the cancel-
+    // confirm step when it expires.
     if (_pttCachedIsFinal && _pttCachedText != null) {
       _pttCompletePress(sid, _pttCachedText);
+    }
+  }
+
+  /// The 1.5 s final-wait expired with no final for this
+  /// press's session: settle the session by CANCEL, not
+  /// by guessing. cancel() makes the platform discard the
+  /// session (Android's SpeechRecognizer.cancel delivers
+  /// no further results), so once the cancel's close is
+  /// CONFIRMED (the adapter's pending-close count reaches
+  /// zero -- the same ledger that gates every new listen),
+  /// no result of this session can ever surface again,
+  /// in this session or a later one. The press then
+  /// completes with its cached last partial if it has one,
+  /// else with the no-content notice.
+  ///
+  /// The confirmation wait is bounded at 1.5 s: if the
+  /// platform never confirms, the press still completes
+  /// (the adapter's close watchdog remains the backstop
+  /// for the ledger itself, and the new-listen barrier
+  /// keeps holding until the count does reach zero), so
+  /// a press can never hang on a dead recogniser.
+  Future<void> _pttFinalWaitExpired(int sid) async {
+    // Close the result window first: from here on a late
+    // final of this session is no longer accepted for
+    // this press (the cancel settles the session).
+    _setPttStoppingWindow(false);
+    await _cancelListeningInternal();
+    if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
+      return;
+    }
+    if (_voiceInput is SystemVoiceInput) {
+      try {
+        // Drive the confirmation the way the press path
+        // does (the adapter's re-registration asks the
+        // platform for the closing outcome), bounded by
+        // the same 1.5 s: the confirm helper itself waits
+        // unbounded, so the timeout here is what bounds
+        // this step.
+        await _ensureAsrCloseConfirmed()
+            .timeout(const Duration(milliseconds: 1500));
+      } on TimeoutException {
+        // Confirmation never landed (see the doc above):
+        // complete anyway; the barrier/watchdog own the
+        // ledger from here.
+      }
+    }
+    if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
+      return;
+    }
+    if (_pttCachedText != null && !_pttCachedIsFinal) {
+      _pttCompletePress(sid, _pttCachedText);
+    } else {
+      _pttCompletePress(sid, null);
     }
   }
 

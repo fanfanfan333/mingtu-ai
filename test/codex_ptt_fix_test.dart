@@ -1462,7 +1462,7 @@ void main() {
       );
 
       // Release with the platform stop GATED: the app is
-      // inside the stopping window, stop() has not
+      // inside the 1.5 s final-wait, stop() has not
       // returned yet, and the app has opened the adapter's
       // stopping pass-through window
       // (acceptStoppingResults) for exactly this stop.
@@ -1483,13 +1483,14 @@ void main() {
           reason: '${h.events}');
 
       // The session's final arrives BEFORE stop() returns.
-      // STOPPING-WINDOW MECHANISM (final form): the open
+      // FINAL-WAIT MECHANISM: the open pass-through
       // window lets the result through the adapter, main
       // accepts it in stopping and completes the press
       // IMMEDIATELY (_onPttFinalInStopping) -- the
       // submission itself (the scheduler taking the reply
       // as the active prompt, mirrored on screen) happens
-      // NOW, before stop() is released. The reply's
+      // NOW, before stop() is released, so the press
+      // never reaches the cancel step at all. The reply's
       // CHANNEL speak stays parked behind the still-gated
       // platform stop (speakAfterClosingMic): the mic must
       // be fully closed before speech starts, which is a
@@ -1747,6 +1748,307 @@ void main() {
         expect(text, isNot(contains('安全')),
             reason: 'spoken text must never use the word: $text');
       }
+    });
+  });
+
+  group('settle-by-order release (no residue heuristics)', () {
+    // Shared shape (the stopping-window group's driver):
+    // settle, drain, stop the automatic loop, clear the
+    // event log, then press until PTT listening.
+    testWidgets(
+        'N1: a genuine final arriving fast in a fresh '
+        'session is accepted and executed; no extra '
+        'listen, no no-content notice',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.autoCloseStatus = false;
+      h.events.clear();
+
+      final TestGesture gesture = await startPttGesture(tester);
+      // The wait itself is the kept R7 behaviour: vibrate
+      // plus ONE wait notice while the close is
+      // unconfirmed -- nothing else (no cue, no listen).
+      expect(h.events, <String>['vibrate', 'tts.speak:请稍等'],
+          reason: '${h.events}');
+      expect(h.count('tts.speak:请稍等'), 1, reason: '${h.events}');
+      expect(h.completeSpeak('请稍等'), isTrue);
+      await h.deliverCloseStatus();
+      for (int i = 0;
+          i < 20 && !h.events.contains('tts.speak:请说');
+          i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(h.events, contains('tts.speak:请说'),
+          reason: '${h.events}');
+      await pressUntilPttListeningFrom(tester, h, gesture);
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+
+      // A genuine final FAST (fake milliseconds after the
+      // listen -- deep inside the removed 300 ms window,
+      // as the session's very first result): accepted,
+      // cached, never judged.
+      const String envReply = '前方情况：尚未模拟感知帧。';
+      await deliverFinalResult(tester, '前面有什么');
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.listen'), 1,
+          reason: 'no recovery re-listen: ${h.events}');
+      expect(h.events, isNot(contains('tts.speak:$envReply')),
+          reason: 'cached while held: ${h.events}');
+
+      await holdPastThreshold(tester);
+      await gesture.up();
+      await pumpUntilSpeak(tester, h, envReply);
+      expect(h.count('tts.speak:$envReply'), 1,
+          reason: '${h.events}');
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+      h.autoCloseStatus = true;
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'N2: the same word spoken in two consecutive '
+        'sessions is executed twice',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.events.clear();
+      final String helpText = voiceCommandHelpText();
+
+      for (int round = 1; round <= 2; round++) {
+        final TestGesture gesture =
+            await pressUntilPttListening(tester, h);
+        expect(h.count('asr.listen'), round,
+            reason: 'round $round: ${h.events}');
+        await holdPastThreshold(tester);
+        // The SAME word as the previous session, as this
+        // session's first (fast) final: the removed gate
+        // dropped exactly this (same text, no time
+        // limit). Now it is this session's own result.
+        await deliverFinalResult(tester, '帮助');
+        await tester.pump(const Duration(milliseconds: 100));
+        await gesture.up();
+        await pumpUntilSpeak(tester, h, helpText);
+        expect(h.count('tts.speak:$helpText'), round,
+            reason: 'round $round executed: ${h.events}');
+        expect(h.completeSpeak(helpText), isTrue);
+        await tester.pump(const Duration(milliseconds: 100));
+        expect(
+          h.events,
+          isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+          reason: 'round $round: ${h.events}',
+        );
+      }
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'N3: late old traffic after a confirmed close '
+        'never executes out of turn; session 2 stays '
+        'listening and only its own result is submitted',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.events.clear();
+
+      // Session 1 (a complete PTT press): its own final
+      // is delivered while held, submitted on release and
+      // executed; the release stop's close is then
+      // CONFIRMED (its queued statuses delivered) before
+      // anything else happens.
+      final String helpText = voiceCommandHelpText();
+      final TestGesture g1 = await pressUntilPttListening(tester, h);
+      await holdPastThreshold(tester);
+      await deliverFinalResult(tester, '帮助');
+      await tester.pump(const Duration(milliseconds: 100));
+      await g1.up();
+      await pumpUntilSpeak(tester, h, helpText);
+      expect(h.count('tts.speak:$helpText'), 1,
+          reason: 'session 1 executed its own result: '
+              '${h.events}');
+      expect(h.completeSpeak(helpText), isTrue);
+      await tester.pump(const Duration(milliseconds: 100));
+      for (int i = 0; i < 10 && h.pendingCloseStatuses > 0; i++) {
+        await h.deliverAutoCloseStatus();
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(h.pendingCloseStatuses, 0,
+          reason: 'session 1 close confirmed: ${h.events}');
+      h.events.clear();
+
+      // Session 2 opens (a PTT press) whose cue stays
+      // IN FLIGHT (its speak is gated): the press is in
+      // prompting and its platform listen has NOT been
+      // issued yet.
+      final TestGesture gesture = await pressPtt(tester, h);
+      expect(h.count('tts.speak:请说'), 1, reason: '${h.events}');
+      expect(h.count('asr.listen'), 0, reason: '${h.events}');
+
+      // Session 1's LEFTOVER final arrives now. This is
+      // the shape task scene 3 targets at the app layer:
+      // the final is routed through the OLD session's
+      // plugin closure (no new listen exists yet to
+      // replace it), the adapter's generation gate for
+      // that closed session drops it, and the app --
+      // whose press is only prompting, never listening --
+      // has no path that could execute or cache it. It
+      // is NOT judged by text or timing: it belongs to a
+      // voided generation, full stop.
+      await deliverFinalResult(tester, '帮助');
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('tts.speak:$helpText'), 0,
+          reason: 'the leftover never executed: ${h.events}');
+      expect(h.count('asr.listen'), 0,
+          reason: 'still only prompting: ${h.events}');
+
+      // Session 1's duplicate closing status arrives in
+      // the same window: repaid from session 1's
+      // owed-status ledger (and the close ledger), and
+      // PTT mode never lets a status event relisten.
+      await h.deliverCloseStatus();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.listen'), 0,
+          reason: 'no status-driven relisten: ${h.events}');
+
+      // The cue completes (the driver completes its
+      // speak): the press enters its own listening
+      // session (session 2 proper).
+      await pressUntilPttListeningFrom(tester, h, gesture);
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+
+      // Session 2's OWN final while still held: cached,
+      // and on release it is the ONLY submission.
+      const String envReply = '前方情况：尚未模拟感知帧。';
+      await deliverFinalResult(tester, '前面有什么');
+      await tester.pump(const Duration(milliseconds: 100));
+      await holdPastThreshold(tester);
+      await gesture.up();
+      await pumpUntilSpeak(tester, h, envReply);
+      expect(h.count('tts.speak:$envReply'), 1,
+          reason: 'only session 2 own result submitted: '
+              '${h.events}');
+      expect(h.count('tts.speak:$helpText'), 0,
+          reason: 'the leftover was never submitted: '
+              '${h.events}');
+      await tester.pump(const Duration(seconds: 3));
+      expect(h.count('tts.speak:$envReply'), 1,
+          reason: '${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'N4: no final within 1.5 s of the release: the '
+        'session is cancelled, its close confirmed, and '
+        'the cached partial is submitted exactly once',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      await tapPanelText(tester, '停止语音识别');
+      h.events.clear();
+
+      final TestGesture gesture =
+          await pressUntilPttListening(tester, h);
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+      await holdPastThreshold(tester);
+      // A partial only -- never a final.
+      final String helpText = voiceCommandHelpText();
+      await deliverPartialResult(tester, '帮助');
+      await tester.pump(const Duration(milliseconds: 100));
+
+      // Release with the platform stop GATED: the stop
+      // stays in flight, so the plugin cannot forward
+      // the partial as the stop's terminal final during
+      // the wait -- the session genuinely has no final.
+      // The 1.5 s final-wait starts at the release.
+      h.stopGate = Completer<dynamic>();
+      final int cancelsBefore = h.count('asr.cancel');
+      await gesture.up();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.count('asr.stop'), greaterThanOrEqualTo(1),
+          reason: '${h.events}');
+      for (int i = 0; i < 16; i++) {
+        await h.deliverAutoCloseStatus();
+        h.completeAllSpeaks();
+        await tester.pump(const Duration(milliseconds: 250));
+      }
+      // Release the gated stop (its answer changes
+      // nothing: the final-wait already expired with no
+      // final). The escalation then shows exactly ONE
+      // cancel (the watchdog never gets near this -- its
+      // ladder is 3 s and the confirmation lands first).
+      h.stopGate!.complete(null);
+      h.stopGate = null;
+      for (int i = 0; i < 10; i++) {
+        await h.deliverAutoCloseStatus();
+        h.completeAllSpeaks();
+        await tester.pump(const Duration(milliseconds: 150));
+      }
+      // The timeout's own cancel landed, and it landed
+      // BEFORE the submission: the press settled by
+      // cancel, then completed. (If this harness's
+      // confirmation flush runs past the adapter's 3 s
+      // watchdog ladder under the pumped fake clock, the
+      // ladder's prod and restart notice may legitimately
+      // follow as the standing backstop -- they change
+      // nothing about the settled press, asserted below
+      // by the exactly-once submission.)
+      expect(h.count('asr.cancel'), greaterThanOrEqualTo(cancelsBefore + 1),
+          reason: 'the timeout cancel landed: ${h.events}');
+      expect(
+        h.events.indexOf('asr.cancel') <
+            h.events.indexOf('tts.speak:$helpText'),
+        isTrue,
+        reason: 'cancel settled the session BEFORE the '
+            'partial was submitted: ${h.events}',
+      );
+      // The close confirmed, the press completed with
+      // the cached partial: the help reply, exactly once.
+      await pumpUntilSpeak(tester, h, helpText);
+      expect(h.count('tts.speak:$helpText'), 1,
+          reason: '${h.events}');
+      await tester.pump(const Duration(seconds: 3));
+      expect(h.count('tts.speak:$helpText'), 1,
+          reason: 'submitted exactly once: ${h.events}');
+      expect(
+        h.events,
+        isNot(contains('tts.speak:没有听清，请按住按钮再说一次。')),
+        reason: '${h.events}',
+      );
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
     });
   });
 
