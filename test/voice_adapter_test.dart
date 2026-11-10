@@ -90,6 +90,17 @@ class FakeStt implements stt.SpeechToText {
   int initializeCalls = 0;
   int cancelCalls = 0;
 
+  /// The plugin's public listener fields: the adapter
+  /// assigns its CURRENT registrations here after every
+  /// initialize (the plugin's initialize latch otherwise
+  /// keeps the first registration forever). Capturing the
+  /// assignments mirrors the real plugin's single-listener
+  /// replacement exactly.
+  @override
+  stt.SpeechErrorListener? errorListener;
+  @override
+  stt.SpeechStatusListener? statusListener;
+
   /// The onResult listener of EVERY listen() call, in call
   /// order. The adapter registers a fresh closure per
   /// session; keeping them all lets tests invoke an OLD
@@ -463,8 +474,15 @@ void main() {
       // The recorded order is the proof: speak ran strictly
       // AFTER the microphone stop completed.
       expect(order, <String>['stop-released', 'speak']);
-      // And listening can resume afterwards.
+      // And listening can resume afterwards. (This
+      // session produced no results, so the adapter's
+      // first-result gate has nothing to compare; a fresh
+      // session here is silent anyway.)
       expect(await input.startListening(), isTrue);
+      // The previous session's closing status was already
+      // consumed above; this listen's own stop now owes
+      // one status debt, which the next test-file user of
+      // this input does not see (the input is disposed).
     });
 
     test(
@@ -495,7 +513,8 @@ void main() {
       // The failed stop still opened a pending close; the
       // platform's status confirms it (the recogniser did
       // close, only the acknowledgement failed).
-      sttFake.capturedOnStatus!('notListening');
+      (sttFake.statusListener ?? sttFake.capturedOnStatus)!(
+          'notListening');
       expect(input.pendingCloses, 0);
     });
   });
@@ -568,6 +587,14 @@ void main() {
 
       final SystemVoiceInput input = SystemVoiceInput();
       addTearDown(input.dispose);
+      // Stale-status debt bookkeeping for THIS walk
+      // (rule B): generation 1's closing status is still
+      // owed when generation 2's stop lands below, so the
+      // FIRST status after that stop repays generation 1
+      // -- and generation 2's own close then needs the
+      // SECOND status. Tracked here so the walk delivers
+      // exactly what the platform owes, no more.
+      bool gen1CloseStatusConsumed = false;
       final List<AsrResultEvent> finals = <AsrResultEvent>[];
       final List<AsrResultEvent> partials = <AsrResultEvent>[];
       final List<AsrStatusEvent> ends = <AsrStatusEvent>[];
@@ -624,6 +651,7 @@ void main() {
       expect(input.pendingCloses, 0);
       expect(input.sessionOpen, isFalse);
       expect(ends, isEmpty);
+      gen1CloseStatusConsumed = true;
 
       // --- Generation 2 opens at once (nothing pending).
       final Stopwatch sw2 = Stopwatch()..start();
@@ -632,9 +660,21 @@ void main() {
           reason: 'a confirmed close must not wait');
       final int gen2 = input.currentSessionId;
       expect(gen2, greaterThan(gen1));
+      // Session 2's own speech comes as a partial first,
+      // then its final: the adapter's first-result gate
+      // (this round) drops a session's FIRST result when
+      // it is a bare final arriving within 300 ms of the
+      // listen start, so a lone instant final here would
+      // be judged old-session residue by design. A real
+      // recogniser streams partials before its final;
+      // the walk mirrors that.
       await deliverPlatform(
-          'textRecognition', resultJson('第二句', 2));
+          'textRecognition', resultJson('第二句', 0)); // partial
+      await deliverPlatform(
+          'textRecognition', resultJson('第二句', 2)); // final
       await Future<void>.delayed(Duration.zero);
+      expect(partials.last.sessionId, gen2);
+      expect(partials.last.text, '第二句');
       expect(finals.last.sessionId, gen2);
       expect(finals.last.text, '第二句');
 
@@ -673,9 +713,15 @@ void main() {
       final int gen3Id = input.currentSessionId;
       expect(gen3Id, greaterThan(gen2));
       expect(input.isListening, isTrue);
+      // Partial first, then the final -- same gate note
+      // as generation 2 above.
       await deliverPlatform(
-          'textRecognition', resultJson('第三句', 2));
+          'textRecognition', resultJson('第三句', 0)); // partial
+      await deliverPlatform(
+          'textRecognition', resultJson('第三句', 2)); // final
       await Future<void>.delayed(Duration.zero);
+      expect(partials.last.sessionId, gen3Id);
+      expect(partials.last.text, '第三句');
       expect(finals.last.sessionId, gen3Id);
       expect(finals.last.text, '第三句');
       // The late status never produced a session end.
@@ -683,6 +729,108 @@ void main() {
 
       await input.stopListening();
       expect(platformCalls, contains('listen'));
+
+      // Settle generation 3's own close so its closing
+      // status debt is repaid and no watchdog ladder is
+      // left armed past this walk.
+      await deliverPlatform('notifyStatus', 'notListening');
+      await Future<void>.delayed(Duration.zero);
+      expect(input.pendingCloses, 0);
+
+      // ===== Codex synthetic scene (this round) =====
+      // A session produces its result, its close is
+      // CONFIRMED, a successor session opens -- and only
+      // THEN do the old session's leftovers arrive: a
+      // duplicate final (routed by the plugin's single
+      // listener through the SUCCESSOR's result closure,
+      // the '[newId:<old text>]' shape) and a duplicate
+      // closing status. Neither may touch the successor.
+      expect(gen1CloseStatusConsumed, isTrue);
+      // --- Session A: results flow, then a confirmed close.
+      expect(await input.startListening(), isTrue);
+      final int genA = input.currentSessionId;
+      await deliverPlatform(
+          'textRecognition', resultJson('去图书馆', 0)); // partial
+      await deliverPlatform(
+          'textRecognition', resultJson('去图书馆', 2)); // final
+      await Future<void>.delayed(Duration.zero);
+      expect(partials.last.sessionId, genA);
+      expect(partials.last.text, '去图书馆');
+      expect(finals.last.sessionId, genA);
+      expect(finals.last.text, '去图书馆');
+      final int finalsBeforeScene = finals.length;
+      final int partialsBeforeScene = partials.length;
+      await input.stopListening();
+      expect(input.pendingCloses, 1);
+      await deliverPlatform('notifyStatus', 'notListening');
+      await Future<void>.delayed(Duration.zero);
+      expect(input.pendingCloses, 0,
+          reason: 'session A close CONFIRMED before B opens');
+      expect(ends, isEmpty);
+
+      // --- Session B opens.
+      expect(await input.startListening(), isTrue);
+      final int genB = input.currentSessionId;
+      expect(genB, greaterThan(genA));
+      expect(input.isListening, isTrue);
+
+      // Step 2: the OLD session's late final arrives now.
+      // The plugin routes it through session B's closure,
+      // so without a defence it would be stamped genB.
+      // The first-result gate drops it: it repeats
+      // session A's last text.
+      await deliverPlatform(
+          'textRecognition', resultJson('去图书馆', 2));
+      await Future<void>.delayed(Duration.zero);
+      expect(finals, hasLength(finalsBeforeScene),
+          reason: 'the stale final produced NO stream event');
+      expect(partials, hasLength(partialsBeforeScene));
+      expect(
+        finals.where((AsrResultEvent e) =>
+            e.sessionId == genB && e.text == '去图书馆'),
+        isEmpty,
+        reason: 'never [genB:<old text>]',
+      );
+      expect(input.isListening, isTrue);
+
+      // Step 3: the OLD session's late status arrives.
+      // It repays session A's close debt: session B keeps
+      // listening and no sessionEnded is emitted for it.
+      await deliverPlatform('notifyStatus', 'notListening');
+      await Future<void>.delayed(Duration.zero);
+      expect(input.isListening, isTrue,
+          reason: 'the stale status must not end session B');
+      expect(input.pendingCloses, 0,
+          reason: 'no close is open for session B: session '
+              'A\'s close was confirmed above (its count '
+              'reached zero) and session B has not been '
+              'stopped -- the stale status repaid the owed '
+              'status recorded when its stale final was '
+              'dropped, it did not open or confirm a close');
+      expect(ends, isEmpty,
+          reason: 'no sessionEnded for session B');
+
+      // Step 4: session B's OWN results flow normally --
+      // a partial first (which also lifts the gate), then
+      // its final, both stamped genB.
+      await deliverPlatform(
+          'textRecognition', resultJson('去学校', 0));
+      await deliverPlatform(
+          'textRecognition', resultJson('去学校门口', 2));
+      await Future<void>.delayed(Duration.zero);
+      expect(partials.last.sessionId, genB);
+      expect(partials.last.text, '去学校');
+      expect(finals.last.sessionId, genB);
+      expect(finals.last.text, '去学校门口');
+
+      // Session B closes normally: stop, then its closing
+      // status is consumed by its own pending close.
+      await input.stopListening();
+      expect(input.pendingCloses, 1);
+      await deliverPlatform('notifyStatus', 'notListening');
+      await Future<void>.delayed(Duration.zero);
+      expect(input.pendingCloses, 0);
+      expect(ends, isEmpty);
     });
   });
 
@@ -695,6 +843,15 @@ void main() {
       final FakeStt fake = FakeStt();
       final SystemVoiceInput input = SystemVoiceInput(fake);
       addTearDown(input.dispose);
+      // Deterministic ladder (this round): the watchdog
+      // steps run on a short injected ladder instead of
+      // the production 3 s / 1 s, and every assertion below
+      // POLLS for its condition instead of sleeping one
+      // fixed duration that must land inside a window.
+      input.debugWatchdogLadder = (
+        prod: const Duration(milliseconds: 250),
+        restart: const Duration(milliseconds: 150),
+      );
       expect(await input.initialize(), isTrue);
       final int epoch0 = input.engineEpoch;
       // The injected recogniser IS the engine object the
@@ -709,21 +866,25 @@ void main() {
       // The closing status NEVER arrives (FakeStt
       // delivers none on its own and this test delivers
       // none either).
-      // At ~3 s the watchdog prods the engine with ONE
-      // cancel -- which must NOT itself open a pending
-      // close.
-      await Future<void>.delayed(const Duration(milliseconds: 3300));
+      // After the prod step the watchdog prods the engine
+      // with ONE cancel -- which must NOT itself open a
+      // pending close. Poll for the prod, do not sleep a
+      // fixed window.
+      for (int i = 0; i < 100 && fake.cancelCalls == 0; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
       expect(fake.cancelCalls, 1,
           reason: 'exactly one watchdog cancel prod');
       expect(input.pendingCloses, 1,
           reason: 'the prod is not a new close');
-      // At ~4 s the engine is force-restarted: the
-      // injected recogniser is re-initialized in place
-      // (its initialize count grows), the epoch bumps,
-      // the count is forgiven, and 'restarted' is
-      // emitted.
-      await Future<void>.delayed(const Duration(milliseconds: 1200));
-      expect(await restarted.timeout(const Duration(seconds: 2)),
+      expect(input.engineEpoch, epoch0,
+          reason: 'the restart step has not run yet');
+      // After the restart step the engine is force-
+      // restarted: the injected recogniser is re-
+      // initialized in place (its initialize count
+      // grows), the epoch bumps, the count is forgiven,
+      // and 'restarted' is emitted.
+      expect(await restarted.timeout(const Duration(seconds: 5)),
           'restarted');
       expect(input.pendingCloses, 0);
       expect(input.engineEpoch, epoch0 + 1);
@@ -743,7 +904,7 @@ void main() {
       final List<AsrStatusEvent> ends = <AsrStatusEvent>[];
       final StreamSubscription<AsrStatusEvent> sub =
           input.sessionEnded.listen(ends.add);
-      fake.capturedOnStatus!('notListening');
+      (fake.statusListener ?? fake.capturedOnStatus)!('notListening');
       await Future<void>.delayed(Duration.zero);
       expect(input.pendingCloses, 0);
       expect(ends, isEmpty);
@@ -752,6 +913,11 @@ void main() {
       // And the restarted engine can listen again.
       expect(await input.startListening(), isTrue);
       expect(input.isListening, isTrue);
+      // Settle this session's own close so no watchdog
+      // ladder is left armed past the test.
+      await input.stopListening();
+      (fake.statusListener ?? fake.capturedOnStatus)!('notListening');
+      expect(input.pendingCloses, 0);
     });
   });
 
