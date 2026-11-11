@@ -25,6 +25,8 @@
 ///   timeSinceUpdate).
 library;
 
+import 'dart:math' as math;
+
 import 'package:byte_track_dart/byte_track_dart.dart' as btd;
 
 import '../../modules/visual_perception.dart';
@@ -65,7 +67,23 @@ class ByteTrackBackend implements Tracker {
             // target lost for longer is retired, and a later
             // reappearance is a new own track with a new own id.
             maxAge: 30,
-            minHits: NavHazConfig.confirmFrames,
+            // minHits is 1 ON PURPOSE (CDX4 S1-a root cause):
+            // the package DELETES a still-tentative track on
+            // its second missed frame (timeSinceUpdate > 1),
+            // so with minHits = confirmFrames a target seen
+            // only sparsely (1-2 hits, then a 2-frame gap)
+            // lost its package track -- and with it this
+            // layer's own id, the estimator state and the
+            // alert cooldown keyed by that id -- before this
+            // project's ~1 s buffer ever applied. With
+            // minHits 1 a package track is "confirmed" from
+            // its first hit FOR LIFECYCLE PURPOSES ONLY and
+            // coasts to maxAge like any other; CONFIRMATION
+            // semantics stay exactly where they were, in
+            // this project's own Track (consecutive hits),
+            // and this layer never reads the package's
+            // state field.
+            minHits: 1,
           ),
         ),
       );
@@ -98,6 +116,58 @@ class ByteTrackBackend implements Tracker {
   /// Retired-key count, exposed for the long-running cap
   /// test only.
   int get retiredKeyCountForTest => _retiredKeys.length;
+
+  /// Find a retained own track that a re-keyed package
+  /// track [bt] should inherit (see the migration note in
+  /// update()): a currently-lost own track of the same
+  /// class, inside the retention window, whose last
+  /// sample box overlaps the new package box at the SORT
+  /// association threshold. On a hit the track is REMOVED
+  /// from its old key (the caller re-files it under the
+  /// new key) and the old key is retired so the package's
+  /// coasting remnant can never resurrect a second own
+  /// track for it. Returns null when no candidate
+  /// qualifies -- the caller then allocates a fresh id.
+  Track? _migrateCandidate(btd.Track bt) {
+    final String label = _labelFor(bt.classId);
+    String? bestKey;
+    Track? best;
+    double bestIou = NavHazConfig.sortIouThreshold;
+    for (final MapEntry<String, Track> e in _own.entries) {
+      final Track candidate = e.value;
+      if (candidate.label != label) continue;
+      if (candidate.lostFrames <= 0 ||
+          candidate.lostFrames > NavHazConfig.lostRetentionFrames) {
+        continue;
+      }
+      final TrackSample? last = candidate.latest;
+      if (last == null) continue;
+      final double iw =
+          (math.min(last.cx + last.w / 2, bt.bbox.x2) -
+                  math.max(last.cx - last.w / 2, bt.bbox.x1))
+              .clamp(0, double.infinity);
+      final double ih =
+          (math.min(last.cy + last.h / 2, bt.bbox.y2) -
+                  math.max(last.cy - last.h / 2, bt.bbox.y1))
+              .clamp(0, double.infinity);
+      final double inter = iw * ih;
+      if (inter <= 0) continue;
+      final double union =
+          last.w * last.h + bt.bbox.width * bt.bbox.height - inter;
+      if (union <= 0) continue;
+      final double iou = inter / union;
+      if (iou >= bestIou) {
+        bestIou = iou;
+        bestKey = e.key;
+        best = candidate;
+      }
+    }
+    final String? key = bestKey;
+    if (best == null || key == null) return null;
+    _own.remove(key);
+    _retire(key);
+    return best;
+  }
 
   /// Seeded with the labels the hazard vocabulary knows;
   /// any other label is assigned the next free id on first
@@ -163,8 +233,33 @@ class ByteTrackBackend implements Tracker {
             // reborn below with a fresh own id.
             continue;
           }
-          track = Track(id: _nextOwnId++, label: _labelFor(bt.classId));
-          _own[key] = track;
+          if (matched) {
+            // Identity migration safety net (CDX4 S1-a):
+            // if the package ever RE-KEYS a target inside
+            // the lost buffer (its association dropped the
+            // old package track and minted a new one for
+            // what is geometrically the same target), the
+            // retained own Track MOVES to the new key
+            // instead of dying with the old one -- the own
+            // id, the estimator state and the cooldown
+            // survive. The reuse conditions are strict:
+            // the candidate must be a CURRENTLY LOST own
+            // track of the same class (its key is ageing in
+            // this same update), inside the retention
+            // window, whose last observed box is compatible
+            // with the new box at the SORT association
+            // threshold (IoU >= sortIouThreshold). A
+            // crossing second target at an incompatible
+            // position never inherits the id.
+            track = _migrateCandidate(bt);
+            if (track != null) {
+              _own[key] = track;
+            }
+          }
+          if (track == null) {
+            track = Track(id: _nextOwnId++, label: _labelFor(bt.classId));
+            _own[key] = track;
+          }
           _retiredKeys.remove(key);
         }
         track.age += 1;

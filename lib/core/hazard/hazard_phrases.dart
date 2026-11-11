@@ -125,25 +125,35 @@ String metresText(double rangeM) {
   return '';
 }
 
-/// Navigation distance wording (FIX3B; thresholds in
-/// NavHazConfig): whole metres under 17 m; floored DOWN
-/// to a 10 m multiple from 17 to 100 m (a turn prompt
-/// must never name a distance LONGER than the real one
-/// by rounding up); rounded to the nearest 50 m from 100
-/// to 1000 m; "about 1 km" from 1000 to 1500 m; "about
-/// X km" (X = kilometres rounded to the nearest integer)
-/// up to 10 km; the fixed "beyond 10 km" form past that.
-/// The rounding HABITS follow OsmAnd's Chinese
-/// announcements -- rule reference only, independently
-/// implemented (OsmAnd is GPL; no code or text tables
-/// taken). Returns the announcement-ready form, leading
-/// "about" included, so templates embed it directly.
-/// NOT used by entrance guidance, which keeps its own
-/// Step D 10 m bands.
+/// Navigation distance wording (bands FIX3B; rounding
+/// FIX4-FINAL S2; thresholds in NavHazConfig): whole
+/// metres under 17 m, but never below
+/// [NavHazConfig.navMinReportedMetres] -- a sub-half-metre
+/// distance rounds to 0, and "about 0 metres" is a
+/// nonsense announcement, so the minimum readout is
+/// "about 1 metre"; NEAREST 10 m from 17 to 100 m and
+/// NEAREST 50 m from 100 to 1000 m, halves rounding UP in
+/// both bands (Dart's round() rounds halves away from
+/// zero, which on this non-negative domain IS half-up;
+/// the worst-case error is therefore 5 m / 25 m, not the
+/// almost-10 m understatement the previous floor rule
+/// allowed in the 10 m band); "about 1 km" from 1000 to
+/// 1500 m; "about X km" (X = kilometres rounded to the
+/// nearest integer) up to 10 km; the fixed "beyond 10 km"
+/// form past that. The rounding HABITS follow OsmAnd's
+/// Chinese announcements -- rule reference only,
+/// independently implemented (OsmAnd is GPL; no code or
+/// text tables taken). Returns the announcement-ready
+/// form, leading "about" included, so templates embed it
+/// directly. NOT used by entrance guidance, which keeps
+/// its own Step D 10 m bands.
 String navigationDistanceText(double d) {
-  if (d < NavHazConfig.navWholeMetresBelow) return '约${d.round()}米';
+  if (d < NavHazConfig.navWholeMetresBelow) {
+    final int whole = d.round();
+    return '约${whole < NavHazConfig.navMinReportedMetres ? NavHazConfig.navMinReportedMetres : whole}米';
+  }
   if (d < NavHazConfig.navRound50Below) {
-    return '约${(d / 10).floor() * 10}米';
+    return '约${(d / 10).round() * 10}米';
   }
   if (d < NavHazConfig.navKilometreFrom) {
     return '约${(d / 50).round() * 50}米';
@@ -156,22 +166,55 @@ String navigationDistanceText(double d) {
 }
 
 /// Every readout [navigationDistanceText] can produce,
-/// enumerated by sweeping its domain across every band
-/// (the banned-word exhaustion and the property tests
-/// consume this set).
+/// derived ANALYTICALLY from the band table (FIX4-FINAL:
+/// no input sampling of any step size -- the previous
+/// whole-metre sweep silently missed readouts that only
+/// fractional inputs reach, e.g. 16.5-16.999 m rounding
+/// to "about 17 metres"). For a band [lo, hi) whose
+/// readout is round(d / step) * step (half-up), the
+/// reachable multiples are exactly those m whose rounding
+/// interval [m - step/2, m + step/2) intersects the band;
+/// the whole-metre band's reachable integers are the
+/// clamped rounding range. The set is therefore BY
+/// CONSTRUCTION the production function's full range; the
+/// fine-grid property test in navhaz_phrases_test sweeps
+/// the production function against this set so any future
+/// drift between the two fails loudly.
 Set<String> enumerateNavigationDistanceTexts() {
   final Set<String> out = <String>{};
-  for (double d = 0; d < 100; d += 1) {
-    out.add(navigationDistanceText(d));
+  // Whole-metre band [0, navWholeMetresBelow): round(d)
+  // spans 0..navWholeMetresBelow (the top value is
+  // reached from just under the band edge), clamped
+  // below at navMinReportedMetres.
+  final int wholeTop = NavHazConfig.navWholeMetresBelow.round();
+  for (int k = NavHazConfig.navMinReportedMetres; k <= wholeTop; k++) {
+    out.add('约$k米');
   }
-  for (double d = 100; d < 1000; d += 25) {
-    out.add(navigationDistanceText(d));
+  // Stepped bands: every multiple whose half-up rounding
+  // interval intersects the band.
+  void stepped(double lo, double hi, int step, String unit) {
+    for (int m = 0; m < hi + step; m += step) {
+      if (m - step / 2 < hi && m + step / 2 > lo) {
+        out.add('约$m$unit');
+      }
+    }
   }
-  for (double d = 1000; d < 10000; d += 250) {
-    out.add(navigationDistanceText(d));
+
+  stepped(NavHazConfig.navWholeMetresBelow,
+      NavHazConfig.navRound50Below, 10, '米');
+  stepped(NavHazConfig.navRound50Below,
+      NavHazConfig.navKilometreFrom, 50, '米');
+  out.add('约1公里');
+  // Kilometre band: multiples of 1000 m with the same
+  // interval rule, rendered in kilometres.
+  for (int k = 0; k * 1000 < NavHazConfig.navFixedBeyondFrom + 1000; k++) {
+    final int m = k * 1000;
+    if (m - 500 < NavHazConfig.navFixedBeyondFrom &&
+        m + 500 > NavHazConfig.navAboutOneKmBelow) {
+      out.add('约$k公里');
+    }
   }
-  out.add(navigationDistanceText(10000));
-  out.add(navigationDistanceText(99999));
+  out.add('10公里以外');
   return out;
 }
 

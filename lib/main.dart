@@ -950,6 +950,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _yoloRiskActive = false;
   int _yoloEmptyFrames = 0;
 
+  /// FIX4-FINAL S3, segment 2 bookkeeping: hazard alert
+  /// request id -> the wall-clock moment the hazard
+  /// pipeline RETURNED for that alert's frame. Entries are
+  /// created in _onYoloDetectionsPipeline and consumed by
+  /// _trackedSpeak (which moves the stamp into
+  /// [_speakStartSegmentFrom]); the segment closes when
+  /// the TTS engine reports the utterance actually started
+  /// (SystemVoiceOutput.onSpeakStart -> _onTtsSpeakStart).
+  /// Stamps carry stage name + milliseconds only.
+  final Map<String, DateTime> _hazardSpeakSegmentStarts =
+      <String, DateTime>{};
+  DateTime? _speakStartSegmentFrom;
+
   // Blind-first voice control: the command text is a simulation of a
   // real recogniser transcript until system ASR is integrated (see
   // adapters/voice_io.dart). The last spoken prompt is kept so the
@@ -1762,7 +1775,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       chineseVoiceVerified: ttsOk && (tts?.chineseVoiceVerified ?? false),
       asrOk: asrOk,
     );
-    if (plan.speechUsable && tts != null) _voiceOutput = tts;
+    if (plan.speechUsable && tts != null) {
+      _voiceOutput = tts;
+      // FIX4-FINAL S3: the engine's speak-start callback
+      // closes the pipeline-to-speak latency segment.
+      tts.onSpeakStart = _onTtsSpeakStart;
+    }
     _health.report(
       'voice_output',
       plan.speechUsable ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
@@ -2387,8 +2405,30 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// issued within the current utterance's first moments
   /// does not let that utterance's instant completion
   /// finish the request early.
+  /// FIX4-FINAL S3: the TTS engine reports an utterance
+  /// actually STARTED (SystemVoiceOutput.onSpeakStart).
+  /// Speech is strictly serialised by the scheduler, so
+  /// the start event belongs to the request _trackedSpeak
+  /// most recently armed; close its pipeline-to-speak
+  /// segment. Stage name + milliseconds only.
+  void _onTtsSpeakStart() {
+    final DateTime? from = _speakStartSegmentFrom;
+    _speakStartSegmentFrom = null;
+    if (from == null) return;
+    final int? ms = latencySegmentMs(from, DateTime.now());
+    if (ms != null) {
+      _logMsg('NAVHAZ延迟 pipeline-to-speak ${ms}ms');
+    }
+  }
+
   Future<void> _trackedSpeak(SpeechRequest request) async {
     _lastSpeechStartedAt = DateTime.now();
+    // S3 segment 2 arming: if this request is a hazard
+    // alert, its pipeline-return stamp moves into the
+    // single start-watch slot (playback is serialised, so
+    // one slot is exact); the engine's speak-start
+    // callback closes the segment in _onTtsSpeakStart.
+    _speakStartSegmentFrom = _hazardSpeakSegmentStarts.remove(request.id);
     if (request.kind == SpeechKind.danger ||
         request.kind == SpeechKind.emergency) {
       _lastP0SpokenText = request.text;
@@ -4200,7 +4240,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// a detection box has no distance, so no left/right step is ever
   /// spoken from YOLO alone. The risk clears only after 3 consecutive
   /// frames without such a detection, and straight never auto-resumes.
-  void _onYoloDetections(List<Detection> detections) {
+  void _onYoloDetections(List<Detection> detections,
+      [DateTime? frameCapturedAt]) {
+    // Detection-CALLBACK arrival (FIX4-FINAL S3): `now` is
+    // stamped at handler entry; [frameCapturedAt] is the
+    // frame's own timestamp as stamped by the YOLO adapter
+    // at delivery (null for simulated / scripted frames,
+    // which then stamp no frame-to-callback segment).
     final DateTime now = DateTime.now();
     // Avoidance advisor bookkeeping for EVERY frame: the
     // side-clear streaks behind the three-condition rule and
@@ -4224,7 +4270,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // and the existing test harness) keep the legacy chain
     // below, unchanged.
     if (detections.any((Detection d) => d.w > 0 && d.h > 0)) {
-      _onYoloDetectionsPipeline(detections, now);
+      _onYoloDetectionsPipeline(detections, now, frameCapturedAt);
     } else {
       _onYoloDetectionsLegacy(detections, events, now);
     }
@@ -4313,10 +4359,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// what (if anything) is announced; the policy also
   /// drives the risk state (three consecutive risk-free
   /// frames clear it, same as the legacy chain).
-  void _onYoloDetectionsPipeline(List<Detection> detections, DateTime now) {
-    // End-to-end latency stamps (FIX3B): frame timestamp
-    // -> alert / pre-urgent emission, milliseconds and
-    // stage name only, through the existing app log.
+  void _onYoloDetectionsPipeline(List<Detection> detections, DateTime now,
+      DateTime? frameCapturedAt) {
+    // Latency stamps (FIX3B + FIX4-FINAL S3): the
+    // pipeline's own segment (frame -> alert / pre-urgent
+    // emission, wired through onLatency below) plus the
+    // two segments added this round -- frame-to-callback
+    // (stamped just below, on alert / pre-urgent frames)
+    // and pipeline-to-speak (its start is recorded below;
+    // it closes at the TTS engine's speak-start callback,
+    // see _onTtsSpeakStart). Milliseconds and stage name
+    // only, through the existing app log.
     _hazardPipeline.onLatency ??=
         (String stage, int ms) => _logMsg('NAVHAZ延迟 $stage ${ms}ms');
     final bool navigating = _tasks.state == TaskState.navigating ||
@@ -4333,6 +4386,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       ego: _egoMotionNow(now),
       commit: navigating,
     );
+    // S3 segment 2 START: the pipeline has returned.
+    final DateTime pipelineReturnedAt = DateTime.now();
+    // S3 segment 1: frame timestamp -> detection-callback
+    // arrival (`now`, stamped at _onYoloDetections entry).
+    // Only frames the adapter actually stamped carry a
+    // segment (simulated frames pass null), and only
+    // alert / pre-urgent frames stamp it, like the
+    // pipeline's own segment.
+    if (frameCapturedAt != null &&
+        (result.alert != null || result.preUrgentTrackIds.isNotEmpty)) {
+      final int? segment1 = latencySegmentMs(frameCapturedAt, now);
+      if (segment1 != null) {
+        _logMsg('NAVHAZ延迟 frame-to-callback ${segment1}ms');
+      }
+    }
     // Pre-emptive urgent vibration (FIX3B): the urgent
     // vibration fires the moment tau_now crosses the
     // pre-vibration threshold, BEFORE urgent confirmation;
@@ -4381,9 +4449,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         unawaited(_triggerHazardScan(VisionTrigger.yoloHazard));
       }
     }
+    final String requestId = 'navhaz-${alert.urgent ? 'urgent' : 'warning'}-'
+        '${now.millisecondsSinceEpoch}';
+    // S3 segment 2: remember when the pipeline returned
+    // for THIS alert; _trackedSpeak picks the stamp up
+    // when the request starts playing and the engine's
+    // speak-start callback closes the segment.
+    _hazardSpeakSegmentStarts[requestId] = pipelineReturnedAt;
     _say(_request(
-      id: 'navhaz-${alert.urgent ? 'urgent' : 'warning'}-'
-          '${now.millisecondsSinceEpoch}',
+      id: requestId,
       eventId: 'navhaz-track-${alert.trackId}',
       text: '$text。',
       kind: alert.speechKind,

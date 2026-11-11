@@ -195,12 +195,21 @@ void main() {
       // Navigation bands.
       expect(navigationDistanceText(12), '约12米');
       expect(navigationDistanceText(16.6), '约17米');
-      expect(navigationDistanceText(29.5), '约20米',
-          reason: '17-100 m floors DOWN to a 10 m '
-              'multiple (a turn prompt never names a '
-              'distance longer than the real one)');
-      expect(navigationDistanceText(35), '约30米');
-      expect(navigationDistanceText(99), '约90米');
+      expect(navigationDistanceText(29.5), '约30米',
+          reason: 'S2 acceptance point (FIX4-FINAL): '
+              '17-100 m rounds to the NEAREST 10 m, '
+              'halves up -- 29.5 -> 30 (the FIX3B floor '
+              'rule read 20 here)');
+      expect(navigationDistanceText(24.9), '约20米',
+          reason: 'S2 acceptance point: just under the '
+              '25 m midpoint rounds down to 20');
+      expect(navigationDistanceText(25), '约30米',
+          reason: 'S2 acceptance point: exactly on the '
+              'midpoint, half-up -> 30');
+      expect(navigationDistanceText(35), '约40米',
+          reason: '35 is the 30/40 midpoint: half-up '
+              'gives 40 under S2 (the floor rule gave 30)');
+      expect(navigationDistanceText(99), '约100米');
       expect(navigationDistanceText(100), '约100米');
       expect(navigationDistanceText(120), '约100米');
       expect(navigationDistanceText(130), '约150米',
@@ -215,19 +224,68 @@ void main() {
       expect(navigationDistanceText(10000), '10公里以外');
     });
 
-    test('property: large distances land in the enumerated '
-        'sets, both wordings (FIX3B)', () {
+    test('minimum readout: sub-half-metre never says '
+        'about-0-metres (FIX4-FINAL)', () {
+      final Set<String> navSet = enumerateNavigationDistanceTexts();
+      for (final double d in <double>[0, 0.1, 0.49]) {
+        expect(navigationDistanceText(d), '约1米',
+            reason: 'd=$d rounds to 0 whole metres; the '
+                'readout clamps at navMinReportedMetres '
+                'instead of announcing "about 0 metres"');
+        expect(navSet.contains(navigationDistanceText(d)), isTrue,
+            reason: 'the clamped readout is in the '
+                'analytic enumeration');
+      }
+      expect(navigationDistanceText(0.5), '约1米',
+          reason: 'the 0.5 boundary follows round() '
+              'semantics (half away from zero): 0.5 -> 1, '
+              'the clamp is not even needed');
+      expect(navSet.contains('约0米'), isFalse,
+          reason: 'the analytic set has no about-0 readout');
+    });
+
+    test('property: fine grid lands in the ANALYTIC '
+        'enumerated set (FIX4-FINAL)', () {
+      // The enumeration is derived from the band table
+      // analytically (no input sampling); this sweep is
+      // the drift guard between it and the production
+      // function. Grid steps are FINER than each band's
+      // smallest rounding granularity (1 m in the
+      // whole-metre band, so the 0.01 step crosses every
+      // rounding boundary; the coarser bands keep a 1 m
+      // step, still finer than their 10/50/1000 m
+      // granularities), and every band edge is probed at
+      // +/- 0.001 explicitly below via the boundary
+      // samples in the samples list.
       final Set<String> navSet = enumerateNavigationDistanceTexts();
       final Set<String> hazardReachable = reachableMetresTexts();
-      final List<double> samples = <double>[105, 1234, 99999];
+      void check(double d) {
+        final String out = navigationDistanceText(d);
+        expect(navSet.contains(out), isTrue,
+            reason: 'navigation wording for $d m ("$out") '
+                'is in the analytic enumeration');
+        expect(containsBannedWord(out), isFalse,
+            reason: 'no banned word in the SAMPLED output '
+                'for $d m, not just in the enumerated set');
+      }
+
+      for (double d = 0; d <= 200; d += 0.01) {
+        check(d);
+      }
+      for (double d = 200; d <= 12000; d += 1) {
+        check(d);
+      }
+      final List<double> samples = <double>[
+        16.999, 17, 17.001, 99.999, 100, 100.001,
+        999.999, 1000, 1499.999, 1500, 9999.999, 10000,
+        1234, 99999,
+      ];
       final Random rng = Random(20261111);
       for (int i = 0; i < 24; i++) {
         samples.add(100 + rng.nextDouble() * 200000);
       }
       for (final double d in samples) {
-        expect(navSet.contains(navigationDistanceText(d)), isTrue,
-            reason: 'navigation wording for $d m is enumerated');
-        expect(containsBannedWord(navigationDistanceText(d)), isFalse);
+        check(d);
         final String hazard = metresText(d);
         expect(hazard.isEmpty || hazardReachable.contains(hazard),
             isTrue,
@@ -237,7 +295,7 @@ void main() {
       }
       // Every enumerated navigation readout is itself
       // banned-word free (the navigation space joins the
-      // section 2.7.10 exhaustion this round).
+      // section 2.7.10 exhaustion).
       for (final String text in navSet) {
         expect(containsBannedWord(text), isFalse, reason: text);
       }

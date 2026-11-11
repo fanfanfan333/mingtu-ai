@@ -37,10 +37,22 @@ static const int confirmFrames = 3;
 /// kept for velocity / TTC estimation. (Spec value.)
 static const int sampleBufferFrames = 30;
 
-/// A lost track keeps its ID for this many frames before it
-/// is retired (a reappearing target within the window is
-/// the same target, not a new one). (Spec value.)
-static const int lostRetentionFrames = 5;
+/// Lost-track buffer (CDX4 S1-a): how long a target may
+/// vanish and STILL come back as the same track. The time
+/// form is the ruling: about one second. The frame form
+/// below is that second expressed at the nominal frame
+/// interval (10 FPS): retention is counted in MISSED
+/// FRAMES (the pipeline's frame clock), so at the nominal
+/// rate the two agree; the frame count is what both
+/// backends enforce.
+static const double lostTrackBufferSeconds = 1.0;
+
+/// A lost track keeps its ID for this many frames before
+/// it is retired (a reappearing target within the window
+/// is the same target, not a new one). = the
+/// [lostTrackBufferSeconds] buffer at the nominal 10 FPS
+/// frame interval (10 x 100 ms = 1.0 s).
+static const int lostRetentionFrames = 10;
 
 /// Detections below this confidence never enter tracking
 /// (mirrors the long-standing VisualPerception default).
@@ -55,8 +67,8 @@ static const double minDetectionConfidence = 0.3;
 /// recent [retiredKeyCap] retirements -- in exchange the
 /// set cannot grow without bound on a long-running camera
 /// session (each retirement is one target that left and
-/// stayed gone > 5 frames; 1024 of them is far beyond a
-/// realistic single-session count).
+/// stayed gone past the ~1 s lost-track buffer; 1024 of
+/// them is far beyond a realistic single-session count).
 static const int retiredKeyCap = 1024;
 
 /// SORT fallback association threshold (IoU).
@@ -292,12 +304,20 @@ static const double nearWordingRangeM = 5.0;
 /// by navigationDistanceText for turn prompts and route
 /// announcements -- NOT by entrance guidance, which
 /// keeps its own Step D 10 m bands.
-///   d < navWholeMetresBelow   -> whole metres
-///   d < navRound50Below       -> floored to 10 m
-///   d < navKilometreFrom      -> rounded to 50 m
+///   d < navWholeMetresBelow   -> whole metres (never
+///                                  below
+///                                  [navMinReportedMetres])
+///   d < navRound50Below       -> nearest 10 m (half up;
+///                                  max error 5 m)
+///   d < navKilometreFrom      -> nearest 50 m (half up)
 ///   d < navAboutOneKmBelow    -> "about 1 km"
 ///   d < navFixedBeyondFrom    -> "about X km"
 ///   d >= navFixedBeyondFrom   -> fixed "beyond 10 km"
+/// The 17-100 m band rounded DOWN (floor) until the
+/// FIX4-FINAL ruling (S2): a floored readout could
+/// understate by almost 10 m; nearest-with-half-up caps
+/// the error at 5 m either way.
+static const int navMinReportedMetres = 1;
 static const double navWholeMetresBelow = 17;
 static const double navRound50Below = 100;
 static const double navKilometreFrom = 1000;

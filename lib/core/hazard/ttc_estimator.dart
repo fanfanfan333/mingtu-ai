@@ -236,12 +236,28 @@ class TrackEstimate {
   /// The URGENT judgement's TTC (FIX3B): the agile tier's
   /// one-step PREDICTED TTC (fused like [ttcS] when the
   /// ego speed is known, scale-only when it is not) minus
-  /// [NavHazConfig.pipelineLatencyS]. Null when no
-  /// predicted leg is usable. ONLY the urgent branches of
-  /// the policy read this; warnings and every other
-  /// consumer keep the normal-tier [ttcS] / [ttcScaleS],
-  /// so the prediction can never pull a warning early.
+  /// [NavHazConfig.pipelineLatencyS], PUBLISHED through
+  /// the persistence guard (three consecutive in-band
+  /// estimates). Null when no predicted leg is usable.
+  /// ONLY the urgent branches of the policy read this;
+  /// warnings and every other consumer keep the
+  /// normal-tier [ttcS] / [ttcScaleS], so the prediction
+  /// can never pull a warning early.
   final double? ttcUrgentS;
+
+  /// The same urgent TTC BEFORE the persistence guard:
+  /// this frame's own tau_now, available from the first
+  /// frame the agile tier produces one (FIX4-FINAL dual
+  /// reading surfaces). ONLY the pre-urgent VIBRATION
+  /// reads this: a fast-approaching target's first frames
+  /// carry a genuinely low tau that the guard has not
+  /// published yet, and the vibration -- cheap, revocable,
+  /// never speech -- must not wait for publication. The
+  /// urgent SPEECH never reads it: speech stays on the
+  /// guard-published [ttcUrgentS] plus confirmation,
+  /// unpromoted. Hand-built estimates leave it null and
+  /// consumers fall back to [ttcUrgentS].
+  final double? ttcUrgentRawS;
 
   const TrackEstimate({
     required this.track,
@@ -254,6 +270,7 @@ class TrackEstimate {
     required this.willHit,
     required this.cxVelocity,
     this.ttcUrgentS,
+    this.ttcUrgentRawS,
     this.ttcDisagreement = false,
     this.egoSpeedKnown = true,
     this.scaleRate = 0,
@@ -573,6 +590,7 @@ class TtcEstimator {
       willHit: willHit,
       cxVelocity: cxVel,
       ttcUrgentS: ttcUrgent,
+      ttcUrgentRawS: tauNowRaw,
       ttcDisagreement: disagreement,
       egoSpeedKnown: ego.speedKnown,
       scaleRate: scaleV,

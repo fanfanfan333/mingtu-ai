@@ -1030,109 +1030,294 @@ void main() {
               'the warning latch is still open');
     });
 
-    test('pre-urgent vibration: tau_now < 1.5 before '
-        'confirmation vibrates once, speech waits for '
-        'confirmation (pipeline timeline)', () {
-      // Sparse hits (frames 0, 3, 6, 9, 12, 13): each hit
-      // is isolated by two misses, so the 2-of-3 window
-      // never confirms -- until the back-to-back hit at
-      // frame 13. The box grows across the gaps (x1.25 a
-      // gap, faster at the end): the agile seed promotes
-      // at the 3rd estimate, the raw tau_now runs in-band
-      // from then, the jitter guard issues it at the 3rd
-      // consecutive in-band estimate (frame 12, issued
-      // tau 1.42 < 1.5), and the track is STILL
-      // unconfirmed there -- that is the pre-urgent
-      // frame. Measured on the SORT backend: the
-      // ByteTrack backend re-ids a target that vanishes
-      // for two frames (its internal association drops
-      // the track), so a sparse-reappearance scenario
-      // cannot develop estimator state there -- a
-      // pre-existing backend difference, recorded in the
-      // FIX3B report; the mechanism itself is one code
-      // path for both backends.
-      final HazardPipeline pipeline =
-          HazardPipeline(tracker: trackerForBackend('sort'));
-      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
-      Detection car(double s) => Detection(
-          label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s);
-      final Map<int, List<Detection>> frames = <int, List<Detection>>{
-        0: <Detection>[car(0.30)],
-        3: <Detection>[car(0.375)],
-        6: <Detection>[car(0.47)],
-        9: <Detection>[car(0.59)],
-        12: <Detection>[car(0.80)],
-        13: <Detection>[car(0.95)],
-      };
-      int preUrgentAt = -1;
-      int urgentSpeechAt = -1;
-      for (int i = 0; i <= 13; i++) {
-        final HazardPipelineResult r = pipeline.processFrame(
-          frames[i] ?? const <Detection>[],
-          epoch.add(Duration(milliseconds: i * 100)),
-          pitchDeg: null,
-          ego: EgoMotion.unknown,
-        );
-        if (r.preUrgentTrackIds.isNotEmpty && preUrgentAt < 0) {
-          preUrgentAt = i;
+    for (final String backend in kBackends) {
+      test('$backend pre-urgent vibration: sparse '
+          'reappearance walks through on BOTH backends '
+          '(CDX4 S1-a)', () {
+        // Sparse hits (frames 0, 3, 6, 9, 12, 13): each
+        // hit is isolated by two misses, so the 2-of-3
+        // window never confirms -- until the back-to-back
+        // hit at frame 13. The box grows across the gaps
+        // (x1.25 a gap, faster at the end): the agile seed
+        // promotes at the 3rd estimate, the raw tau_now
+        // runs in-band from then, the jitter guard issues
+        // it at the 3rd consecutive in-band estimate
+        // (frame 12, issued tau 1.42 < 1.5), and the track
+        // is STILL unconfirmed there -- that is the
+        // pre-urgent frame.
+        //
+        // History: in the FIX3B round this test ran on
+        // SORT only, because the ByteTrack backend re-idd
+        // a target that vanished for two frames (the
+        // package deleted its still-tentative track, so
+        // no estimator state could develop). CDX4 S1-a
+        // fixed the root cause (package minHits 1 +
+        // the ~1 s buffer at every layer), and the
+        // scenario now walks through IDENTICALLY on the
+        // default backend: pre-urgent at 12, urgent
+        // speech at 13, one track id throughout.
+        final HazardPipeline pipeline =
+            HazardPipeline(tracker: trackerForBackend(backend));
+        final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+        Detection car(double s) => Detection(
+            label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s);
+        final Map<int, List<Detection>> frames = <int, List<Detection>>{
+          0: <Detection>[car(0.30)],
+          3: <Detection>[car(0.375)],
+          6: <Detection>[car(0.47)],
+          9: <Detection>[car(0.59)],
+          12: <Detection>[car(0.80)],
+          13: <Detection>[car(0.95)],
+        };
+        int preUrgentAt = -1;
+        int urgentSpeechAt = -1;
+        final Set<int> ids = <int>{};
+        for (int i = 0; i <= 13; i++) {
+          final HazardPipelineResult r = pipeline.processFrame(
+            frames[i] ?? const <Detection>[],
+            epoch.add(Duration(milliseconds: i * 100)),
+            pitchDeg: null,
+            ego: EgoMotion.unknown,
+          );
+          for (final TrackEstimate e in r.estimates) {
+            ids.add(e.track.id);
+          }
+          if (r.preUrgentTrackIds.isNotEmpty && preUrgentAt < 0) {
+            preUrgentAt = i;
+          }
+          if (r.alert != null && r.alert!.urgent && urgentSpeechAt < 0) {
+            urgentSpeechAt = i;
+          }
+          if (i < 13) {
+            expect(r.alert, isNull,
+                reason: 'frame $i: no speech of any level '
+                    'before urgent confirmation (the sparse '
+                    'hits never confirm the warning tier '
+                    'either)');
+          }
         }
-        if (r.alert != null && r.alert!.urgent && urgentSpeechAt < 0) {
-          urgentSpeechAt = i;
-        }
-        if (i < 13) {
-          expect(r.alert, isNull,
-              reason: 'frame $i: no speech of any level '
-                  'before urgent confirmation (the sparse '
-                  'hits never confirm the warning tier '
-                  'either)');
-        }
-      }
-      expect(preUrgentAt, 12,
-          reason: 'frame 12: tau_now issued below 1.5 '
-              'with the track still unconfirmed -> the '
-              'pre-urgent vibration fires (and only there)');
-      expect(urgentSpeechAt, 13,
-          reason: 'frame 13: the back-to-back hit '
-              'confirms (2-of-3), the urgent speaks AFTER '
-              'the vibration on the timeline');
-    });
+        expect(ids, hasLength(1),
+            reason: 'the sparse target keeps ONE id on '
+                '$backend (the S1-a regression)');
+        expect(preUrgentAt, 12,
+            reason: 'frame 12: tau_now issued below 1.5 '
+                'with the track still unconfirmed -> the '
+                'pre-urgent vibration fires (and only there)');
+        expect(urgentSpeechAt, 13,
+            reason: 'frame 13: the back-to-back hit '
+                'confirms (2-of-3), the urgent speaks AFTER '
+                'the vibration on the timeline');
+      });
 
-    test('pre-urgent one-shot: without confirmation the '
-        'speech is never made up', () {
-      final HazardPipeline pipeline =
-          HazardPipeline(tracker: trackerForBackend('sort'));
-      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
-      Detection car(double s) => Detection(
-          label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s);
-      // Same sparse dive as above through frame 12 (the
-      // pre-urgent fires), then the track VANISHES for
-      // good: no urgent speech may ever follow.
-      final Map<int, List<Detection>> frames = <int, List<Detection>>{
-        0: <Detection>[car(0.30)],
-        3: <Detection>[car(0.375)],
-        6: <Detection>[car(0.47)],
-        9: <Detection>[car(0.59)],
-        12: <Detection>[car(0.80)],
-      };
-      int preCount = 0;
-      for (int i = 0; i <= 16; i++) {
-        final HazardPipelineResult r = pipeline.processFrame(
-          frames[i] ?? const <Detection>[],
-          epoch.add(Duration(milliseconds: i * 100)),
-          pitchDeg: null,
-          ego: EgoMotion.unknown,
-        );
-        preCount += r.preUrgentTrackIds.length;
-        expect(r.alert, isNull,
-            reason: 'frame $i: confirmation never arrives, '
-                'so the urgent speech is never made up '
-                '(the spent vibration is the accepted '
-                'false-alarm cost)');
+      test('$backend pre-urgent one-shot: without '
+          'confirmation the speech is never made up', () {
+        final HazardPipeline pipeline =
+            HazardPipeline(tracker: trackerForBackend(backend));
+        final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+        Detection car(double s) => Detection(
+            label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s);
+        // Same sparse dive as above through frame 12 (the
+        // pre-urgent fires), then the track VANISHES for
+        // good: no urgent speech may ever follow.
+        final Map<int, List<Detection>> frames = <int, List<Detection>>{
+          0: <Detection>[car(0.30)],
+          3: <Detection>[car(0.375)],
+          6: <Detection>[car(0.47)],
+          9: <Detection>[car(0.59)],
+          12: <Detection>[car(0.80)],
+        };
+        int preCount = 0;
+        for (int i = 0; i <= 16; i++) {
+          final HazardPipelineResult r = pipeline.processFrame(
+            frames[i] ?? const <Detection>[],
+            epoch.add(Duration(milliseconds: i * 100)),
+            pitchDeg: null,
+            ego: EgoMotion.unknown,
+          );
+          preCount += r.preUrgentTrackIds.length;
+          expect(r.alert, isNull,
+              reason: 'frame $i: confirmation never arrives, '
+                  'so the urgent speech is never made up '
+                  '(the spent vibration is the accepted '
+                  'false-alarm cost)');
+        }
+        expect(preCount, 1,
+            reason: 'exactly one pre-urgent vibration for '
+                'the whole unbroken condition run');
+      });
+    }
+
+    for (final String backend in kBackends) {
+      for (final double bigT in <double>[1.0, 0.9]) {
+        test('$backend fast approach (start TTC $bigT s, '
+            'ego UNKNOWN): pre-urgent reads the RAW frame '
+            'estimate (FIX4-FINAL dual surfaces)', () {
+          // Pure scale dive, pitch unknown: s(t) =
+          // s0*T/(T-t) has true scale TTC (T - t) from the
+          // first frame. The persistence guard cannot have
+          // published tau by frame 2 (it needs three
+          // in-band estimates), yet the RAW agile tau_now
+          // is already < 1.5 s there -- the pre-urgent
+          // vibration reads THAT surface and fires at
+          // frame 2 (<= the 3-frame cap). The urgent
+          // SPEECH on this path lands the same frame via
+          // the scale path's NORMAL-ttcS band (ttcS is
+          // already <= 3 s with urgent confirmation) --
+          // never via the raw surface; inside the frame,
+          // _onYoloDetectionsPipeline dispatches the
+          // pre-urgent vibrations BEFORE the alert speech,
+          // so on the real timeline vibration still
+          // strictly precedes speech.
+          final HazardPipeline pipeline =
+              HazardPipeline(tracker: trackerForBackend(backend));
+          final DateTime epoch =
+              DateTime.fromMillisecondsSinceEpoch(0);
+          Detection dive(double t) {
+            final double s = 0.30 * bigT / (bigT - t);
+            return Detection(
+                label: 'car',
+                confidence: 0.9,
+                cx: 0.5,
+                cy: 0.55,
+                w: s,
+                h: s);
+          }
+
+          int preAt = -1;
+          int urgAt = -1;
+          for (int i = 0; i <= 8; i++) {
+            final double t = i * 0.1;
+            final HazardPipelineResult r = pipeline.processFrame(
+              t < bigT - 0.05
+                  ? <Detection>[dive(t)]
+                  : const <Detection>[],
+              epoch.add(Duration(milliseconds: i * 100)),
+              pitchDeg: null,
+              ego: EgoMotion.unknown,
+            );
+            if (r.preUrgentTrackIds.isNotEmpty && preAt < 0) {
+              preAt = i;
+            }
+            if (r.alert != null && r.alert!.urgent && urgAt < 0) {
+              urgAt = i;
+            }
+          }
+          expect(preAt, 2,
+              reason: 'the raw current-frame tau_now '
+                  '(< 1.5 s from frame 2) fires the '
+                  'vibration inside the first three frames '
+                  '-- the guard-published value does not '
+                  'exist yet at that point');
+          expect(urgAt, 2,
+              reason: 'urgent speech follows through the '
+                  'existing published/normal surfaces, '
+                  'dispatched after the vibration in the '
+                  'same frame');
+          expect(preAt, lessThanOrEqualTo(urgAt));
+        });
       }
-      expect(preCount, 1,
-          reason: 'exactly one pre-urgent vibration for '
-              'the whole unbroken condition run');
-    });
+
+      test('$backend fast approach (start TTC 1.0 s, ego '
+          'KNOWN): vibration strictly precedes speech by '
+          'frames (FIX4-FINAL dual surfaces)', () {
+        // Ranged geometry (carAt: scale and ground plane
+        // agree), walking user. The known-ego urgent
+        // branches read ONLY the guard-published tau:
+        // raw tau_now is in-band from frame 2 but the
+        // guard publishes at the 3rd consecutive in-band
+        // estimate, so speech lands at frame 4 while the
+        // vibration -- reading the raw surface -- fired
+        // at frame 2. The two frame numbers ARE the dual
+        // reading surfaces made visible.
+        final HazardPipeline pipeline =
+            HazardPipeline(tracker: trackerForBackend(backend));
+        final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+        int preAt = -1;
+        int urgAt = -1;
+        for (int i = 0; i <= 8; i++) {
+          final double t = i * 0.1;
+          final double z = 6.0 * (1.0 - t);
+          final HazardPipelineResult r = pipeline.processFrame(
+            z > 0.6 ? <Detection>[carAt(z)] : const <Detection>[],
+            epoch.add(Duration(milliseconds: i * 100)),
+            pitchDeg: 10,
+            ego: EgoMotion.judge(gpsSpeedMps: 1.2),
+          );
+          if (r.preUrgentTrackIds.isNotEmpty && preAt < 0) {
+            preAt = i;
+          }
+          if (r.alert != null && r.alert!.urgent && urgAt < 0) {
+            urgAt = i;
+          }
+        }
+        expect(preAt, 2,
+            reason: 'raw tau_now < 1.5 s at frame 2: the '
+                'vibration fires on the current-frame '
+                'estimate');
+        expect(urgAt, 4,
+            reason: 'the speech waits for the '
+                'guard-published tau (3rd consecutive '
+                'in-band estimate) -- it does NOT follow '
+                'the raw surface down');
+        expect(preAt, lessThan(urgAt),
+            reason: 'vibration strictly before speech');
+      });
+
+      test('$backend cooldown survives a 2-frame gap '
+          'after the urgent (CDX4 S1-a regression)', () {
+        // Scenario (2) geometry (Z 12 -> 2 m at 2.5 m/s,
+        // still user): find the urgent frame on a clean
+        // run, then re-run with the target VANISHED for
+        // the two frames right after the urgent and back
+        // for six more. With the id (and with it the
+        // estimator state and the cooldown) intact, the
+        // reappeared target produces NO second urgent
+        // inside the cooldown; the window after the gap
+        // is kept short enough that neither the cooldown
+        // expiry (4 s) nor the 40% TTC-drop exception can
+        // legitimately re-arm it.
+        List<Detection?> frames({Set<int> gap = const <int>{}}) =>
+            <Detection?>[
+              for (int i = 0; i <= 40; i++)
+                gap.contains(i) ? null : carAt(12.0 - 0.25 * i),
+            ];
+        final EgoRun clean =
+            runEgo(backend, frames(), EgoMotion.still);
+        final int uIdx = clean.alerts
+            .indexWhere((HazardAlert a) => a.urgent);
+        expect(uIdx, greaterThanOrEqualTo(0),
+            reason: 'the clean run urgents (scenario 2)');
+        final int uFrame = clean.alertFrames[uIdx];
+        final int uTrackId = clean.alerts[uIdx].trackId;
+        final List<Detection?> gappedAll =
+            frames(gap: <int>{uFrame + 1, uFrame + 2});
+        final EgoRun gapped = runEgo(
+          backend,
+          gappedAll.sublist(0, uFrame + 9),
+          EgoMotion.still,
+        );
+        final List<HazardAlert> urgents =
+            gapped.alerts.where((HazardAlert a) => a.urgent).toList();
+        expect(urgents, hasLength(1),
+            reason: 'exactly one urgent across the gap: '
+                'the cooldown is keyed by the SURVIVING '
+                'track id, not restarted by the '
+                'reappearance');
+        expect(urgents.single.trackId, uTrackId);
+        // One estimate per present frame in frame order
+        // (single-target scenario), so the estimates
+        // after the gap are a plain tail slice: frames
+        // uFrame+3 .. uFrame+8 are the last six entries.
+        final List<TrackEstimate> afterGap =
+            gapped.estimates.sublist(gapped.estimates.length - 6);
+        expect(afterGap, hasLength(6));
+        for (final TrackEstimate e in afterGap) {
+          expect(e.track.id, uTrackId,
+              reason: 'the reappeared target keeps its '
+                  'pre-gap id');
+        }
+      });
+    }
 
     test('main wiring: pre-urgent ids vibrate without '
         'speech; latency stamps wired', () {
@@ -1141,8 +1326,21 @@ void main() {
           reason: 'the app consumes the pipeline\'s '
               'pre-urgent set');
       expect(src.contains('_hazardPipeline.onLatency'), isTrue,
-          reason: 'the end-to-end latency stamp is wired '
-              'to the app log');
+          reason: 'the pipeline-segment latency stamp is '
+              'wired to the app log (kept, FIX4-FINAL S3)');
+      expect(src.contains('frame-to-callback'), isTrue,
+          reason: 'S3 segment 1 (frame timestamp -> '
+              'detection callback) is stamped');
+      expect(src.contains('pipeline-to-speak'), isTrue,
+          reason: 'S3 segment 2 (pipeline return -> TTS '
+              'speak start) is stamped');
+      expect(src.contains('onSpeakStart'), isTrue,
+          reason: 'segment 2 closes on the engine\'s '
+              'speak-start callback, not on the speak() '
+              'call');
+      expect(src.contains('latencySegmentMs'), isTrue,
+          reason: 'both segments use the shared, '
+              'unit-tested segment helper');
     });
 
     for (final String backend in kBackends) {

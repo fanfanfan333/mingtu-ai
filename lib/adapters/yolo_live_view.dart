@@ -21,11 +21,16 @@ import 'yolo_live_view_stub.dart'
     if (dart.library.io) 'yolo_live_view_mobile.dart' as impl;
 
 /// A live YOLO camera view. [onDetections] fires per frame with the
-/// mapped detections; [onLatencyMs] reports the frame processing
+/// mapped detections and the frame's app-side timestamp (stamped
+/// by the adapter the moment the plugin delivers the frame's
+/// results -- the plugin exposes no capture timestamp; the stamp
+/// is the start point of the frame-to-callback latency segment,
+/// FIX4-FINAL S3); [onLatencyMs] reports the frame processing
 /// time in milliseconds when the plugin provides it.
 class YoloLiveView extends StatelessWidget {
   final String modelPath;
-  final void Function(List<Detection> detections) onDetections;
+  final void Function(List<Detection> detections, DateTime frameCapturedAt)
+      onDetections;
   final void Function(double latencyMs)? onLatencyMs;
   final void Function(Object error)? onError;
 

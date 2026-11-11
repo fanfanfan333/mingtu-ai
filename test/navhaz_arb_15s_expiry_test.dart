@@ -432,26 +432,30 @@ void main() {
       expect(idxOf('speak:右转'), greaterThanOrEqualTo(0),
           reason: 'timeline: ${timeline()}');
       // A warning interrupts it. While the warning plays,
-      // the freshest fix reads ~35 m out (successive GPS
-      // fixes vary; the regeneration honestly uses the
-      // LATEST fix). When the warning finishes, the
-      // arbitration regenerates the turn from that fix --
-      // and under the FIX3B navigation bands 35 m floors
-      // to the 30 m readout, so THAT distance-form prompt,
-      // 「前方约30米右转」, is what is playing when the
-      // urgent alert arrives. (Construction note: in this
-      // codebase the distance form is produced by the
-      // regeneration path, so the scenario stages it
-      // through one interruption; the victim prompt below
-      // is the literal spec text. The pre-FIX3B staging
-      // regenerated from the 29.5 m fix itself, whose
-      // rounded readout was also 30 m; the band change is
-      // what moved the staging fix, not the victim text.)
+      // the freshest fix reads ~29.5 m out (the
+      // regeneration honestly uses the LATEST fix). When
+      // the warning finishes, the arbitration regenerates
+      // the turn from that fix -- and under the
+      // FIX4-FINAL S2 navigation bands 29.5 m rounds
+      // half-up to the NEAREST 10 m, the 30 m readout, so
+      // THAT distance-form prompt, 「前方约30米右转」, is
+      // what is playing when the urgent alert arrives.
+      // (Construction note: in this codebase the distance
+      // form is produced by the regeneration path, so the
+      // scenario stages it through one interruption; the
+      // victim prompt below is the literal spec text.
+      // Staging history: the pre-FIX3B text came from the
+      // whole-metre readout of the 29.5 m fix itself;
+      // FIX3B staged 35 m because its FLOOR rule read
+      // 35 -> 30; S2's half-up rule reads 35 -> 40, so
+      // the staging fix is 29.5 m again -- the same value
+      // as the S2 acceptance point 29.5 -> 「约30米」.
+      // The victim text never changed.)
       feedStaticPerson(h);
       await pumpFrames(tester);
       expect(idxOf('speak:注意，前方有行人。'), greaterThanOrEqualTo(0),
           reason: 'timeline: ${timeline()}');
-      h.debugLiveFix(southOfB(35), 5);
+      h.debugLiveFix(southOfB(29.5), 5);
       await pumpFrames(tester);
       await completeSpeak(tester, 'speak:注意，前方有行人。');
       final int promptIdx = idxOf('speak:前方约30米右转');

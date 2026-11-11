@@ -10,7 +10,8 @@ import '../modules/visual_perception.dart';
 
 Widget buildYoloLiveView({
   required String modelPath,
-  required void Function(List<Detection> detections) onDetections,
+  required void Function(List<Detection> detections, DateTime frameCapturedAt)
+      onDetections,
   void Function(double latencyMs)? onLatencyMs,
   void Function(Object error)? onError,
 }) {
