@@ -41,6 +41,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.2"
+  byte_track_dart:
+    dependency: "direct main"
+    description:
+      name: byte_track_dart
+      sha256: "82de3284802be7fa77a60cbb2deac3dab4101ef541d78ce7f0768b3117fb34f3"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.4.0"
   camera:
     dependency: "direct main"
     description:

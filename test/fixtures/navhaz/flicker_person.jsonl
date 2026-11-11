@@ -1,0 +1,30 @@
+{"t_ms": 0, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 100, "dets": [], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 200, "dets": [], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 300, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 400, "dets": [], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 500, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 600, "dets": [], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 700, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 800, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 900, "dets": [], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1000, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1100, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1200, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1300, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1400, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1500, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1600, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1700, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1800, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 1900, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2000, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2100, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2200, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2300, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2400, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2500, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2600, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2700, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2800, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}
+{"t_ms": 2900, "dets": [{"label": "person", "conf": 0.9, "cx": 0.5, "cy": 0.55, "w": 0.2, "h": 0.4}], "pitch_deg": 10.0, "ego": "still", "gps_speed": 0.0, "expect": "0 alerts before t=1200; exactly 1 W at t=1200"}

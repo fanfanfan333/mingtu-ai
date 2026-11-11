@@ -21,6 +21,8 @@ library;
 
 import '../adapters/amap_client.dart';
 import '../modules/map_navigation.dart';
+import 'hazard/hazard_phrases.dart';
+import 'navhaz_config.dart';
 import 'real_navigation.dart' show haversineMeters;
 
 class NavFix {
@@ -114,6 +116,17 @@ class NavigationTracker {
   DateTime? _lastWeakAt;
   int _offRouteStreak = 0;
   bool _offRouteAnnounced = false;
+
+  /// Steps whose turn-ahead event has been EMITTED by
+  /// [onFix]. This is a spam guard (one event per step, not
+  /// one per fix) -- it does NOT mean the user heard the
+  /// prompt: a hazard announcement can interrupt the speech
+  /// after the event fired. The pre-M1 defect was treating
+  /// this set as "announced, done": an interrupted turn was
+  /// lost forever. Recovery now lives in the speech
+  /// arbitration: the interrupted request is replayed via
+  /// [regenerateTurnPrompt], which deliberately does NOT
+  /// consult this set.
   final Set<int> _turnsAnnounced = <int>{};
 
   NavigationTracker({
@@ -144,6 +157,52 @@ class NavigationTracker {
   }
 
   int get totalPoints => _points.length;
+
+  /// NAVHAZ M1 arbitration (spec section 2.6): regenerate an
+  /// interrupted turn-ahead prompt for [stepIndex] from the
+  /// LATEST fix -- the distance is recomputed against the
+  /// step's start point, never copied from the interrupted
+  /// text. Returns null (drop the replay) when:
+  /// - the trip already handed over (arrived), or the index
+  ///   names no step / no step text;
+  /// - the user has already entered a LATER step, or their
+  ///   nearest route point lies beyond the step's start
+  ///   point: the intersection is behind them;
+  /// - they are already within
+  ///   [NavHazConfig.replayMinDistanceM] of the start point:
+  ///   a fresh distance call-out is pointless at the kerb.
+  ///
+  /// Note the "passed" test is currentStepIndex > stepIndex,
+  /// not >=: [onFix] parks currentStepIndex AT the announced
+  /// step when the turn event fires, so equality means "in
+  /// the announcement zone of that very intersection", which
+  /// is exactly the case a regeneration exists for.
+  String? regenerateTurnPrompt(int stepIndex, NavFix latestFix) {
+    if (arrived) return null;
+    if (stepIndex < 0 || stepIndex >= _stepStartPointIndex.length) {
+      return null;
+    }
+    if (stepIndex >= stepTexts.length) return null;
+    if (currentStepIndex > stepIndex) return null;
+    final int startPointIdx = _stepStartPointIndex[stepIndex];
+    final (int nearestIdx, double _) = _nearest(latestFix.point);
+    if (nearestIdx > startPointIdx) return null;
+    final double d =
+        haversineMeters(latestFix.point, _points[startPointIdx]);
+    if (d < NavHazConfig.replayMinDistanceM) return null;
+    // Distance wording: the FIX3B navigation bands (the
+    // function returns the announcement-ready form,
+    // leading "about" included). CDX5 S2-1: an abnormal
+    // distance (non-finite / negative -- a haversine over
+    // real fixes cannot produce one, but the wording
+    // layer must not trust that) yields the EMPTY
+    // readout; the prompt then drops the distance prefix
+    // entirely and keeps the bare turn text, a complete
+    // sentence, instead of splicing a hole into it.
+    final String distanceText = navigationDistanceText(d);
+    if (distanceText.isEmpty) return stepTexts[stepIndex];
+    return '前方$distanceText${stepTexts[stepIndex]}';
+  }
 
   /// Nearest route point to [p]: (index, distance in metres).
   (int, double) _nearest(GeoPoint p) {

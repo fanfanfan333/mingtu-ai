@@ -62,6 +62,17 @@ class SystemVoiceOutput implements VoiceOutput {
 
   SystemVoiceOutput([FlutterTts? tts]) : _tts = tts;
 
+  /// Engine speak-START callback (FIX4-FINAL S3): wired to
+  /// the TTS engine's start handler in [_doInitialize] and
+  /// invoked when an utterance ACTUALLY starts playing --
+  /// the end point of the pipeline-to-speak latency
+  /// segment. Distinct from "speak() was called": queueing
+  /// and engine latency sit between the two, which is
+  /// exactly what the segment exists to measure. Null until
+  /// the app installs it; engines that never report a start
+  /// simply never stamp the segment (no fabricated value).
+  void Function()? onSpeakStart;
+
   /// Whether a zh-CN voice was *verified* on this device during
   /// [initialize]. False until verification actually succeeded:
   /// unknown is never reported as verified.
@@ -69,7 +80,10 @@ class SystemVoiceOutput implements VoiceOutput {
 
   Future<void> _doInitialize(FlutterTts tts) async {
     await tts.awaitSpeakCompletion(true);
-    // P0 zh-CN verification: an engine that answers is not proof
+    tts.setStartHandler(() {
+      onSpeakStart?.call();
+    });
+    // Startup zh-CN verification (highest priority): an engine that answers is not proof
     // it can speak Chinese -- a missing zh-CN voice data set would
     // otherwise be silently reported as "zh-CN 已接入". Ask the
     // engine for its language list and resolve zh-CN from evidence;

@@ -1,0 +1,412 @@
+/// NAVHAZ M1 configuration: every threshold for the
+/// tracking + time-to-collision (TTC) + hazard-alert
+/// pipeline in ONE place.
+///
+/// Per the project lead's decision (2026-11-11), after
+/// on-device testing only the VALUES in this file may be
+/// tuned -- the logic that consumes them must not change.
+/// Values marked are engineering estimates whose
+/// sources were not verified; they are starting points for
+/// field calibration, not measurements.
+library;
+
+/// Which tracking backend the hazard pipeline uses.
+enum TrackerBackend { byteTrack, sort}
+
+class NavHazConfig {
+NavHazConfig._();
+
+// ---- Tracking -------------------------------------------------
+
+/// Compile-time override: --dart-define=MINGTU_TRACKER=sort
+/// selects the hand-written SORT fallback (e.g. when the
+/// default backend's IDs prove unstable on a real device).
+static const String _trackerDefine =
+String.fromEnvironment('MINGTU_TRACKER');
+
+/// Active backend: the define wins when it names a known
+/// backend; anything else falls back to byteTrack.
+static TrackerBackend get trackerBackend =>
+_trackerDefine == 'sort'? TrackerBackend.sort: TrackerBackend.byteTrack;
+
+/// A track is CONFIRMED after this many CONSECUTIVE matched
+/// frames; unconfirmed tracks never alert. (Spec value.)
+static const int confirmFrames = 3;
+
+/// Per-track ring-buffer capacity: the most recent samples
+/// kept for velocity / TTC estimation. (Spec value.)
+static const int sampleBufferFrames = 30;
+
+/// Lost-track buffer (CDX4 S1-a): how long a target may
+/// vanish and STILL come back as the same track. The time
+/// form is the ruling: about one second. The frame form
+/// below is that second expressed at the nominal frame
+/// interval (10 FPS): retention is counted in MISSED
+/// FRAMES (the pipeline's frame clock), so at the nominal
+/// rate the two agree; the frame count is what both
+/// backends enforce.
+static const double lostTrackBufferSeconds = 1.0;
+
+/// A lost track keeps its ID for this many frames before
+/// it is retired (a reappearing target within the window
+/// is the same target, not a new one). = the
+/// [lostTrackBufferSeconds] buffer at the nominal 10 FPS
+/// frame interval (10 x 100 ms = 1.0 s).
+static const int lostRetentionFrames = 10;
+
+/// Detections below this confidence never enter tracking
+/// (mirrors the long-standing VisualPerception default).
+static const double minDetectionConfidence = 0.3;
+
+/// Cap on the ByteTrack backend's retired-key set (keys of
+/// tracks retired by this layer while the package may
+/// still coast them internally). Beyond the cap the OLDEST
+/// keys are evicted. Trade-off, accepted: eviction weakens
+/// the "a retired package track is never reborn under its
+/// old own ID" guarantee only for keys older than the most
+/// recent [retiredKeyCap] retirements -- in exchange the
+/// set cannot grow without bound on a long-running camera
+/// session (each retirement is one target that left and
+/// stayed gone past the ~1 s lost-track buffer; 1024 of
+/// them is far beyond a realistic single-session count).
+static const int retiredKeyCap = 1024;
+
+/// SORT fallback association threshold (IoU).
+static const double sortIouThreshold = 0.3;
+
+// ---- Camera / ranging ------------------------------------------
+
+/// Camera height above the ground when chest-worn, metres.
+/// (spec value; calibrate on device).
+static const double cameraHeightM = 1.3;
+
+/// Assumed vertical field of view, degrees, used to derive
+/// the ground-plane ranging constants below until a real
+/// calibration replaces them.
+static const double verticalFovDeg = 60.0;
+
+/// Assumed horizontal field of view, degrees, used for the
+/// clock-direction wording of far hazards.
+static const double horizontalFovDeg = 70.0;
+
+/// Normalised principal-point y (image centre until
+/// calibrated).
+static const double principalY = 0.5;
+
+/// Focal length in normalised image units, derived from
+/// [verticalFovDeg]: f_y = 0.5 / tan(VFOV / 2). Computed by
+/// the TTC estimator from the FOV constant so the pair can
+/// never drift apart.
+
+/// Ground-plane ranging only applies when the box bottom
+/// is above this normalised y (a bottom pinned to the
+/// image edge carries no horizon geometry). (Spec value.)
+static const double groundPlaneMaxBottom = 0.98;
+
+// ---- TTC estimation ----------------------------------------------
+
+/// Two-tier alpha-beta filtering (FIX3B). The NORMAL
+/// tier (alpha 0.3) feeds the warning judgement and the
+/// general estimate outputs; the AGILE tier (alpha 0.7)
+/// exists only for the urgent judgement, whose one-step
+/// prediction compensates the filter lag the CDX3 delay
+/// ledger measured (the old single tier -- alpha 0.5 with
+/// a hand-filled beta 0.1 -- read TTC_s about +0.87 s
+/// high at the urgent crossing).
+///
+/// Beta is NOT hand-filled any more: it is derived from
+/// alpha by the Kalata relation
+///   beta = 2(2 - alpha) - 4 * sqrt(1 - alpha)
+/// alpha 0.3 -> beta ~= 0.0534; alpha 0.7 -> beta ~=
+/// 0.4091. The derivation lives in AlphaBetaFilter.
+static const double alphaBetaAlphaNormal = 0.3;
+static const double alphaBetaAlphaAgile = 0.7;
+
+/// Pipeline latency subtracted from the agile tier's
+/// one-step predicted TTC before the urgent judgement
+/// (tau_now = tau_pred - pipelineLatencyS): detection ->
+/// tracking -> policy -> speech/haptics dispatch.
+/// PROVISIONAL value; to be calibrated on a real device
+/// against the end-to-end latency stamps the pipeline
+/// emits (see HazardPipeline.onLatency). Calibration
+/// note (FIX3B): the lead's initial provisional 0.5 s
+/// overshot the acceptance grid on the range-leg path --
+/// that leg is essentially unbiased, so the full 0.5 s
+/// came straight off the crossing point and the first
+/// urgent landed at true TTC 3.5 s, past the grid's 3.3 s
+/// upper bound. The grid measurements put the total
+/// effective compensation (prediction step + latency) at
+/// about 0.3 s; 0.2 s here plus the 0.1 s prediction
+/// step lands all four backend x ego combinations
+/// inside [2.4, 3.3]. The device stamps refine this.
+static const double pipelineLatencyS = 0.2;
+
+/// Pre-emptive urgent vibration (FIX3B): on any frame
+/// whose urgent-predicted tau_now drops below this, the
+/// pipeline fires the urgent vibration immediately --
+/// before urgent confirmation -- while the urgent
+/// SPEECH still waits for confirmation. One shot per
+/// track until the condition clears or the urgent speech
+/// is actually delivered.
+static const double preVibrationTtcS = 1.5;
+
+/// TTC fusion consistency rule (spec 2.2, tightened by
+/// the M1 fix round): when BOTH TTC estimates are valid
+/// (ground-plane TTC_z and box-scale TTC_s), their relative
+/// difference |a-b| / max(a,b) decides. Consistent --
+/// difference at or below this tolerance -- the fused TTC
+/// is the SMALLER of the two. Inconsistent -- difference
+/// above this tolerance -- the two measurements contradict
+/// each other and, per the spec's degrade-or-do-not-confirm
+/// rule, the fused TTC is null and the estimate carries a
+/// disagreement marker: contradictory ranging is not
+/// trustworthy, so the policy must never promote a hazard
+/// to URGENT on either leg's value alone; it may still use
+/// the (separately valid) range Z under the static /
+/// close-range rules, exactly as for any TTC == null frame.
+/// (Spec value.)
+static const double ttcFusionTolerance = 0.5;
+
+/// Nominal frame interval used when frame timestamps are
+/// degenerate (zero / absurd gaps, e.g. bursts delivered
+/// inside one event-loop turn in tests). 10 FPS matches
+/// the M1 replay fixtures.
+static const Duration nominalFrameInterval = Duration(milliseconds: 100);
+
+// ---- Ego motion -----------------------------------------------------
+
+/// Walking speed assumed while the ego-motion judge says
+/// "walking", m/s. (spec value).
+static const double walkingSpeedMps = 1.2;
+
+/// GPS speed at or above this (m/s) counts as walking even
+/// when the accelerometer is quiet.
+static const double walkingGpsSpeedMps = 0.5;
+
+/// Accelerometer-magnitude variance at or above this
+/// ((m/s^2)^2) counts as walking motion.
+static const double walkingAccelVariance = 0.8;
+
+/// Ego-speed source priority (M1 fix round): a GPS speed is
+/// trusted only when the fix that carried it is at most
+/// this accurate (metres) AND the speed is fresh (below).
+/// Otherwise the accelerometer step-frequency estimate
+/// carries the speed, and when neither source is usable
+/// the ego speed is UNKNOWN -- the conservative branch in
+/// which a vehicle can never be confirmed "approaching".
+static const double gpsSpeedMaxAccuracyM = 20.0;
+static const Duration gpsSpeedFreshness = Duration(seconds: 5);
+
+/// Stride length for the step-frequency speed estimate
+/// (speed = step frequency x stride), metres. PROVISIONAL:
+/// a mid-range adult stride (published averages run about
+/// 0.7-0.8 m); not yet calibrated on device.
+static const double strideLengthM = 0.75;
+
+/// Sliding window over which the accelerometer magnitude
+/// variance and step frequency are estimated.
+static const Duration accelWindow = Duration(milliseconds: 2500);
+
+/// A vehicle counts as APPROACHING only when its relative
+/// closing speed exceeds the user's own speed by more
+/// than this margin, m/s. (Spec value.)
+static const double approachingMarginMps = 1.0;
+
+// ---- Forward channel (intersection test, ALL paths) ----------------
+// Every will-hit / intersection judgement in the hazard
+// pipeline -- the known-ego corridor test and the
+// ego-unknown scale path alike (unified in the CDX3
+// round) -- asks ONE question: does the box bottom-centre,
+// extrapolated laterally to the TTC horizon, land inside
+// the user's forward channel? The channel is metric when
+// a range Z is available and a centre fraction of the
+// frame when it is not. There is NO second way in: a box
+// that merely OVERLAPS the channel in the current frame
+// does not count (a crossing target's box sweeps through
+// the channel while its extrapolated landing point is far
+// outside it). Both values are PROVISIONAL (the lead's
+// ruling fixes the defaults; field calibration may tune
+// them).
+//
+// This channel is a HIT JUDGEMENT, a different thing from
+// the wording / advisor corridor [corridorLeft,
+// corridorRight] below (three-zone wording edges, shared
+// with the avoidance advisor's three-condition rule):
+// neither may be tuned by editing the other.
+
+/// Half width of the forward channel, metres, for the
+/// intersection test when the target's range can be
+/// converted to metres. Default +/-1.0 m per the lead's
+/// ruling. 【暂定】
+static const double channelHalfWidthM = 1.0;
+
+/// Width of the forward channel as a fraction of the
+/// frame width, centred, for the intersection test when
+/// no metric range is available: the channel is
+/// [0.5 - f/2, 0.5 + f/2] = [0.30, 0.70] at the default.
+/// 【暂定】
+static const double channelCenterFraction = 0.40;
+
+/// Legacy names for the two channel values above, kept
+/// for the ego-unknown path's call sites and tests: the
+/// channel is ONE definition (see the section header), so
+/// these are aliases, not a second pair of values.
+static const double egoUnknownChannelHalfWidthM = channelHalfWidthM;
+static const double egoUnknownChannelCenterFraction =
+    channelCenterFraction;
+
+// ---- Corridor ----------------------------------------------------
+
+/// The virtual walking corridor on normalised centre-x
+/// (same edges as the avoidance advisor's three-condition
+/// rule; a hazard only matters when its extrapolated path
+/// intersects this band). (Spec values.)
+static const double corridorLeft = 0.33;
+static const double corridorRight = 0.67;
+
+/// Near-corridor rule inherited from the pre-M1 behaviour:
+/// with no usable TTC, a hazard whose box bottom is below
+/// this normalised y inside the corridor is treated as
+/// near. (Existing project value.)
+static const double nearBottom = 0.85;
+
+// ---- Alert levels ---------------------------------------------------
+
+/// URGENT: an approaching vehicle (or any obstacle at very
+/// close range) with TTC at or below this, seconds.
+/// (Spec value.)
+static const double urgentTtcS = 3.0;
+
+/// URGENT close-range branch: any obstacle this close
+/// (metres) with TTC at or below [urgentCloseTtcS].
+/// (spec values).
+static const double urgentCloseRangeM = 1.5;
+static const double urgentCloseTtcS = 2.0;
+
+/// WARNING: a confirmed will-hit hazard with TTC at or
+/// below this, seconds (the band above [urgentTtcS]).
+/// (Spec value: device test plan asks for >= 3 s of
+/// advance warning for approaching vehicles.)
+static const double warningTtcS = 5.0;
+
+/// WARNING: a static obstacle inside the corridor at or
+/// within this range, metres. (Spec value.)
+static const double warningStaticRangeM = 3.0;
+
+/// Wording switches from three-zone to clock+distance
+/// beyond this range, metres. (Spec value.)
+static const double nearWordingRangeM = 5.0;
+
+/// Navigation distance wording bands (FIX3B; the
+/// rounding HABITS follow OsmAnd's Chinese announcements
+/// -- rule reference only, independently implemented, no
+/// OsmAnd code or text tables used; OsmAnd is GPL). Used
+/// by navigationDistanceText for turn prompts and route
+/// announcements -- NOT by entrance guidance, which
+/// keeps its own Step D 10 m bands.
+///   d < navWholeMetresBelow   -> whole metres (never
+///                                  below
+///                                  [navMinReportedMetres])
+///   d < navRound50Below       -> nearest 10 m (half up;
+///                                  max error 5 m)
+///   d < navKilometreFrom      -> nearest 50 m (half up)
+///   d < navAboutOneKmBelow    -> "about 1 km"
+///   d < navFixedBeyondFrom    -> "about X km"
+///   d >= navFixedBeyondFrom   -> fixed "beyond 10 km"
+/// The 17-100 m band rounded DOWN (floor) until the
+/// FIX4-FINAL ruling (S2): a floored readout could
+/// understate by almost 10 m; nearest-with-half-up caps
+/// the error at 5 m either way.
+static const int navMinReportedMetres = 1;
+static const double navWholeMetresBelow = 17;
+static const double navRound50Below = 100;
+static const double navKilometreFrom = 1000;
+static const double navAboutOneKmBelow = 1500;
+static const double navFixedBeyondFrom = 10000;
+
+/// Hazard distance wording bands (FIX3B), used by
+/// metresText for obstacle / danger announcements:
+///   Z < hazardVeryCloseBelow    -> "very close", no
+///                                  number
+///   Z < hazardWholeMetresBelow  -> whole metres
+///   Z < hazardNumberedBelow     -> "about 5 m" / "about
+///                                  10 m", split at
+///                                  hazardAboutSplit
+///   Z >= hazardNumberedBelow    -> no number at all
+///                                  (category + bearing
+///                                  only)
+static const double hazardVeryCloseBelow = 1.5;
+static const double hazardWholeMetresBelow = 5;
+static const double hazardNumberedBelow = 10;
+static const double hazardAboutSplit = 7.5;
+
+// ---- Cooldown / dedup ------------------------------------------------
+
+/// Per-track alert cooldown, seconds (spec allows 3-5 s;
+/// 4 s chosen). Inside the cooldown only two re-alerts are
+/// allowed: a level upgrade (W -> U), or a TTC that has
+/// fallen by at least [ttcDropReAlertRatio] since the last
+/// spoken alert for that track.
+static const int cooldownSeconds = 4;
+
+/// Per-track alert cooldown, seconds, when the frame's
+/// ego speed is UNKNOWN (lead's ruling, 2026-11-11): the
+/// scale-only path re-alerts less often (6 s instead of
+/// [cooldownSeconds]). The window is chosen per alert
+/// evaluation from THAT frame's ego state (not latched
+/// per track). The two re-alert exceptions above (level
+/// upgrade, TTC drop >= [ttcDropReAlertRatio]) apply
+/// unchanged inside this longer window.
+static const int cooldownSecondsEgoUnknown = 6;
+static const double ttcDropReAlertRatio = 0.4;
+
+/// Two DIFFERENT tracks of the same category and direction
+/// zone alerting within this window are merged into one
+/// announcement. (Spec value.)
+static const Duration mergeWindow = Duration(milliseconds: 500);
+
+// ---- Speech arbitration ------------------------------------------------
+
+/// An interrupted navigation prompt that could not be
+/// replayed within this window is dropped for good.
+/// (Spec value.)
+static const Duration replayExpiry = Duration(seconds: 15);
+
+/// A turn replay is dropped when the user is already
+/// closer than this to the intersection, metres.
+/// (Spec value.)
+static const double replayMinDistanceM = 3.0;
+
+// ---- Danger speech timing -------------------------------------------------
+
+/// Cap on how long a danger / emergency prompt waits for
+/// the physical stop of the current utterance before it
+/// speaks anyway (FIX2 ruling, 2026-11-11): the stop is
+/// still ISSUED first (physical preemption is preserved),
+/// but its completion is no longer a precondition for the
+/// danger voice -- after this cap the speak proceeds and
+/// relies on the TTS engine's own speak-interrupts-current
+/// behaviour. The cap is sized so vibration-start ->
+/// danger-speech stays inside the spec's 300 ms bound
+/// (150 ms stop cap + scheduling slack). Non-danger paths
+/// keep their existing 800 ms stop bound; this constant
+/// applies ONLY to the danger / emergency branch of the
+/// sequenced speak path in main.dart.
+static const Duration dangerStopWaitCap = Duration(milliseconds: 150);
+
+// ---- Vibration patterns ---------------------------------------------------
+// VibrationEffect waveform semantics: timings alternate
+// wait/vibrate starting with a wait; amplitudes are
+// parallel (0 = off). Consumed by the device haptics
+// channel and asserted by the arbitration tests.
+
+/// URGENT: three strong pulses (100 ms on, 50 ms off,
+/// ~350 ms total). (Spec pattern.)
+static const List<int> urgentVibrationTimings = <int>[0, 100, 50, 100, 50, 100];
+static const List<int> urgentVibrationAmplitudes = <int>[0, 255, 0, 255, 0, 255];
+
+/// WARNING: two light taps (40 ms on, 60 ms off).
+/// (Spec pattern; amplitude 128 = half strength.)
+static const List<int> warningVibrationTimings = <int>[0, 40, 60, 40];
+static const List<int> warningVibrationAmplitudes = <int>[0, 128, 0, 128];
+}

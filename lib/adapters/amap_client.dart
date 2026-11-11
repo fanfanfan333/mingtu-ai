@@ -47,6 +47,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../core/hazard/hazard_phrases.dart';
 import '../core/route_scoring.dart';
 import '../modules/map_navigation.dart';
 
@@ -192,7 +193,16 @@ String amapStepSpeechText({
     act = action;
   }
   final String head = direction.isEmpty ? act : '$direction$act';
-  return '$head，约 ${distanceM.toStringAsFixed(0)} 米';
+  // Step distance wording: the FIX3B navigation bands
+  // (announcement-ready form from navigationDistanceText).
+  // CDX5 S2-1: an abnormal distance (non-finite /
+  // negative, e.g. a malformed upstream payload) yields
+  // the EMPTY readout; the step text then stands alone
+  // as a complete sentence instead of ending in a
+  // dangling separator with no distance after it.
+  final String distanceText = navigationDistanceText(distanceM);
+  if (distanceText.isEmpty) return head;
+  return '$head，$distanceText';
 }
 
 class AmapWalkingResult {

@@ -41,7 +41,8 @@ Future<void> get yoloLiveViewDisposed =>
 
 Widget buildYoloLiveView({
   required String modelPath,
-  required void Function(List<Detection> detections) onDetections,
+  required void Function(List<Detection> detections, DateTime frameCapturedAt)
+      onDetections,
   void Function(double latencyMs)? onLatencyMs,
   void Function(Object error)? onError,
 }) {
@@ -55,7 +56,8 @@ Widget buildYoloLiveView({
 
 class _YoloLiveViewHost extends StatefulWidget {
   final String modelPath;
-  final void Function(List<Detection> detections) onDetections;
+  final void Function(List<Detection> detections, DateTime frameCapturedAt)
+      onDetections;
   final void Function(double latencyMs)? onLatencyMs;
   final void Function(Object error)? onError;
 
@@ -96,16 +98,27 @@ class _YoloLiveViewHostState extends State<_YoloLiveViewHost> {
       task: YOLOTask.detect,
       confidenceThreshold: 0.25,
       onResult: (List<YOLOResult> results) {
-        widget.onDetections(results
-            .map((YOLOResult r) => yoloResultToDetection(
+        // Frame timestamp (FIX4-FINAL S3): stamped HERE,
+        // the moment the plugin delivers this frame's
+        // results -- the plugin exposes no camera capture
+        // timestamp, so this delivery stamp is the frame's
+        // app-side timestamp and the start point of the
+        // frame-to-callback latency segment. Scope of that
+        // segment (NH-M1-10): it measures ONLY result-
+        // delivery -> detection callback; it does NOT
+        // include camera frame capture or model inference
+        // time (both happen before this stamp exists).
+        final DateTime frameCapturedAt = DateTime.now();
+        widget.onDetections(
+            results.map((YOLOResult r) => yoloResultToDetection(
                   label: r.className,
                   confidence: r.confidence,
                   centerX: r.normalizedBox.left + r.normalizedBox.width / 2,
                   centerY: r.normalizedBox.top + r.normalizedBox.height / 2,
                   boxWidth: r.normalizedBox.width,
                   boxHeight: r.normalizedBox.height,
-                ))
-            .toList());
+                )).toList(),
+            frameCapturedAt);
       },
       onPerformanceMetrics: (YOLOPerformanceMetrics metrics) {
         widget.onLatencyMs?.call(metrics.processingTimeMs);

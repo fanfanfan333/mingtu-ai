@@ -1,4 +1,4 @@
-/// Coordinate-system conversion for Mingtu AI (navigation P0).
+/// Coordinate-system conversion for Mingtu AI (navigation core).
 ///
 /// Why this file exists, with the evidence stated once:
 ///

@@ -354,7 +354,11 @@ void main() {
         stepsCount: 2,
       );
       expect(text, contains('图书馆'));
-      expect(text, contains('186 米'));
+      expect(text, contains('约200米'),
+          reason: 'FIX3B navigation bands: the route '
+              'distance is announced via '
+              'navigationDistanceText; 186 m rounds to the '
+              'nearest 50 m (was: 186 米, the raw figure)');
     });
 
     test('about 150 m from the gate: still inside the demo range', () async {

@@ -34,6 +34,27 @@ class FakeTts extends FlutterTts {
   bool stopCalledWhileSpeakInFlight = false;
   String? languageSetTo;
 
+  /// NH-M1-10: the start handler the adapter registers
+  /// via setStartHandler (the real engine invokes it when
+  /// an utterance ACTUALLY starts sounding). The mock
+  /// fires it at the speak() call point -- an APPROXIMATION:
+  /// on a device the callback comes from the engine at
+  /// true phonation, after queueing/engine latency the
+  /// mock does not model; that magnitude difference is
+  /// exactly what the pipeline-to-speak segment measures
+  /// and stays on the real-device checklist for
+  /// calibration.
+  int startHandlerCalls = 0;
+
+  @override
+  void setStartHandler(void Function() handler) {
+    // FlutterTts.startHandler is a plain field the plugin
+    // invokes from its platform call handler; assigning
+    // it IS the registration (the plugin's own
+    // setStartHandler does exactly this).
+    startHandler = handler;
+  }
+
   @override
   Future<dynamic> awaitSpeakCompletion(bool awaitCompletion) async => 1;
 
@@ -63,6 +84,11 @@ class FakeTts extends FlutterTts {
   Future<dynamic> speak(String text, {bool focus = false}) async {
     callLog.add('speak:$text');
     speakInFlight = true;
+    // NH-M1-10: fire the registered start handler at the
+    // call point (see the field doc for the approximation
+    // this is, and what remains for the real device).
+    startHandlerCalls += 1;
+    startHandler?.call();
     if (speakGate != null) await speakGate!.future;
     speakInFlight = false;
     if (speakError != null) throw speakError!;
@@ -203,6 +229,27 @@ void main() {
       await expectLater(out.speak('你好'), throwsStateError);
       expect(out.isAvailable, isFalse);
       expect(out.chineseVoiceVerified, isFalse);
+    });
+
+    test('mock speak fires the registered start handler '
+        '(NH-M1-10 segment-2 testability)', () async {
+      final FakeTts fake = FakeTts();
+      final out = SystemVoiceOutput(fake);
+      await out.initialize();
+      // The adapter registered its start handler on the
+      // engine during initialize (setStartHandler), wired
+      // to SystemVoiceOutput.onSpeakStart.
+      expect(fake.startHandler, isNotNull,
+          reason: 'the adapter registers a start handler '
+              'on the TTS object at initialize');
+      int starts = 0;
+      out.onSpeakStart = () => starts++;
+      await out.speak('前方有车');
+      expect(starts, 1,
+          reason: 'one speak -> one start event through '
+              'the adapter seam, same signature as the '
+              'real engine callback');
+      expect(fake.startHandlerCalls, 1);
     });
 
     test('speak returning 1 completes normally', () async {

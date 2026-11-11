@@ -52,11 +52,16 @@ void main() {
     // Speech is GENERATED from the enum fields (direction +
     // action + distance), never copied from provider free text.
     expect(first, contains('朝北方向直行'));
-    expect(first, contains('约 80 米'));
+    expect(first, contains('约80米'),
+        reason: 'FIX3B navigation bands via '
+            'navigationDistanceText (was: 约 80 米, the '
+            'raw provider distance with spaces)');
     expect(first, contains('第 1 段，共 2 段'));
     final String? second = speaker.nextStepText();
     expect(second, contains('朝东方向左转'));
-    expect(second, contains('约 106 米'));
+    expect(second, contains('约100米'),
+        reason: 'FIX3B navigation bands: 106 m rounds to '
+            'the nearest 50 m (was: 约 106 米)');
     expect(second, contains('第 2 段，共 2 段'));
     expect(speaker.isDone, isTrue);
     expect(speaker.nextStepText(), isNull);

@@ -1,4 +1,4 @@
-/// Current-location adapter for Mingtu AI (navigation P0).
+/// Current-location adapter for Mingtu AI (navigation core).
 ///
 /// Contract: one call returns either a single GPS fix -- already
 /// converted to GCJ-02, with its accuracy -- or one explicit
@@ -42,6 +42,13 @@ class LocationResult {
   /// Horizontal accuracy in metres of the fix, when known.
   final double? accuracyM;
 
+  /// Ground speed reported by the fix itself, m/s, when
+  /// the platform supplied a usable one (NAVHAZ M1 fix
+  /// round: this is the ego-motion judge's GPS source).
+  /// Null when unknown or negative (the platform's
+  /// "no speed" sentinel).
+  final double? speedMps;
+
   final LocationFailure? failure;
 
   /// Human-readable Chinese detail for status display / logs.
@@ -50,14 +57,17 @@ class LocationResult {
   const LocationResult._({
     this.pointGcj02,
     this.accuracyM,
+    this.speedMps,
     this.failure,
     required this.detail,
   });
 
-  factory LocationResult.fix(GeoPoint pointGcj02, double? accuracyM) =>
+  factory LocationResult.fix(GeoPoint pointGcj02, double? accuracyM,
+          {double? speedMps}) =>
       LocationResult._(
         pointGcj02: pointGcj02,
         accuracyM: accuracyM,
+        speedMps: speedMps,
         detail: '已取得当前位置（GCJ-02，精度 '
             '${accuracyM == null ? '未知' : '${accuracyM.toStringAsFixed(0)} 米'}）。',
       );
@@ -125,7 +135,8 @@ class GeolocatorCurrentLocation implements CurrentLocationProvider {
       final GeoPoint gcj02 = wgs84ToGcj02(
         GeoPoint(latitude: position.latitude, longitude: position.longitude),
       );
-      return LocationResult.fix(gcj02, position.accuracy);
+      return LocationResult.fix(gcj02, position.accuracy,
+          speedMps: position.speed >= 0 ? position.speed : null);
     } catch (e) {
       return LocationResult.error(
         LocationFailure.failed,
@@ -162,7 +173,8 @@ class GeolocatorCurrentLocation implements CurrentLocationProvider {
         final GeoPoint gcj02 = wgs84ToGcj02(
           GeoPoint(latitude: position.latitude, longitude: position.longitude),
         );
-        return LocationResult.fix(gcj02, position.accuracy);
+        return LocationResult.fix(gcj02, position.accuracy,
+            speedMps: position.speed >= 0 ? position.speed : null);
       });
     } catch (_) {
       return const Stream<LocationResult>.empty();

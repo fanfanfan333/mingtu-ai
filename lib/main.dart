@@ -31,6 +31,15 @@ import 'core/avoidance_advisor.dart';
 import 'core/cloud_vision_hazard.dart';
 import 'core/orientation.dart';
 import 'adapters/orientation_monitor.dart';
+import 'adapters/haptics.dart';
+import 'adapters/pitch_monitor.dart';
+import 'core/haptics.dart';
+import 'core/navhaz_config.dart';
+import 'core/pitch.dart';
+import 'core/hazard/ego_motion.dart';
+import 'core/hazard/hazard_phrases.dart';
+import 'core/hazard/hazard_pipeline.dart';
+import 'core/hazard/hazard_policy.dart';
 import 'core/destination_dialogue.dart';
 import 'core/entrance_guidance.dart';
 import 'core/navigation_tracker.dart';
@@ -75,7 +84,7 @@ import 'skills/route_planning.dart';
 ///   orientation-and-mobility training, and it is NOT validated for
 ///   real-road safety. Do not use this demo for real navigation.
 void main() {
-  // Startup backstop (P0): the whole app runs in a guarded
+  // Startup backstop: the whole app runs in a guarded
   // zone with a FlutterError handler installed, so an
   // unexpected framework/startup error is recorded and later
   // ANNOUNCED (see _initRealIntegrations) instead of the app
@@ -246,6 +255,65 @@ class MingtuHomeDebugHandle {
     }
   }
 
+  /// NAVHAZ M1 seams: substitute the haptics implementation
+  /// (widget tests inject a recording fake; production
+  /// never calls this).
+  void debugSetHaptics(Haptics haptics) => _state._haptics = haptics;
+
+  /// NAVHAZ M1 seam: ids of interrupted navigation prompts
+  /// the arbitration dropped as EXPIRED (the scheduler's
+  /// dropped-expired log) -- the observable readout for
+  /// the 15 s replay-window rule.
+  List<String> get debugExpired =>
+      List<String>.unmodifiable(_state._scheduler.droppedExpiredLog);
+
+  /// NAVHAZ M1 seam (CDX3): install a fake clock for the
+  /// speech-arbitration timeline (see _speechNow in the
+  /// state). Tests drive the 15 s replay-expiry boundary
+  /// by advancing the fake clock; passing null restores
+  /// the wall clock. Production never calls this.
+  void debugSetSpeechClock(DateTime Function()? clock) =>
+      _state._speechNow = clock ?? DateTime.now;
+
+  /// NAVHAZ M1 seam (EGOUNK round): inject a fixed camera
+  /// pitch for tests. The widget environment has no
+  /// accelerometer, so the pitch monitor reads unknown and
+  /// ground-plane ranging stays off; the arbitration
+  /// scenarios are specified against the same geometry the
+  /// replay fixtures use (pitch 10 degrees), so the tests
+  /// inject that evidence here instead of weakening their
+  /// assertions. Production never calls this; the
+  /// production reading stays the pitch monitor's.
+  void debugSetPitchDeg(double? pitchDeg) =>
+      _state._pitchDegOverride = pitchDeg;
+
+  /// NAVHAZ M1 seam: install a live navigation tracker
+  /// directly (the arbitration tests drive fixes and hazard
+  /// frames against it without the network route flow).
+  void debugInstallLiveTracker({
+    required List<AmapStep> steps,
+    required List<String> stepTexts,
+    required GeoPoint destination,
+    required String destinationName,
+  }) {
+    _state._liveNav = NavigationTracker(
+      steps: steps,
+      stepTexts: stepTexts,
+      destination: destination,
+      destinationName: destinationName,
+    );
+    _state._liveNavDestName = destinationName;
+    _state._liveNavRemainingM = null;
+  }
+
+  /// NAVHAZ M1 seam: the installed live tracker, if any.
+  NavigationTracker? get debugLiveNav => _state._liveNav;
+
+  /// NAVHAZ M1 seam: feed one live-navigation fix through
+  /// the production fix handler.
+  void debugLiveFix(GeoPoint point, double? accuracyM) =>
+      _state._onLiveNavFix(LocationResult.fix(point, accuracyM));
+
   Future<void> openYoloLive() => _state._openYoloLive();
   void closeYoloLive() => _state._closeYoloLiveView();
   bool get yoloLiveOpen => _state._yoloLiveOpen;
@@ -270,6 +338,26 @@ class MingtuHomeDebugHandle {
       unawaited(_state._onPttRecordCapReached(_state._pttSession));
   Map<String, int> get recoverableErrorCounts =>
       Map<String, int>.unmodifiable(_state._asrStreakSnapshot);
+
+  /// NH-M1-10 segment-2 test seams: install the fake
+  /// segment clock + the stamp collection, and read the
+  /// stamps back. Production never calls these; the
+  /// segment's arithmetic is otherwise wall-clock (see
+  /// _latencyNow in the state).
+  void debugInstallLatencyClock(
+          DateTime Function() clock, List<(String, int)> sink) =>
+      _state._debugInstallLatencyClock(clock, sink);
+  List<(String, int)> get debugLatencySegments =>
+      List<(String, int)>.unmodifiable(
+          _state._latencySegmentsForTest ?? const <(String, int)>[]);
+
+  /// NH-M1-10: feed one detection frame WITH an injected
+  /// frame timestamp (the adapter's delivery stamp in
+  /// production), so a test can drive the pipeline path
+  /// with a known frame time.
+  void simulateDetectionsAt(
+          List<Detection> detections, DateTime frameCapturedAt) =>
+      _state._onYoloDetections(detections, frameCapturedAt);
 
   /// CDX2 streak view: the one code currently streaking
   /// and its length (0 / null when no streak is open).
@@ -384,6 +472,36 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     with WidgetsBindingObserver {
   TaskManager _tasks = TaskManager();
   SpeechScheduler _scheduler = SpeechScheduler();
+
+  /// The clock every speech-arbitration timestamp runs on
+  /// (CDX3): request creation / expiry stamps, the
+  /// scheduler's submit stamps -- which is where an
+  /// interruption's timestamp comes from -- and the
+  /// replay-expiry judgement in _buildInterruptedReplay
+  /// all read time through here, so a test can install ONE
+  /// fake clock and drive the 15 s boundary exactly
+  /// (14.999 s alive, 15.000 s expired) instead of
+  /// short-circuiting the window. Production never
+  /// replaces it: it stays DateTime.now and the window
+  /// stays NavHazConfig.replayExpiry (15 s). (The earlier
+  /// zero-window override seam is gone: two coexisting
+  /// time bases for the same judgement invited exactly
+  /// the confusion the CDX3 round removed.)
+  DateTime Function() _speechNow = DateTime.now;
+
+  /// NH-M1-10: install the fake segment clock + stamp
+  /// collection for the segment-2 test (debug handle
+  /// entry). Production never calls this.
+  void _debugInstallLatencyClock(
+      DateTime Function() clock, List<(String, int)> sink) {
+    _latencyNow = clock;
+    _latencySegmentsForTest = sink;
+  }
+
+  /// Test-only override of the camera pitch reading (see
+  /// debugSetPitchDeg); null in production, where the
+  /// pitch monitor's live reading always applies.
+  double? _pitchDegOverride;
   MapNavigationService _mapService = MapNavigationService(StubMapProvider());
   late RoutePlanningSkill _routeSkill = RoutePlanningSkill(_mapService);
   final EnvironmentAnalysisSkill _envSkill = EnvironmentAnalysisSkill();
@@ -592,6 +710,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // is created at startup).
   final AvoidanceAdvisor _avoidance = AvoidanceAdvisor();
   OrientationMonitor _orientation = const UnavailableOrientationMonitor();
+
+  /// NAVHAZ M1: camera pitch for ground-plane ranging
+  /// (unknown on stub platforms -> ranging off, scale TTC
+  /// still applies).
+  PitchMonitor _pitchMonitor = const UnavailablePitchMonitor();
+
+  /// NAVHAZ M1: patterned vibration seam (device channel on
+  /// mobile, no-op elsewhere; tests inject a recording fake
+  /// through the debug handle).
+  Haptics _haptics = const NoOpHaptics();
+
+  /// NAVHAZ M1: tracking + TTC + alert policy pipeline for
+  /// geometry-bearing YOLO frames.
+  final HazardPipeline _hazardPipeline = HazardPipeline();
   // Cloud-vision cycle merging + 429 backoff (hazard scans).
   final VisionCycleCoordinator _visionCycle = VisionCycleCoordinator();
   final VisionRateBackoff _visionBackoff = VisionRateBackoff();
@@ -599,6 +731,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   Timer? _hazardScanTimer;
   GeoPoint? _lastFixPoint;
   double? _lastFixAccuracyM;
+  // Latest GPS ground speed carried by a live fix, and
+  // when it arrived (ego-motion judge evidence, M1 fix
+  // round; freshness is judged against the frame time).
+  double? _lastFixSpeedMps;
+  DateTime? _lastFixSpeedAt;
   GeoPoint? _scanAnchorPoint;
   DateTime? _lastVisionCallAt;
   bool _manualCycleOwned = false;
@@ -737,7 +874,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   int _destAttempts = 0;
   bool _yoloAvailableAtStartup = false;
   final DangerAlertGate _dangerGate = DangerAlertGate();
-  // Voice P0 re-test fixes: once TTS has failed at runtime the app
+  // Voice re-test fixes: once TTS has failed at runtime the app
   // is in a perceptible voice-failed state (no simulated success,
   // no automatic ASR restart); once an ASR error has been announced
   // it is not announced again (no retry/announce loop).
@@ -797,9 +934,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// unconfirmed close exactly once, never repeatedly.
   bool _pttCloseWaitAnnounced = false;
 
-  /// This press began during a P0 announcement: it waits
+  /// This press began during a danger/emergency announcement: it waits
   /// (vibration only -- no cue, no ASR) and enters
-  /// prompting when the P0 prompt finishes, IF the button
+  /// prompting when the danger/emergency prompt finishes, IF the button
   /// is still held then.
   bool _pttDeferredByP0 = false;
 
@@ -842,6 +979,35 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _yoloRiskActive = false;
   int _yoloEmptyFrames = 0;
 
+  /// FIX4-FINAL S3, segment 2 bookkeeping: hazard alert
+  /// request id -> the wall-clock moment the hazard
+  /// pipeline RETURNED for that alert's frame. Entries are
+  /// created in _onYoloDetectionsPipeline and consumed by
+  /// _trackedSpeak (which moves the stamp into
+  /// [_speakStartSegmentFrom]); the segment closes when
+  /// the TTS engine reports the utterance actually started
+  /// (SystemVoiceOutput.onSpeakStart -> _onTtsSpeakStart).
+  /// Stamps carry stage name + milliseconds only.
+  final Map<String, DateTime> _hazardSpeakSegmentStarts =
+      <String, DateTime>{};
+  DateTime? _speakStartSegmentFrom;
+
+  /// NH-M1-10 segment-test clock + collection seam: the
+  /// wall clock segment 2's arithmetic runs on, and the
+  /// list of (stage, milliseconds) the segment has
+  /// stamped. Production never installs either: the clock
+  /// defaults to [DateTime.now] and the collection stays
+  /// null (the log line is then the only output, exactly
+  /// as before). Tests install both through the debug
+  /// handle to assert the segment's VALUE -- the mock
+  /// TTS reports its speak-start at the speak() call, so
+  /// a test can only pin the segment's arithmetic against
+  /// injected stamps, never the engine's real latency
+  /// (that calibration stays on the real-device checklist
+  /// in the README).
+  DateTime Function() _latencyNow = DateTime.now;
+  List<(String, int)>? _latencySegmentsForTest;
+
   // Blind-first voice control: the command text is a simulation of a
   // real recogniser transcript until system ASR is integrated (see
   // adapters/voice_io.dart). The last spoken prompt is kept so the
@@ -851,18 +1017,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   /// When the utterance the sequencer most recently started
   /// playing began; a push-to-talk press uses it to recognise
-  /// a just-started P0 utterance whose scheduler entry has
+  /// a just-started danger/emergency utterance whose scheduler entry has
   /// already completed (see _interruptSpeechForPushToTalk).
   DateTime? _lastSpeechStartedAt;
 
-  /// The text of the most recent P0 (danger/emergency)
-  /// utterance actually played; compared against
+  /// The text of the most recent danger (level 1) / emergency
+  /// (level 0) utterance actually played; compared against
   /// _lastSpokenText by the push-to-talk interruption rules.
   String _lastP0SpokenText = '';
 
-  /// The scheduler id of that P0 utterance; the scheduler's
-  /// interrupted/cancelled logs carry ids, so the P0 gate
-  /// can recognise a just-interrupted P0 playback.
+  /// The scheduler id of that utterance; the scheduler's
+  /// interrupted/cancelled logs carry ids, so the danger/
+  /// emergency gate can recognise a just-interrupted
+  /// danger/emergency playback.
   String _lastP0RequestId = '';
 
   /// When a physical stop was last issued inside an
@@ -947,6 +1114,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     if (!mounted) return;
     _orientation = createOrientationMonitor()..start();
+    _pitchMonitor = createPitchMonitor()..start();
+    _haptics = createHaptics();
+    // Vibration failures reported by the device channel
+    // (M1 fix round) surface in the app log: a pattern the
+    // device did not execute must never pass unnoticed.
+    HapticsFailureLog.listener = () {
+      _logMsg('振动未执行：设备报告振动失败（累计 ${HapticsFailureLog.count} 次）。');
+    };
     _hazardScanTimer?.cancel();
     _hazardScanTimer = Timer.periodic(
       const Duration(seconds: 8),
@@ -1117,6 +1292,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     _lastFixPoint = r.pointGcj02;
     _lastFixAccuracyM = r.accuracyM;
+    // The fix's own ground speed feeds the ego-motion
+    // judge (M1 fix round); a fix without a usable speed
+    // leaves the previous reading to age out by freshness.
+    if (r.speedMps != null) {
+      _lastFixSpeedMps = r.speedMps;
+      _lastFixSpeedAt = DateTime.now();
+    }
     if (_entranceActive && _entrance != null) {
       // Step D: the tracker has handed over; fixes now feed
       // the entrance guidance, not route following.
@@ -1190,6 +1372,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       eventId: done ? 'entrance-arrived' : 'entrance-guide-$now',
       text: text,
       kind: done ? SpeechKind.alert : SpeechKind.turn,
+      // Entrance distance announcements are distance-class:
+      // if a hazard interrupts one, the replay recomputes it
+      // from the latest fix instead of repeating stale text.
+      replay: done ? NavReplay.drop : NavReplay.regenerate,
     ));
     if (done) _finishEntranceTrip();
   }
@@ -1222,6 +1408,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           eventId: 'nav-turn-$ts',
           text: e.text,
           kind: SpeechKind.turn,
+          // NAVHAZ M1: an interrupted turn is regenerated
+          // from the latest fix, never replayed verbatim.
+          navStepIndex: e.stepIndex,
+          replay: NavReplay.regenerate,
         ));
       case NavEventKind.weakSignal:
         _say(_request(
@@ -1273,6 +1463,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             eventId: 'nav-offroute-$ts',
             text: '你已偏离路线，正在重新规划。',
             kind: SpeechKind.info,
+            replay: NavReplay.shortenedReplay,
           ));
           unawaited(_rerouteLiveNavigation());
         } else if (decision == RerouteDecision.exhausted) {
@@ -1293,6 +1484,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             eventId: 'nav-offroute-wait-$ts',
             text: '你已偏离路线。',
             kind: SpeechKind.info,
+            replay: NavReplay.shortenedReplay,
           ));
         }
     }
@@ -1616,7 +1808,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _handleAsrError(error);
       });
     }
-    // P0 startup plan (pure logic in core/voice_startup.dart): the
+    // Startup plan (pure logic in core/voice_startup.dart): the
     // greeting is spoken whenever *Chinese* speech is verified
     // usable -- including when ASR failed, which previously left
     // the user in total silence because the greeting only ran
@@ -1628,7 +1820,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       chineseVoiceVerified: ttsOk && (tts?.chineseVoiceVerified ?? false),
       asrOk: asrOk,
     );
-    if (plan.speechUsable && tts != null) _voiceOutput = tts;
+    if (plan.speechUsable && tts != null) {
+      _voiceOutput = tts;
+      // FIX4-FINAL S3: the engine's speak-start callback
+      // closes the pipeline-to-speak latency segment.
+      tts.onSpeakStart = _onTtsSpeakStart;
+    }
     _health.report(
       'voice_output',
       plan.speechUsable ? ServiceHealthStatus.ok : ServiceHealthStatus.degraded,
@@ -1857,6 +2054,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _straightTimer?.cancel();
     _hazardScanTimer?.cancel();
     _orientation.dispose();
+    _pitchMonitor.dispose();
     _transcriptSub?.cancel();
     _partialSub?.cancel();
     _pttNoContentTimer?.cancel();
@@ -1898,8 +2096,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     bool requiresStraight = false,
     int expiresSeconds = 5,
     bool neverExpires = false,
+    int? navStepIndex,
+    NavReplay? replay,
   }) {
-    final DateTime now = DateTime.now();
+    final DateTime now = _speechNow();
     // Critical delivery: emergencies, danger prompts and alerts
     // (safety/failure announcements) NEVER expire -- a dropped
     // safety message is worse than a late one. Ordinary prompts
@@ -1920,6 +2120,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       navigationStateVersion: _navVersion,
       requiresStraightSegment: requiresStraight,
       neverExpires: critical,
+      navStepIndex: navStepIndex,
+      // NAVHAZ M1 arbitration defaults (spec section 2.6):
+      // straight prompts replay shortened after an
+      // interruption; turn / distance prompts opt into
+      // regeneration explicitly at their call sites;
+      // everything else is never replayed.
+      replay: replay ??
+          (kind == SpeechKind.straight
+              ? NavReplay.shortenedReplay
+              : NavReplay.drop),
     );
   }
 
@@ -1947,8 +2157,37 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 
+  /// A copy of [r] with a different [text] (banned-word
+  /// substitution keeps every other field identical).
+  SpeechRequest _withText(SpeechRequest r, String text) {
+    return SpeechRequest(
+      id: r.id,
+      eventId: r.eventId,
+      text: text,
+      kind: r.kind,
+      createdAt: r.createdAt,
+      expiresAt: r.expiresAt,
+      navigationStateVersion: r.navigationStateVersion,
+      requiresStraightSegment: r.requiresStraightSegment,
+      neverExpires: r.neverExpires,
+      navStepIndex: r.navStepIndex,
+      replay: r.replay,
+    );
+  }
+
   bool _say(SpeechRequest request) {
-    final DateTime now = DateTime.now();
+    // NAVHAZ M1 banned-word guard (spec sections 0.1 /
+    // 2.4): NO announcement may grant or imply passage. In
+    // debug builds the assert fires; in release builds the
+    // text is replaced by the fixed fallback sentence and
+    // the substitution is logged (the offending text itself
+    // is never logged or spoken).
+    if (containsBannedWord(request.text)) {
+      assertNoBannedWords(request.text);
+      _logMsg('一条播报含禁词，已改写为固定兜底句，未播报原文。');
+      request = _withText(request, bannedWordFallbackPhrase);
+    }
+    final DateTime now = _speechNow();
     if (request.kind == SpeechKind.danger) {
       // A danger prompt pauses straight guidance (the pacing
       // machine's persistent hold + the scheduler's straight
@@ -1980,6 +2219,90 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     return accepted;
   }
 
+  /// NAVHAZ M1 arbitration (spec section 2.6): build the
+  /// replay for the oldest still-replayable interrupted
+  /// navigation prompt, or null. Each interrupted item is
+  /// discarded exactly once here -- replayed, expired into
+  /// droppedExpiredLog (15 s window from the interruption),
+  /// or dropped because its moment has passed (the
+  /// intersection is behind the user / too close): an old
+  /// navigation text is never spoken late.
+  SpeechRequest? _buildInterruptedReplay() {
+    // The judgement and the interruption stamps it is
+    // measured against share ONE clock (_speechNow), so
+    // the boundary is exact: an interruption is expired
+    // once its age REACHES the window (14.999 s alive,
+    // 15.000 s expired at the production 15 s window).
+    final DateTime now = _speechNow();
+    const Duration expiry = NavHazConfig.replayExpiry;
+    for (final SpeechRequest r
+        in _scheduler.interruptedNavigationRequests()) {
+      final DateTime? at = _scheduler.interruptedAtOf(r);
+      if (at != null && now.difference(at) >= expiry) {
+        _scheduler.discardInterrupted(r);
+        _scheduler.droppedExpiredLog.add(r.id);
+        continue;
+      }
+      final String? text = switch (r.replay) {
+        NavReplay.regenerate => _regenerateNavText(r),
+        NavReplay.shortenedReplay => _shortenedNavText(r),
+        NavReplay.drop => null,
+      };
+      _scheduler.discardInterrupted(r);
+      if (text == null) continue;
+      return _request(
+        id: 'nav-replay-${now.millisecondsSinceEpoch}',
+        eventId: 'nav-replay-${r.eventId}',
+        text: text,
+        kind: r.kind,
+        requiresStraight: r.kind == SpeechKind.straight,
+        navStepIndex: r.navStepIndex,
+        // A replay is never itself replayed: if a hazard
+        // interrupts IT, the moment is gone.
+        replay: NavReplay.drop,
+      );
+    }
+    return null;
+  }
+
+  /// Regenerated text for an interrupted turn / distance
+  /// prompt, recomputed from the latest GPS fix. Null when
+  /// the moment has passed (see NavigationTracker).
+  String? _regenerateNavText(SpeechRequest r) {
+    final int? step = r.navStepIndex;
+    if (step != null) {
+      final NavigationTracker? nav = _liveNav;
+      final GeoPoint? fix = _lastFixPoint;
+      if (nav == null || fix == null) return null;
+      return nav.regenerateTurnPrompt(
+        step,
+        NavFix(point: fix, accuracyM: _lastFixAccuracyM, at: DateTime.now()),
+      );
+    }
+    // Entrance distance prompt: the guidance recomputes
+    // from the latest fix (its own throttles apply, so a
+    // replay usually -- and correctly -- yields nothing).
+    if (_entranceActive && _entrance != null && _lastFixPoint != null) {
+      return _entrance!.onFix(
+        _lastFixPoint!,
+        _lastFixAccuracyM,
+        DateTime.now(),
+        headingDeg: _currentHeadingDeg(),
+      );
+    }
+    return null;
+  }
+
+  /// Shortened replay text, by the interrupted prompt's
+  /// semantics: straight prompts resume as 「继续直走」,
+  /// off-route prompts as 「已偏离路线」. Anything else has
+  /// no honest shortened form and is dropped.
+  String? _shortenedNavText(SpeechRequest r) {
+    if (r.kind == SpeechKind.straight) return '继续直走';
+    if (r.eventId.startsWith('nav-offroute')) return '已偏离路线';
+    return null;
+  }
+
   /// Shared completion step: mark the active prompt spoken, then
   /// promote the next queued prompt if it is still valid -- and speak
   /// it too, through the same real-or-simulated path.
@@ -1987,8 +2310,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (_scheduler.active?.id == id) {
       final SpeechRequest finished = _scheduler.active!;
       _scheduler.completeActive();
+      // NAVHAZ M1 arbitration: after a hazard prompt
+      // (danger / obstacleAvoidance) finishes and no other
+      // urgent prompt is pending, an interrupted navigation
+      // prompt is replayed per its policy (see
+      // _buildInterruptedReplay). If the replay becomes the
+      // active prompt, promoteNext below finds the seat
+      // taken and correctly does nothing.
+      if ((finished.kind == SpeechKind.danger ||
+              finished.kind == SpeechKind.obstacleAvoidance) &&
+          !_dangerPending) {
+        final SpeechRequest? replay = _buildInterruptedReplay();
+        if (replay != null) _say(replay);
+      }
       final SpeechRequest? next = _scheduler.promoteNext(
-        DateTime.now(),
+        _speechNow(),
         straightSegmentConfirmed: _straightSegmentConfirmedNow,
         riskActive: _riskActive,
       );
@@ -2006,7 +2342,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _recheckStraightResume();
       }
       if (next == null) {
-        // A press deferred by the P0 prompt that just
+        // A press deferred by the danger/emergency prompt that just
         // finished enters prompting now (still held only);
         // otherwise the turn-taking loop may open the
         // microphone (v0.7).
@@ -2049,16 +2385,42 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         request.kind == SpeechKind.emergency) {
       // Physical preemption, UNCONDITIONAL (Codex re-test of
       // d01a081, as corrected): a high-priority prompt first
-      // stops the currently playing utterance and AWAITS the
-      // stop, then speaks. No active-flag test decides this:
-      // the old design inspected scheduler state that the
-      // straight pause had already mutated, so on the YOLO
-      // path the stop silently never ran. The stop is bounded
-      // so a hung engine cannot block the danger prompt.
+      // stops the currently playing utterance, then speaks.
+      // No active-flag test decides this: the old design
+      // inspected scheduler state that the straight pause
+      // had already mutated, so on the YOLO path the stop
+      // silently never ran.
+      //
+      // FIX2 (2026-11-11): the wait for the stop to COMPLETE
+      // is capped at NavHazConfig.dangerStopWaitCap
+      // (150 ms), not the 800 ms bound this branch used
+      // before -- on a slow device the old bound could push
+      // the danger voice to 800 ms after the vibration,
+      // past the spec's 300 ms vibration -> speech limit.
+      // The stop is still issued (preemption preserved);
+      // on timeout the speak proceeds immediately and the
+      // engine's speak call interrupts the old utterance
+      // itself. The timeout is a NORMAL path here, not an
+      // error: it is swallowed by the onTimeout below and
+      // only logged. The late stop completion is harmless
+      // to the new utterance by construction: playback
+      // completion is routed per request id through
+      // _playActiveRequest's cancelled/active guards, and
+      // _finishSpeech only acts when the finishing id is
+      // still the scheduler's active id -- a stop that
+      // lands after the danger speak started cannot finish
+      // or cancel the danger request.
       try {
-        await _stopTtsPlayback().timeout(const Duration(milliseconds: 800));
+        await _stopTtsPlayback().timeout(
+          NavHazConfig.dangerStopWaitCap,
+          onTimeout: () {},
+        );
       } on TimeoutException {
-        _logMsg('停止当前播报 800 毫秒内未完成，继续播报高优先级提示；旧声音可能短暂残留。');
+        // Defensive: with onTimeout above the timeout does
+        // not throw; keep the historical catch so no
+        // timeout exception can ever leak into the speech
+        // chain from this branch.
+        _logMsg('停止当前播报未完成，继续播报高优先级提示；旧声音可能短暂残留。');
       }
       if (_scheduler.active?.id != request.id) return;
     }
@@ -2083,13 +2445,36 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   /// Speak [request] through the output while tracking the
   /// playback for the push-to-talk interruption rules: the
-  /// start time and (for P0 kinds) the text are recorded
+  /// start time and (for danger/emergency kinds) the text are recorded
   /// when playback actually begins, and a physical stop
   /// issued within the current utterance's first moments
   /// does not let that utterance's instant completion
   /// finish the request early.
+  /// FIX4-FINAL S3: the TTS engine reports an utterance
+  /// actually STARTED (SystemVoiceOutput.onSpeakStart).
+  /// Speech is strictly serialised by the scheduler, so
+  /// the start event belongs to the request _trackedSpeak
+  /// most recently armed; close its pipeline-to-speak
+  /// segment. Stage name + milliseconds only.
+  void _onTtsSpeakStart() {
+    final DateTime? from = _speakStartSegmentFrom;
+    _speakStartSegmentFrom = null;
+    if (from == null) return;
+    final int? ms = latencySegmentMs(from, _latencyNow());
+    if (ms != null) {
+      _logMsg('NAVHAZ延迟 pipeline-to-speak ${ms}ms');
+      _latencySegmentsForTest?.add(('pipeline-to-speak', ms));
+    }
+  }
+
   Future<void> _trackedSpeak(SpeechRequest request) async {
     _lastSpeechStartedAt = DateTime.now();
+    // S3 segment 2 arming: if this request is a hazard
+    // alert, its pipeline-return stamp moves into the
+    // single start-watch slot (playback is serialised, so
+    // one slot is exact); the engine's speak-start
+    // callback closes the segment in _onTtsSpeakStart.
+    _speakStartSegmentFrom = _hazardSpeakSegmentStarts.remove(request.id);
     if (request.kind == SpeechKind.danger ||
         request.kind == SpeechKind.emergency) {
       _lastP0SpokenText = request.text;
@@ -2386,7 +2771,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _say(_request(
       id: 'route-planned',
       eventId: 'route-planned',
-      // Simulation labelling (navigation P0): this flow is the
+      // Simulation labelling (navigation core): this flow is the
       // stub/demo route, and its spoken start must SAY it is a
       // simulation -- a blind user cannot see the on-screen 演示
       // labels.
@@ -2395,7 +2780,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
-  /// Navigation P0: start REAL voice navigation to a verified
+  /// Navigation: start REAL voice navigation to a verified
   /// destination. The starter (core/real_navigation.dart) checks,
   /// in order: verified destination -> route proxy configured ->
   /// GPS fix -> accuracy -> route fetch. Every failure is spoken
@@ -2529,13 +2914,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
-  /// True while a P0 (danger/emergency) announcement is
-  /// audibly playing. Three layers of evidence, strongest
-  /// first: a P0 request is the scheduler's active entry
-  /// or queued; a P0 entry was interrupted/cancelled a
-  /// moment ago (its playback can outlive the entry); the
-  /// most recent utterance started within the last 1.5 s
-  /// and IS the most recent P0 text. Used to refuse
+  /// True while a danger (level 1) / emergency (level 0)
+  /// announcement is audibly playing. Three layers of
+  /// evidence, strongest first: a danger/emergency request
+  /// is the scheduler's active entry or queued; a danger/
+  /// emergency entry was interrupted/cancelled a moment ago
+  /// (its playback can outlive the entry); the most recent
+  /// utterance started within the last 1.5 s and IS the most
+  /// recent danger/emergency text. Used to refuse
   /// push-to-talk presses during danger announcements.
   bool get _p0SpeechPlaying {
     if (_dangerPending) return true;
@@ -2565,7 +2951,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   ///   1. vibrate;
   ///   2. stop the AUTOMATIC listening session if one is
   ///      open, and stop any playing TTS utterance --
-  ///      EXCEPT a P0 danger/emergency prompt, which a
+  ///      EXCEPT a danger/emergency prompt (levels 1 and 0), which a
   ///      press must never interrupt;
   ///   3. speak the short cue DIRECTLY through the voice
   ///      output and AWAIT its completion (never through
@@ -2598,10 +2984,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         (_voiceInput as SystemVoiceInput).isListening;
     HapticFeedback.vibrate();
     if (_p0SpeechPlaying) {
-      // P0 gate: during a danger/emergency announcement
+      // Danger/emergency gate: during a danger/emergency announcement
       // the press only vibrates -- no cue, no ASR. It waits
       // in prompting; _finishSpeech enters the prompt step
-      // when the P0 prompt completes, if still held.
+      // when the danger/emergency prompt completes, if still held.
       _pttDeferredByP0 = true;
       _logMsg('按住说话：危险播报进行中，先等待播报结束。');
       return;
@@ -2653,7 +3039,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// The previous session finished closing: a press that
   /// waited for the barrier enters prompting, if the
   /// button is still held and the press is still live
-  /// (same shape as the P0 deferral hook).
+  /// (same shape as the danger/emergency deferral hook).
   void _maybeEnterPttAfterClose() {
     if (_pttState != _PttState.prompting || !_pttDeferredByClose) return;
     _pttDeferredByClose = false;
@@ -2726,7 +3112,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttCachedIsFinal = false;
   }
 
-  /// prompting: hand the microphone over, clear non-P0
+  /// prompting: hand the microphone over, clear lower-priority
   /// speech, speak the cue and await it. Every await is
   /// followed by a session + pendingStop re-check: a
   /// release recorded meanwhile is honoured by the
@@ -2753,7 +3139,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     if (_p0SpeechPlaying) {
-      // A P0 announcement began mid-prompt: defer the
+      // A danger/emergency announcement began mid-prompt: defer the
       // same way as a press that started during one.
       _pttDeferredByP0 = true;
       _logMsg('按住说话：危险播报已开始，先等待播报结束。');
@@ -2843,7 +3229,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // (MT-1111-PTT-D(2)): this branch is reached only
       // AFTER _interruptSpeechForPushToTalk above has run
       // for this press, so any scheduler-active or
-      // physically playing non-P0 TTS was already stopped
+      // physically playing lower-priority TTS was already stopped
       // before the recorder opens -- the same pre-capture
       // stop the local-ASR path gets. (TalkBack speech is
       // system-level and the app cannot stop it; that
@@ -2928,7 +3314,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           return;
         }
         if (_pttDeferredByP0) {
-          // A deferred press released before the P0 prompt
+          // A deferred press released before the danger/emergency prompt
           // finished: cancel quietly; the finish hook must
           // not start a press nobody holds anymore.
           _pttDeferredByP0 = false;
@@ -3397,7 +3783,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  /// Called from _finishSpeech: a deferred press whose P0
+  /// Called from _finishSpeech: a deferred press whose danger/emergency
   /// prompt just completed enters prompting, if the button
   /// is still held and the press is still the live one.
   void _maybeEnterPttAfterP0() {
@@ -3427,19 +3813,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   /// Stop the currently playing utterance for a press --
-  /// unless it is P0. Two layers, because the physical stop
+  /// unless it is danger/emergency. Two layers, because the physical stop
   /// has no cancel callback: while a cancellable prompt is
   /// still the scheduler's ACTIVE entry, cancelAll both
   /// drops it (its late completion is ignored by the
   /// stop-race guard) and the physical stop silences it.
   /// When the entry already completed -- a simulated
-  /// prompt whose playback outlives its entry, or a P0
-  /// prompt inside its post-completion window -- the
-  /// playback is recognised by recency and kind: recent
-  /// non-P0 playback is stopped physically, recent P0
-  /// playback is left completely alone.
+  /// prompt whose playback outlives its entry, or a danger/
+  /// emergency prompt inside its post-completion window --
+  /// the playback is recognised by recency and kind: recent
+  /// lower-priority playback is stopped physically, recent
+  /// danger/emergency playback is left completely alone.
   Future<void> _interruptSpeechForPushToTalk() async {
-    // A queued P0 prompt is about to play: clearing the
+    // A queued danger/emergency prompt is about to play: clearing the
     // queue for a cue would kill it. Leave everything.
     if (_scheduler.queue.any((SpeechRequest r) =>
         r.kind == SpeechKind.danger || r.kind == SpeechKind.emergency)) {
@@ -3449,7 +3835,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (active != null) {
       if (active.kind == SpeechKind.danger ||
           active.kind == SpeechKind.emergency) {
-        return; // P0 playing: never interrupt.
+        return; // Danger/emergency playing: never interrupt.
       }
       _scheduler.cancelAll();
       await _stopTtsPlayback();
@@ -3900,7 +4286,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// a detection box has no distance, so no left/right step is ever
   /// spoken from YOLO alone. The risk clears only after 3 consecutive
   /// frames without such a detection, and straight never auto-resumes.
-  void _onYoloDetections(List<Detection> detections) {
+  void _onYoloDetections(List<Detection> detections,
+      [DateTime? frameCapturedAt]) {
+    // Detection-CALLBACK arrival (FIX4-FINAL S3): `now` is
+    // stamped at handler entry; [frameCapturedAt] is the
+    // frame's own timestamp as stamped by the YOLO adapter
+    // at delivery (null for simulated / scripted frames,
+    // which then stamp no frame-to-callback segment).
     final DateTime now = DateTime.now();
     // Avoidance advisor bookkeeping for EVERY frame: the
     // side-clear streaks behind the three-condition rule and
@@ -3918,6 +4310,232 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     final List<PerceptionEvent> events =
         _perception.processFrame(detections, now);
+    // NAVHAZ M1 routing: frames that carry real box
+    // geometry run through the tracking + TTC pipeline;
+    // geometry-less frames (scripted / simulated sources
+    // and the existing test harness) keep the legacy chain
+    // below, unchanged.
+    if (detections.any((Detection d) => d.w > 0 && d.h > 0)) {
+      _onYoloDetectionsPipeline(detections, now, frameCapturedAt);
+    } else {
+      _onYoloDetectionsLegacy(detections, events, now);
+    }
+    setState(() {
+      _perceptionText = 'YOLO 实时：${detections.length} 个检测，'
+          '新跟踪事件 ${events.length} 条，跟踪目标 ${_perception.tracks.length} 个。'
+          '${_yoloLatencyMs == null ? '' : '单帧 ${_yoloLatencyMs!.toStringAsFixed(0)} 毫秒。'}';
+    });
+    if (events.isNotEmpty) {
+      final String labels =
+          events.map((PerceptionEvent e) => e.label).join('、');
+      _logMsg('YOLO 新跟踪：$labels（仅报告检测，不给行走方向）。');
+    }
+  }
+
+  /// Shared risk-state entry for both hazard chains
+  /// (legacy + NAVHAZ pipeline): pause straight pacing and
+  /// move the task to obstacle-avoidance.
+  void _enterYoloRiskState() {
+    _yoloRiskActive = true;
+    if (_tasks.state == TaskState.navigating) {
+      _tasks.transitionTo(TaskState.avoidingObstacle,
+          trigger: 'yolo-obstacle');
+      _stopStraightTimer();
+    }
+    _pauseStraightForRisk();
+    setState(() {
+      _riskActive = true;
+      _straightConfirmed = false;
+    });
+  }
+
+  /// Shared risk-state exit: the caller observed three
+  /// consecutive risk-free frames. Runs the unified resume
+  /// re-check NOW, not at some later speech completion, and
+  /// restarts the straight timer so the re-armed 3 s cadence
+  /// can actually fire.
+  void _exitYoloRiskState(DateTime now) {
+    _yoloRiskActive = false;
+    if (_tasks.state == TaskState.avoidingObstacle) {
+      _tasks.transitionTo(TaskState.navigating, trigger: 'yolo-cleared');
+    }
+    setState(() {
+      _riskActive = false;
+      _straightConfirmed = false;
+    });
+    _recheckStraightResume();
+    _say(_request(
+      id: 'yolo-cleared-${now.millisecondsSinceEpoch}',
+      eventId: 'yolo-cleared-${now.millisecondsSinceEpoch}',
+      text: '前方已无检测到的障碍。请说继续，重新确认直行路段后再走。',
+      kind: SpeechKind.info,
+    ));
+  }
+
+  /// Ego-motion estimate for one hazard frame (M1 fix
+  /// round). Source priority lives in [EgoMotion.judge];
+  /// this method only assembles the freshest evidence:
+  /// - GPS speed: the latest live fix's own speed, used
+  ///   only while fresh ([NavHazConfig.gpsSpeedFreshness])
+  ///   and gated by that fix's accuracy inside the judge;
+  /// - accelerometer: step frequency + magnitude variance
+  ///   from the pitch monitor's single subscription (the
+  ///   monitor owns the sliding window).
+  /// With neither source usable the judge returns its
+  /// UNKNOWN verdict, and no vehicle can be confirmed as
+  /// approaching this frame.
+  EgoMotion _egoMotionNow(DateTime now) {
+    double? gpsSpeed;
+    final DateTime? speedAt = _lastFixSpeedAt;
+    if (_lastFixSpeedMps != null &&
+        speedAt != null &&
+        now.difference(speedAt) <= NavHazConfig.gpsSpeedFreshness) {
+      gpsSpeed = _lastFixSpeedMps;
+    }
+    return EgoMotion.judge(
+      gpsSpeedMps: gpsSpeed,
+      gpsAccuracyM: _lastFixAccuracyM,
+      stepFrequencyHz: _pitchMonitor.currentStepFrequencyHz,
+      accelVariance: _pitchMonitor.currentAccelVariance,
+    );
+  }
+
+  /// NAVHAZ M1: geometry-bearing frames -- multi-target
+  /// tracking, TTC estimation and the hazard policy decide
+  /// what (if anything) is announced; the policy also
+  /// drives the risk state (three consecutive risk-free
+  /// frames clear it, same as the legacy chain).
+  void _onYoloDetectionsPipeline(List<Detection> detections, DateTime now,
+      DateTime? frameCapturedAt) {
+    // Latency stamps (FIX3B + FIX4-FINAL S3): the
+    // pipeline's own segment (frame -> alert / pre-urgent
+    // emission, wired through onLatency below) plus the
+    // two segments added this round -- frame-to-callback
+    // (stamped just below, on alert / pre-urgent frames)
+    // and pipeline-to-speak (its start is recorded below;
+    // it closes at the TTS engine's speak-start callback,
+    // see _onTtsSpeakStart). Milliseconds and stage name
+    // only, through the existing app log.
+    _hazardPipeline.onLatency ??=
+        (String stage, int ms) => _logMsg('NAVHAZ延迟 $stage ${ms}ms');
+    final bool navigating = _tasks.state == TaskState.navigating ||
+        _tasks.state == TaskState.avoidingObstacle;
+    final HazardPipelineResult result = _hazardPipeline.processFrame(
+      detections,
+      now,
+      pitchDeg: _pitchDegOverride ?? _pitchMonitor.currentPitchDeg,
+      // Ego motion, judged per frame from the live evidence
+      // (M1 fix round -- see _egoMotionNow): frame -> ego
+      // estimate -> pipeline -> estimator, where the
+      // vehicle's relative closing speed must beat v_ego
+      // by the configured margin to count as "approaching".
+      ego: _egoMotionNow(now),
+      commit: navigating,
+    );
+    // S3 segment 2 START: the pipeline has returned.
+    // (Stamped on the segment clock -- the wall clock in
+    // production; a test may install a fake through the
+    // debug handle to pin the segment's arithmetic.)
+    final DateTime pipelineReturnedAt = _latencyNow();
+    // S3 segment 1: frame timestamp -> detection-callback
+    // arrival (`now`, stamped at _onYoloDetections entry).
+    // Scope (NH-M1-10): the frame timestamp is the
+    // adapter's delivery-moment stamp, so this segment
+    // measures ONLY result-delivery -> detection callback;
+    // it does NOT include camera frame capture or model
+    // inference time. Only frames the adapter actually
+    // stamped carry a segment (simulated frames pass
+    // null), and only alert / pre-urgent frames stamp it,
+    // like the pipeline's own segment.
+    if (frameCapturedAt != null &&
+        (result.alert != null || result.preUrgentTrackIds.isNotEmpty)) {
+      final int? segment1 = latencySegmentMs(frameCapturedAt, now);
+      if (segment1 != null) {
+        _logMsg('NAVHAZ延迟 frame-to-callback ${segment1}ms');
+      }
+    }
+    // Vibrations (NH-M1-13 ladder): the pipeline has
+    // already merged this frame's pre-urgent one-shot and
+    // the alert's ladder-step vibration into ONE dispatch
+    // list (result.vibrations) -- the two same-frame
+    // duplicate sources (a pre-urgent firing on the alert
+    // frame, an alert vibration on top of an already-spent
+    // pre-urgent) are resolved there, so this loop is the
+    // ONLY vibration dispatch on the pipeline path and
+    // fires exactly the counted entries: urgent pattern
+    // for pre-urgent / urgent entries, warning pattern
+    // for a warning alert's step. No speech accompanies a
+    // pre-urgent entry -- the urgent speech still comes
+    // only through the confirmed alert path below.
+    if (navigating) {
+      for (final ({int trackId, bool urgent}) v in result.vibrations) {
+        unawaited(
+            v.urgent ? _haptics.vibrateUrgent() : _haptics.vibrateWarning());
+      }
+    }
+    if (result.riskPresent) {
+      _yoloEmptyFrames = 0;
+      if (navigating && !_yoloRiskActive) {
+        _enterYoloRiskState();
+      }
+    } else {
+      _yoloEmptyFrames += 1;
+      if (_yoloRiskActive && _yoloEmptyFrames >= 3) {
+        _exitYoloRiskState(now);
+      }
+    }
+    final HazardAlert? alert = result.alert;
+    if (alert == null) return;
+    // NH-M1-13: NO vibration dispatch here any more --
+    // the alert's vibration (when its ladder step allows
+    // one) was already dispatched in parallel with the
+    // speech preparation by the result.vibrations loop
+    // above (vibration first, never awaited before
+    // speech; spec section 2.5 timing is unchanged).
+    // Dispatching again here was duplicate source (ii):
+    // the same urgent frame vibrated twice.
+    String text = alert.phrase;
+    if (alert.urgent) {
+      // A sideways step may ONLY come from the avoidance
+      // advisor's three-condition decision -- the tracking
+      // / TTC pipeline never produces a direction itself.
+      final AvoidanceDecision decision = _avoidance.decide(
+        hazard: alert.detection,
+        orientationStable: _orientation.isStable,
+      );
+      if (decision.advice == StepAdvice.stepLeft) {
+        text = '$text，向左迈一步';
+      } else if (decision.advice == StepAdvice.stepRight) {
+        text = '$text，向右迈一步';
+      }
+      if (alert.nearCenter) {
+        unawaited(_triggerHazardScan(VisionTrigger.yoloHazard));
+      }
+    }
+    final String requestId = 'navhaz-${alert.urgent ? 'urgent' : 'warning'}-'
+        '${now.millisecondsSinceEpoch}';
+    // S3 segment 2: remember when the pipeline returned
+    // for THIS alert; _trackedSpeak picks the stamp up
+    // when the request starts playing and the engine's
+    // speak-start callback closes the segment.
+    _hazardSpeakSegmentStarts[requestId] = pipelineReturnedAt;
+    _say(_request(
+      id: requestId,
+      eventId: 'navhaz-track-${alert.trackId}',
+      text: '$text。',
+      kind: alert.speechKind,
+    ));
+    _logMsg('NAVHAZ ${alert.urgent ? '紧急' : '警示'}：$text'
+        '（track ${alert.trackId}）。');
+  }
+
+  /// The pre-M1 announcement chain, kept for frames
+  /// without box geometry (see _onYoloDetections).
+  void _onYoloDetectionsLegacy(
+    List<Detection> detections,
+    List<PerceptionEvent> events,
+    DateTime now,
+  ) {
     final bool hasObstacleNow = detections.any((Detection d) =>
         _yoloObstacleLabels.containsKey(d.label) && d.confidence >= 0.3);
     if (hasObstacleNow) {
@@ -3940,17 +4558,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // active must still be announced immediately -- only
       // the per-category cooldown debounces repeats.
       if (!_yoloRiskActive) {
-        _yoloRiskActive = true;
-        if (_tasks.state == TaskState.navigating) {
-          _tasks.transitionTo(TaskState.avoidingObstacle,
-              trigger: 'yolo-obstacle');
-          _stopStraightTimer();
-        }
-        _pauseStraightForRisk();
-        setState(() {
-          _riskActive = true;
-          _straightConfirmed = false;
-        });
+        _enterYoloRiskState();
       }
       final String names = newObstacles
           .map((PerceptionEvent e) => _yoloObstacleLabels[e.label] ?? e.label)
@@ -4013,37 +4621,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         ));
       }
     } else if (_yoloRiskActive && _yoloEmptyFrames >= 3) {
-      _yoloRiskActive = false;
-      if (_tasks.state == TaskState.avoidingObstacle) {
-        _tasks.transitionTo(TaskState.navigating, trigger: 'yolo-cleared');
-      }
-      setState(() {
-        _riskActive = false;
-        _straightConfirmed = false;
-      });
-      // Risk cleared: run the unified resume re-check NOW,
-      // not at some later speech completion, and restart the
-      // straight timer so the re-armed 3 s cadence can
-      // actually fire. The tick stays gated regardless: in
-      // the demo flow on the user's own re-confirmation
-      // （继续）, in live nav on the tracker's current step.
-      _recheckStraightResume();
-      _say(_request(
-        id: 'yolo-cleared-${now.millisecondsSinceEpoch}',
-        eventId: 'yolo-cleared-${now.millisecondsSinceEpoch}',
-        text: '前方已无检测到的障碍。请说继续，重新确认直行路段后再走。',
-        kind: SpeechKind.info,
-      ));
-    }
-    setState(() {
-      _perceptionText = 'YOLO 实时：${detections.length} 个检测，'
-          '新跟踪事件 ${events.length} 条，跟踪目标 ${_perception.tracks.length} 个。'
-          '${_yoloLatencyMs == null ? '' : '单帧 ${_yoloLatencyMs!.toStringAsFixed(0)} 毫秒。'}';
-    });
-    if (events.isNotEmpty) {
-      final String labels =
-          events.map((PerceptionEvent e) => e.label).join('、');
-      _logMsg('YOLO 新跟踪：$labels（仅报告检测，不给行走方向）。');
+      // The tick stays gated regardless: in the demo flow
+      // on the user's own re-confirmation（继续）, in live
+      // nav on the tracker's current step.
+      _exitYoloRiskState(now);
     }
   }
 
@@ -4961,7 +5542,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         return;
       case VoiceCommand.startLibrary:
         if (_tasks.state == TaskState.idle) {
-          // Navigation P0: a real voice request goes to REAL
+          // Navigation: a real voice request goes to REAL
           // navigation (verified destination + GPS + proxy route).
           // The simulated flow stays available only through its
           // explicitly labelled demo buttons, never as a silent
@@ -4981,7 +5562,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _tasks.transitionTo(TaskState.paused, trigger: 'voice-pause');
           _stopStraightTimer();
           _scheduler.pauseStraight();
-          // P0: "停下" must also cancel everything still pending
+          // Stop command (highest priority): "停下" must also cancel everything still pending
           // (queued turn / navigation prompts) and stop the actual
           // playback -- not only the straight prompt. The
           // confirmation below is submitted after this, so it is
@@ -5047,7 +5628,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _endLiveNavigation();
           _stopStraightTimer();
           _scheduler.pauseStraight();
-          // P0 + re-test: same sequenced stop semantics as pause.
+          // Stop semantics (re-test fix): same sequenced stop as pause.
           unawaited(_stopSpeechThenConfirm(
             idPrefix: 'voice-cancel',
             confirmText: '任务已取消，直行提醒已停止。',
@@ -5369,7 +5950,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           ),
           // The one very large push-to-talk area (lower
           // half): a plain colour block with no caption.
-          // Hold: vibrate, stop any non-P0 speech, speak
+          // Hold: vibrate, stop any lower-priority speech, speak
           // the cue and await it, then listen while held.
           // Release: stop listening and submit the result.
           // The area is never disabled: with no recogniser

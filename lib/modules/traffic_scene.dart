@@ -3,8 +3,8 @@
 /// This module REPLACES the deleted "traffic-light crossing decision".
 /// A single camera image can never prove that a light belongs to the
 /// user's crossing, that no vehicle is coming, or that crossing is safe.
-/// Therefore this module NEVER outputs "可以过马路" or any crossing
-/// permission, and NEVER outputs a step across a road.
+/// Therefore this module NEVER outputs a crossing
+/// permission of any wording, and NEVER outputs a step across a road.
 ///
 /// What it does output, always as caution/stop:
 /// - light seen but direction unconfirmed -> stop, ask for help / other confirmation

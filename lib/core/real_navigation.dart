@@ -1,4 +1,4 @@
-/// Real-navigation starter for Mingtu AI (navigation P0).
+/// Real-navigation starter for Mingtu AI (navigation core).
 ///
 /// One attempt to start REAL voice navigation to a human-verified
 /// destination, as a pure orchestration over injected adapters so
@@ -37,6 +37,7 @@ import 'dart:math' as math;
 
 import '../adapters/amap_client.dart';
 import '../adapters/current_location.dart';
+import 'hazard/hazard_phrases.dart';
 import '../config/verified_locations.dart';
 import '../modules/map_navigation.dart';
 
@@ -266,9 +267,18 @@ String realRouteReadyAnnouncement({
   required String destinationName,
   required double distanceM,
   required int stepsCount,
-}) =>
-    '已获取到$destinationName的真实步行路线，距离 '
-    '${distanceM.toStringAsFixed(0)} 米，共 $stepsCount 段。'
-    '注意：高德不提供盲道信息，这条路线没有经过无障碍核查。'
-    '接下来我会按你的实时位置播报转向和偏航，'
-    '到达时会提醒你。';
+}) {
+  // Route distance wording: the FIX3B navigation bands.
+  // CDX5 S2-1: an abnormal distance (non-finite /
+  // negative) yields the EMPTY readout; the distance
+  // clause is then dropped wholesale ("...路线，共 N 段")
+  // so the sentence stays complete instead of reading
+  // "距离，共 N 段" with a hole where the figure belongs.
+  final String distanceText = navigationDistanceText(distanceM);
+  final String distanceClause =
+      distanceText.isEmpty ? '' : '，距离$distanceText';
+  return '已获取到$destinationName的真实步行路线$distanceClause，共 $stepsCount 段。'
+      '注意：高德不提供盲道信息，这条路线没有经过无障碍核查。'
+      '接下来我会按你的实时位置播报转向和偏航，'
+      '到达时会提醒你。';
+}

@@ -1,5 +1,5 @@
-/// Startup voice plan and voice-notice texts for Mingtu AI (P0
-/// follow-up on the Android submission PR).
+/// Startup voice plan and voice-notice texts for Mingtu AI
+/// (follow-up on the Android submission PR).
 ///
 /// Blind-first rules encoded here, as pure testable logic:
 ///
