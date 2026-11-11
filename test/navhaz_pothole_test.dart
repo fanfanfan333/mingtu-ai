@@ -1,8 +1,15 @@
 /// NAVHAZ M3 pothole second detector (spec section 4.4,
 /// this step's part): grading fixtures, the switch, the
 /// walking gate, the scan cadence, the enumeration /
-/// banned-word surface and the thermal-restriction
-/// intersection.
+/// banned-word surface and the thermal intersection.
+///
+/// COMMIT23 rework (this commit): the thermal group no
+/// longer pins "runs, then filtered at intake" as the
+/// primary behaviour -- 大川 ruled the detector STOPS
+/// RUNNING at applied SEVERE / CRITICAL (the intake
+/// restriction remains only as a backstop, still pinned).
+/// New groups pin the Sewage-Manhole EXPLICIT discard and
+/// the zero-burden build / missing-model startup states.
 ///
 /// Everything here runs on fakes and synthetic geometry:
 /// the detector is a counting fake, the frame source is a
@@ -75,12 +82,53 @@ const Detection _pitDetection = Detection(
   h: 0.24,
 );
 
+/// Sink capture for the discard test (reset by that test
+/// itself; file-scope because the sink is a closure).
+List<Detection>? _lastDelivered;
+
+/// Run ONE scan through a scanner fed by [detector] and
+/// return what the sink received (the list the wiring
+/// layer would store and merge into live frames).
+Future<List<Detection>> _scanOnce(_FakePotholeDetector detector) async {
+  List<Detection>? delivered;
+  final PotholeScanner scanner = PotholeScanner(
+    enabled: true,
+    detector: detector,
+    frameSource: _FakeFrameSource(),
+    onDetections: (List<Detection> d, DateTime at) => delivered = d,
+  );
+  await scanner.maybeScan(
+    walking: true,
+    now: DateTime.fromMillisecondsSinceEpoch(0),
+  );
+  return delivered!;
+}
+
 /// Run one constant pit geometry through the real
 /// pipeline for 15 frames at 100 ms and collect the
 /// spoken alerts (the policy's cooldown yields exactly
 /// one for these static geometries).
 List<HazardAlert> _runPitGeometry(
   String backend, {
+  required double bottom,
+  required double h,
+  required double pitchDeg,
+}) =>
+    _runLabelGeometry(
+      backend,
+      label: potholeLabel,
+      bottom: bottom,
+      h: h,
+      pitchDeg: pitchDeg,
+    );
+
+/// The same constant-geometry run for an arbitrary label
+/// (the Sewage-Manhole discard fixtures reuse the pit
+/// geometry with the manhole label: if the class leaked
+/// into grading, these are the boxes that would speak).
+List<HazardAlert> _runLabelGeometry(
+  String backend, {
+  required String label,
   required double bottom,
   required double h,
   required double pitchDeg,
@@ -93,7 +141,7 @@ List<HazardAlert> _runPitGeometry(
     final HazardPipelineResult r = pipeline.processFrame(
       <Detection>[
         Detection(
-          label: potholeLabel,
+          label: label,
           confidence: 0.9,
           cx: 0.5,
           cy: bottom - h / 2,
@@ -179,8 +227,11 @@ void main() {
       expect(hazardKindForLabel(potholeLabel), HazardKind.pit);
       expect(hazardSpokenName(potholeLabel, HazardKind.pit), '坑洞');
       expect(hazardKindName(HazardKind.pit), '坑洞');
-      // The model's second class stays unmapped.
-      expect(hazardKindForLabel('sewage-manhole'), isNull);
+      // The model's second class has NO hazard kind: it
+      // is discarded at the scanner by name (COMMIT23 --
+      // see the discard group below), not graded.
+      expect(sewageManholeLabel, 'sewage-manhole');
+      expect(hazardKindForLabel(sewageManholeLabel), isNull);
     });
   });
 
@@ -189,7 +240,11 @@ void main() {
       // No --dart-define=MINGTU_POTHOLE in the test build:
       // the single access point must read off.
       expect(AppConfig.potholeEnabled, isFalse);
-      expect(AppConfig.potholeModelPath, 'assets/models/pothole2v.tflite');
+      // COMMIT23: the weight moved into its own directory
+      // (the pubspec directory-declaration form), so the
+      // default asset path moved with it.
+      expect(AppConfig.potholeModelPath,
+          'assets/models/pothole/pothole2v.tflite');
     });
 
     test('off: the scanner never captures and never detects', () async {
@@ -256,7 +311,7 @@ void main() {
           _FakePotholeDetector(<Detection>[
         _pitDetection,
         const Detection(
-          label: 'sewage-manhole',
+          label: sewageManholeLabel,
           confidence: 0.8,
           cx: 0.4,
           cy: 0.7,
@@ -379,9 +434,20 @@ void main() {
     });
   });
 
-  group('thermal intersection (section 4.4f)', () {
-    test('SEVERE class restriction filters pit input at the shared intake',
-        () {
+  group('thermal intersection (section 4.4f, COMMIT23 rework)', () {
+    // COMMIT23 supersession, recorded per protocol: in
+    // step 2 this group pinned "the detector runs and its
+    // input is filtered at the intake" as THE thermal
+    // behaviour. 大川 ruled the second model must instead
+    // STOP RUNNING at applied SEVERE / CRITICAL (it is
+    // itself a heat source, and stopping matches the
+    // announced scope). The intake assertions below are
+    // KEPT, but demoted to what they now are -- the
+    // backstop for a result already in flight when the
+    // heat spiked. The gate itself is pinned by the new
+    // tests after them.
+    test('backstop: SEVERE class restriction still filters pit input at '
+        'the shared intake', () {
       // The restriction's pass set is judged by the same
       // label->kind mapping: vehicles and persons pass,
       // pit (like pole and clutter) does not.
@@ -403,6 +469,295 @@ void main() {
           reason: 'pit detections merge first, so the '
               'thermal restriction gates them like any '
               'other intake input');
+    });
+
+    test('gate wiring: the applied cap feeds the scanner gate', () {
+      final String main = File('lib/main.dart').readAsStringSync();
+      expect(
+          main.contains(
+              '_potholeScanner?.setThermalRestricted(cap.restrictClasses'),
+          isTrue,
+          reason: 'the gate follows the SAME applied cap '
+              'that drives the restriction and the scope '
+              'announcement');
+    });
+
+    test('gate closed at boot: no capture, no inference, no load', () async {
+      // "No load" is observable here because loading is
+      // lazy inside the first detectImage call: zero
+      // detector calls means the model was never loaded.
+      final _FakePotholeDetector detector =
+          _FakePotholeDetector(<Detection>[_pitDetection]);
+      final _FakeFrameSource frames = _FakeFrameSource();
+      final List<List<Detection>> delivered = <List<Detection>>[];
+      final PotholeScanner scanner = PotholeScanner(
+        enabled: true,
+        detector: detector,
+        frameSource: frames,
+        onDetections: (List<Detection> d, DateTime at) => delivered.add(d),
+      );
+      final DateTime t0 = DateTime.fromMillisecondsSinceEpoch(0);
+      scanner.setThermalRestricted(true, now: t0);
+      expect(scanner.thermalRestricted, isTrue);
+      for (int i = 0; i < 5; i++) {
+        await scanner.maybeScan(
+          walking: true,
+          now: t0.add(Duration(milliseconds: 300 * i)),
+        );
+      }
+      expect(scanner.scanCount, 0);
+      expect(frames.calls, 0);
+      expect(detector.calls, 0);
+      // The only sink call is the gate-close clearing
+      // (an empty list): nothing was ever detected.
+      expect(delivered, hasLength(1));
+      expect(delivered.single, isEmpty);
+    });
+
+    test('gate closing clears the stored result and drops an in-flight '
+        'scan', () async {
+      final Completer<List<Detection>> completer =
+          Completer<List<Detection>>();
+      final _SwitchableDetector detector =
+          _SwitchableDetector(() async => <Detection>[_pitDetection]);
+      final _FakeFrameSource frames = _FakeFrameSource();
+      final List<List<Detection>> delivered = <List<Detection>>[];
+      final PotholeScanner scanner = PotholeScanner(
+        enabled: true,
+        detector: detector,
+        frameSource: frames,
+        onDetections: (List<Detection> d, DateTime at) => delivered.add(d),
+      );
+      final DateTime t0 = DateTime.fromMillisecondsSinceEpoch(0);
+      // One healthy scan: the pit is stored (delivered).
+      await scanner.maybeScan(walking: true, now: t0);
+      expect(delivered, hasLength(1));
+      expect(delivered.single.single.label, potholeLabel);
+      // A second scan starts and hangs inside inference.
+      detector.handler = () => completer.future;
+      final Future<void> inFlight = scanner.maybeScan(
+        walking: true,
+        now: t0.add(const Duration(seconds: 1)),
+      );
+      await pumpEventQueue();
+      expect(scanner.inFlight, isTrue);
+      // The heat spike lands mid-scan: stored result is
+      // cleared at once (empty delivery)...
+      scanner.setThermalRestricted(
+          true, now: t0.add(const Duration(seconds: 1, milliseconds: 100)));
+      expect(delivered, hasLength(2));
+      expect(delivered.last, isEmpty);
+      // ...and when the stale scan finally returns its
+      // pit, the result is DROPPED, never delivered.
+      completer.complete(<Detection>[_pitDetection]);
+      await inFlight;
+      expect(delivered, hasLength(2));
+      expect(scanner.scanCount, 2);
+    });
+
+    test('gate reopening resumes scanning on its own', () async {
+      final _FakePotholeDetector detector =
+          _FakePotholeDetector(<Detection>[_pitDetection]);
+      final _FakeFrameSource frames = _FakeFrameSource();
+      final List<List<Detection>> delivered = <List<Detection>>[];
+      final PotholeScanner scanner = PotholeScanner(
+        enabled: true,
+        detector: detector,
+        frameSource: frames,
+        onDetections: (List<Detection> d, DateTime at) => delivered.add(d),
+      );
+      final DateTime t0 = DateTime.fromMillisecondsSinceEpoch(0);
+      // Settled severe: nothing runs.
+      scanner.setThermalRestricted(true, now: t0);
+      await scanner.maybeScan(walking: true, now: t0);
+      expect(scanner.scanCount, 0);
+      // The ladder settles back to a non-restricting rung
+      // (NONE / LIGHT / MODERATE): the very next offer
+      // scans again, with no restart and no speech from
+      // this layer (the thermal recovery announcement is
+      // the policy's, not the scanner's).
+      scanner.setThermalRestricted(false,
+          now: t0.add(const Duration(seconds: 30)));
+      await scanner.maybeScan(
+          walking: true, now: t0.add(const Duration(seconds: 30)));
+      expect(scanner.scanCount, 1);
+      expect(delivered.last.single.label, potholeLabel);
+      // Re-closing is a transition again (idempotence:
+      // feeding the same state twice clears only once).
+      final int sinkCalls = delivered.length;
+      scanner.setThermalRestricted(true,
+          now: t0.add(const Duration(seconds: 31)));
+      scanner.setThermalRestricted(true,
+          now: t0.add(const Duration(seconds: 32)));
+      expect(delivered.length, sinkCalls + 1);
+    });
+  });
+
+  group('sewage-manhole explicit discard (COMMIT23)', () {
+    const Detection sewageUrgent = Detection(
+      label: sewageManholeLabel,
+      confidence: 0.9,
+      cx: 0.5,
+      cy: 0.8215,
+      w: 0.3,
+      h: 0.25,
+    );
+
+    test('scanner: a manhole-only scan delivers an empty result', () async {
+      _lastDelivered = null;
+      final _FakePotholeDetector detector =
+          _FakePotholeDetector(<Detection>[sewageUrgent]);
+      final PotholeScanner scanner = PotholeScanner(
+        enabled: true,
+        detector: detector,
+        frameSource: _FakeFrameSource(),
+        onDetections: (List<Detection> d, DateTime at) =>
+            _lastDelivered = d,
+      );
+      await scanner.maybeScan(
+        walking: true,
+        now: DateTime.fromMillisecondsSinceEpoch(0),
+      );
+      expect(detector.calls, 1,
+          reason: 'the model DID see the manhole; the '
+              'discard is a code path, not blindness');
+      expect(_lastDelivered, isNotNull);
+      expect(_lastDelivered, isEmpty);
+    });
+
+    // The two end-to-end fixtures below compose the
+    // PRODUCTION path (fake detector -> scanner -> what
+    // the wiring would merge -> pipeline). They do NOT
+    // feed a raw manhole-labelled detection straight into
+    // the pipeline, on purpose: the pipeline grades ANY
+    // unmapped label as clutter -- a pre-existing,
+    // deliberate fallback for the MAIN detector's unknown
+    // labels (an unknown object in the corridor is still
+    // an obstacle). The manhole class can never take that
+    // path in production because the scanner is its only
+    // door into the app and the discard happens there;
+    // that is exactly why the ruling puts the discard at
+    // the scanner, and why these tests compose through it.
+    test('end-to-end: manhole frames reach the pipeline as nothing, on '
+        'both backends', () async {
+      // The sewage box IS the pit fixture's urgent
+      // geometry (bottom 0.9465 at pitch 20 -> Z ~= 1.2 m
+      // <= pitUrgentRangeM): if the class leaked past the
+      // scanner, this is the box that would speak URGENT.
+      final List<Detection> delivered = await _scanOnce(
+          _FakePotholeDetector(<Detection>[sewageUrgent]));
+      expect(delivered, isEmpty);
+      for (final String backend in <String>['byteTrack', 'sort']) {
+        final HazardPipeline pipeline =
+            HazardPipeline(tracker: trackerForBackend(backend));
+        final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+        for (int i = 0; i < 15; i++) {
+          final HazardPipelineResult r = pipeline.processFrame(
+            delivered,
+            epoch.add(Duration(milliseconds: 100 * i)),
+            pitchDeg: 20,
+            ego: EgoMotion.still,
+          );
+          expect(r.alert, isNull, reason: backend);
+        }
+      }
+    });
+
+    test('end-to-end: manhole and pit in the same scan -- only the pit '
+        'speaks', () async {
+      const Detection pitUrgent = Detection(
+        label: potholeLabel,
+        confidence: 0.9,
+        cx: 0.5,
+        cy: 0.8215,
+        w: 0.3,
+        h: 0.25,
+      );
+      final List<Detection> delivered = await _scanOnce(
+          _FakePotholeDetector(<Detection>[pitUrgent, sewageUrgent]));
+      expect(delivered, hasLength(1));
+      expect(delivered.single.label, potholeLabel);
+      final HazardPipeline pipeline =
+          HazardPipeline(tracker: trackerForBackend('byteTrack'));
+      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      final List<HazardAlert> alerts = <HazardAlert>[];
+      for (int i = 0; i < 15; i++) {
+        final HazardPipelineResult r = pipeline.processFrame(
+          delivered,
+          epoch.add(Duration(milliseconds: 100 * i)),
+          pitchDeg: 20,
+          ego: EgoMotion.still,
+        );
+        if (r.alert != null) alerts.add(r.alert!);
+      }
+      expect(alerts, hasLength(1));
+      expect(alerts.single.kind, HazardKind.pit);
+      expect(alerts.single.phrase, '停，前方很近有坑洞');
+    });
+  });
+
+  group('zero-burden startup (COMMIT23)', () {
+    test('the three startup states', () {
+      // Switch off: disabled, whatever the bundle holds
+      // (the check never runs in this state at all).
+      expect(
+          potholeStartupState(enabled: false, modelBundled: false),
+          PotholeStartupState.disabled);
+      expect(
+          potholeStartupState(enabled: false, modelBundled: true),
+          PotholeStartupState.disabled);
+      // Switch on: presence decides.
+      expect(potholeStartupState(enabled: true, modelBundled: false),
+          PotholeStartupState.unavailable);
+      expect(potholeStartupState(enabled: true, modelBundled: true),
+          PotholeStartupState.ready);
+    });
+
+    test('the unavailable notice latch fires exactly once per process',
+        () {
+      final PotholeUnavailableNoticeLatch latch =
+          PotholeUnavailableNoticeLatch();
+      expect(latch.claimed, isFalse);
+      expect(latch.claimOnce(), isTrue);
+      expect(latch.claimed, isTrue);
+      expect(latch.claimOnce(), isFalse);
+      expect(latch.claimOnce(), isFalse);
+    });
+
+    test('the unavailable sentence is the ruled literal and banned-clean',
+        () {
+      expect(NavHazConfig.potholeUnavailableAnnouncementText, '坑洞识别不可用');
+      expect(
+          containsBannedWord(
+              NavHazConfig.potholeUnavailableAnnouncementText),
+          isFalse);
+    });
+
+    test('zero-burden build shape: directory declared, single pothole '
+        'file NOT declared, .gitkeep in place', () {
+      final String pubspec = File('pubspec.yaml').readAsStringSync();
+      expect(pubspec, contains('- assets/models/pothole/'));
+      expect(pubspec, isNot(contains('- assets/models/pothole2v.tflite')),
+          reason: 'a single-file declaration would make '
+              'the build fail whenever the weight is absent');
+      // The main model keeps its single-file discipline.
+      expect(pubspec, contains('- assets/models/yolo11n.tflite'));
+      expect(File('assets/models/pothole/.gitkeep').existsSync(), isTrue,
+          reason: 'the declared directory must exist in a '
+              'clean checkout, weight or no weight');
+    });
+
+    test('missing-model wiring goes through the asset system', () {
+      final String main = File('lib/main.dart').readAsStringSync();
+      expect(main.contains('rootBundle.load(AppConfig.potholeModelPath)'),
+          isTrue,
+          reason: 'presence is an asset-system question, '
+              'never a file-system probe');
+      expect(main.contains('_announcePotholeModelMissing'), isTrue);
+      expect(
+          main.contains(
+              'NavHazConfig.potholeUnavailableAnnouncementText'),
+          isTrue);
     });
   });
 
@@ -437,5 +792,26 @@ class _HangingDetector implements PotholeDetector {
   Future<List<Detection>> detectImage(List<int> imageBytes) {
     onCall();
     return Completer<List<Detection>>().future;
+  }
+}
+
+/// A detector whose behaviour the test can swap between
+/// scans (healthy first, hanging on the gate test's
+/// second scan).
+class _SwitchableDetector implements PotholeDetector {
+  Future<List<Detection>> Function() handler;
+  int calls = 0;
+  _SwitchableDetector(this.handler);
+
+  @override
+  bool get isAvailable => true;
+
+  @override
+  String get status => 'switchable fake';
+
+  @override
+  Future<List<Detection>> detectImage(List<int> imageBytes) {
+    calls += 1;
+    return handler();
   }
 }

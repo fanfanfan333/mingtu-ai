@@ -17,8 +17,10 @@
 /// names: [potholeClassLabel] accepts the card names when
 /// they do arrive, and otherwise falls back to the card's
 /// index order. Only index 0 maps into the hazard system
-/// (as [potholeLabel]); index 1 stays unmapped on purpose
-/// (see avoidance_advisor.dart).
+/// (as [potholeLabel]); index 1 normalises to
+/// [sewageManholeLabel] and is EXPLICITLY DISCARDED by
+/// the scanner (M3 COMMIT23 ruling, see
+/// core/pothole_scan.dart).
 library;
 
 import '../core/avoidance_advisor.dart';
@@ -36,12 +38,12 @@ String potholeClassLabel({
 }) {
   final String name = className.trim().toLowerCase();
   if (name == 'pothole') return potholeLabel;
-  if (name == 'sewage-manhole' || name == 'sewage manhole') {
-    return 'sewage-manhole';
+  if (name == sewageManholeLabel || name == 'sewage manhole') {
+    return sewageManholeLabel;
   }
   // No usable name: the model card's index order is the
   // only authoritative mapping left.
   if (classIndex == 0) return potholeLabel;
-  if (classIndex == 1) return 'sewage-manhole';
+  if (classIndex == 1) return sewageManholeLabel;
   return name;
 }

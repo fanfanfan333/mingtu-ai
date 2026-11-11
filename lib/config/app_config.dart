@@ -119,10 +119,16 @@ class AppConfig {
   /// Bundled pothole model asset (fetched and
   /// SHA256-verified by tool/fetch_pothole_model.sh; the
   /// weights are never committed). Only ever loaded when
-  /// [potholeEnabled] is on.
+  /// [potholeEnabled] is on. The asset lives in its own
+  /// pubspec DIRECTORY declaration (M3 COMMIT23
+  /// zero-burden rule): the build succeeds whether or not
+  /// the weight file is present, and presence is checked
+  /// at runtime through the asset system -- a missing
+  /// weight with the switch on degrades to "feature off
+  /// plus one spoken notice", never a build failure.
   static const String potholeModelPath = String.fromEnvironment(
     'MINGTU_POTHOLE_MODEL_PATH',
-    defaultValue: 'assets/models/pothole2v.tflite',
+    defaultValue: 'assets/models/pothole/pothole2v.tflite',
   );
 
   static bool get hasRouteProxy => routeProxyUrl.isNotEmpty;

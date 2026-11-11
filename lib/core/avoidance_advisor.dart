@@ -56,11 +56,20 @@ int hazardKindPriority(HazardKind kind) => switch (kind) {
 /// The pipeline label of a pothole detection. The pothole
 /// model (M3) has two classes -- 'Pothole' (index 0) and
 /// 'Sewage-Manhole' (index 1) per its model card; the
-/// adapter normalises class 0 to this label, and class 1
-/// stays UNMAPPED (a manhole cover is not the hazard this
-/// round was ruled for, so it never enters the hazard
-/// system).
+/// adapter normalises class 0 to this label.
 const String potholeLabel = 'pothole';
+
+/// The normalised label of the pothole model's SECOND
+/// class (Sewage-Manhole, card index 1). This class is
+/// EXPLICITLY DISCARDED at the scanner (M3 COMMIT23
+/// ruling -- see core/pothole_scan.dart): most manholes
+/// are closed and can be stepped on, the model cannot
+/// tell an open one from a closed one, and announcing
+/// them would false-alarm constantly. It has NO hazard
+/// kind ([hazardKindForLabel] returns null for it): the
+/// discard is a named code path, not an accident of the
+/// class being unmapped.
+const String sewageManholeLabel = 'sewage-manhole';
 
 /// Map a detector label to a hazard category. The bundled
 /// COCO model has no pole class, so [HazardKind.pole] is

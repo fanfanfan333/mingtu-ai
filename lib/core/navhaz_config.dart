@@ -743,4 +743,14 @@ static const Duration potholeScanMinInterval =
 /// track coasts out through the tracker's normal lost
 /// window instead of being re-fed forever.
 static const Duration potholeResultMaxAge = Duration(seconds: 1);
+
+/// The ONE spoken notice for "the switch is on but the
+/// weight asset is not bundled" (M3 COMMIT23 zero-burden
+/// rule): spoken exactly once per process, at alert level
+/// like the other degradation notices (startup failures,
+/// the cloud-vision downgrade sentence). While the switch
+/// is OFF nothing is checked or spoken at all. Short and
+/// factual on purpose -- it names the feature and its
+/// state, nothing else.
+static const String potholeUnavailableAnnouncementText = '坑洞识别不可用';
 }

@@ -834,6 +834,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   List<Detection> _latestPotholeDetections = const <Detection>[];
   DateTime? _latestPotholeAt;
 
+  /// M3 COMMIT23 zero-burden rule: the switch was on at
+  /// startup but the weight asset is not bundled in this
+  /// build. The feature then behaves as off (no scanner
+  /// is constructed); the absence is logged once and --
+  /// because the user explicitly enabled the feature --
+  /// spoken once through [_potholeUnavailableNotice].
+  bool _potholeModelMissing = false;
+  final PotholeUnavailableNoticeLatch _potholeUnavailableNotice =
+      PotholeUnavailableNoticeLatch();
+
   /// When the current unbroken stillness began (ego
   /// judge not walking); null while walking.
   DateTime? _stillSince;
@@ -1253,6 +1263,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _logMsg('振动未执行：设备报告振动失败（累计 ${HapticsFailureLog.count} 次）。');
     };
     _announceStartupFailures(speechUsable: speechUsable);
+    _announcePotholeModelMissing(speechUsable: speechUsable);
     unawaited(_kickoffVoiceNavFlow(speechUsable));
   }
 
@@ -1706,6 +1717,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  /// M3 COMMIT23: the missing-pothole-weight notice. The
+  /// switch was explicitly enabled for this build but the
+  /// weight asset is not in the bundle: the feature is
+  /// off (no scanner exists), one fixed line goes to the
+  /// app log, and -- because the enablement was explicit
+  /// -- the fixed sentence is spoken ONCE per process at
+  /// alert level, like the other degradation notices
+  /// (startup failures, the cloud-vision downgrade). The
+  /// latch keeps any startup re-run from repeating it.
+  /// When speech itself is unusable nothing is claimed to
+  /// be spoken; the log line still lands.
+  void _announcePotholeModelMissing({required bool speechUsable}) {
+    if (!_potholeModelMissing) return;
+    _logMsg('坑洞识别：开关已开启但模型权重未随包提供，功能已停用'
+        '（补入权重并重新打包后生效）。');
+    if (!speechUsable) return;
+    if (!_potholeUnavailableNotice.claimOnce()) return;
+    _say(_request(
+      id: 'pothole-unavailable',
+      eventId: 'pothole-unavailable',
+      text: NavHazConfig.potholeUnavailableAnnouncementText,
+      kind: SpeechKind.alert,
+    ));
+  }
+
   /// Test-marker channel (harness -> app -> adapter):
   /// widget tests send 'noteTestMarker' here to drive
   /// the missed-restart replay scenario; production
@@ -1768,14 +1804,41 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // build-time switch is on (default off). The detector
     // loads its model lazily on the first scan, so
     // construction itself costs nothing; while the switch
-    // is off nothing here exists at all.
+    // is off nothing here exists at all -- not even the
+    // bundled check below (COMMIT23: switch off means no
+    // check, no log, no speech).
     if (AppConfig.potholeEnabled) {
-      _potholeScanner = PotholeScanner(
+      // Zero-burden rule (COMMIT23): the build succeeds
+      // with or without the weight, so presence is a
+      // RUNTIME question, answered through the asset
+      // system (rootBundle), never the file system. A
+      // missing weight degrades the feature to off (the
+      // absence is logged and spoken once, after startup
+      // -- see _announcePotholeModelMissing); it never
+      // crashes startup.
+      final PotholeStartupState potholeState = potholeStartupState(
         enabled: AppConfig.potholeEnabled,
-        detector: createPotholeDetector(AppConfig.potholeModelPath),
-        frameSource: _frameSource,
-        onDetections: _onPotholeScanResult,
+        modelBundled: await _potholeModelBundled(),
       );
+      if (potholeState == PotholeStartupState.ready) {
+        _potholeScanner = PotholeScanner(
+          enabled: AppConfig.potholeEnabled,
+          detector: createPotholeDetector(AppConfig.potholeModelPath),
+          frameSource: _frameSource,
+          onDetections: _onPotholeScanResult,
+        );
+        // Feed the CURRENT applied thermal cap before the
+        // first scan can run: a device that is already hot
+        // at boot must not load the second model at all
+        // (COMMIT23 thermal gate; later changes arrive
+        // through _onThermalStatus).
+        _potholeScanner!.setThermalRestricted(
+          _thermalCap.restrictClasses,
+          now: DateTime.now(),
+        );
+      } else {
+        _potholeModelMissing = true;
+      }
     }
     _amapClient = init.amapClient;
     _locationProvider = init.locationProvider;
@@ -4438,7 +4501,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // downstream gate (the thermal class restriction
     // below included -- a pit is not in its pass set, so
     // a restricted frame drops pit input exactly like
-    // any other non-vehicle/pedestrian input). The merge
+    // any other non-vehicle/pedestrian input; since the
+    // COMMIT23 thermal gate the scanner is stopped and
+    // its stored result cleared while the cap restricts,
+    // so this restriction is only the backstop for a
+    // result already in flight when the heat spiked). The merge
     // is the ONLY entry pit detections have: they never
     // call this handler on their own, so the avoidance
     // bookkeeping and perception below always see whole
@@ -4512,6 +4579,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       final String labels =
           events.map((PerceptionEvent e) => e.label).join('、');
       _logMsg('YOLO 新跟踪：$labels（仅报告检测，不给行走方向）。');
+    }
+  }
+
+  /// M3 COMMIT23: is the pothole weight actually in this
+  /// build's asset bundle? Asked through the asset system
+  /// (rootBundle) -- the ONLY sanctioned presence check:
+  /// the pubspec declares the model's DIRECTORY, so the
+  /// build succeeds either way and this load is what
+  /// tells the two shapes apart. Any load failure (asset
+  /// absent, bundle unreadable) reads as "not bundled".
+  Future<bool> _potholeModelBundled() async {
+    try {
+      await rootBundle.load(AppConfig.potholeModelPath);
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -4626,6 +4709,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final DateTime now = DateTime.now();
     final ThermalCap cap = _thermalPolicy.evaluate(status: status, now: now);
     _thermalCap = cap;
+    // M3 COMMIT23 thermal gate: the pothole scanner runs
+    // only while the APPLIED cap does not restrict
+    // classes. It is fed here, from the same evaluation
+    // that drives the intake restriction and the scope
+    // announcement, so the three can never disagree: at
+    // SEVERE / CRITICAL the second model stops entirely
+    // (no load, no captures -- it is itself a heat
+    // source); when the ladder settles back to a
+    // non-restricting rung it resumes on its own. (No
+    // scanner exists while the pothole switch is off.)
+    _potholeScanner?.setThermalRestricted(cap.restrictClasses, now: now);
     // Episode-latch announcement mapping (thermal_policy
     // raises at most one event per evaluation): the FPS
     // drop and the scope restriction are degradations the

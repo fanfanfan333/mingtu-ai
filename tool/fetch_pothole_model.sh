@@ -7,10 +7,12 @@
 #           file pothole2v.tflite at the repo root; repo
 #           revision 5cc2892b1366ca3c70d4ef4b13f1a940dddb2cc5,
 #           verified 2026-11-11 via the HF API)
-# Target : assets/models/pothole2v.tflite (bundled in the APK
-#           only for builds that enable the detector; the
-#           ultralytics_yolo resolver copies assets/... paths
-#           to the documents directory at runtime)
+# Target : assets/models/pothole/pothole2v.tflite (bundled
+#           when present: pubspec declares the DIRECTORY
+#           assets/models/pothole/, so the weight rides
+#           along only if this script has placed it there;
+#           the ultralytics_yolo resolver copies assets/...
+#           paths to the documents directory at runtime)
 # Size   : 10552936 bytes
 # SHA256 : 4fe02a0894985cdafda11e6aa13c354af4323172fae9f18384143d40b7339afb
 #          (matches the LFS sha256 recorded by Hugging Face
@@ -21,23 +23,27 @@
 #          "pothole-yolo11n" (see README, YOLO model section).
 # Classes: 0 = Pothole, 1 = Sewage-Manhole (model card).
 #          Only class 0 is mapped into the hazard system
-#          (label 'pothole'); class 1 stays unmapped.
+#          (label 'pothole'); class 1 is EXPLICITLY
+#          DISCARDED by the scanner (M3 COMMIT23 ruling:
+#          most manholes are closed and walkable, the
+#          model cannot tell open from closed).
 # Input  : [1, 3, 320, 320] (320x320), output [1, 6, 2100]
 #          (4 box + 2 classes) -- read from the TFLite
 #          flatbuffer itself, 2026-11-11.
 #
-# The weights are NOT committed to this repository: run this
-# script before building, exactly like tool/fetch_model.sh.
-# The detector is behind --dart-define=MINGTU_POTHOLE=1 and
-# OFF by default; a build that never enables it still needs
-# the asset only because pubspec declares it (same
-# discipline as the main model).
+# The weights are NOT committed to this repository, and --
+# unlike the main model -- NO build depends on this script
+# having run (M3 COMMIT23 zero-burden rule): pubspec
+# declares only the directory, so a clean checkout builds
+# fine without the weight; the default demo package ships
+# without it. Run this script only for a build that should
+# actually carry the detector's weight.
 # The script is idempotent: a present, verified file is kept.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 URL="https://huggingface.co/tahaUgan/pothole-yolo11n/resolve/main/pothole2v.tflite"
-TARGET="assets/models/pothole2v.tflite"
+TARGET="assets/models/pothole/pothole2v.tflite"
 EXPECTED_SHA256="4fe02a0894985cdafda11e6aa13c354af4323172fae9f18384143d40b7339afb"
 EXPECTED_SIZE="10552936"
 
@@ -54,7 +60,7 @@ if verify "$TARGET"; then
   exit 0
 fi
 
-mkdir -p assets/models
+mkdir -p assets/models/pothole
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 echo "Downloading $URL"
