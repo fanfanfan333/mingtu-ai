@@ -71,3 +71,29 @@ class RecordingHaptics implements Haptics {
     patterns.add(NavHazConfig.warningVibrationTimings);
   }
 }
+
+/// Observable record of vibration failures reported by
+/// the platform implementation (M1 fix round): the native
+/// side now answers `false` when a pattern was NOT
+/// executed (permission missing, invalid arguments,
+/// platform exception). The [Haptics] interface keeps its
+/// fire-and-forget shape -- hazard speech must never block
+/// on vibration -- so failures surface HERE instead of
+/// being swallowed: the device implementation records
+/// every false, and the app wires [listener] to its log /
+/// status so a silent vibration is never mistaken for a
+/// delivered one.
+class HapticsFailureLog {
+  static int count = 0;
+  static void Function()? listener;
+
+  static void record() {
+    count++;
+    listener?.call();
+  }
+
+  static void reset() {
+    count = 0;
+    listener = null;
+  }
+}

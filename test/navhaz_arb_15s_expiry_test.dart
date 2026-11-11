@@ -1,0 +1,527 @@
+/// NAVHAZ M1 fix round, items F + 4: the Codex arbitration
+/// suite, independently maintained (the older
+/// navhaz_arbitration_test.dart stays untouched; where the
+/// two overlap this file's wording follows the Codex
+/// re-test), PLUS:
+/// - the spec 2.7.8(a) scenario in its literal form: the
+///   prompt playing when the urgent alert lands is
+///   「前方约30米右转」 (a distance-form turn prompt,
+///   constructed through the app's own regeneration path);
+/// - the 300 ms timing assertion: vibration-start and
+///   danger-speech-start are stamped from a TEST-CONTROLLED
+///   clock (the fake TTS stop advances it by a fixed
+///   simulated latency), never from real waiting;
+/// - the 15 s expiry case (Codex arb-15s): an interrupted
+///   navigation prompt older than the replay window is
+///   dropped into the expired log and never replayed. The
+///   window itself is injected through the debug handle
+///   (production stays at NavHazConfig.replayExpiry =
+///   15 s; the production logic is NOT bent to "expire on
+///   danger completion" -- the test short-circuits the
+///   window, the arbitration code path is the real one);
+/// - every spoken text on the timeline is asserted free
+///   of banned words (spec 2.7.10 aggregation point).
+library;
+import 'dart:async';
+
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:mingtu_ai/adapters/amap_client.dart';
+import 'package:mingtu_ai/core/haptics.dart';
+import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
+import 'package:mingtu_ai/core/navigation_tracker.dart';
+import 'package:mingtu_ai/core/speech_scheduler.dart';
+import 'package:mingtu_ai/main.dart';
+import 'package:mingtu_ai/modules/map_navigation.dart';
+import 'package:mingtu_ai/modules/visual_perception.dart';
+
+// ---------------------------------------------------------------------------
+// Route geometry (same shape as the sibling suite):
+// A --200 m north--> B --100 m east--> C.
+// ---------------------------------------------------------------------------
+const GeoPoint kA = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+const GeoPoint kB = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+const GeoPoint kC = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+
+GeoPoint southOfB(double metres) => GeoPoint(
+      latitude: kB.latitude! - metres / 111194.9,
+      longitude: kB.longitude,
+    );
+
+GeoPoint eastOfB(double metres) => GeoPoint(
+      latitude: kB.latitude,
+      longitude: kB.longitude! + metres / 111194.9 / 0.7912,
+    );
+
+NavigationTracker buildTracker(
+    {List<String> stepTexts = const <String>['直行', '右转进入林荫道']}) {
+  return NavigationTracker(
+    steps: const <AmapStep>[
+      AmapStep(
+        action: '直行',
+        orientation: '北',
+        polyline: <GeoPoint>[kA, kB],
+        distanceM: 200,
+        durationS: 150,
+      ),
+      AmapStep(
+        action: '右转',
+        orientation: '东',
+        polyline: <GeoPoint>[kB, kC],
+        distanceM: 100,
+        durationS: 75,
+      ),
+    ],
+    stepTexts: stepTexts,
+    destination: kC,
+    destinationName: '图书馆',
+  );
+}
+
+NavFix fixAt(GeoPoint p) => NavFix(point: p, accuracyM: 5, at: DateTime.now());
+
+void main() {
+  group('scheduler interrupted-request objects', () {
+    SpeechRequest req(
+      String id,
+      SpeechKind kind, {
+      NavReplay replay = NavReplay.drop,
+      int? step,
+    }) {
+      final DateTime now = DateTime.now();
+      return SpeechRequest(
+        id: id,
+        eventId: id,
+        text: 'text-$id',
+        kind: kind,
+        createdAt: now,
+        expiresAt: now.add(const Duration(minutes: 1)),
+        navigationStateVersion: 'v',
+        navStepIndex: step,
+        replay: replay,
+      );
+    }
+
+    test('interruption stores the object; the id view stays readable', () {
+      final SpeechScheduler s = SpeechScheduler();
+      final SpeechRequest turn =
+          req('turn-1', SpeechKind.turn, replay: NavReplay.regenerate, step: 1);
+      s.submit(turn, DateTime.now());
+      s.submit(req('danger-1', SpeechKind.danger), DateTime.now());
+      expect(s.active?.id, 'danger-1');
+      expect(s.interruptedRequests.single.navStepIndex, 1);
+      expect(s.interruptedLog, <String>['turn-1']);
+    });
+  });
+
+  group('NavigationTracker.regenerateTurnPrompt', () {
+    test('regenerates with a fresh distance; drops past / too close', () {
+      final NavigationTracker tracker = buildTracker();
+      tracker.onFix(fixAt(southOfB(25)));
+      expect(tracker.regenerateTurnPrompt(1, fixAt(southOfB(12))),
+          '前方约12米右转进入林荫道');
+      expect(tracker.regenerateTurnPrompt(1, fixAt(eastOfB(65))), isNull);
+      expect(tracker.regenerateTurnPrompt(1, fixAt(southOfB(2))), isNull);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Widget layer: fake TTS + fake haptics on ONE stamped
+  // timeline(). The stamps come from a test-controlled clock:
+  // the only thing that advances it is the fake TTS 'stop'
+  // (a fixed simulated physical-stop latency), so the
+  // "speech starts within 300 ms of vibration start"
+  // assertion is arithmetic on recorded stamps.
+  // -------------------------------------------------------------------------
+  group('widget arbitration (Codex suite + 30 m + 300 ms + 15 s)', () {
+    final List<(int, String)> events = <(int, String)>[];
+    final List<Completer<dynamic>> pendingSpeaks = <Completer<dynamic>>[];
+    int clockMs = 0;
+    int stopLatencyMs = 80;
+
+    List<String> timeline() =>
+        events.map(((int, String) e) => e.$2).toList();
+    int idxOf(String event) => timeline().indexOf(event);
+    int stampOf(String event) => events[idxOf(event)].$1;
+    int countOf(String event) =>
+        timeline().where((String e) => e == event).length;
+
+    void installMocks() {
+      final TestDefaultBinaryMessenger messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(
+        const MethodChannel('flutter_tts'),
+        (MethodCall call) async {
+          switch (call.method) {
+            case 'getLanguages':
+              return <String>['zh-CN', 'en-US'];
+            case 'setLanguage':
+              return 1;
+            case 'speak':
+              events.add((clockMs, 'speak:${call.arguments}'));
+              final Completer<dynamic> c = Completer<dynamic>();
+              pendingSpeaks.add(c);
+              return c.future;
+            case 'stop':
+              events.add((clockMs, 'stop'));
+              // Simulated physical-stop latency on the
+              // test clock: this is what separates the
+              // vibration stamp from the danger-speech
+              // stamp, deterministically.
+              clockMs += stopLatencyMs;
+              return 1;
+            default:
+              return 1;
+          }
+        },
+      );
+      messenger.setMockMethodCallHandler(
+        const MethodChannel('plugin.csdcorp.com/speech_to_text'),
+        (MethodCall call) async {
+          if (call.method == 'initialize') return false;
+          return null;
+        },
+      );
+      messenger.setMockMethodCallHandler(SystemChannels.platform,
+          (MethodCall call) async {
+        return null;
+      });
+    }
+
+    void clearMocks() {
+      final TestDefaultBinaryMessenger messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(
+          const MethodChannel('flutter_tts'), null);
+      messenger.setMockMethodCallHandler(
+          const MethodChannel('plugin.csdcorp.com/speech_to_text'), null);
+      messenger.setMockMethodCallHandler(SystemChannels.platform, null);
+    }
+
+    Future<void> pumpFrames(WidgetTester tester, [int n = 3]) async {
+      for (int i = 0; i < n; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+    }
+
+    Future<void> drainSpeaks(WidgetTester tester) async {
+      for (int i = 0; i < 40; i++) {
+        final List<Completer<dynamic>> pending = pendingSpeaks
+            .where((Completer<dynamic> c) => !c.isCompleted)
+            .toList();
+        if (pending.isEmpty) {
+          await pumpFrames(tester, 2);
+          if (pendingSpeaks.every((Completer<dynamic> c) => c.isCompleted)) {
+            return;
+          }
+          continue;
+        }
+        for (final Completer<dynamic> c in pending) {
+          c.complete(1);
+        }
+        await pumpFrames(tester, 2);
+      }
+      fail('speaks did not drain');
+    }
+
+    Future<void> completeSpeak(WidgetTester tester, String marker) async {
+      final int idx = timeline().lastIndexOf(marker);
+      expect(idx, greaterThanOrEqualTo(0), reason: 'no such speak: $marker');
+      final int speakOrdinal =
+          timeline().sublist(0, idx + 1).where((String e) => e.startsWith('speak:')).length - 1;
+      pendingSpeaks[speakOrdinal].complete(1);
+      await pumpFrames(tester);
+    }
+
+    Future<MingtuHomeDebugHandle> startApp(WidgetTester tester) async {
+      await tester.pumpWidget(const MingtuApp());
+      await pumpFrames(tester);
+      final MingtuHomeDebugHandle h = mingtuHomeDebugHandle!;
+      h.debugSetHaptics(_StampedHaptics(events, () => clockMs));
+      await drainSpeaks(tester);
+      h.startVoiceDemo();
+      await drainSpeaks(tester);
+      h.planRoute();
+      await drainSpeaks(tester);
+      h.startNavigating();
+      await drainSpeaks(tester);
+      return h;
+    }
+
+    void installTracker(MingtuHomeDebugHandle h,
+        {List<String> stepTexts = const <String>['直行', '右转进入林荫道']}) {
+      final NavigationTracker t = buildTracker(stepTexts: stepTexts);
+      h.debugInstallLiveTracker(
+        steps: t.steps,
+        stepTexts: t.stepTexts,
+        destination: kC,
+        destinationName: '图书馆',
+      );
+    }
+
+    void feedApproachingCar(MingtuHomeDebugHandle h) {
+      for (final double s in <double>[0.20, 0.32, 0.45, 0.60, 0.75]) {
+        h.simulateDetections(<Detection>[
+          Detection(
+              label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s),
+        ]);
+      }
+    }
+
+    void feedStaticPerson(MingtuHomeDebugHandle h) {
+      for (int i = 0; i < 3; i++) {
+        h.simulateDetections(const <Detection>[
+          Detection(
+              label: 'person',
+              confidence: 0.9,
+              cx: 0.5,
+              cy: 0.7,
+              w: 0.2,
+              h: 0.4),
+        ]);
+      }
+    }
+
+    /// Spec 2.7.10 aggregation for this suite: EVERY text
+    /// the app spoke on this timeline is banned-word free.
+    void expectTimelineClean() {
+      for (final String e in timeline()) {
+        if (e.startsWith('speak:')) {
+          expect(containsBannedWord(e.substring(6)), isFalse,
+              reason: 'spoken text "$e"');
+        }
+      }
+    }
+
+    /// The spec 2.7.8 timing assertion, on recorded stamps:
+    /// vibration starts BEFORE the danger voice, and the
+    /// voice starts within 300 ms of the vibration start.
+    void expectVibrationLeadsDanger() {
+      final int vib = stampOf('vibrate:urgent');
+      final int danger = stampOf('speak:停，前方来车。');
+      expect(danger, greaterThan(vib),
+          reason: 'vibration (t=$vib) precedes the danger '
+              'voice (t=$danger) on the test clock');
+      expect(danger - vib, lessThanOrEqualTo(300),
+          reason: 'danger speech starts ${danger - vib} ms '
+              'after vibration start (limit 300 ms)');
+    }
+
+    setUp(() {
+      events.clear();
+      pendingSpeaks.clear();
+      clockMs = 0;
+      stopLatencyMs = 80;
+      installMocks();
+    });
+    tearDown(clearMocks);
+
+    testWidgets(
+        '(a) danger interrupts a turn: stop between, vibration '
+        'leads voice by <= 300 ms, replay recomputed', (tester) async {
+      final MingtuHomeDebugHandle h = await startApp(tester);
+      installTracker(h);
+      h.debugLiveFix(southOfB(25), 5);
+      await pumpFrames(tester);
+      final int turnIdx = idxOf('speak:右转进入林荫道');
+      expect(turnIdx, greaterThanOrEqualTo(0), reason: 'timeline: ${timeline()}');
+      h.debugLiveFix(southOfB(12), 5);
+      await pumpFrames(tester);
+      feedApproachingCar(h);
+      await pumpFrames(tester);
+      final int dangerIdx = idxOf('speak:停，前方来车。');
+      expect(dangerIdx, greaterThan(turnIdx));
+      expect(timeline().sublist(turnIdx + 1, dangerIdx), contains('stop'),
+          reason: 'physical stop between the two voices');
+      expectVibrationLeadsDanger();
+      await completeSpeak(tester, 'speak:停，前方来车。');
+      final int replayIdx = idxOf('speak:前方约12米右转进入林荫道');
+      expect(replayIdx, greaterThan(dangerIdx),
+          reason: 'regenerated from the 12 m fix, not the '
+              'original 25 m text. timeline: ${timeline()}');
+      expect(countOf('speak:前方约12米右转进入林荫道'), 1);
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets(
+        '(a-literal) the playing prompt is 「前方约30米右转」 when '
+        'the urgent alert lands', (tester) async {
+      final MingtuHomeDebugHandle h = await startApp(tester);
+      // Step text is the bare action, so the DISTANCE form
+      // is the tracker's own regeneration wording.
+      installTracker(h, stepTexts: const <String>['直行', '右转']);
+      // 29.5 m out: inside the 30 m announce distance, and
+      // the regenerated wording rounds it to 约30米. The
+      // turn fires and its (bare) text starts playing.
+      h.debugLiveFix(southOfB(29.5), 5);
+      await pumpFrames(tester);
+      expect(idxOf('speak:右转'), greaterThanOrEqualTo(0),
+          reason: 'timeline: ${timeline()}');
+      // A warning interrupts it; when the warning finishes
+      // the arbitration regenerates the turn from the same
+      // ~30 m fix -- and THAT distance-form prompt,
+      // 「前方约30米右转」, is what is playing when the
+      // urgent alert arrives. (Construction note: in this
+      // codebase the distance form is produced by the
+      // regeneration path, so the scenario stages it
+      // through one interruption; the victim prompt below
+      // is the literal spec text.)
+      feedStaticPerson(h);
+      await pumpFrames(tester);
+      expect(idxOf('speak:注意，前方有行人。'), greaterThanOrEqualTo(0),
+          reason: 'timeline: ${timeline()}');
+      await completeSpeak(tester, 'speak:注意，前方有行人。');
+      final int promptIdx = idxOf('speak:前方约30米右转');
+      expect(promptIdx, greaterThanOrEqualTo(0),
+          reason: 'the literal 30 m prompt is playing. '
+              'timeline: ${timeline()}');
+      // The urgent alert lands on THAT prompt.
+      feedApproachingCar(h);
+      await pumpFrames(tester);
+      final int dangerIdx = idxOf('speak:停，前方来车。');
+      expect(dangerIdx, greaterThan(promptIdx));
+      expect(timeline().sublist(promptIdx + 1, dangerIdx), contains('stop'),
+          reason: 'the 30 m prompt is physically stopped');
+      expectVibrationLeadsDanger();
+      await completeSpeak(tester, 'speak:停，前方来车。');
+      await pumpFrames(tester, 5);
+      // The victim was itself a replay, and a replay is
+      // never itself replayed (the arbitration's terminal
+      // rule): the stale 30 m text is not spoken again from
+      // a position it no longer matches.
+      expect(countOf('speak:前方约30米右转'), 1,
+          reason: 'timeline: ${timeline()}');
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets('(b) intersection passed during the danger: no replay',
+        (tester) async {
+      final MingtuHomeDebugHandle h = await startApp(tester);
+      installTracker(h);
+      h.debugLiveFix(southOfB(25), 5);
+      await pumpFrames(tester);
+      expect(timeline(), contains('speak:右转进入林荫道'));
+      feedApproachingCar(h);
+      await pumpFrames(tester);
+      expect(timeline(), contains('speak:停，前方来车。'));
+      h.debugLiveFix(eastOfB(65), 5);
+      await pumpFrames(tester);
+      await completeSpeak(tester, 'speak:停，前方来车。');
+      await pumpFrames(tester, 5);
+      expect(
+        timeline().where((String e) => e.startsWith('speak:前方约')).length,
+        0,
+        reason: 'a passed turn is dropped. timeline: ${timeline()}',
+      );
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets('(c) straight interrupted by danger replays shortened',
+        (tester) async {
+      await tester.pumpWidget(const MingtuApp());
+      await pumpFrames(tester);
+      final MingtuHomeDebugHandle h = mingtuHomeDebugHandle!;
+      h.debugSetHaptics(_StampedHaptics(events, () => clockMs));
+      await drainSpeaks(tester);
+      h.startVoiceDemo();
+      await drainSpeaks(tester);
+      h.planRoute();
+      await drainSpeaks(tester);
+      h.startNavigating();
+      await pumpFrames(tester);
+      expect(timeline(), contains('speak:直走'));
+      feedApproachingCar(h);
+      await pumpFrames(tester);
+      expect(timeline(), contains('speak:停，前方来车。'));
+      expectVibrationLeadsDanger();
+      await completeSpeak(tester, 'speak:停，前方来车。');
+      expect(timeline(), contains('speak:继续直走'),
+          reason: 'the shortened straight replay. timeline: ${timeline()}');
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets('(d) urgent replaces a playing warning immediately',
+        (tester) async {
+      final MingtuHomeDebugHandle h = await startApp(tester);
+      feedStaticPerson(h);
+      await pumpFrames(tester);
+      final int warnIdx = idxOf('speak:注意，前方有行人。');
+      expect(warnIdx, greaterThanOrEqualTo(0), reason: 'timeline: ${timeline()}');
+      expect(timeline(), contains('vibrate:warning'));
+      feedApproachingCar(h);
+      await pumpFrames(tester);
+      final int dangerIdx = idxOf('speak:停，前方来车。');
+      expect(dangerIdx, greaterThan(warnIdx), reason: 'timeline: ${timeline()}');
+      final int warnOrdinal = timeline()
+              .sublist(0, warnIdx + 1)
+              .where((String e) => e.startsWith('speak:'))
+              .length -
+          1;
+      expect(pendingSpeaks[warnOrdinal].isCompleted, isFalse,
+          reason: 'the warning never finished -- it was replaced');
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets(
+        'temporary 15s expired interrupted navigation (Codex arb-15s)',
+        (tester) async {
+      final MingtuHomeDebugHandle h = await startApp(tester);
+      installTracker(h);
+      h.debugLiveFix(southOfB(25), 5);
+      await pumpFrames(tester);
+      expect(timeline(), contains('speak:右转进入林荫道'));
+      // Inject the short-circuited replay window (the
+      // production 15 s default is untouched; in the
+      // Codex scenario the interruption is already older
+      // than the window when the danger finishes).
+      h.debugSetReplayExpiry(Duration.zero);
+      feedApproachingCar(h);
+      await pumpFrames(tester);
+      expect(timeline(), contains('speak:停，前方来车。'));
+      await completeSpeak(tester, 'speak:停，前方来车。');
+      await pumpFrames(tester, 5);
+      expect(h.debugExpired, isNotEmpty,
+          reason: 'the interrupted turn was dropped as '
+              'expired, observably');
+      expect(h.debugExpired.any((String id) => id.startsWith('nav-turn')),
+          isTrue,
+          reason: 'the expired item is the turn prompt: '
+              '${h.debugExpired}');
+      expect(
+        timeline().where((String e) => e.startsWith('speak:前方约')).length,
+        0,
+        reason: 'an expired prompt is never replayed late. '
+            'timeline: ${timeline()}',
+      );
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+  });
+}
+
+/// Recording haptics on the test's stamped timeline().
+class _StampedHaptics implements Haptics {
+  final List<(int, String)> events;
+  final int Function() clock;
+  _StampedHaptics(this.events, this.clock);
+
+  @override
+  Future<void> vibrateUrgent() async {
+    events.add((clock(), 'vibrate:urgent'));
+  }
+
+  @override
+  Future<void> vibrateWarning() async {
+    events.add((clock(), 'vibrate:warning'));
+  }
+
+  @override
+  Future<void> vibratePattern(List<int> timings, List<int> amplitudes) async {
+    events.add((clock(), 'vibrate:pattern'));
+  }
+}

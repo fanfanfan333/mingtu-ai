@@ -1,4 +1,4 @@
-/// Real-navigation starter for Mingtu AI (navigation P0).
+/// Real-navigation starter for Mingtu AI (navigation core).
 ///
 /// One attempt to start REAL voice navigation to a human-verified
 /// destination, as a pure orchestration over injected adapters so

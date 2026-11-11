@@ -84,7 +84,7 @@ import 'skills/route_planning.dart';
 ///   orientation-and-mobility training, and it is NOT validated for
 ///   real-road safety. Do not use this demo for real navigation.
 void main() {
-  // Startup backstop (P0): the whole app runs in a guarded
+  // Startup backstop: the whole app runs in a guarded
   // zone with a FlutterError handler installed, so an
   // unexpected framework/startup error is recorded and later
   // ANNOUNCED (see _initRealIntegrations) instead of the app
@@ -260,6 +260,21 @@ class MingtuHomeDebugHandle {
   /// never calls this).
   void debugSetHaptics(Haptics haptics) => _state._haptics = haptics;
 
+  /// NAVHAZ M1 seam: ids of interrupted navigation prompts
+  /// the arbitration dropped as EXPIRED (the scheduler's
+  /// dropped-expired log) -- the observable readout for
+  /// the 15 s replay-window rule.
+  List<String> get debugExpired =>
+      List<String>.unmodifiable(_state._scheduler.droppedExpiredLog);
+
+  /// NAVHAZ M1 seam: inject a short arbitration replay
+  /// window for tests (e.g. Duration.zero makes any
+  /// interrupted prompt expire at the next arbitration
+  /// pass). Production never calls this; the production
+  /// window stays NavHazConfig.replayExpiry (15 s).
+  void debugSetReplayExpiry(Duration expiry) =>
+      _state._replayExpiryOverride = expiry;
+
   /// NAVHAZ M1 seam: install a live navigation tracker
   /// directly (the arbitration tests drive fixes and hazard
   /// frames against it without the network route flow).
@@ -425,6 +440,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     with WidgetsBindingObserver {
   TaskManager _tasks = TaskManager();
   SpeechScheduler _scheduler = SpeechScheduler();
+
+  /// Test-only override of the arbitration replay window
+  /// (see _buildInterruptedReplay); null in production,
+  /// where NavHazConfig.replayExpiry (15 s) always applies.
+  Duration? _replayExpiryOverride;
   MapNavigationService _mapService = MapNavigationService(StubMapProvider());
   late RoutePlanningSkill _routeSkill = RoutePlanningSkill(_mapService);
   final EnvironmentAnalysisSkill _envSkill = EnvironmentAnalysisSkill();
@@ -654,6 +674,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   Timer? _hazardScanTimer;
   GeoPoint? _lastFixPoint;
   double? _lastFixAccuracyM;
+  // Latest GPS ground speed carried by a live fix, and
+  // when it arrived (ego-motion judge evidence, M1 fix
+  // round; freshness is judged against the frame time).
+  double? _lastFixSpeedMps;
+  DateTime? _lastFixSpeedAt;
   GeoPoint? _scanAnchorPoint;
   DateTime? _lastVisionCallAt;
   bool _manualCycleOwned = false;
@@ -792,7 +817,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   int _destAttempts = 0;
   bool _yoloAvailableAtStartup = false;
   final DangerAlertGate _dangerGate = DangerAlertGate();
-  // Voice P0 re-test fixes: once TTS has failed at runtime the app
+  // Voice re-test fixes: once TTS has failed at runtime the app
   // is in a perceptible voice-failed state (no simulated success,
   // no automatic ASR restart); once an ASR error has been announced
   // it is not announced again (no retry/announce loop).
@@ -852,9 +877,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// unconfirmed close exactly once, never repeatedly.
   bool _pttCloseWaitAnnounced = false;
 
-  /// This press began during a P0 announcement: it waits
+  /// This press began during a danger/emergency announcement: it waits
   /// (vibration only -- no cue, no ASR) and enters
-  /// prompting when the P0 prompt finishes, IF the button
+  /// prompting when the danger/emergency prompt finishes, IF the button
   /// is still held then.
   bool _pttDeferredByP0 = false;
 
@@ -906,18 +931,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   /// When the utterance the sequencer most recently started
   /// playing began; a push-to-talk press uses it to recognise
-  /// a just-started P0 utterance whose scheduler entry has
+  /// a just-started danger/emergency utterance whose scheduler entry has
   /// already completed (see _interruptSpeechForPushToTalk).
   DateTime? _lastSpeechStartedAt;
 
-  /// The text of the most recent P0 (danger/emergency)
-  /// utterance actually played; compared against
+  /// The text of the most recent danger (level 1) / emergency
+  /// (level 0) utterance actually played; compared against
   /// _lastSpokenText by the push-to-talk interruption rules.
   String _lastP0SpokenText = '';
 
-  /// The scheduler id of that P0 utterance; the scheduler's
-  /// interrupted/cancelled logs carry ids, so the P0 gate
-  /// can recognise a just-interrupted P0 playback.
+  /// The scheduler id of that utterance; the scheduler's
+  /// interrupted/cancelled logs carry ids, so the danger/
+  /// emergency gate can recognise a just-interrupted
+  /// danger/emergency playback.
   String _lastP0RequestId = '';
 
   /// When a physical stop was last issued inside an
@@ -1004,6 +1030,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _orientation = createOrientationMonitor()..start();
     _pitchMonitor = createPitchMonitor()..start();
     _haptics = createHaptics();
+    // Vibration failures reported by the device channel
+    // (M1 fix round) surface in the app log: a pattern the
+    // device did not execute must never pass unnoticed.
+    HapticsFailureLog.listener = () {
+      _logMsg('振动未执行：设备报告振动失败（累计 ${HapticsFailureLog.count} 次）。');
+    };
     _hazardScanTimer?.cancel();
     _hazardScanTimer = Timer.periodic(
       const Duration(seconds: 8),
@@ -1174,6 +1206,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     _lastFixPoint = r.pointGcj02;
     _lastFixAccuracyM = r.accuracyM;
+    // The fix's own ground speed feeds the ego-motion
+    // judge (M1 fix round); a fix without a usable speed
+    // leaves the previous reading to age out by freshness.
+    if (r.speedMps != null) {
+      _lastFixSpeedMps = r.speedMps;
+      _lastFixSpeedAt = DateTime.now();
+    }
     if (_entranceActive && _entrance != null) {
       // Step D: the tracker has handed over; fixes now feed
       // the entrance guidance, not route following.
@@ -1683,7 +1722,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _handleAsrError(error);
       });
     }
-    // P0 startup plan (pure logic in core/voice_startup.dart): the
+    // Startup plan (pure logic in core/voice_startup.dart): the
     // greeting is spoken whenever *Chinese* speech is verified
     // usable -- including when ASR failed, which previously left
     // the user in total silence because the greeting only ran
@@ -2099,10 +2138,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// navigation text is never spoken late.
   SpeechRequest? _buildInterruptedReplay() {
     final DateTime now = DateTime.now();
+    // Production window: NavHazConfig.replayExpiry (15 s).
+    // The override exists only so widget tests can inject
+    // a short-circuited window (the 15 s expiry case); it
+    // is never set outside the debug handle.
+    final Duration expiry = _replayExpiryOverride ?? NavHazConfig.replayExpiry;
     for (final SpeechRequest r
         in _scheduler.interruptedNavigationRequests()) {
       final DateTime? at = _scheduler.interruptedAtOf(r);
-      if (at != null && now.difference(at) > NavHazConfig.replayExpiry) {
+      if (at != null && now.difference(at) > expiry) {
         _scheduler.discardInterrupted(r);
         _scheduler.droppedExpiredLog.add(r.id);
         continue;
@@ -2206,7 +2250,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _recheckStraightResume();
       }
       if (next == null) {
-        // A press deferred by the P0 prompt that just
+        // A press deferred by the danger/emergency prompt that just
         // finished enters prompting now (still held only);
         // otherwise the turn-taking loop may open the
         // microphone (v0.7).
@@ -2283,7 +2327,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   /// Speak [request] through the output while tracking the
   /// playback for the push-to-talk interruption rules: the
-  /// start time and (for P0 kinds) the text are recorded
+  /// start time and (for danger/emergency kinds) the text are recorded
   /// when playback actually begins, and a physical stop
   /// issued within the current utterance's first moments
   /// does not let that utterance's instant completion
@@ -2586,7 +2630,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _say(_request(
       id: 'route-planned',
       eventId: 'route-planned',
-      // Simulation labelling (navigation P0): this flow is the
+      // Simulation labelling (navigation core): this flow is the
       // stub/demo route, and its spoken start must SAY it is a
       // simulation -- a blind user cannot see the on-screen 演示
       // labels.
@@ -2595,7 +2639,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
-  /// Navigation P0: start REAL voice navigation to a verified
+  /// Navigation: start REAL voice navigation to a verified
   /// destination. The starter (core/real_navigation.dart) checks,
   /// in order: verified destination -> route proxy configured ->
   /// GPS fix -> accuracy -> route fetch. Every failure is spoken
@@ -2729,13 +2773,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
-  /// True while a P0 (danger/emergency) announcement is
-  /// audibly playing. Three layers of evidence, strongest
-  /// first: a P0 request is the scheduler's active entry
-  /// or queued; a P0 entry was interrupted/cancelled a
-  /// moment ago (its playback can outlive the entry); the
-  /// most recent utterance started within the last 1.5 s
-  /// and IS the most recent P0 text. Used to refuse
+  /// True while a danger (level 1) / emergency (level 0)
+  /// announcement is audibly playing. Three layers of
+  /// evidence, strongest first: a danger/emergency request
+  /// is the scheduler's active entry or queued; a danger/
+  /// emergency entry was interrupted/cancelled a moment ago
+  /// (its playback can outlive the entry); the most recent
+  /// utterance started within the last 1.5 s and IS the most
+  /// recent danger/emergency text. Used to refuse
   /// push-to-talk presses during danger announcements.
   bool get _p0SpeechPlaying {
     if (_dangerPending) return true;
@@ -2765,7 +2810,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   ///   1. vibrate;
   ///   2. stop the AUTOMATIC listening session if one is
   ///      open, and stop any playing TTS utterance --
-  ///      EXCEPT a P0 danger/emergency prompt, which a
+  ///      EXCEPT a danger/emergency prompt (levels 1 and 0), which a
   ///      press must never interrupt;
   ///   3. speak the short cue DIRECTLY through the voice
   ///      output and AWAIT its completion (never through
@@ -2798,10 +2843,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         (_voiceInput as SystemVoiceInput).isListening;
     HapticFeedback.vibrate();
     if (_p0SpeechPlaying) {
-      // P0 gate: during a danger/emergency announcement
+      // Danger/emergency gate: during a danger/emergency announcement
       // the press only vibrates -- no cue, no ASR. It waits
       // in prompting; _finishSpeech enters the prompt step
-      // when the P0 prompt completes, if still held.
+      // when the danger/emergency prompt completes, if still held.
       _pttDeferredByP0 = true;
       _logMsg('按住说话：危险播报进行中，先等待播报结束。');
       return;
@@ -2853,7 +2898,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// The previous session finished closing: a press that
   /// waited for the barrier enters prompting, if the
   /// button is still held and the press is still live
-  /// (same shape as the P0 deferral hook).
+  /// (same shape as the danger/emergency deferral hook).
   void _maybeEnterPttAfterClose() {
     if (_pttState != _PttState.prompting || !_pttDeferredByClose) return;
     _pttDeferredByClose = false;
@@ -2926,7 +2971,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttCachedIsFinal = false;
   }
 
-  /// prompting: hand the microphone over, clear non-P0
+  /// prompting: hand the microphone over, clear lower-priority
   /// speech, speak the cue and await it. Every await is
   /// followed by a session + pendingStop re-check: a
   /// release recorded meanwhile is honoured by the
@@ -2953,7 +2998,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     if (_p0SpeechPlaying) {
-      // A P0 announcement began mid-prompt: defer the
+      // A danger/emergency announcement began mid-prompt: defer the
       // same way as a press that started during one.
       _pttDeferredByP0 = true;
       _logMsg('按住说话：危险播报已开始，先等待播报结束。');
@@ -3043,7 +3088,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // (MT-1111-PTT-D(2)): this branch is reached only
       // AFTER _interruptSpeechForPushToTalk above has run
       // for this press, so any scheduler-active or
-      // physically playing non-P0 TTS was already stopped
+      // physically playing lower-priority TTS was already stopped
       // before the recorder opens -- the same pre-capture
       // stop the local-ASR path gets. (TalkBack speech is
       // system-level and the app cannot stop it; that
@@ -3128,7 +3173,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           return;
         }
         if (_pttDeferredByP0) {
-          // A deferred press released before the P0 prompt
+          // A deferred press released before the danger/emergency prompt
           // finished: cancel quietly; the finish hook must
           // not start a press nobody holds anymore.
           _pttDeferredByP0 = false;
@@ -3597,7 +3642,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  /// Called from _finishSpeech: a deferred press whose P0
+  /// Called from _finishSpeech: a deferred press whose danger/emergency
   /// prompt just completed enters prompting, if the button
   /// is still held and the press is still the live one.
   void _maybeEnterPttAfterP0() {
@@ -3627,19 +3672,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   /// Stop the currently playing utterance for a press --
-  /// unless it is P0. Two layers, because the physical stop
+  /// unless it is danger/emergency. Two layers, because the physical stop
   /// has no cancel callback: while a cancellable prompt is
   /// still the scheduler's ACTIVE entry, cancelAll both
   /// drops it (its late completion is ignored by the
   /// stop-race guard) and the physical stop silences it.
   /// When the entry already completed -- a simulated
-  /// prompt whose playback outlives its entry, or a P0
-  /// prompt inside its post-completion window -- the
-  /// playback is recognised by recency and kind: recent
-  /// non-P0 playback is stopped physically, recent P0
-  /// playback is left completely alone.
+  /// prompt whose playback outlives its entry, or a danger/
+  /// emergency prompt inside its post-completion window --
+  /// the playback is recognised by recency and kind: recent
+  /// lower-priority playback is stopped physically, recent
+  /// danger/emergency playback is left completely alone.
   Future<void> _interruptSpeechForPushToTalk() async {
-    // A queued P0 prompt is about to play: clearing the
+    // A queued danger/emergency prompt is about to play: clearing the
     // queue for a cue would kill it. Leave everything.
     if (_scheduler.queue.any((SpeechRequest r) =>
         r.kind == SpeechKind.danger || r.kind == SpeechKind.emergency)) {
@@ -3649,7 +3694,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (active != null) {
       if (active.kind == SpeechKind.danger ||
           active.kind == SpeechKind.emergency) {
-        return; // P0 playing: never interrupt.
+        return; // Danger/emergency playing: never interrupt.
       }
       _scheduler.cancelAll();
       await _stopTtsPlayback();
@@ -4180,6 +4225,34 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
+  /// Ego-motion estimate for one hazard frame (M1 fix
+  /// round). Source priority lives in [EgoMotion.judge];
+  /// this method only assembles the freshest evidence:
+  /// - GPS speed: the latest live fix's own speed, used
+  ///   only while fresh ([NavHazConfig.gpsSpeedFreshness])
+  ///   and gated by that fix's accuracy inside the judge;
+  /// - accelerometer: step frequency + magnitude variance
+  ///   from the pitch monitor's single subscription (the
+  ///   monitor owns the sliding window).
+  /// With neither source usable the judge returns its
+  /// UNKNOWN verdict, and no vehicle can be confirmed as
+  /// approaching this frame.
+  EgoMotion _egoMotionNow(DateTime now) {
+    double? gpsSpeed;
+    final DateTime? speedAt = _lastFixSpeedAt;
+    if (_lastFixSpeedMps != null &&
+        speedAt != null &&
+        now.difference(speedAt) <= NavHazConfig.gpsSpeedFreshness) {
+      gpsSpeed = _lastFixSpeedMps;
+    }
+    return EgoMotion.judge(
+      gpsSpeedMps: gpsSpeed,
+      gpsAccuracyM: _lastFixAccuracyM,
+      stepFrequencyHz: _pitchMonitor.currentStepFrequencyHz,
+      accelVariance: _pitchMonitor.currentAccelVariance,
+    );
+  }
+
   /// NAVHAZ M1: geometry-bearing frames -- multi-target
   /// tracking, TTC estimation and the hazard policy decide
   /// what (if anything) is announced; the policy also
@@ -4192,12 +4265,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       detections,
       now,
       pitchDeg: _pitchMonitor.currentPitchDeg,
-      // Ego-motion evidence: the live location stream
-      // carries no speed and accelerometer variance is not
-      // wired in M1, so the judge reports still; closing
-      // vehicles are then judged on raw relative speed --
-      // the conservative direction.
-      ego: EgoMotion.still,
+      // Ego motion, judged per frame from the live evidence
+      // (M1 fix round -- see _egoMotionNow): frame -> ego
+      // estimate -> pipeline -> estimator, where the
+      // vehicle's relative closing speed must beat v_ego
+      // by the configured margin to count as "approaching".
+      ego: _egoMotionNow(now),
       commit: navigating,
     );
     if (result.riskPresent) {
@@ -5262,7 +5335,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         return;
       case VoiceCommand.startLibrary:
         if (_tasks.state == TaskState.idle) {
-          // Navigation P0: a real voice request goes to REAL
+          // Navigation: a real voice request goes to REAL
           // navigation (verified destination + GPS + proxy route).
           // The simulated flow stays available only through its
           // explicitly labelled demo buttons, never as a silent
@@ -5282,7 +5355,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _tasks.transitionTo(TaskState.paused, trigger: 'voice-pause');
           _stopStraightTimer();
           _scheduler.pauseStraight();
-          // P0: "停下" must also cancel everything still pending
+          // Stop command (highest priority): "停下" must also cancel everything still pending
           // (queued turn / navigation prompts) and stop the actual
           // playback -- not only the straight prompt. The
           // confirmation below is submitted after this, so it is
@@ -5348,7 +5421,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _endLiveNavigation();
           _stopStraightTimer();
           _scheduler.pauseStraight();
-          // P0 + re-test: same sequenced stop semantics as pause.
+          // Stop semantics (re-test fix): same sequenced stop as pause.
           unawaited(_stopSpeechThenConfirm(
             idPrefix: 'voice-cancel',
             confirmText: '任务已取消，直行提醒已停止。',
@@ -5670,7 +5743,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           ),
           // The one very large push-to-talk area (lower
           // half): a plain colour block with no caption.
-          // Hold: vibrate, stop any non-P0 speech, speak
+          // Hold: vibrate, stop any lower-priority speech, speak
           // the cue and await it, then listen while held.
           // Release: stop listening and submit the result.
           // The area is never disabled: with no recogniser

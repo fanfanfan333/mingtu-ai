@@ -6,6 +6,7 @@
 library;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/core/navhaz_config.dart';
+import 'package:mingtu_ai/core/tracking/byte_track_backend.dart';
 import 'package:mingtu_ai/core/tracking/tracker.dart';
 import 'package:mingtu_ai/modules/visual_perception.dart';
 
@@ -157,5 +158,64 @@ void main() {
       expect(run.trackIds, hasLength(1),
           reason: '$backend must never switch IDs mid-approach');
     }
+  });
+
+  test('byteTrack retired keys stay capped on a long session (fix round)',
+      () {
+    // Flood: far more target retirements than the cap.
+    // Each cycle shows a car for three frames at a fresh
+    // grid cell (pairwise IoU 0, so the package can never
+    // glue it onto a coasting track; three frames also put
+    // the package track into its coasting regime), then
+    // starves it for 6 frames so this layer retires it.
+    // Cells are reused only after a full round (288
+    // frames), long past the package's own 30-frame coast,
+    // so every cycle retires a DISTINCT key.
+    final ByteTrackBackend backend = ByteTrackBackend();
+    int ms = 0;
+    DateTime tick() => at(ms += 100);
+    const List<double> cxs = <double>[
+      0.06, 0.18, 0.30, 0.42, 0.55, 0.68, 0.80, 0.93,
+    ];
+    const List<double> cys = <double>[0.15, 0.35, 0.55, 0.75];
+    const int cycles = NavHazConfig.retiredKeyCap + 40;
+    int done = 0;
+    while (done < cycles) {
+      for (final double cy in cys) {
+        for (final double cx in cxs) {
+          if (done >= cycles) break;
+          for (int i = 0; i < 3; i++) {
+            backend.update(<Detection>[
+              Detection(
+                  label: 'car',
+                  confidence: 0.9,
+                  cx: cx,
+                  cy: cy,
+                  w: 0.08,
+                  h: 0.08),
+            ], tick());
+          }
+          for (int i = 0; i < 6; i++) {
+            backend.update(const <Detection>[], tick());
+          }
+          done++;
+          expect(
+              backend.retiredKeyCountForTest,
+              lessThanOrEqualTo(NavHazConfig.retiredKeyCap),
+              reason: 'the retired set must never exceed the cap '
+                  '(after $done retirements)');
+        }
+      }
+    }
+    expect(backend.retiredKeyCountForTest, NavHazConfig.retiredKeyCap,
+        reason: 'the set saturates at the cap instead of growing '
+            'with the session');
+    // And tracking still works normally afterwards.
+    List<Track> tracks = const <Track>[];
+    for (int i = 0; i < 3; i++) {
+      tracks = backend.update(<Detection>[carAt(0.5)], tick());
+    }
+    expect(tracks, hasLength(1));
+    expect(tracks.single.confirmed, isTrue);
   });
 }

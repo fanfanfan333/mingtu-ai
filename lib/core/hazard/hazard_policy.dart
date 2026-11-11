@@ -16,7 +16,14 @@
 /// estimate only the inherited near-corridor rule applies
 /// (box bottom low in the frame inside the corridor ->
 /// warning), matching the pre-M1 behaviour for close
-/// obstacles without geometry history.
+/// obstacles without geometry history. That holds for a
+/// TTC null by DISAGREEMENT too (see
+/// [TrackEstimate.ttcDisagreement]): when the two ranging
+/// legs contradict each other, no TTC branch below may
+/// promote on either leg's value -- every urgent branch
+/// requires the fused TTC to be non-null -- while the
+/// range-based static / close-range rules still apply to
+/// the separately valid range.
 ///
 /// Cooldown / dedup live here, per track: inside the
 /// cooldown a re-alert needs a level upgrade (W -> U) or a

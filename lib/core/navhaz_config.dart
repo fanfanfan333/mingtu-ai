@@ -46,6 +46,19 @@ static const int lostRetentionFrames = 5;
 /// (mirrors the long-standing VisualPerception default).
 static const double minDetectionConfidence = 0.3;
 
+/// Cap on the ByteTrack backend's retired-key set (keys of
+/// tracks retired by this layer while the package may
+/// still coast them internally). Beyond the cap the OLDEST
+/// keys are evicted. Trade-off, accepted: eviction weakens
+/// the "a retired package track is never reborn under its
+/// old own ID" guarantee only for keys older than the most
+/// recent [retiredKeyCap] retirements -- in exchange the
+/// set cannot grow without bound on a long-running camera
+/// session (each retirement is one target that left and
+/// stayed gone > 5 frames; 1024 of them is far beyond a
+/// realistic single-session count).
+static const int retiredKeyCap = 1024;
+
 /// SORT fallback association threshold (IoU).
 static const double sortIouThreshold = 0.3;
 
@@ -85,8 +98,21 @@ static const double groundPlaneMaxBottom = 0.98;
 static const double alphaBetaAlpha = 0.5;
 static const double alphaBetaBeta = 0.1;
 
-/// Two TTC estimates that agree within this relative
-/// tolerance are fused by taking the smaller. (Spec value.)
+/// TTC fusion consistency rule (spec 2.2, tightened by
+/// the M1 fix round): when BOTH TTC estimates are valid
+/// (ground-plane TTC_z and box-scale TTC_s), their relative
+/// difference |a-b| / max(a,b) decides. Consistent --
+/// difference at or below this tolerance -- the fused TTC
+/// is the SMALLER of the two. Inconsistent -- difference
+/// above this tolerance -- the two measurements contradict
+/// each other and, per the spec's degrade-or-do-not-confirm
+/// rule, the fused TTC is null and the estimate carries a
+/// disagreement marker: contradictory ranging is not
+/// trustworthy, so the policy must never promote a hazard
+/// to URGENT on either leg's value alone; it may still use
+/// the (separately valid) range Z under the static /
+/// close-range rules, exactly as for any TTC == null frame.
+/// (Spec value.)
 static const double ttcFusionTolerance = 0.5;
 
 /// Nominal frame interval used when frame timestamps are
@@ -108,6 +134,26 @@ static const double walkingGpsSpeedMps = 0.5;
 /// Accelerometer-magnitude variance at or above this
 /// ((m/s^2)^2) counts as walking motion.
 static const double walkingAccelVariance = 0.8;
+
+/// Ego-speed source priority (M1 fix round): a GPS speed is
+/// trusted only when the fix that carried it is at most
+/// this accurate (metres) AND the speed is fresh (below).
+/// Otherwise the accelerometer step-frequency estimate
+/// carries the speed, and when neither source is usable
+/// the ego speed is UNKNOWN -- the conservative branch in
+/// which a vehicle can never be confirmed "approaching".
+static const double gpsSpeedMaxAccuracyM = 20.0;
+static const Duration gpsSpeedFreshness = Duration(seconds: 5);
+
+/// Stride length for the step-frequency speed estimate
+/// (speed = step frequency x stride), metres. PROVISIONAL:
+/// a mid-range adult stride (published averages run about
+/// 0.7-0.8 m); not yet calibrated on device.
+static const double strideLengthM = 0.75;
+
+/// Sliding window over which the accelerometer magnitude
+/// variance and step frequency are estimated.
+static const Duration accelWindow = Duration(milliseconds: 2500);
 
 /// A vehicle counts as APPROACHING only when its relative
 /// closing speed exceeds the user's own speed by more

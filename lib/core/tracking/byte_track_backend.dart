@@ -84,6 +84,21 @@ class ByteTrackBackend implements Tracker {
   final Set<String> _retiredKeys = <String>{};
   int _nextOwnId = 1;
 
+  /// Retire [key] under the size cap (see
+  /// [NavHazConfig.retiredKeyCap] for the trade-off): the
+  /// set is insertion-ordered, so eviction removes the
+  /// OLDEST retirements first.
+  void _retire(String key) {
+    _retiredKeys.add(key);
+    while (_retiredKeys.length > NavHazConfig.retiredKeyCap) {
+      _retiredKeys.remove(_retiredKeys.first);
+    }
+  }
+
+  /// Retired-key count, exposed for the long-running cap
+  /// test only.
+  int get retiredKeyCountForTest => _retiredKeys.length;
+
   /// Seeded with the labels the hazard vocabulary knows;
   /// any other label is assigned the next free id on first
   /// sight and remembered for the backend's lifetime.
@@ -177,7 +192,7 @@ class ByteTrackBackend implements Tracker {
           }
           if (track.lostFrames > NavHazConfig.lostRetentionFrames) {
             _own.remove(key);
-            _retiredKeys.add(key);
+            _retire(key);
           }
         }
       }

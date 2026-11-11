@@ -10,6 +10,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/core/hazard/ego_motion.dart';
 import 'package:mingtu_ai/core/hazard/ttc_estimator.dart';
 import 'package:mingtu_ai/core/navhaz_config.dart';
+import 'package:mingtu_ai/core/tracking/tracker.dart';
+import 'package:mingtu_ai/modules/visual_perception.dart';
 
 import 'navhaz_fixture_harness.dart';
 
@@ -48,35 +50,46 @@ void main() {
   });
 
   group('alpha-beta filter', () {
-    test('velocity starts at zero and builds by beta corrections', () {
+    test('velocity is seeded from the first difference, promoted '
+        'after one alpha-beta update', () {
       final AlphaBetaFilter f = AlphaBetaFilter();
       final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      // First observation: value seeded, velocity 0.
       f.update(12, epoch);
       expect(f.velocity, 0);
-      // A constant closing rate of 2 m/s: after ~2 s of
-      // frames the velocity estimate must be close -- and
-      // crucially it must UNDERSHOOT early (never overshoot
-      // the way a first-difference seed did), so early TTC
-      // reads high, not low.
+      // Second observation: the difference seed (-2 m/s)
+      // is computed but held pending -- the reported
+      // velocity is still 0 for this frame.
+      f.update(11.8, epoch.add(const Duration(milliseconds: 100)));
+      expect(f.velocity, 0,
+          reason: 'the seed is not used raw (fix-round rule)');
+      // Third observation: the seed has passed one
+      // alpha-beta update; for an exact constant-rate
+      // series the residual is 0 and the velocity is the
+      // seeded rate itself.
+      f.update(11.6, epoch.add(const Duration(milliseconds: 200)));
+      expect(f.velocity, closeTo(-2.0, 0.05),
+          reason: 'seeded from the first difference over the '
+              'real interval');
+      // It then tracks the constant rate without the
+      // overshoot the rejected raw-seed experiment showed.
       double v = 0;
-      for (int i = 1; i <= 20; i++) {
+      for (int i = 3; i <= 20; i++) {
         f.update(12 - 0.2 * i, epoch.add(Duration(milliseconds: i * 100)));
         v = f.velocity;
-        expect(v, lessThanOrEqualTo(0),
-            reason: 'velocity is signed: closing range gives v <= 0');
-        expect(v.abs(), lessThanOrEqualTo(2.0 * 1.02),
-            reason: 'no material overshoot beyond the true rate '
-                '(the rejected first-difference seed overshot by ~15%)');
+        expect(v.abs(), lessThanOrEqualTo(2.0 * 1.05),
+            reason: 'no material overshoot beyond the true rate');
       }
       expect(v.abs(), closeTo(2.0, 0.15));
     });
   });
 
   group('ego motion', () {
-    test('no evidence -> still', () {
+    test('no evidence -> speed UNKNOWN (conservative branch)', () {
       final EgoMotion e = EgoMotion.judge();
+      expect(e.speedKnown, isFalse);
+      expect(e.vEgoMps, isNull);
       expect(e.isWalking, isFalse);
-      expect(e.vEgoMps, 0);
     });
 
     test('GPS speed at walking pace -> walking with that speed', () {
@@ -127,5 +140,78 @@ void main() {
         expect(run.estimatesByTime[3000]!.single.approaching, isTrue);
       });
     }
+  });
+
+  group('TTC fusion consistency rule (fix round, spec 2.2)', () {
+    test('difference 30% -> consistent, fused is the smaller', () {
+      // |4.0 - 2.8| / 4.0 = 30%.
+      expect(TtcEstimator.legsDisagree(4.0, 2.8), isFalse);
+      expect(TtcEstimator.fuseLegs(4.0, 2.8), closeTo(2.8, 1e-12));
+      expect(TtcEstimator.fuseLegs(2.8, 4.0), closeTo(2.8, 1e-12),
+          reason: 'the smaller wins regardless of leg order');
+    });
+
+    test('difference exactly 50% -> consistent (boundary inclusive)', () {
+      // |5.0 - 2.5| / 5.0 = 50%: at the tolerance, not above.
+      expect(TtcEstimator.legsDisagree(5.0, 2.5), isFalse);
+      expect(TtcEstimator.fuseLegs(5.0, 2.5), closeTo(2.5, 1e-12));
+    });
+
+    test('difference 80% -> inconsistent, fused is null', () {
+      // |5.0 - 1.0| / 5.0 = 80%.
+      expect(TtcEstimator.legsDisagree(5.0, 1.0), isTrue);
+      expect(TtcEstimator.fuseLegs(5.0, 1.0), isNull);
+    });
+
+    test('a single valid leg is used as-is; none -> null', () {
+      expect(TtcEstimator.fuseLegs(3.3, null), closeTo(3.3, 1e-12));
+      expect(TtcEstimator.fuseLegs(null, 4.4), closeTo(4.4, 1e-12));
+      expect(TtcEstimator.fuseLegs(null, null), isNull);
+    });
+
+    test('estimator level: contradictory legs yield ttc null + marker',
+        () {
+      // Range law: Z falls 12 -> 6 m at 2 m/s (TTC_z ~ 3 s
+      // and shrinking). Scale law: s grows as exp(t/12)
+      // (TTC_s = 12 s throughout). The legs contradict
+      // each other by ~75%: the fused TTC must be null and
+      // the estimate marked, never the min of the two.
+      final TtcEstimator estimator = TtcEstimator();
+      final Track track = Track(id: 77, label: 'car');
+      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      TrackEstimate? last;
+      for (int i = 0; i <= 30; i++) {
+        final double t = i / 10.0;
+        final double z = 12.0 - 2.0 * t;
+        final double fy = 0.5 / math.tan(math.pi / 6);
+        final double depression = math.atan(NavHazConfig.cameraHeightM / z);
+        final double bottom = NavHazConfig.principalY +
+            fy * math.tan(depression - 10.0 * math.pi / 180);
+        final double s = 0.08 * math.exp(t / 12.0);
+        track.recordMatch(
+          Detection(
+              label: 'car',
+              confidence: 0.9,
+              cx: 0.5,
+              cy: bottom - s / 2,
+              w: s,
+              h: s),
+          epoch.add(Duration(milliseconds: i * 100)),
+        );
+        last = estimator.estimate(track,
+            at: epoch.add(Duration(milliseconds: i * 100)),
+            pitchDeg: 10,
+            ego: EgoMotion.still);
+      }
+      expect(last!.ttcScaleS, isNotNull);
+      expect(last.ttcRangeS, isNotNull);
+      expect(last.ttcDisagreement, isTrue,
+          reason: 'legs ${last.ttcScaleS} vs ${last.ttcRangeS}');
+      expect(last.ttcS, isNull,
+          reason: 'contradictory ranging is distrusted, not min-ed');
+      expect(last.rangeM, isNotNull,
+          reason: 'the range itself stays usable for the '
+              'static / close-range policy rules');
+    });
   });
 }

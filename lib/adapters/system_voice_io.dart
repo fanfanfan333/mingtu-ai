@@ -69,7 +69,7 @@ class SystemVoiceOutput implements VoiceOutput {
 
   Future<void> _doInitialize(FlutterTts tts) async {
     await tts.awaitSpeakCompletion(true);
-    // P0 zh-CN verification: an engine that answers is not proof
+    // Startup zh-CN verification (highest priority): an engine that answers is not proof
     // it can speak Chinese -- a missing zh-CN voice data set would
     // otherwise be silently reported as "zh-CN 已接入". Ask the
     // engine for its language list and resolve zh-CN from evidence;

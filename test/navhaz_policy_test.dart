@@ -40,6 +40,7 @@ TrackEstimate estimate(
   double? closing,
   bool approaching = false,
   bool willHit = true,
+  bool disagreement = false,
 }) {
   return TrackEstimate(
     track: track,
@@ -51,6 +52,7 @@ TrackEstimate estimate(
     approaching: approaching,
     willHit: willHit,
     cxVelocity: 0,
+    ttcDisagreement: disagreement,
   );
 }
 
@@ -285,6 +287,82 @@ void main() {
         at(0),
       );
       expect(r.alert?.level, HazardLevel.warning);
+    });
+  });
+
+  group('TTC disagreement degrades, never promotes (fix round)', () {
+    test('one leg at 2.5 s + disagreement -> NO urgent', () {
+      final HazardPolicy policy = HazardPolicy();
+      final Track car = confirmedTrack(1, 'car');
+      // The estimator nulls the fused TTC on disagreement;
+      // even though a (distrusted) scale leg read 2.5 s and
+      // the target is closing, no TTC branch may promote.
+      // Range 8 m keeps every range rule out of reach, and
+      // the box bottom (0.75) keeps the near rule out.
+      final HazardPolicyResult r = policy.evaluate(
+        <TrackEstimate>[
+          estimate(car,
+              ttc: null, range: 8, closing: 2, approaching: true,
+              disagreement: true),
+        ],
+        at(0),
+      );
+      expect(r.alert, isNull);
+      expect(r.riskPresent, isFalse);
+    });
+
+    test('disagreement still allows the static Z rule (W)', () {
+      final HazardPolicy policy = HazardPolicy();
+      final Track car = confirmedTrack(1, 'car');
+      final HazardPolicyResult r = policy.evaluate(
+        <TrackEstimate>[
+          estimate(car, ttc: null, range: 2.5, disagreement: true),
+        ],
+        at(0),
+      );
+      expect(r.alert?.level, HazardLevel.warning,
+          reason: 'range Z is separately valid: the static '
+              'corridor rule applies as for any TTC == null');
+    });
+
+    test('disagreement at 1.2 m: close-range TTC branch stays off', () {
+      final HazardPolicy policy = HazardPolicy();
+      final Track car = confirmedTrack(1, 'car');
+      // Range <= 1.5 m would be urgent WITH a trusted TTC
+      // <= 2 s; with the fused TTC null by distrust only
+      // the static warning remains.
+      final HazardPolicyResult r = policy.evaluate(
+        <TrackEstimate>[
+          estimate(car, ttc: null, range: 1.2, disagreement: true),
+        ],
+        at(0),
+      );
+      expect(r.alert?.level, HazardLevel.warning);
+    });
+
+    test('disagreement still allows the near-corridor rule (W)', () {
+      final HazardPolicy policy = HazardPolicy();
+      final Track person = Track(id: 1, label: 'person');
+      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      for (int i = 0; i < 4; i++) {
+        person.recordMatch(
+          const Detection(
+              label: 'person',
+              confidence: 0.9,
+              cx: 0.5,
+              cy: 0.75,
+              w: 0.2,
+              h: 0.4),
+          epoch.add(Duration(milliseconds: i * 100)),
+        );
+      }
+      final HazardPolicyResult r = policy.evaluate(
+        <TrackEstimate>[estimate(person, disagreement: true)],
+        at(0),
+      );
+      expect(r.alert?.level, HazardLevel.warning,
+          reason: 'box bottom 0.95 in the corridor: the '
+              'inherited TTC == null rule');
     });
   });
 }

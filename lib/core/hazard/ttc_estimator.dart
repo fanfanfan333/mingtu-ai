@@ -21,13 +21,17 @@
 ///    TTC_s is then infinite (reported as null here, and
 ///    kept distinct from "unknown" by [TrackEstimate]).
 ///
-/// Fusion (V1): both valid and within
-/// [NavHazConfig.ttcFusionTolerance] of each other -> the
-/// smaller; only one valid -> that one; none -> null. When
-/// both are valid but DISAGREE beyond tolerance the smaller
-/// is still used -- for a hazard warning the conservative
-/// direction is the earlier one (noted here because the
-/// spec lists only the agreeing case).
+/// Fusion (spec 2.2): both valid and consistent with
+/// each other (relative difference |a-b| / max(a,b) at or
+/// below [NavHazConfig.ttcFusionTolerance]) -> the
+/// smaller; only one valid -> that one; none -> null.
+/// Both valid but INCONSISTENT (difference above the
+/// tolerance) -> the fused TTC is null and the estimate
+/// is marked [TrackEstimate.ttcDisagreement]: contradictory
+/// ranging is not trustworthy, so the policy degrades to
+/// the range-based rules and never promotes a hazard to
+/// urgent on either leg's value alone (see the config
+/// comment for the full rule).
 library;
 
 import 'dart:math' as math;
@@ -37,17 +41,31 @@ import '../tracking/tracker.dart';
 import 'ego_motion.dart';
 
 /// One-dimensional alpha-beta filter over time-stamped
-/// values: tracks (value, velocity). The first observation
-/// seeds the value; the second seeds the velocity from the
-/// finite difference (so a steadily growing series is
-/// tracked from the start instead of after a long ramp --
-/// the alert timing windows in the acceptance tests leave
-/// no room for a multi-second filter warm-up).
+/// values: tracks (value, velocity). Seeding (M1 fix
+/// round): the FIRST observation seeds the value (velocity
+/// 0); when the SECOND observation arrives, the velocity
+/// is seeded from that first finite difference, divided by
+/// the REAL interval between the two samples. The seeded
+/// velocity is not used straight away: it is held pending
+/// for one frame and promoted only after the third
+/// observation has run it through one standard alpha-beta
+/// update, so the first beta correction acts on the seed
+/// before it can drive a TTC. That ordering matters --
+/// both tracker backends smooth the box with their own
+/// filter, whose early catch-up transient can make the raw
+/// first difference overestimate the closing rate (an
+/// earlier experiment with the raw difference as the seed
+/// overestimated it by ~15% and fired warnings ~1 s
+/// early). Measured on the acceptance fixture, the
+/// promoted-after-one-update seed keeps every alert inside
+/// its spec window (see the fix-round report).
 class AlphaBetaFilter {
   final double alpha;
   final double beta;
   double _x = 0;
   double _v = 0;
+  double? _pendingSeedV;
+  int _samples = 0;
   DateTime? _lastAt;
   bool _seeded = false;
 
@@ -83,22 +101,30 @@ class AlphaBetaFilter {
       _x = z;
       _v = 0;
       _seeded = true;
+      _samples = 1;
       return _x;
     }
+    if (_samples == 1) {
+      // Second observation: seed the velocity from the
+      // first finite difference over the real interval,
+      // but hold it pending (see the class doc); the value
+      // takes the new observation and the reported
+      // velocity stays 0 for this frame.
+      _pendingSeedV = (z - _x) / dt;
+      _x = z;
+      _samples = 2;
+      return _x;
+    }
+    if (_pendingSeedV != null) {
+      // Third observation: promote the seed, then let the
+      // standard update below apply one alpha-beta
+      // correction to it before any caller reads it.
+      _v = _pendingSeedV!;
+      _pendingSeedV = null;
+    }
+    _samples++;
     final double predicted = _x + _v * dt;
     final double residual = z - predicted;
-    // The velocity starts at ZERO and is built purely by
-    // the beta corrections. Seeding it from the first
-    // finite difference was tried and rejected: both
-    // tracker backends smooth the box with their own
-    // filter, whose early catch-up transient makes the
-    // first difference systematically OVERESTIMATE the
-    // closing rate (~15% on the acceptance fixture), which
-    // dragged TTC ~13% low and fired warnings a full
-    // second early. A zero seed errs the other way --
-    // early TTC reads HIGH, alerts come a few frames later
-    // but inside their windows, and the estimate converges
-    // well before the TTC 2-4 s accuracy band.
     _x = predicted + alpha * residual;
     _v = _v + (beta / dt) * residual;
     return _x;
@@ -107,6 +133,8 @@ class AlphaBetaFilter {
   void reset() {
     _x = 0;
     _v = 0;
+    _pendingSeedV = null;
+    _samples = 0;
     _lastAt = null;
     _seeded = false;
   }
@@ -126,6 +154,16 @@ class TrackEstimate {
   /// for the scale estimate).
   final double? ttcScaleS;
   final double? ttcRangeS;
+
+  /// True when both TTC legs were valid but contradicted
+  /// each other beyond [NavHazConfig.ttcFusionTolerance]:
+  /// the fused [ttcS] is then null BY DISTRUST, not by
+  /// missing data. The policy treats it like any TTC null
+  /// for level purposes (never urgent on a TTC branch) and
+  /// may still use [rangeM] under the static / close-range
+  /// rules; the marker exists for the policy's assertions
+  /// and for logging.
+  final bool ttcDisagreement;
 
   /// Filtered ground-plane range, metres; null when the
   /// ground-plane preconditions do not hold.
@@ -158,6 +196,7 @@ class TrackEstimate {
     required this.approaching,
     required this.willHit,
     required this.cxVelocity,
+    this.ttcDisagreement = false,
   });
 }
 
@@ -197,6 +236,24 @@ class TtcEstimator {
   void forget(int trackId) => _filters.remove(trackId);
 
   void reset() => _filters.clear();
+
+  /// Whether two valid TTC legs contradict each other:
+  /// relative difference |a-b| / max(a,b) strictly above
+  /// [NavHazConfig.ttcFusionTolerance].
+  static bool legsDisagree(double a, double b) =>
+      (a - b).abs() / math.max(a, b) > NavHazConfig.ttcFusionTolerance;
+
+  /// Fuse the two TTC legs (spec 2.2): both valid and
+  /// consistent -> the smaller; exactly one valid -> that
+  /// one; both valid but inconsistent -> null (the pair is
+  /// distrusted, never averaged and never min-ed into an
+  /// urgent the measurements do not jointly support).
+  static double? fuseLegs(double? scale, double? range) {
+    if (scale != null && range != null) {
+      return legsDisagree(scale, range) ? null : math.min(scale, range);
+    }
+    return scale ?? range;
+  }
 
   /// Estimate one track for the current frame.
   ///
@@ -251,16 +308,23 @@ class TtcEstimator {
       // separate fused input -- it only feeds `approaching`.
     }
 
-    // --- fusion ---
-    double? ttc;
-    if (ttcScale != null && ttcRange != null) {
-      ttc = math.min(ttcScale, ttcRange);
-    } else {
-      ttc = ttcScale ?? ttcRange;
-    }
+    // --- fusion (spec 2.2; the full consistency rule is
+    // written out at NavHazConfig.ttcFusionTolerance) ---
+    final bool disagreement = ttcScale != null &&
+        ttcRange != null &&
+        TtcEstimator.legsDisagree(ttcScale, ttcRange);
+    final double? ttc = TtcEstimator.fuseLegs(ttcScale, ttcRange);
 
+    // Approaching: the measured closing must beat the
+    // user's own speed by the margin. With the ego speed
+    // UNKNOWN (no usable source) an approach can never be
+    // confirmed -- the conservative branch of the ego
+    // judge; the estimate then flows through the range /
+    // TTC == null policy rules only.
+    final double? vEgo = ego.vEgoMps;
     final bool approaching = closing != null &&
-        closing - ego.vEgoMps > NavHazConfig.approachingMarginMps;
+        vEgo != null &&
+        closing - vEgo > NavHazConfig.approachingMarginMps;
 
     // --- corridor intersection ---
     final double cxVel = _cxVelocity(track);
@@ -282,6 +346,7 @@ class TtcEstimator {
       approaching: approaching,
       willHit: willHit,
       cxVelocity: cxVel,
+      ttcDisagreement: disagreement,
     );
   }
 

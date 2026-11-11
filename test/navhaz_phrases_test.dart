@@ -1,12 +1,18 @@
 /// NAVHAZ M1, spec sections 0.1 / 2.4 / 2.7.10: no spoken
 /// text may grant or imply passage. The check runs over
-/// the FULL cross-product of the hazard-phrase templates
-/// (levels x zones x clock positions x ranges x item
-/// names), over every phrase the acceptance fixtures
-/// produce, and over the lib/ sources themselves (string
-/// literals must not contain a banned word; the banned
-/// list itself is assembled from adjacent literals so this
-/// scan stays clean by construction).
+/// the FULL output space of the hazard-phrase templates --
+/// every item name (all hazardKindName values and every
+/// spoken label name) x every direction form (the three
+/// near zones and all twelve clock hours) x the whole
+/// spoken-metre domain (the near set, 1..10 m per metre,
+/// and every 5 m step beyond) x both levels -- enumerated
+/// at one central point (fix round: the earlier sampled
+/// cross-product was replaced by this exhaustive one),
+/// over every phrase the acceptance fixtures produce, and
+/// over the lib/ sources themselves (string literals must
+/// not contain a banned word; the banned list itself is
+/// assembled from adjacent literals so this scan stays
+/// clean by construction).
 library;
 import 'dart:io';
 
@@ -101,43 +107,105 @@ String stripComments(String src) {
 
 void main() {
   group('hazard phrase templates', () {
-    test('full expansion contains no banned word', () {
-      final List<String> labels = <String>[
-        'person', 'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'pole',
-        'chair', 'unknown-thing',
+    test('EXHAUSTIVE output space contains no banned word (2.7.10)',
+        () {
+      // Every spoken item name: the five hazardKindName
+      // values plus every label name the detector
+      // vocabulary maps to (an unknown label falls back
+      // to its kind name -- deduplicated by the set).
+      final Map<String, bool> names = <String, bool>{};
+      for (final HazardKind kind in HazardKind.values) {
+        names[hazardKindName(kind)] =
+            kind == HazardKind.motorVehicle ||
+                kind == HazardKind.nonMotorVehicle;
+      }
+      for (final String label in <String>[
+        'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'person',
+        'pole', 'mystery-box',
+      ]) {
+        final HazardKind kind =
+            hazardKindForLabel(label) ?? HazardKind.clutter;
+        names[hazardSpokenName(label, kind)] =
+            kind == HazardKind.motorVehicle ||
+                kind == HazardKind.nonMotorVehicle;
+      }
+      // Near direction forms: the three zones.
+      const List<double> nearCxs = <double>[0.1, 0.5, 0.9];
+      // Far direction forms: all twelve clock hours, one
+      // centre-x per hour offset (-5..+6).
+      final List<double> farCxs = <double>[
+        for (int offset = -5; offset <= 6; offset++) 0.5 + offset * 30.0 / 70.0,
       ];
-      final List<double> cxs = <double>[
-        0.0, 0.2, 0.33, 0.5, 0.67, 0.85, 1.0,
+      // Near metre domain: unknown range plus every
+      // half metre up to the near-wording limit.
+      final List<double?> nearRanges = <double?>[
+        null,
+        for (double r = 0.5; r <= 5.0; r += 0.5) r,
       ];
-      final List<double?> ranges = <double?>[
-        null, 0.8, 1.5, 2.5, 3.0, 4.2, 5.0, 7.0, 9.6, 12.0, 20.0, 33.0,
+      // Far metre domain: the boundary just past the near
+      // limit, every whole metre 6..10, and every 5 m step
+      // the readout can produce up to 100 m.
+      final List<double> farRanges = <double>[
+        5.5,
+        for (double r = 6; r <= 10; r += 1) r,
+        for (double r = 15; r <= 100; r += 5) r,
       ];
+      final Set<String> zonesSeen = <String>{};
+      final Set<String> clocksSeen = <String>{};
+      final Set<String> metresSeen = <String>{};
       int count = 0;
-      for (final String label in labels) {
-        for (final double cx in cxs) {
-          for (final double? range in ranges) {
-            for (final bool urgent in <bool>[true, false]) {
-              final HazardKind kind =
-                  hazardKindForLabel(label) ?? HazardKind.clutter;
+      void check(String phrase, bool urgent) {
+        count++;
+        expect(containsBannedWord(phrase), isFalse,
+            reason: 'banned word in "$phrase"');
+        expect(phrase.startsWith(urgent ? '停，' : '注意，'), isTrue,
+            reason: 'template shape: $phrase');
+      }
+
+      for (final MapEntry<String, bool> name in names.entries) {
+        for (final bool urgent in <bool>[true, false]) {
+          for (final double cx in nearCxs) {
+            for (final double? range in nearRanges) {
               final String phrase = hazardPhrase(
                 urgent: urgent,
-                name: hazardSpokenName(label, kind),
-                isVehicle: kind == HazardKind.motorVehicle ||
-                    kind == HazardKind.nonMotorVehicle,
+                name: name.key,
+                isVehicle: name.value,
                 cx: cx,
                 rangeM: range,
               );
-              count++;
-              expect(containsBannedWord(phrase), isFalse,
-                  reason: 'phrase "$phrase" (label=$label cx=$cx '
-                      'range=$range urgent=$urgent)');
-              expect(phrase.startsWith(urgent ? '停，' : '注意，'), isTrue,
-                  reason: 'template shape: $phrase');
+              zonesSeen.add(zoneName(cx));
+              if (range != null) metresSeen.add(metresText(range));
+              check(phrase, urgent);
+            }
+          }
+          for (final double cx in farCxs) {
+            for (final double range in farRanges) {
+              final String phrase = hazardPhrase(
+                urgent: urgent,
+                name: name.key,
+                isVehicle: name.value,
+                cx: cx,
+                rangeM: range,
+              );
+              clocksSeen.add('${clockHour(cx)}');
+              metresSeen.add(metresText(range));
+              check(phrase, urgent);
             }
           }
         }
       }
-      expect(count, labels.length * cxs.length * ranges.length * 2);
+      // The enumeration really covered the whole space:
+      final int expected = names.length *
+          2 *
+          (nearCxs.length * nearRanges.length +
+              farCxs.length * farRanges.length);
+      expect(count, expected);
+      expect(zonesSeen, <String>{'左边', '前方', '右边'});
+      expect(clocksSeen.length, 12,
+          reason: 'all twelve clock hours were produced');
+      expect(metresSeen.length, greaterThanOrEqualTo(28),
+          reason: 'near half-metres, 1..10 m and the 5 m '
+              'steps were all produced: $metresSeen');
     });
 
     test('zone and clock wording follow the geometry', () {
