@@ -6,19 +6,26 @@
 /// scheduler marks as `active`, and for reporting completion back via
 /// [completeActive].
 ///
-/// Priority: lower number = higher priority.
-///   P0 emergency, P1 high-risk avoidance AND critical alerts
-///   (safety/failure announcements that must be delivered:
-///   recognition results, failures, permission denials),
-///   P2 turn, P3 straight, P4 info.
+/// Priority: lower number = higher priority. The enum has
+/// SIX levels (an earlier draft of this comment listed five
+/// -- the table below is the code's actual [priorityOf]):
+///   0 emergency       紧急求助
+///   1 danger          紧急危险 (imminent hazard)
+///   2 obstacleAvoidance / alert  警示 (avoidance + critical
+///                     announcements that must be delivered:
+///                     recognition results, failures,
+///                     permission denials)
+///   3 turn            转向
+///   4 straight        直行
+///   5 info            信息
 ///
 /// Delivery guarantee for critical speech: requests of kind
 /// emergency / obstacleAvoidance / alert are submitted with
 /// [SpeechRequest.neverExpires] by the app layer, so neither
 /// submission nor promotion can drop them as "expired" -- for a
 /// blind user a silently dropped safety/failure message is worse
-/// than a late one. An alert (P1) can be interrupted ONLY by a
-/// strictly higher priority (an emergency, P0); the user's own
+/// than a late one. An alert (level 2) can be interrupted ONLY by a
+/// strictly higher priority (an emergency, level 0); the user's own
 /// "停下" is not an interruption but an explicit cancelAll(),
 /// which is the one sanctioned way to clear everything.
 enum SpeechKind {
@@ -55,6 +62,27 @@ int priorityOf(SpeechKind kind) {
   }
 }
 
+/// What the arbitration does with a NAVIGATION prompt that
+/// a hazard announcement interrupted (NAVHAZ M1, spec
+/// section 2.6). Hazard and info prompts themselves are
+/// never replayed; this only governs navigation items.
+enum NavReplay {
+  /// Recompute the prompt from the latest GPS fix before
+  /// replaying (turn-ahead and entrance-distance prompts):
+  /// the distance in the original text is stale the moment
+  /// it is interrupted.
+  regenerate,
+
+  /// Replay a shortened fixed form (straight / off-route
+  /// prompts): the full original wording is not worth
+  /// repeating, but the user still needs the gist.
+  shortenedReplay,
+
+  /// Never replay (the default for everything else,
+  /// including all non-navigation prompts).
+  drop,
+}
+
 class SpeechRequest {
   final String id;
   final String eventId; // for dedup: same event must not be spoken twice
@@ -72,6 +100,18 @@ class SpeechRequest {
   /// the default false and expire as before: a stale "直走" must
   /// never be spoken late.
   final bool neverExpires;
+
+  /// For a turn-ahead prompt: the index of the step it
+  /// announces, so the arbitration can regenerate the prompt
+  /// against the step geometry after an interruption. Null
+  /// for every non-turn prompt.
+  final int? navStepIndex;
+
+  /// Interruption handling for navigation prompts
+  /// (see [NavReplay]). Defaults to [NavReplay.drop], which
+  /// preserves the pre-M1 behaviour for every existing
+  /// submission site.
+  final NavReplay replay;
   const SpeechRequest({
     required this.id,
     required this.eventId,
@@ -82,6 +122,8 @@ class SpeechRequest {
     required this.navigationStateVersion,
     this.requiresStraightSegment = false,
     this.neverExpires = false,
+    this.navStepIndex,
+    this.replay = NavReplay.drop,
   });
 
   int get priority => priorityOf(kind);
@@ -94,13 +136,66 @@ class SpeechScheduler {
   SpeechRequest? _active;
   final List<SpeechRequest> _queue = [];
   final List<String> playedLog = [];
-  final List<String> interruptedLog = [];
+
+  /// Requests that were interrupted, as OBJECTS (NAVHAZ
+  /// M1): the arbitration needs the request itself -- its
+  /// kind, its step index, its replay policy -- not only an
+  /// id. [interruptedLog] below remains as the id view of
+  /// this list for the callers (and tests) that only ever
+  /// read ids.
+  final List<SpeechRequest> interruptedRequests = [];
+
+  /// When each interrupted request was interrupted, by id:
+  /// the replay window is measured from the interruption,
+  /// not from submission.
+  final Map<String, DateTime> _interruptedAt = <String, DateTime>{};
+
+  /// Id view of [interruptedRequests], in interruption
+  /// order (derived; the object list is the source of
+  /// truth).
+  List<String> get interruptedLog =>
+      interruptedRequests.map((SpeechRequest r) => r.id).toList();
+
+  /// Record an interruption (single write point so the
+  /// object list and the timestamps can never drift).
+  void _recordInterrupted(SpeechRequest request, DateTime now) {
+    interruptedRequests.add(request);
+    _interruptedAt[request.id] = now;
+  }
+
+  /// When [request] was interrupted, if it was.
+  DateTime? interruptedAtOf(SpeechRequest request) =>
+      _interruptedAt[request.id];
+
+  /// The interrupted NAVIGATION requests the arbitration
+  /// may still replay (peek -- nothing is removed). Hazard
+  /// interruptions stay recorded: the log semantics other
+  /// callers rely on (a just-interrupted urgent prompt must
+  /// remain recognisable) are unchanged.
+  List<SpeechRequest> interruptedNavigationRequests() {
+    return interruptedRequests
+        .where((SpeechRequest r) =>
+            r.replay != NavReplay.drop &&
+            (r.kind == SpeechKind.turn ||
+                r.kind == SpeechKind.straight ||
+                r.kind == SpeechKind.info))
+        .toList();
+  }
+
+  /// Remove one interrupted request for good: it was either
+  /// replayed, dropped as expired, or dropped because its
+  /// moment has passed. Exactly-once arbitration is the
+  /// caller's discipline built on this + the peek above.
+  void discardInterrupted(SpeechRequest request) {
+    interruptedRequests.remove(request);
+    _interruptedAt.remove(request.id);
+  }
   final List<String> droppedExpiredLog = [];
   final List<String> droppedDuplicateLog = [];
   // v0.4: conflicting action instructions (a turn vs an avoidance
   // step) are dropped, never played one after the other.
   final List<String> droppedConflictLog = [];
-  // P0 follow-up: requests cancelled by an explicit stop (voice
+  // Follow-up: requests cancelled by an explicit stop (voice
   // pause / cancel command). A stopped prompt must never be played
   // afterwards, so cancellation is recorded, not silent.
   final List<String> cancelledLog = [];
@@ -156,7 +251,7 @@ class SpeechScheduler {
       return true;
     }
     if (request.priority < _active!.priority) {
-      interruptedLog.add(_active!.id);
+      _recordInterrupted(_active!, now);
       _active = null;
       _activate(request);
       return true;
@@ -170,7 +265,7 @@ class SpeechScheduler {
       // interrupts immediately -- same-level dangers never
       // queue behind each other -- and the interrupted
       // prompt is never replayed.
-      interruptedLog.add(_active!.id);
+      _recordInterrupted(_active!, now);
       _active = null;
       _activate(request);
       return true;
@@ -183,7 +278,7 @@ class SpeechScheduler {
           .where((SpeechRequest q) => q.kind == request.kind)
           .toList()) {
         _queue.remove(q);
-        interruptedLog.add(q.id);
+        _recordInterrupted(q, now);
       }
     }
     _queue.add(request);
@@ -263,7 +358,7 @@ class SpeechScheduler {
 
   /// Cancel everything: the active prompt and every queued prompt.
   ///
-  /// P0 follow-up: a voice "停下 / 取消" must cancel pending
+  /// Follow-up: a voice "停下 / 取消" must cancel pending
   /// navigation speech, not only the currently playing straight
   /// prompt -- before this, a turn prompt queued behind another
   /// prompt could still be spoken after the user said stop. The
