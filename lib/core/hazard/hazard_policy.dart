@@ -25,13 +25,36 @@
 /// range-based static / close-range rules still apply to
 /// the separately valid range.
 ///
+/// EGO-UNKNOWN SCALE PATH (lead's ruling, 2026-11-11):
+/// when the frame's ego speed is unknown
+/// ([TrackEstimate.egoSpeedKnown] == false) NONE of the
+/// table above applies. The estimate is judged by
+/// [_levelForEgoUnknownScalePath] instead: no approaching
+/// test (there is no v_ego to subtract), levels from the
+/// box-scale TTC alone -- TTC_s <= 3.0 s urgent, in
+/// (3.0, 5.0] warning, no downgrade -- gated by the
+/// intersection test [TtcEstimator.scalePathIntersects]
+/// (the extrapolated bottom-centre must land in the
+/// forward channel; a crossing target stays silent). A
+/// fused-TTC disagreement is NOT this path: the scale leg
+/// is distrusted there too and the path stays silent.
+/// Accepted consequence, per the ruling ("rather
+/// over-report than miss"): with the ego speed unknown a
+/// user walking toward a PARKED vehicle alerts exactly
+/// like a vehicle approaching the user.
+///
 /// Cooldown / dedup live here, per track: inside the
 /// cooldown a re-alert needs a level upgrade (W -> U) or a
 /// TTC that has fallen >= 40% since that track's last
-/// spoken alert. Different tracks with the same category
-/// and zone inside 500 ms merge into one announcement. A
-/// frame yields at most ONE alert: urgent before warning,
-/// then smaller TTC, then the hazard-kind order.
+/// spoken alert. The cooldown window is chosen per
+/// evaluation from that frame's ego state: 4 s when the
+/// ego speed is known, 6 s when it is unknown (the
+/// ego-unknown path talks less often); the two re-alert
+/// exceptions apply unchanged in both windows. Different
+/// tracks with the same category and zone inside 500 ms
+/// merge into one announcement. A frame yields at most
+/// ONE alert: urgent before warning, then smaller TTC,
+/// then the hazard-kind order.
 ///
 /// This policy never produces a step direction: wording is
 /// [hazard_phrases] only, and a sideways step may be added
@@ -130,6 +153,28 @@ class HazardPolicy {
   HazardLevel? levelFor(TrackEstimate e) {
     final Track track = e.track;
     if (!track.confirmed || track.lostFrames > 0) return null;
+    // Ego speed unknown: the dedicated scale path judges
+    // the estimate on its own rules (no willHit corridor,
+    // no approaching test) -- see the library doc. When
+    // the scale leg yields no usable TTC the estimate
+    // degrades to the two TTC == null rules below (static
+    // range / near corridor), as CDX2-1 prescribes; the
+    // approaching and TTC-band branches stay off because
+    // the (scale-only) TTC is null in that case.
+    if (!e.egoSpeedKnown) {
+      final HazardLevel? scaleLevel = _levelForEgoUnknownScalePath(e);
+      if (scaleLevel != null || e.ttcScaleS != null) return scaleLevel;
+      if (!e.willHit) return null;
+      if (e.rangeM != null &&
+          e.rangeM! <= NavHazConfig.warningStaticRangeM) {
+        return HazardLevel.warning;
+      }
+      final TrackSample? s = track.latest;
+      if (s != null && s.bottom > NavHazConfig.nearBottom) {
+        return HazardLevel.warning;
+      }
+      return null;
+    }
     if (!e.willHit) return null;
     final HazardKind kind =
         hazardKindForLabel(track.label) ?? HazardKind.clutter;
@@ -150,7 +195,9 @@ class HazardPolicy {
     // vehicle in the corridor cannot be PROVEN closing in
     // m/s terms; the scale TTC alone then carries the urgent
     // call. (With ranging available the measured test above
-    // is the only urgent vehicle path.)
+    // is the only urgent vehicle path.) This branch is the
+    // KNOWN-ego case; the unknown-ego case never reaches
+    // here -- it is judged by _levelForEgoUnknownScalePath.
     if (isVehicle &&
         e.closingSpeedMps == null &&
         ttc != null &&
@@ -175,10 +222,86 @@ class HazardPolicy {
     return null;
   }
 
-  bool _cooldownAllows(int trackId, HazardLevel level, double? ttc, DateTime now) {
-    final _LastAlert? last = _lastByTrack[trackId];
+  /// The ego-unknown scale path (lead's ruling,
+  /// 2026-11-11; conjunction pinned by the FIX2 round):
+  /// the level for one estimate whose frame had NO usable
+  /// ego speed. A warning or an urgent requires ALL FOUR
+  /// conditions at once:
+  ///   (i)   the track is confirmed (checked by the
+  ///         caller, [levelFor]);
+  ///   (ii)  the box scale is GROWING -- the estimator's
+  ///         filtered scale rate is positive. (A usable
+  ///         TTC_s exists only when the rate is positive,
+  ///         so this is the same fact stated as an
+  ///         independent, testable condition, per FIX2;
+  ///         a constant-size target has TTC_s == null and
+  ///         fails here, never on its position alone.)
+  ///   (iii) the intersection gate passes: the box
+  ///         bottom-centre, extrapolated laterally to
+  ///         t + TTC_s, lands inside the forward channel
+  ///         (metric +/- channel half width when a range
+  ///         exists, the central frame fraction when it
+  ///         does not -- [TtcEstimator.scalePathIntersects],
+  ///         which deliberately has NO "current box
+  ///         overlaps the channel" clause: only the
+  ///         extrapolated landing point counts, so a
+  ///         crossing target whose box currently overlaps
+  ///         the channel stays silent);
+  ///   (iv)  TTC_s falls in a band: urgent at <= 3.0 s,
+  ///         warning in (3.0, 5.0], no downgrade for the
+  ///         missing ego evidence (with the ego speed
+  ///         unknown, a user walking toward a parked
+  ///         vehicle alerts just like a vehicle
+  ///         approaching the user -- accepted by the
+  ///         ruling: rather over-report than miss).
+  /// No condition may substitute for another: in
+  /// particular TTC_s alone never promotes.
+  ///
+  /// When TTC_s itself is unusable (no measurable scale
+  /// growth) this path grades nothing and the caller
+  /// degrades to the TTC == null rules, exactly as
+  /// CDX2-1 prescribes (the estimator has already nulled
+  /// the fused TTC in that case). A fused-TTC
+  /// disagreement cannot occur on this path: with the ego
+  /// speed unknown the estimator performs no fusion (see
+  /// TtcEstimator.estimate), so there is nothing to
+  /// distrust and [TrackEstimate.ttcDisagreement] is
+  /// always false here.
+  HazardLevel? _levelForEgoUnknownScalePath(TrackEstimate e) {
+    final double? ttcS = e.ttcScaleS;
+    if (ttcS == null) return null;
+    // Condition (ii): measurable scale growth, asserted
+    // independently of the TTC value (FIX2 conjunction).
+    if (e.scaleRate <= 0) return null;
+    final TrackSample? s = e.track.latest;
+    if (s == null) return null;
+    // Condition (iii): extrapolated intersection only.
+    if (!TtcEstimator.scalePathIntersects(
+      cx: s.cx,
+      cxVelocity: e.cxVelocity,
+      ttcScaleS: ttcS,
+      rangeM: e.rangeM,
+    )) {
+      return null;
+    }
+    // Condition (iv): the plain scale-TTC bands.
+    if (ttcS <= NavHazConfig.urgentTtcS) return HazardLevel.urgent;
+    if (ttcS <= NavHazConfig.warningTtcS) return HazardLevel.warning;
+    return null;
+  }
+
+  bool _cooldownAllows(TrackEstimate e, HazardLevel level, DateTime now) {
+    final _LastAlert? last = _lastByTrack[e.track.id];
     if (last == null) return true;
-    const Duration cd = Duration(seconds: NavHazConfig.cooldownSeconds);
+    // The window follows THIS frame's ego state: unknown
+    // ego speed -> the longer window (see the library
+    // doc); the upgrade / TTC-drop exceptions below are
+    // unchanged in both windows.
+    final Duration cd = Duration(
+        seconds: e.egoSpeedKnown
+            ? NavHazConfig.cooldownSeconds
+            : NavHazConfig.cooldownSecondsEgoUnknown);
+    final double? ttc = e.ttcS;
     if (now.difference(last.at) >= cd) return true;
     if (level == HazardLevel.urgent && last.level == HazardLevel.warning) {
       return true; // upgrade W -> U is never held back
@@ -205,8 +328,7 @@ class HazardPolicy {
     }
 
     final List<TrackEstimate> candidates = risky
-        .where((TrackEstimate e) => _cooldownAllows(
-            e.track.id, levelOf(e)!, e.ttcS, now))
+        .where((TrackEstimate e) => _cooldownAllows(e, levelOf(e)!, now))
         .toList();
     if (candidates.isEmpty) {
       return const HazardPolicyResult(alert: null, riskPresent: true);
@@ -247,6 +369,9 @@ class HazardPolicy {
       return const HazardPolicyResult(alert: null, riskPresent: true);
     }
 
+    if (!commit) {
+      return const HazardPolicyResult(alert: null, riskPresent: true);
+    }
     final HazardAlert alert = HazardAlert(
       level: level,
       trackId: track.id,
@@ -267,9 +392,6 @@ class HazardPolicy {
           s.cx <= NavHazConfig.corridorRight &&
           s.bottom > NavHazConfig.nearBottom,
     );
-    if (!commit) {
-      return const HazardPolicyResult(alert: null, riskPresent: true);
-    }
     _lastByTrack[track.id] = _LastAlert(now, level, chosen.ttcS);
     _lastEmitted = _Emitted(now, kind, zone, level);
     return HazardPolicyResult(alert: alert, riskPresent: true);

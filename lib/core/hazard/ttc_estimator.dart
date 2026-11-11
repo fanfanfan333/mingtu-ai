@@ -32,6 +32,12 @@
 /// the range-based rules and never promotes a hazard to
 /// urgent on either leg's value alone (see the config
 /// comment for the full rule).
+///
+/// CDX2-1 exception: fusion applies only when the ego
+/// speed is KNOWN. With the ego speed unknown the
+/// effective TTC is the box-scale leg alone (the policy's
+/// ego-unknown path grades on it) and disagreement never
+/// applies -- see [TtcEstimator.estimate].
 library;
 
 import 'dart:math' as math;
@@ -186,6 +192,26 @@ class TrackEstimate {
   /// Centre-x velocity, normalised units per second.
   final double cxVelocity;
 
+  /// Whether the ego speed behind this estimate was a real
+  /// measurement ([EgoMotion.speedKnown]). When false, the
+  /// policy runs its dedicated ego-unknown scale path (see
+  /// hazard_policy.dart): no approaching judgement, levels
+  /// from [ttcScaleS] alone, its own intersection gate and
+  /// the longer unknown-ego cooldown. Defaults to true so
+  /// hand-built estimates in older tests keep the known-ego
+  /// behaviour.
+  final bool egoSpeedKnown;
+
+  /// Filtered box-scale growth rate ds/dt (normalised
+  /// units per second): positive while the box grows. The
+  /// ego-unknown path asserts growth through THIS field
+  /// (FIX2 conjunction condition (ii)) rather than
+  /// inferring it from the TTC's finiteness; a usable
+  /// [ttcScaleS] exists only when this is positive, so the
+  /// two are consistent by construction. Defaults to 0
+  /// (no growth) for hand-built estimates.
+  final double scaleRate;
+
   const TrackEstimate({
     required this.track,
     required this.ttcS,
@@ -197,6 +223,8 @@ class TrackEstimate {
     required this.willHit,
     required this.cxVelocity,
     this.ttcDisagreement = false,
+    this.egoSpeedKnown = true,
+    this.scaleRate = 0,
   });
 }
 
@@ -214,6 +242,49 @@ class TtcEstimator {
   /// vertical FOV: f_y = 0.5 / tan(VFOV/2).
   static double get focalY =>
       0.5 / math.tan(NavHazConfig.verticalFovDeg * math.pi / 180 / 2);
+
+  /// Focal length in normalised units, from the configured
+  /// horizontal FOV: f_x = 0.5 / tan(HFOV/2).
+  static double get focalX =>
+      0.5 / math.tan(NavHazConfig.horizontalFovDeg * math.pi / 180 / 2);
+
+  /// Lateral offset, in metres, of a point at normalised
+  /// centre-x [cx] whose ground range is [rangeM]: the
+  /// ray's angle off the optical axis satisfies
+  /// tan(angle) = (cx - 0.5) / f_x, and the offset is
+  /// rangeM * tan(angle). Sign follows the image x axis
+  /// (positive = right of centre).
+  static double lateralOffsetM(double cx, double rangeM) =>
+      (cx - 0.5) / focalX * rangeM;
+
+  /// Intersection gate for the ego-unknown scale path
+  /// (lead's ruling, 2026-11-11): extrapolate the box
+  /// bottom-centre's lateral position (its centre-x [cx],
+  /// moving at [cxVelocity]) to t + [ttcScaleS] and ask
+  /// whether it lands inside the user's forward channel.
+  /// With a metric range the channel is
+  /// +/-[NavHazConfig.egoUnknownChannelHalfWidthM] metres
+  /// (via [lateralOffsetM] at [rangeM]); without one it is
+  /// the central [NavHazConfig.egoUnknownChannelCenterFraction]
+  /// of the frame. A crossing target extrapolates OUT of
+  /// the channel and never intersects, however small its
+  /// TTC. This gate belongs to the ego-unknown path only;
+  /// the known-ego corridor test ([TrackEstimate.willHit])
+  /// is a separate rule and is not reused here.
+  static bool scalePathIntersects({
+    required double cx,
+    required double cxVelocity,
+    required double ttcScaleS,
+    required double? rangeM,
+  }) {
+    final double cxAtHit = cx + cxVelocity * ttcScaleS;
+    if (rangeM != null) {
+      return lateralOffsetM(cxAtHit, rangeM).abs() <=
+          NavHazConfig.egoUnknownChannelHalfWidthM;
+    }
+    const double half = NavHazConfig.egoUnknownChannelCenterFraction / 2;
+    return cxAtHit >= 0.5 - half && cxAtHit <= 0.5 + half;
+  }
 
   /// Raw (unfiltered) ground-plane range for one detection,
   /// or null when the geometry does not apply: no pitch, box
@@ -310,17 +381,31 @@ class TtcEstimator {
 
     // --- fusion (spec 2.2; the full consistency rule is
     // written out at NavHazConfig.ttcFusionTolerance) ---
-    final bool disagreement = ttcScale != null &&
+    // CDX2-1: with the ego speed UNKNOWN there is NO
+    // fusion at all -- the effective TTC is the scale leg
+    // itself, so the range leg can never promote (or
+    // demote) an unknown-path judgement, and disagreement
+    // is not applicable (no fusion, no divergence). The
+    // range leg's own outputs (rangeM, ttcRangeS) keep
+    // their diagnostic meaning; only the effective TTC
+    // changes. With the ego speed known the two legs fuse
+    // exactly as before.
+    final bool disagreement = ego.speedKnown &&
+        ttcScale != null &&
         ttcRange != null &&
         TtcEstimator.legsDisagree(ttcScale, ttcRange);
-    final double? ttc = TtcEstimator.fuseLegs(ttcScale, ttcRange);
+    final double? ttc = ego.speedKnown
+        ? TtcEstimator.fuseLegs(ttcScale, ttcRange)
+        : ttcScale;
 
     // Approaching: the measured closing must beat the
     // user's own speed by the margin. With the ego speed
     // UNKNOWN (no usable source) an approach can never be
     // confirmed -- the conservative branch of the ego
-    // judge; the estimate then flows through the range /
-    // TTC == null policy rules only.
+    // judge. The estimate then carries egoSpeedKnown ==
+    // false and the policy runs its dedicated ego-unknown
+    // scale path (scale TTC + intersection gate, no
+    // approaching judgement at all).
     final double? vEgo = ego.vEgoMps;
     final bool approaching = closing != null &&
         vEgo != null &&
@@ -347,6 +432,8 @@ class TtcEstimator {
       willHit: willHit,
       cxVelocity: cxVel,
       ttcDisagreement: disagreement,
+      egoSpeedKnown: ego.speedKnown,
+      scaleRate: scaleV,
     );
   }
 

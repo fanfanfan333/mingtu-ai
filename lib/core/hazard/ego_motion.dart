@@ -19,11 +19,13 @@
 ///    provisional [NavHazConfig.walkingSpeedMps], or still).
 ///
 /// When NO source is usable the speed is UNKNOWN
-/// ([speedKnown] == false): the conservative branch. The
-/// TTC estimator then never confirms a vehicle as
-/// "approaching" -- an unproven approach must not promote
-/// a hazard to urgent on the approaching rule; the range /
-/// TTC == null rules of the policy still apply unchanged.
+/// ([speedKnown] == false). The TTC estimator then never
+/// confirms a vehicle as "approaching" -- an unproven
+/// approach must not promote a hazard on the approaching
+/// rule. Instead the policy runs its dedicated ego-unknown
+/// scale path (lead's ruling, 2026-11-11): levels from the
+/// box-scale TTC alone, gated by an intersection test,
+/// under a longer repeat cooldown -- see hazard_policy.
 library;
 
 import '../navhaz_config.dart';

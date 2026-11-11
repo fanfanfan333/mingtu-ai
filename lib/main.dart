@@ -275,6 +275,18 @@ class MingtuHomeDebugHandle {
   void debugSetReplayExpiry(Duration expiry) =>
       _state._replayExpiryOverride = expiry;
 
+  /// NAVHAZ M1 seam (EGOUNK round): inject a fixed camera
+  /// pitch for tests. The widget environment has no
+  /// accelerometer, so the pitch monitor reads unknown and
+  /// ground-plane ranging stays off; the arbitration
+  /// scenarios are specified against the same geometry the
+  /// replay fixtures use (pitch 10 degrees), so the tests
+  /// inject that evidence here instead of weakening their
+  /// assertions. Production never calls this; the
+  /// production reading stays the pitch monitor's.
+  void debugSetPitchDeg(double? pitchDeg) =>
+      _state._pitchDegOverride = pitchDeg;
+
   /// NAVHAZ M1 seam: install a live navigation tracker
   /// directly (the arbitration tests drive fixes and hazard
   /// frames against it without the network route flow).
@@ -445,6 +457,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// (see _buildInterruptedReplay); null in production,
   /// where NavHazConfig.replayExpiry (15 s) always applies.
   Duration? _replayExpiryOverride;
+
+  /// Test-only override of the camera pitch reading (see
+  /// debugSetPitchDeg); null in production, where the
+  /// pitch monitor's live reading always applies.
+  double? _pitchDegOverride;
   MapNavigationService _mapService = MapNavigationService(StubMapProvider());
   late RoutePlanningSkill _routeSkill = RoutePlanningSkill(_mapService);
   final EnvironmentAnalysisSkill _envSkill = EnvironmentAnalysisSkill();
@@ -2293,16 +2310,42 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         request.kind == SpeechKind.emergency) {
       // Physical preemption, UNCONDITIONAL (Codex re-test of
       // d01a081, as corrected): a high-priority prompt first
-      // stops the currently playing utterance and AWAITS the
-      // stop, then speaks. No active-flag test decides this:
-      // the old design inspected scheduler state that the
-      // straight pause had already mutated, so on the YOLO
-      // path the stop silently never ran. The stop is bounded
-      // so a hung engine cannot block the danger prompt.
+      // stops the currently playing utterance, then speaks.
+      // No active-flag test decides this: the old design
+      // inspected scheduler state that the straight pause
+      // had already mutated, so on the YOLO path the stop
+      // silently never ran.
+      //
+      // FIX2 (2026-11-11): the wait for the stop to COMPLETE
+      // is capped at NavHazConfig.dangerStopWaitCap
+      // (150 ms), not the 800 ms bound this branch used
+      // before -- on a slow device the old bound could push
+      // the danger voice to 800 ms after the vibration,
+      // past the spec's 300 ms vibration -> speech limit.
+      // The stop is still issued (preemption preserved);
+      // on timeout the speak proceeds immediately and the
+      // engine's speak call interrupts the old utterance
+      // itself. The timeout is a NORMAL path here, not an
+      // error: it is swallowed by the onTimeout below and
+      // only logged. The late stop completion is harmless
+      // to the new utterance by construction: playback
+      // completion is routed per request id through
+      // _playActiveRequest's cancelled/active guards, and
+      // _finishSpeech only acts when the finishing id is
+      // still the scheduler's active id -- a stop that
+      // lands after the danger speak started cannot finish
+      // or cancel the danger request.
       try {
-        await _stopTtsPlayback().timeout(const Duration(milliseconds: 800));
+        await _stopTtsPlayback().timeout(
+          NavHazConfig.dangerStopWaitCap,
+          onTimeout: () {},
+        );
       } on TimeoutException {
-        _logMsg('停止当前播报 800 毫秒内未完成，继续播报高优先级提示；旧声音可能短暂残留。');
+        // Defensive: with onTimeout above the timeout does
+        // not throw; keep the historical catch so no
+        // timeout exception can ever leak into the speech
+        // chain from this branch.
+        _logMsg('停止当前播报未完成，继续播报高优先级提示；旧声音可能短暂残留。');
       }
       if (_scheduler.active?.id != request.id) return;
     }
@@ -4264,7 +4307,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final HazardPipelineResult result = _hazardPipeline.processFrame(
       detections,
       now,
-      pitchDeg: _pitchMonitor.currentPitchDeg,
+      pitchDeg: _pitchDegOverride ?? _pitchMonitor.currentPitchDeg,
       // Ego motion, judged per frame from the live evidence
       // (M1 fix round -- see _egoMotionNow): frame -> ego
       // estimate -> pipeline -> estimator, where the

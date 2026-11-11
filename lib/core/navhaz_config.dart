@@ -160,6 +160,33 @@ static const Duration accelWindow = Duration(milliseconds: 2500);
 /// than this margin, m/s. (Spec value.)
 static const double approachingMarginMps = 1.0;
 
+// ---- Ego-unknown scale path (lead's ruling, 2026-11-11) ------------
+// When the ego speed is UNKNOWN (GPS too inaccurate AND
+// no step-frequency estimate), the policy runs a dedicated
+// scale-only path: no approaching judgement at all, levels
+// come from the box-scale TTC alone, gated by an
+// intersection test -- the box bottom-centre, extrapolated
+// laterally to t + TTC_s, must land inside the user's
+// forward channel. The channel is metric when a range Z
+// is available and a centre fraction of the frame when it
+// is not. Both values are PROVISIONAL (the lead's ruling
+// fixes the defaults; field calibration may tune them).
+
+/// Half width of the forward channel, metres, for the
+/// ego-unknown intersection test when the target's range
+/// can be converted to metres. Default +/-1.0 m per the
+/// lead's ruling. 【暂定】
+static const double egoUnknownChannelHalfWidthM = 1.0;
+
+/// Width of the forward channel as a fraction of the
+/// frame width, centred, for the ego-unknown intersection
+/// test when no metric range is available: the channel is
+/// [0.5 - f/2, 0.5 + f/2] = [0.30, 0.70] at the default.
+/// (This is a DIFFERENT band from the known-ego corridor
+/// [corridorLeft, corridorRight]; neither may be tuned by
+/// editing the other.) 【暂定】
+static const double egoUnknownChannelCenterFraction = 0.40;
+
 // ---- Corridor ----------------------------------------------------
 
 /// The virtual walking corridor on normalised centre-x
@@ -210,6 +237,16 @@ static const double nearWordingRangeM = 5.0;
 /// fallen by at least [ttcDropReAlertRatio] since the last
 /// spoken alert for that track.
 static const int cooldownSeconds = 4;
+
+/// Per-track alert cooldown, seconds, when the frame's
+/// ego speed is UNKNOWN (lead's ruling, 2026-11-11): the
+/// scale-only path re-alerts less often (6 s instead of
+/// [cooldownSeconds]). The window is chosen per alert
+/// evaluation from THAT frame's ego state (not latched
+/// per track). The two re-alert exceptions above (level
+/// upgrade, TTC drop >= [ttcDropReAlertRatio]) apply
+/// unchanged inside this longer window.
+static const int cooldownSecondsEgoUnknown = 6;
 static const double ttcDropReAlertRatio = 0.4;
 
 /// Two DIFFERENT tracks of the same category and direction
@@ -228,6 +265,23 @@ static const Duration replayExpiry = Duration(seconds: 15);
 /// closer than this to the intersection, metres.
 /// (Spec value.)
 static const double replayMinDistanceM = 3.0;
+
+// ---- Danger speech timing -------------------------------------------------
+
+/// Cap on how long a danger / emergency prompt waits for
+/// the physical stop of the current utterance before it
+/// speaks anyway (FIX2 ruling, 2026-11-11): the stop is
+/// still ISSUED first (physical preemption is preserved),
+/// but its completion is no longer a precondition for the
+/// danger voice -- after this cap the speak proceeds and
+/// relies on the TTS engine's own speak-interrupts-current
+/// behaviour. The cap is sized so vibration-start ->
+/// danger-speech stays inside the spec's 300 ms bound
+/// (150 ms stop cap + scheduling slack). Non-danger paths
+/// keep their existing 800 ms stop bound; this constant
+/// applies ONLY to the danger / emergency branch of the
+/// sequenced speak path in main.dart.
+static const Duration dangerStopWaitCap = Duration(milliseconds: 150);
 
 // ---- Vibration patterns ---------------------------------------------------
 // VibrationEffect waveform semantics: timings alternate

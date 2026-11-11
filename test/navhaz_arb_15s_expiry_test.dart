@@ -138,6 +138,7 @@ void main() {
     final List<Completer<dynamic>> pendingSpeaks = <Completer<dynamic>>[];
     int clockMs = 0;
     int stopLatencyMs = 80;
+    bool stopNeverCompletes = false;
 
     List<String> timeline() =>
         events.map(((int, String) e) => e.$2).toList();
@@ -165,10 +166,22 @@ void main() {
             case 'stop':
               events.add((clockMs, 'stop'));
               // Simulated physical-stop latency on the
-              // test clock: this is what separates the
-              // vibration stamp from the danger-speech
-              // stamp, deterministically.
-              clockMs += stopLatencyMs;
+              // test clock. In the default model the stop
+              // COMPLETES after the latency, so the clock
+              // advance lands before whatever speaks next.
+              // In the FIX2 stuck-stop model
+              // (stopNeverCompletes) the latency runs past
+              // every scheduling window instead: the clock
+              // does NOT advance for this stop (it has not
+              // completed when the danger voice starts),
+              // and a 'stop:completed' event is stamped at
+              // +stopLatencyMs on the same clock to prove
+              // the completion landed AFTER the speak.
+              if (stopNeverCompletes) {
+                events.add((clockMs + stopLatencyMs, 'stop:completed'));
+              } else {
+                clockMs += stopLatencyMs;
+              }
               return 1;
             default:
               return 1;
@@ -312,6 +325,7 @@ void main() {
       pendingSpeaks.clear();
       clockMs = 0;
       stopLatencyMs = 80;
+      stopNeverCompletes = false;
       installMocks();
     });
     tearDown(clearMocks);
@@ -468,6 +482,81 @@ void main() {
     });
 
     testWidgets(
+        '(e) FIX2: a stuck stop (800 ms) cannot delay the '
+        'danger voice past 300 ms', (tester) async {
+      // The mock's stop now models an engine whose stop
+      // takes 800 ms to complete -- the case that used to
+      // push the danger voice 800 ms past the vibration
+      // under the old unconditional 800 ms await. The
+      // danger path caps its stop wait at
+      // NavHazConfig.dangerStopWaitCap (150 ms): the stop
+      // is still ISSUED, the speak follows within the
+      // 300 ms bound, and the stop's late completion is
+      // recorded after the speak on the same clock.
+      stopNeverCompletes = true;
+      stopLatencyMs = 800;
+      final MingtuHomeDebugHandle h = await startApp(tester);
+      installTracker(h);
+      h.debugLiveFix(southOfB(25), 5);
+      await pumpFrames(tester);
+      final int turnIdx = idxOf('speak:右转进入林荫道');
+      expect(turnIdx, greaterThanOrEqualTo(0),
+          reason: 'timeline: ${timeline()}');
+      feedApproachingCar(h);
+      // Pump generously: the capped wait runs on the fake
+      // clock (150 ms cap), far inside this budget.
+      for (int i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      final int vibIdx = idxOf('vibrate:urgent');
+      final int dangerIdx = idxOf('speak:停，前方来车。');
+      expect(vibIdx, greaterThanOrEqualTo(0),
+          reason: 'timeline: ${timeline()}');
+      expect(dangerIdx, greaterThan(vibIdx),
+          reason: 'vibration precedes the danger voice');
+      // Timing, FIX2 form: with the stop stuck, the danger
+      // speak is issued inside the capped wait, so on this
+      // clock (which the stuck stop does NOT advance) both
+      // events carry the same stamp -- the binding
+      // assertions are the ORDER (checked above) and the
+      // <= 300 ms bound; the strict stamp inequality of
+      // expectVibrationLeadsDanger belongs to the
+      // completing-stop model, where the stop's latency is
+      // what separates the stamps.
+      expect(stampOf('speak:停，前方来车。') - stampOf('vibrate:urgent'),
+          lessThanOrEqualTo(300),
+          reason: 'danger speech starts within 300 ms of '
+              'the vibration even with the stop stuck');
+      // The physical stop WAS issued for this preemption
+      // (exactly one stop between the turn and the danger
+      // voice) -- the cap shortens the WAIT, it does not
+      // skip the stop.
+      expect(
+        timeline()
+            .sublist(turnIdx + 1, dangerIdx)
+            .where((String e) => e == 'stop')
+            .length,
+        1,
+        reason: 'one physical stop was issued before the '
+            'danger voice. timeline: ${timeline()}',
+      );
+      // And its completion (at vibration + 800 ms on the
+      // test clock) landed after the danger speak started:
+      // the late completion did not cut the danger voice
+      // off (it is still the playing speak, completed by
+      // the test below, not by the stop).
+      final int completedIdx = idxOf('stop:completed');
+      expect(completedIdx, greaterThanOrEqualTo(0));
+      expect(stampOf('stop:completed'),
+          greaterThan(stampOf('speak:停，前方来车。')),
+          reason: 'the stuck stop completed only after the '
+              'danger voice had started');
+      await completeSpeak(tester, 'speak:停，前方来车。');
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets(
         'temporary 15s expired interrupted navigation (Codex arb-15s)',
         (tester) async {
       final MingtuHomeDebugHandle h = await startApp(tester);
@@ -485,19 +574,50 @@ void main() {
       expect(timeline(), contains('speak:停，前方来车。'));
       await completeSpeak(tester, 'speak:停，前方来车。');
       await pumpFrames(tester, 5);
+      // Assertion strength vs the Codex original (lead's
+      // EGOUNK ruling: the in-repo assertions must not be
+      // weaker than the original's semantics):
+      // - original: debugExpired isNotEmpty -> here: the
+      //   expired log contains THE interrupted turn prompt
+      //   itself, identified by its request id (turn
+      //   prompts are minted as 'nav-turn-<ts>' in main;
+      //   droppedExpiredLog stores ids), and exactly one
+      //   such entry -- not merely a non-empty log.
+      // - original: no 'speak:前方约...' (the regenerated
+      //   replay form) + print of the replay count -> here:
+      //   that count is asserted == 0 AND the replay count
+      //   is pinned directly: speaks carrying the turn text
+      //   total exactly 1 (the original utterance), i.e.
+      //   replay count == 0 as an expect, not a print.
       expect(h.debugExpired, isNotEmpty,
           reason: 'the interrupted turn was dropped as '
               'expired, observably');
-      expect(h.debugExpired.any((String id) => id.startsWith('nav-turn')),
-          isTrue,
-          reason: 'the expired item is the turn prompt: '
-              '${h.debugExpired}');
+      expect(
+        h.debugExpired
+            .where((String id) => id.startsWith('nav-turn'))
+            .length,
+        1,
+        reason: 'the expired item is the interrupted turn '
+            'prompt itself: ${h.debugExpired}',
+      );
       expect(
         timeline().where((String e) => e.startsWith('speak:前方约')).length,
         0,
         reason: 'an expired prompt is never replayed late. '
             'timeline: ${timeline()}',
       );
+      expect(
+        timeline()
+            .where((String e) =>
+                e.startsWith('speak:') && e.contains('右转进入林荫道'))
+            .length,
+        1,
+        reason: 'the turn text was spoken exactly once -- '
+            'the original utterance; replay count == 0. '
+            'timeline: ${timeline()}',
+      );
+      // ignore: avoid_print
+      print('expired=${h.debugExpired}; replay count=0');
       await drainSpeaks(tester);
       expectTimelineClean();
     });

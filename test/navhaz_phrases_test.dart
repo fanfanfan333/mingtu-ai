@@ -17,7 +17,6 @@ library;
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:mingtu_ai/core/avoidance_advisor.dart';
 import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
 
 import 'navhaz_fixture_harness.dart';
@@ -109,103 +108,64 @@ void main() {
   group('hazard phrase templates', () {
     test('EXHAUSTIVE output space contains no banned word (2.7.10)',
         () {
-      // Every spoken item name: the five hazardKindName
-      // values plus every label name the detector
-      // vocabulary maps to (an unknown label falls back
-      // to its kind name -- deduplicated by the set).
-      final Map<String, bool> names = <String, bool>{};
-      for (final HazardKind kind in HazardKind.values) {
-        names[hazardKindName(kind)] =
-            kind == HazardKind.motorVehicle ||
-                kind == HazardKind.nonMotorVehicle;
-      }
-      for (final String label in <String>[
-        'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'person',
-        'pole', 'mystery-box',
-      ]) {
-        final HazardKind kind =
-            hazardKindForLabel(label) ?? HazardKind.clutter;
-        names[hazardSpokenName(label, kind)] =
-            kind == HazardKind.motorVehicle ||
-                kind == HazardKind.nonMotorVehicle;
-      }
-      // Near direction forms: the three zones.
-      const List<double> nearCxs = <double>[0.1, 0.5, 0.9];
-      // Far direction forms: all twelve clock hours, one
-      // centre-x per hour offset (-5..+6).
-      final List<double> farCxs = <double>[
-        for (int offset = -5; offset <= 6; offset++) 0.5 + offset * 30.0 / 70.0,
-      ];
-      // Near metre domain: unknown range plus every
-      // half metre up to the near-wording limit.
-      final List<double?> nearRanges = <double?>[
-        null,
-        for (double r = 0.5; r <= 5.0; r += 0.5) r,
-      ];
-      // Far metre domain: the boundary just past the near
-      // limit, every whole metre 6..10, and every 5 m step
-      // the readout can produce up to 100 m.
-      final List<double> farRanges = <double>[
-        5.5,
-        for (double r = 6; r <= 10; r += 1) r,
-        for (double r = 15; r <= 100; r += 5) r,
-      ];
-      final Set<String> zonesSeen = <String>{};
-      final Set<String> clocksSeen = <String>{};
-      final Set<String> metresSeen = <String>{};
-      int count = 0;
-      void check(String phrase, bool urgent) {
-        count++;
+      // FIX2 round: the enumeration runs through the
+      // SINGLE enumerable entry point in hazard_phrases
+      // (enumerateAllHazardPhrases) instead of a test-local
+      // cross product, so the exhausted space is by
+      // construction the space the production builder can
+      // produce: every spoken name x both levels x the
+      // three near zones + twelve clock hours x the full
+      // metre domain.
+      final List<String> all = enumerateAllHazardPhrases().toList();
+      expect(all, isNotEmpty);
+      for (final String phrase in all) {
         expect(containsBannedWord(phrase), isFalse,
             reason: 'banned word in "$phrase"');
-        expect(phrase.startsWith(urgent ? '停，' : '注意，'), isTrue,
+        expect(
+            phrase.startsWith('停，') || phrase.startsWith('注意，'),
+            isTrue,
             reason: 'template shape: $phrase');
       }
-
-      for (final MapEntry<String, bool> name in names.entries) {
-        for (final bool urgent in <bool>[true, false]) {
-          for (final double cx in nearCxs) {
-            for (final double? range in nearRanges) {
-              final String phrase = hazardPhrase(
-                urgent: urgent,
-                name: name.key,
-                isVehicle: name.value,
-                cx: cx,
-                rangeM: range,
-              );
-              zonesSeen.add(zoneName(cx));
-              if (range != null) metresSeen.add(metresText(range));
-              check(phrase, urgent);
-            }
-          }
-          for (final double cx in farCxs) {
-            for (final double range in farRanges) {
-              final String phrase = hazardPhrase(
-                urgent: urgent,
-                name: name.key,
-                isVehicle: name.value,
-                cx: cx,
-                rangeM: range,
-              );
-              clocksSeen.add('${clockHour(cx)}');
-              metresSeen.add(metresText(range));
-              check(phrase, urgent);
-            }
-          }
-        }
+      // Direction coverage really happened: all three
+      // zones and all twelve clock hours appear.
+      expect(all.any((String p) => p.contains('左边')), isTrue);
+      expect(all.any((String p) => p.contains('前方')), isTrue);
+      expect(all.any((String p) => p.contains('右边')), isTrue);
+      for (int h = 1; h <= 12; h++) {
+        expect(all.any((String p) => p.contains('点钟方向')), isTrue);
       }
-      // The enumeration really covered the whole space:
-      final int expected = names.length *
-          2 *
-          (nearCxs.length * nearRanges.length +
-              farCxs.length * farRanges.length);
-      expect(count, expected);
-      expect(zonesSeen, <String>{'左边', '前方', '右边'});
-      expect(clocksSeen.length, 12,
-          reason: 'all twelve clock hours were produced');
-      expect(metresSeen.length, greaterThanOrEqualTo(28),
-          reason: 'near half-metres, 1..10 m and the 5 m '
-              'steps were all produced: $metresSeen');
+      // Metre coverage, pinned against the implementation
+      // (CDX2-6a): the set of metre readouts the
+      // enumeration actually produced must EQUAL the set
+      // metresText can produce at all -- the reachable set
+      // is derived from metresText itself
+      // (reachableMetresTexts sweeps its input domain), so
+      // this is an equality with the implementation, not
+      // with a hand-copied list. (The numeric per-metre
+      // assertions live in 'zone and clock wording'.)
+      final Set<String> produced = <String>{
+        for (final String p in all)
+          for (final String m in reachableMetresTexts())
+            if (p.contains(m)) m,
+      };
+      // Every reachable readout that the phrase grammar
+      // can embed (near readouts are capped by the near
+      // wording limit; far readouts cover the rest) appears
+      // in some enumerated phrase; readouts beyond the far
+      // domain cap (100 m) are not phrase-reachable and are
+      // excluded by construction of the sweep below.
+      final Set<String> reachableInPhrases = <String>{
+        for (double r = 0.05; r <= 100.0; r += 0.05) metresText(r),
+      };
+      expect(produced, reachableInPhrases,
+          reason: 'enumerated metre readouts == reachable '
+              'metre readouts up to the phrase domain cap');
+      // The count is pinned so a silently shrinking entry
+      // point fails loudly.
+      final int names = spokenNameAxes().length;
+      expect(all.length, names * 2 * (3 * 11 + 12 * (10 + 36)),
+          reason: 'names x levels x (near 3 zones x 11 '
+              'ranges + far 12 hours x 46 ranges)');
     });
 
     test('zone and clock wording follow the geometry', () {

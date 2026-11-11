@@ -118,6 +118,90 @@ String metresText(double rangeM) {
 bool isNearWording(double? rangeM) =>
     rangeM == null || rangeM <= NavHazConfig.nearWordingRangeM;
 
+/// The single enumerable entry point for the FULL hazard
+/// phrase space (FIX2 round): every phrase [hazardPhrase]
+/// can ever produce, enumerated from the same axes the
+/// builder consumes -- every spoken item name (the union
+/// produced by [spokenNameAxes]) x both levels x every
+/// direction form (the three near zones and all twelve
+/// clock hours) x every reachable spoken-metre value (see
+/// [reachableMetresTexts]). Production speech goes through
+/// [hazardPhrase] itself; this entry exists so the
+/// banned-word exhaustion (spec 2.7.10) enumerates the
+/// space from ONE place instead of re-deriving it in a
+/// test, and so the axes live next to the builder whose
+/// behaviour defines them.
+Iterable<String> enumerateAllHazardPhrases() sync* {
+  for (final (String, bool) axis in spokenNameAxes()) {
+    final (String name, bool isVehicle) = axis;
+    for (final bool urgent in <bool>[true, false]) {
+      // Near forms: three zones (one cx per zone) x the
+      // near range domain (unknown + the half-metre steps
+      // whose readout stays near) -- ranges are INPUTS
+      // here; the reachable READOUTS are asserted against
+      // reachableMetresTexts() by the exhaustion test.
+      for (final double cx in <double>[0.1, 0.5, 0.9]) {
+        yield hazardPhrase(
+            urgent: urgent, name: name, isVehicle: isVehicle, cx: cx, rangeM: null);
+        for (double r = 0.5; r <= 5.0; r += 0.5) {
+          yield hazardPhrase(
+              urgent: urgent, name: name, isVehicle: isVehicle, cx: cx, rangeM: r);
+        }
+      }
+      // Far forms: twelve clock hours (one cx per hour
+      // offset) x the far range domain.
+      for (int offset = -5; offset <= 6; offset++) {
+        final double cx = 0.5 + offset * 30.0 / NavHazConfig.horizontalFovDeg;
+        for (double r = 5.5; r <= 10.0; r += 0.5) {
+          yield hazardPhrase(
+              urgent: urgent, name: name, isVehicle: isVehicle, cx: cx, rangeM: r);
+        }
+        for (double r = 12.5; r <= 100.0; r += 2.5) {
+          yield hazardPhrase(
+              urgent: urgent, name: name, isVehicle: isVehicle, cx: cx, rangeM: r);
+        }
+      }
+    }
+  }
+}
+
+/// Every (spoken name, isVehicle) pair [hazardPhrase] can
+/// be called with: the five hazard-kind names plus every
+/// detector label's spoken name (unknown labels fall back
+/// to their kind name), deduplicated.
+List<(String, bool)> spokenNameAxes() {
+  final Map<String, bool> names = <String, bool>{};
+  for (final HazardKind kind in HazardKind.values) {
+    names[hazardKindName(kind)] =
+        kind == HazardKind.motorVehicle || kind == HazardKind.nonMotorVehicle;
+  }
+  for (final String label in <String>[
+    'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'person',
+    'pole', 'mystery-box',
+  ]) {
+    final HazardKind kind = hazardKindForLabel(label) ?? HazardKind.clutter;
+    names[hazardSpokenName(label, kind)] =
+        kind == HazardKind.motorVehicle || kind == HazardKind.nonMotorVehicle;
+  }
+  return <(String, bool)>[
+    for (final MapEntry<String, bool> e in names.entries) (e.key, e.value),
+  ];
+}
+
+/// The set of metre READOUTS [metresText] can produce,
+/// derived by sweeping its input domain finely (0.05 m
+/// steps over 0..200 m) rather than by copying the
+/// rounding rules into a second list: if the rounding
+/// changes, this set changes with it and the exhaustion
+/// test's equality assertion follows the implementation.
+Set<String> reachableMetresTexts() {
+  final Set<String> out = <String>{};
+  for (double r = 0.05; r <= 200.0; r += 0.05) {
+    out.add(metresText(r));
+  }
+  return out;
+}
+
 /// Build the spoken text for one alert.
 ///
 /// [urgent] selects the imperative template. [name] is the
