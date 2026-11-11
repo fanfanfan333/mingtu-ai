@@ -175,7 +175,8 @@ void main() {
         expect(alerts, hasLength(1));
         expect(alerts.single.level, HazardLevel.warning);
         expect(alerts.single.kind, HazardKind.pit);
-        expect(alerts.single.phrase, '注意，前方二米有坑洞');
+        expect(alerts.single.phrase, '注意，前方两米有坑洞',
+            reason: 'NH-M3-01: a whole-metre 2 reads 两米');
         expect(alerts.single.rangeM, closeTo(2.0, 0.05));
       });
 
@@ -212,7 +213,9 @@ void main() {
         );
         expect(alerts, hasLength(1));
         expect(alerts.single.level, HazardLevel.warning);
-        expect(alerts.single.phrase, '注意，前方二米有坑洞');
+        expect(alerts.single.phrase, '注意，前方两米有坑洞',
+            reason: 'NH-M3-01: the rounded whole-metre '
+                'readout here is 2 m, read 两米');
         expect(alerts.single.rangeM, closeTo(1.6, 0.05));
       });
     }
@@ -429,7 +432,8 @@ void main() {
       for (final String phrase in all) {
         expect(containsBannedWord(phrase), isFalse, reason: phrase);
       }
-      expect(pit.contains('注意，前方二米有坑洞'), isTrue);
+      expect(pit.contains('注意，前方两米有坑洞'), isTrue,
+          reason: 'NH-M3-01: the 2 m near form reads 两米');
       expect(pit.contains('停，前方很近有坑洞'), isTrue);
     });
   });

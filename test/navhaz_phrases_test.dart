@@ -237,6 +237,16 @@ void main() {
       //   => 1,030 + 102 = 1,132, verified by set
       //   difference this round (gained 102, lost 0;
       //   measured in navhaz_pothole_test.dart).
+      // - NH-M3-01 (reading unification, S3): the shared
+      //   whole-metre band now reads a value of exactly
+      //   2 as 两米 instead of 二米. The 66 near-template
+      //   strings that carried a standalone 二米 (2 levels
+      //   x 3 zones x 11 spoken names) are re-read as
+      //   两米; no string is gained or lost (the 两米
+      //   forms did not exist before, so there is no
+      //   collision), and the cardinality is unchanged.
+      //   => still 1,132, verified by set difference
+      //   this round (66 re-read, gained 0, lost 0).
       // The RAW yield count is deliberately NOT pinned
       // any more (NH-M1-14): the distance axes are now
       // DERIVED from the shared hazardBands table (denser
@@ -251,18 +261,74 @@ void main() {
               'baseline 1,044 + 1 NH-M1-17 short form '
               '(person) + 15 NH-M1-19 bearing forms '
               '- 30 M2-B no-range warning forms '
-              '+ 102 M3 pothole-axis forms (see the '
-              'composition account above)');
+              '+ 102 M3 pothole-axis forms; NH-M3-01 '
+              're-reads 66 of them (二米 -> 两米) with the '
+              'count unchanged (see the composition '
+              'account above)');
       expect(all.length, greaterThan(2460),
           reason: 'the table-derived axes sample at least '
               'the old hand-listed coverage');
+    });
+
+    test('NH-M3-01 invariant: no standalone 二米 anywhere in the '
+        'enumerated space; the 两米 forms exist', () {
+      // "Standalone" is defined precisely, per occurrence:
+      // a '二米' substring whose PRECEDING character is not
+      // '十'. The 二米 inside a compound numeral (十二米,
+      // 二十二米 -- the 二米 there is preceded by 十) is part
+      // of the numeral and stays legal under NH-M3-01,
+      // which governs only a whole-metre value of exactly
+      // 2 standing alone. (The current band table speaks
+      // no number at >= 10 m, so no compound metre readout
+      // is producible today; the invariant is stated in
+      // its general form so a future band change is judged
+      // by the same rule. A plain contains('二米') check
+      // would false-positive on the compounds and is
+      // deliberately NOT what is asserted.)
+      bool hasStandaloneErMi(String s) {
+        int i = s.indexOf('二米');
+        while (i >= 0) {
+          if (i == 0 || s[i - 1] != '十') return true;
+          i = s.indexOf('二米', i + 1);
+        }
+        return false;
+      }
+
+      final Set<String> all = enumerateAllHazardPhrases().toSet();
+      for (final String phrase in all) {
+        expect(hasStandaloneErMi(phrase), isFalse,
+            reason: 'standalone 二米 in "$phrase" (NH-M3-01: '
+                'a whole-metre 2 reads 两米)');
+      }
+      // The re-reading really landed (guard against
+      // changing the wrong direction or the gate silently
+      // producing neither form): the 2 m near forms exist
+      // with 两米, at both levels, and the reachable
+      // readout set carries 两米 and not 二米.
+      expect(all.contains('注意，前方两米有坑洞'), isTrue);
+      expect(all.contains('停，前方两米有汽车'), isTrue);
+      expect(all.where((String p) => p.contains('两米')).length, 66,
+          reason: 'exactly the 66 re-read strings carry 两米 '
+              '(2 levels x 3 zones x 11 spoken names)');
+      expect(reachableMetresTexts().contains('两米'), isTrue);
+      expect(reachableMetresTexts().contains('二米'), isFalse);
+      // The compound-numeral carve-out in the definition
+      // itself: a 十 before 二米 makes it legal (the clock
+      // forms' 十二 keeps its own reading too -- it is
+      // not a metre readout and is untouched).
+      expect(hasStandaloneErMi('十二米'), isFalse);
+      expect(hasStandaloneErMi('二十二米'), isFalse);
+      expect(hasStandaloneErMi('前方二米'), isTrue);
     });
 
     test('distance wording bands (FIX3B)', () {
       // Hazard bands.
       expect(metresText(0.8), '很近');
       expect(metresText(1.49), '很近');
-      expect(metresText(1.5), '二米');
+      expect(metresText(1.5), '两米',
+          reason: 'NH-M3-01: a whole-metre readout of '
+              'exactly 2 reads 两米 (the colloquial '
+              'quantifier form), not 二米');
       expect(metresText(4.4), '四米');
       expect(metresText(6.0), '约五米');
       expect(metresText(7.49), '约五米');

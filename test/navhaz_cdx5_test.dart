@@ -91,7 +91,7 @@ void main() {
       // end of this test); production never feeds one
       // (the estimator's rangeM is finite or null).
       const List<String> metreReadouts = <String>[
-        '很近', '一米', '二米', '三米', '四米', '五米', '约五米', '约十米',
+        '很近', '一米', '两米', '三米', '四米', '五米', '约五米', '约十米',
       ];
       for (final double z in kAbnormal) {
         for (final bool urgent in <bool>[true, false]) {

@@ -107,6 +107,22 @@ String _smallNumber(int n) {
   return '$n';
 }
 
+/// NH-M3-01: the whole-metre DISTANCE readout of exactly
+/// 2 is spoken with the colloquial quantifier form
+/// ('两米'), the same reading the navigation distance
+/// texts get from their Arabic-digit '2米' under TTS
+/// numeral rules -- the two distance systems now read a
+/// 2 m distance identically. This is a distance-only
+/// wrapper by design: [_smallNumber] and the shared
+/// [_hourNames] table stay untouched, because the clock
+/// forms read the same table (十二点钟 keeps its 二), and
+/// compound numerals are not affected either (a 二 inside
+/// 十二 / 二十 / 二十二 is part of the numeral, never a
+/// standalone whole-metre value -- and this helper only
+/// ever receives the whole-metre band's own rounded
+/// value).
+String _wholeMetresNumber(int n) => n == 2 ? '两' : _smallNumber(n);
+
 /// One band of the hazard-distance table (NH-M1-14): the
 /// half-open interval [below, previous band's below) is
 /// rendered by [format]. The table ([hazardBands]) is the
@@ -132,7 +148,8 @@ class HazardBand {
 /// (thresholds in NavHazConfig). Below 1.5 m the distance
 /// is "very close" and NO number is spoken (a sub-1.5 m
 /// number would pretend to a precision the geometry does
-/// not have); 1.5-5 m whole metres; 5-10 m one of two
+/// not have); 1.5-5 m whole metres (a whole-metre 2 reads
+/// 两米, NH-M3-01 -- see [_wholeMetresNumber]); 5-10 m one of two
 /// coarse readouts split at 7.5 m ("about 5" / "about
 /// 10"); at 10 m and beyond NO number at all -- the phrase
 /// carries category and bearing only, so the last row's
@@ -141,7 +158,7 @@ class HazardBand {
 final List<HazardBand> hazardBands = <HazardBand>[
   HazardBand(NavHazConfig.hazardVeryCloseBelow, (_) => '很近'),
   HazardBand(NavHazConfig.hazardWholeMetresBelow,
-      (double r) => '${_smallNumber(r.round())}米'),
+      (double r) => '${_wholeMetresNumber(r.round())}米'),
   HazardBand(
       NavHazConfig.hazardNumberedBelow,
       (double r) =>
