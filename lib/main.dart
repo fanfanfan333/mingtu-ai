@@ -4525,10 +4525,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// NAVHAZ M2 section 3.2: one thermal status event from
   /// the device monitor. The pure policy settles the cap
   /// (immediate derating, hysteretic stepwise recovery,
-  /// the throttled CRITICAL announcement); this handler
-  /// stores it, speaks the announcement when the policy
-  /// says one is due -- through the SAME speech scheduler
-  /// as every other prompt, at alert level -- and
+  /// the episode-latch announcements); this handler
+  /// stores it, speaks the announcement the policy raises
+  /// -- through the SAME speech scheduler as every other
+  /// prompt, the two degradation events at alert level
+  /// and the recovery event at info level -- and
   /// re-applies the composed frame rate at once when a
   /// scene target is already known, so a heat spike does
   /// not wait for the next pipeline frame to slow the
@@ -4537,12 +4538,34 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final DateTime now = DateTime.now();
     final ThermalCap cap = _thermalPolicy.evaluate(status: status, now: now);
     _thermalCap = cap;
-    if (cap.announcementDue) {
+    // Episode-latch announcement mapping (thermal_policy
+    // raises at most one event per evaluation): the FPS
+    // drop and the scope restriction are degradations the
+    // user must hear about (alert); the recovery notice
+    // is informational (info).
+    final ({String text, SpeechKind kind})? spoken =
+        switch (cap.announcement) {
+      ThermalAnnouncement.fpsDrop => (
+          text: NavHazConfig.thermalCriticalAnnouncementText,
+          kind: SpeechKind.alert,
+        ),
+      ThermalAnnouncement.scopeRestricted => (
+          text: NavHazConfig.thermalScopeRestrictedAnnouncementText,
+          kind: SpeechKind.alert,
+        ),
+      ThermalAnnouncement.recovered => (
+          text: NavHazConfig.thermalRecoveryAnnouncementText,
+          kind: SpeechKind.info,
+        ),
+      ThermalAnnouncement.none => null,
+    };
+    if (spoken != null) {
       _say(_request(
-        id: 'thermal-critical-${now.millisecondsSinceEpoch}',
-        eventId: 'thermal-critical-${now.millisecondsSinceEpoch}',
-        text: NavHazConfig.thermalCriticalAnnouncementText,
-        kind: SpeechKind.alert,
+        id: 'thermal-${cap.announcement.name}-${now.millisecondsSinceEpoch}',
+        eventId:
+            'thermal-${cap.announcement.name}-${now.millisecondsSinceEpoch}',
+        text: spoken.text,
+        kind: spoken.kind,
       ));
     }
     final int? scene = _lastSceneTargetFps;

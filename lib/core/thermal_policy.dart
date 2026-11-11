@@ -17,8 +17,7 @@
 ///     [NavHazConfig.thermalCapSevereFps] + detection
 ///     input restricted to vehicle and pedestrian classes;
 ///   CRITICAL and above (EMERGENCY / SHUTDOWN ride the
-///     same tier) -> the SEVERE tier, plus the heat
-///     announcement (throttled, see below).
+///     same tier) -> the SEVERE tier.
 ///
 /// Two judgement calls, recorded here rather than buried:
 /// - CRITICAL inherits SEVERE's class restriction. The
@@ -44,33 +43,106 @@
 ///   straight back to the corresponding strict tier. The
 ///   asymmetry mirrors section 3.1's frame-rate shifts:
 ///   protection never waits, relief always does.
-/// - The CRITICAL announcement is throttled inside the
-///   policy: [ThermalCap.announcementDue] is true on at
-///   most one evaluation per
-///   [NavHazConfig.thermalCriticalAnnouncementInterval],
-///   however many critical events arrive in between.
+/// Announcement model (episode latches; this SUPERSEDES
+/// the section 3.2 rule "CRITICAL announces at most once
+/// per five minutes", which re-announced for as long as
+/// the device stayed critical -- the five-minute
+/// re-announcement and its interval constant are gone):
+/// a blind user cannot see an on-screen degradation
+/// badge, so every material degradation is SPOKEN.
+/// An EPISODE runs from the applied cap first leaving
+/// unconstrained until it returns there. Inside one
+/// episode two latches each fire at most once:
+/// - the FPS latch: the first evaluation whose applied
+///   cap limits the frame rate raises
+///   [ThermalAnnouncement.fpsDrop];
+/// - the scope latch: the first evaluation whose applied
+///   cap restricts detection classes raises
+///   [ThermalAnnouncement.scopeRestricted].
+/// When one evaluation trips both (a direct NONE ->
+/// SEVERE/CRITICAL jump), only the scope event is
+/// raised and the FPS latch is consumed silently: the
+/// narrower detection scope is the graver fact, and
+/// both dictated texts end by asking the user to slow
+/// down. Tier changes inside the episode (moderate <->
+/// severe, severe -> critical -- the cap does not even
+/// change there) raise nothing further.
+/// When the applied cap returns to unconstrained AND at
+/// least one latch fired during the episode,
+/// [ThermalAnnouncement.recovered] is raised once and
+/// both latches reset, so a later episode may announce
+/// again. A PARTIAL recovery (back to the moderate tier,
+/// say) raises nothing.
+/// Correspondence with the old section 3.2 rule
+/// "CRITICAL announces once": on a DIRECT jump to
+/// critical the scope event fires at that very
+/// evaluation, satisfying the once-only critical
+/// announcement with the scope text; on the PROGRESSIVE
+/// path (through severe) the scope fact was already
+/// announced at severe, so critical itself adds no new
+/// fact and stays silent.
+/// UNKNOWN readings never end an episode and never
+/// raise the recovered event. The ladder above treats
+/// an unknown status as the unconstrained tier FOR THE
+/// CAP (a device that cannot report its heat is never
+/// punished), so the cap can settle back to no-cap
+/// under unknown readings alone; the announcement layer
+/// keeps the episode open in that case -- latches stay
+/// consumed, nothing is spoken -- and the recovered
+/// event fires only on an evaluation carrying a REAL
+/// status of NONE with the cap unconstrained (in the
+/// normal course that is exactly the evaluation where
+/// the stepwise ladder, walked under real readings,
+/// arrives back at no-cap).
 library;
 
 import 'avoidance_advisor.dart';
 import 'navhaz_config.dart';
 import 'thermal.dart';
 
+/// A one-shot spoken-announcement event raised by a
+/// single [ThermalPolicy.evaluate] call (see the library
+/// doc for the episode-latch model). At most one event
+/// is raised per evaluation. The wiring layer maps each
+/// event to its dictated text and speech level:
+/// [fpsDrop] and [scopeRestricted] are spoken at alert
+/// level, [recovered] at info level.
+enum ThermalAnnouncement {
+  /// Nothing to say on this evaluation.
+  none,
+
+  /// The episode's frame-rate cap first took hold:
+  /// speak the derating text
+  /// ([NavHazConfig.thermalCriticalAnnouncementText]).
+  fpsDrop,
+
+  /// The episode's class restriction first took hold:
+  /// speak the scope text
+  /// ([NavHazConfig.thermalScopeRestrictedAnnouncementText]).
+  scopeRestricted,
+
+  /// The episode ended at a genuinely cool reading:
+  /// speak the restoration text
+  /// ([NavHazConfig.thermalRecoveryAnnouncementText]).
+  recovered,
+}
+
 /// The settled thermal cap at one moment. [maxFps] null
-/// means no FPS ceiling. [announcementDue] is a ONE-SHOT
-/// event flag: it is true only on the single evaluation
-/// that trips the (throttled) CRITICAL announcement, not
-/// for as long as the device stays critical.
+/// means no FPS ceiling. [announcement] is a ONE-SHOT
+/// event: it is non-[ThermalAnnouncement.none] only on
+/// the single evaluation that trips the episode latch,
+/// not for as long as the condition persists.
 class ThermalCap {
   final int? maxFps;
   final bool analysisResolution720p;
   final bool restrictClasses;
-  final bool announcementDue;
+  final ThermalAnnouncement announcement;
 
   const ThermalCap({
     required this.maxFps,
     required this.analysisResolution720p,
     required this.restrictClasses,
-    this.announcementDue = false,
+    this.announcement = ThermalAnnouncement.none,
   });
 
   /// The no-cap value: no FPS ceiling, no resolution
@@ -87,17 +159,17 @@ class ThermalCap {
       other.maxFps == maxFps &&
       other.analysisResolution720p == analysisResolution720p &&
       other.restrictClasses == restrictClasses &&
-      other.announcementDue == announcementDue;
+      other.announcement == announcement;
 
   @override
   int get hashCode => Object.hash(
-      maxFps, analysisResolution720p, restrictClasses, announcementDue);
+      maxFps, analysisResolution720p, restrictClasses, announcement);
 
   @override
   String toString() => 'ThermalCap(maxFps: $maxFps, '
       '720p: $analysisResolution720p, '
       'restrictClasses: $restrictClasses, '
-      'announcementDue: $announcementDue)';
+      'announcement: $announcement)';
 }
 
 /// Derating tiers as a ladder: recovery climbs it one
@@ -114,12 +186,19 @@ class ThermalPolicy {
   /// above the applied one.
   DateTime? _belowSince;
 
-  /// When the CRITICAL announcement last fired (the
-  /// throttle's memory). Null until the first firing.
-  DateTime? _lastAnnouncementAt;
+  /// Episode latch: the FPS-drop announcement has fired
+  /// (or been silently consumed by a simultaneous scope
+  /// event) during the current derating episode. Reset
+  /// only when the recovered announcement fires.
+  bool _fpsAnnounced = false;
+
+  /// Episode latch: the scope-restriction announcement
+  /// has fired during the current derating episode.
+  /// Reset only when the recovered announcement fires.
+  bool _scopeAnnounced = false;
 
   /// The cap currently in force (without any one-shot
-  /// announcement flag).
+  /// announcement event).
   ThermalCap get currentCap => _capFor(_applied);
 
   static _ThermalTier _tierFor(ThermalStatus status) => switch (status) {
@@ -150,17 +229,11 @@ class ThermalPolicy {
           ),
       };
 
-  /// Whether [status] is CRITICAL or above -- the
-  /// announcement tier (EMERGENCY / SHUTDOWN included).
-  static bool isCriticalOrAbove(ThermalStatus status) =>
-      status == ThermalStatus.critical ||
-      status == ThermalStatus.emergency ||
-      status == ThermalStatus.shutdown;
-
   /// Feed one status event stamped [now]; returns the
-  /// settled cap, with [ThermalCap.announcementDue] set
-  /// when this very event trips the throttled CRITICAL
-  /// announcement.
+  /// settled cap, with [ThermalCap.announcement] set when
+  /// this very event trips an episode latch (the FPS
+  /// latch, the scope latch, or the recovery latch --
+  /// see the library doc).
   ThermalCap evaluate({
     required ThermalStatus status,
     required DateTime now,
@@ -182,23 +255,44 @@ class ThermalPolicy {
         _belowSince = now;
       }
     }
-    bool due = false;
-    if (isCriticalOrAbove(status)) {
-      final DateTime? last = _lastAnnouncementAt;
-      if (last == null ||
-          !now.isBefore(
-              last.add(NavHazConfig.thermalCriticalAnnouncementInterval))) {
-        due = true;
-        _lastAnnouncementAt = now;
+    // Announcement layer (episode latches). The latches
+    // read the SETTLED cap, so they track what the user
+    // actually experiences, not the raw status.
+    ThermalAnnouncement event = ThermalAnnouncement.none;
+    final ThermalCap settled = _capFor(_applied);
+    if (_applied != _ThermalTier.unconstrained) {
+      if (settled.restrictClasses && !_scopeAnnounced) {
+        // The scope event subsumes the FPS event when
+        // both trip on the same evaluation (a direct
+        // jump to the severe tier): the narrower scope
+        // is the graver fact, so the FPS latch is
+        // consumed silently alongside.
+        _scopeAnnounced = true;
+        _fpsAnnounced = true;
+        event = ThermalAnnouncement.scopeRestricted;
+      } else if (settled.maxFps != null && !_fpsAnnounced) {
+        _fpsAnnounced = true;
+        event = ThermalAnnouncement.fpsDrop;
       }
+    } else if ((_fpsAnnounced || _scopeAnnounced) &&
+        status == ThermalStatus.none) {
+      // Genuine recovery: the cap is back to no-cap on a
+      // REAL none reading, with an episode outstanding.
+      // An UNKNOWN reading never satisfies this -- the
+      // ladder may have relaxed the cap under unknown
+      // readings, but the episode stays open (latches
+      // unconsumed-by-recovery) until a real none
+      // confirms the cool-down.
+      _fpsAnnounced = false;
+      _scopeAnnounced = false;
+      event = ThermalAnnouncement.recovered;
     }
-    final ThermalCap cap = _capFor(_applied);
-    if (!due) return cap;
+    if (event == ThermalAnnouncement.none) return settled;
     return ThermalCap(
-      maxFps: cap.maxFps,
-      analysisResolution720p: cap.analysisResolution720p,
-      restrictClasses: cap.restrictClasses,
-      announcementDue: true,
+      maxFps: settled.maxFps,
+      analysisResolution720p: settled.analysisResolution720p,
+      restrictClasses: settled.restrictClasses,
+      announcement: event,
     );
   }
 

@@ -1,18 +1,28 @@
 /// NAVHAZ M2 section 3.2 / acceptance 3.4.2: thermal
-/// derating -- the status-to-cap mapping, the CRITICAL
-/// announcement throttle (at most once per interval), the
-/// stepwise 30 s recovery ladder, immediate re-derating
-/// during recovery, the unknown-status fail-open
-/// behaviour, the min(scene, cap) composition, and the
+/// derating -- the status-to-cap mapping, the stepwise
+/// 30 s recovery ladder, immediate re-derating during
+/// recovery, the unknown-status fail-open behaviour,
+/// the min(scene, cap) composition, and the
 /// vehicle/pedestrian class restriction.
+///
+/// Announcements follow the EPISODE-LATCH model (the
+/// ruling that superseded the original section 3.2
+/// "CRITICAL announces at most once per five minutes"
+/// rule): inside one derating episode the FPS latch and
+/// the scope latch each speak at most once, and a full
+/// recovery speaks the restoration text once. The
+/// five-minute re-announcement and its interval
+/// constant are gone; the tests below pin the new model
+/// and each rewritten assertion carries its reason.
 ///
 /// Everything runs on caller-supplied stamps (the
 /// policy's injectable clock) behind a fake [ThermalMonitor]
-/// stream; the "speech sink" is the policy's one-shot
-/// announcementDue flag, which is exactly what the wiring
-/// layer turns into one scheduler submission. All
-/// thresholds are read from NavHazConfig -- no literal
-/// tier/hold number is restated here.
+/// stream; the "speech sink" records the text the
+/// wiring layer would speak for the policy's one-shot
+/// announcement event -- the same event-to-text mapping
+/// main.dart performs. All thresholds are read from
+/// NavHazConfig -- no literal tier/hold number is
+/// restated here.
 library;
 
 import 'dart:async';
@@ -59,14 +69,23 @@ class FakeThermalMonitor implements ThermalMonitor {
   }
 }
 
-/// A fake speech sink: records every announcement the
-/// policy flags as due, in order.
+/// A fake speech sink: records, in order, the text the
+/// wiring layer speaks for each announcement event the
+/// policy raises (event -> dictated text, mirroring the
+/// mapping in main.dart's thermal handler).
 class FakeSpeechSink {
   final List<String> spoken = <String>[];
 
-  void recordDue(ThermalCap cap) {
-    if (cap.announcementDue) {
-      spoken.add(NavHazConfig.thermalCriticalAnnouncementText);
+  void record(ThermalCap cap) {
+    switch (cap.announcement) {
+      case ThermalAnnouncement.fpsDrop:
+        spoken.add(NavHazConfig.thermalCriticalAnnouncementText);
+      case ThermalAnnouncement.scopeRestricted:
+        spoken.add(NavHazConfig.thermalScopeRestrictedAnnouncementText);
+      case ThermalAnnouncement.recovered:
+        spoken.add(NavHazConfig.thermalRecoveryAnnouncementText);
+      case ThermalAnnouncement.none:
+        break;
     }
   }
 }
@@ -75,49 +94,65 @@ void main() {
   final DateTime t0 = DateTime(2026, 1, 1, 12);
 
   group('acceptance 3.4.2 (1): status sequence maps to caps, '
-      'announcement fires once, recovery is stepwise', () {
+      'episode announcements fire once each, recovery is stepwise',
+      () {
     test('NONE -> MODERATE -> SEVERE -> CRITICAL -> NONE', () {
       final ThermalPolicy policy = ThermalPolicy();
       final FakeSpeechSink sink = FakeSpeechSink();
 
-      // NONE: unconstrained.
+      // NONE: unconstrained, nothing to announce.
       ThermalCap cap = policy.evaluate(status: ThermalStatus.none, now: t0);
-      sink.recordDue(cap);
+      sink.record(cap);
       expect(cap.maxFps, isNull);
       expect(cap.analysisResolution720p, isFalse);
       expect(cap.restrictClasses, isFalse);
+      expect(cap.announcement, ThermalAnnouncement.none);
 
       // MODERATE: FPS ceiling + 720p ceiling, no class
-      // restriction, no announcement.
+      // restriction.
+      // REWRITTEN (episode-latch ruling): the old model
+      // expected NO announcement here -- only CRITICAL
+      // ever spoke. Under the latch model the FPS latch
+      // fires the moment any cap first limits the frame
+      // rate, so this evaluation raises fpsDrop.
       cap = policy.evaluate(
           status: ThermalStatus.moderate,
           now: t0.add(const Duration(seconds: 1)));
-      sink.recordDue(cap);
+      sink.record(cap);
       expect(cap.maxFps, NavHazConfig.thermalCapModerateFps);
       expect(cap.analysisResolution720p, isTrue);
       expect(cap.restrictClasses, isFalse);
-      expect(cap.announcementDue, isFalse);
+      expect(cap.announcement, ThermalAnnouncement.fpsDrop);
 
       // SEVERE: the 5 FPS tier + class restriction.
+      // REWRITTEN (episode-latch ruling): the old model
+      // expected no announcement here either; the scope
+      // latch now speaks the narrowing the moment the
+      // restriction first applies.
       cap = policy.evaluate(
           status: ThermalStatus.severe,
           now: t0.add(const Duration(seconds: 2)));
-      sink.recordDue(cap);
+      sink.record(cap);
       expect(cap.maxFps, NavHazConfig.thermalCapSevereFps);
       expect(cap.restrictClasses, isTrue);
-      expect(cap.announcementDue, isFalse);
+      expect(cap.announcement, ThermalAnnouncement.scopeRestricted);
 
-      // CRITICAL: same tier, and the announcement fires
-      // exactly once for this evaluation.
+      // CRITICAL: same tier, and NO new announcement.
+      // REWRITTEN (episode-latch ruling): the old model
+      // fired its (throttled) announcement exactly here.
+      // Severe -> critical changes no cap fact -- the
+      // scope was already announced at SEVERE -- so this
+      // evaluation raises nothing.
       cap = policy.evaluate(
           status: ThermalStatus.critical,
           now: t0.add(const Duration(seconds: 3)));
-      sink.recordDue(cap);
+      sink.record(cap);
       expect(cap.maxFps, NavHazConfig.thermalCapSevereFps);
       expect(cap.restrictClasses, isTrue);
-      expect(cap.announcementDue, isTrue);
+      expect(cap.announcement, ThermalAnnouncement.none);
       expect(sink.spoken, <String>[
         NavHazConfig.thermalCriticalAnnouncementText,
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
       ]);
 
       // Back to NONE: the cap does NOT fall away at once.
@@ -125,6 +160,7 @@ void main() {
       cap = policy.evaluate(status: ThermalStatus.none, now: cooled);
       expect(cap.maxFps, NavHazConfig.thermalCapSevereFps);
       expect(cap.restrictClasses, isTrue);
+      expect(cap.announcement, ThermalAnnouncement.none);
 
       // One tick before the recovery hold completes:
       // still the severe tier.
@@ -138,75 +174,343 @@ void main() {
 
       // Hold complete: ONE step up -- the moderate tier
       // (10 FPS + 720p, restriction lifted), NOT straight
-      // back to unconstrained.
+      // back to unconstrained. A PARTIAL recovery speaks
+      // no recovery text.
       final DateTime step1 = cooled.add(NavHazConfig.thermalRecoveryHold);
       cap = policy.evaluate(status: ThermalStatus.none, now: step1);
+      sink.record(cap);
       expect(cap.maxFps, NavHazConfig.thermalCapModerateFps);
       expect(cap.analysisResolution720p, isTrue);
       expect(cap.restrictClasses, isFalse);
+      expect(cap.announcement, ThermalAnnouncement.none);
 
-      // A second full hold: fully unconstrained.
+      // A second full hold: fully unconstrained, and the
+      // recovery latch fires exactly here.
+      // REWRITTEN (episode-latch ruling): the old model
+      // compared this cap to ThermalCap.unconstrained;
+      // the settled cap now also carries the one-shot
+      // recovered event, so the fields are asserted
+      // individually.
       cap = policy.evaluate(
           status: ThermalStatus.none,
           now: step1.add(NavHazConfig.thermalRecoveryHold));
-      expect(cap, ThermalCap.unconstrained);
-      // And the whole sequence announced exactly once.
-      expect(sink.spoken, hasLength(1));
+      sink.record(cap);
+      expect(cap.maxFps, isNull);
+      expect(cap.analysisResolution720p, isFalse);
+      expect(cap.restrictClasses, isFalse);
+      expect(cap.announcement, ThermalAnnouncement.recovered);
+      // The whole sequence spoke each text exactly once,
+      // in episode order.
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalCriticalAnnouncementText,
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+        NavHazConfig.thermalRecoveryAnnouncementText,
+      ]);
     });
 
-    test('the announcement text is the dictated wording, '
-        'verbatim, and carries no banned word', () {
+    test('the announcement texts are the dictated wordings, '
+        'verbatim, and carry no banned word', () {
+      // Literal pins: the config constants must equal
+      // these dictated strings character for character
+      // (and the constants' presence is asserted by
+      // referencing them here).
       expect(NavHazConfig.thermalCriticalAnnouncementText,
           '手机较热，识别已降频，请放慢脚步注意脚下');
-      expect(
-          containsBannedWord(NavHazConfig.thermalCriticalAnnouncementText),
-          isFalse);
+      expect(NavHazConfig.thermalScopeRestrictedAnnouncementText,
+          '手机过热，暂时只提醒车辆和行人，请放慢脚步');
+      expect(NavHazConfig.thermalRecoveryAnnouncementText, '障碍提醒已恢复');
+      for (final String text in <String>[
+        NavHazConfig.thermalCriticalAnnouncementText,
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+        NavHazConfig.thermalRecoveryAnnouncementText,
+      ]) {
+        expect(containsBannedWord(text), isFalse, reason: text);
+      }
     });
 
     test('LIGHT takes the moderate tier; EMERGENCY and '
-        'SHUTDOWN ride the critical tier and announce', () {
+        'SHUTDOWN ride the severe tier', () {
       final ThermalPolicy policy = ThermalPolicy();
-      ThermalCap cap =
-          policy.evaluate(status: ThermalStatus.light, now: t0);
+      // LIGHT: the moderate tier, and the FPS latch fires
+      // (first frame-rate cap of the episode).
+      ThermalCap cap = policy.evaluate(status: ThermalStatus.light, now: t0);
       expect(cap.maxFps, NavHazConfig.thermalCapModerateFps);
       expect(cap.analysisResolution720p, isTrue);
+      expect(cap.announcement, ThermalAnnouncement.fpsDrop);
+      // EMERGENCY: the severe tier with the restriction.
+      // REWRITTEN (episode-latch ruling): the old model
+      // flagged this evaluation with its throttled
+      // CRITICAL announcement; under the latch model the
+      // newly-true fact here is the scope restriction
+      // (the FPS latch was consumed at LIGHT), so this
+      // evaluation raises the scope event.
       cap = policy.evaluate(
           status: ThermalStatus.emergency,
           now: t0.add(const Duration(seconds: 1)));
       expect(cap.maxFps, NavHazConfig.thermalCapSevereFps);
       expect(cap.restrictClasses, isTrue);
-      expect(cap.announcementDue, isTrue);
-      // SHUTDOWN is the same tier; its announcement is
-      // throttled by the firing just above.
+      expect(cap.announcement, ThermalAnnouncement.scopeRestricted);
+      // SHUTDOWN is the same tier.
+      // REWRITTEN (episode-latch ruling): the old model
+      // expected silence here because of the five-minute
+      // throttle; the silence now comes from both
+      // episode latches already being consumed -- no
+      // throttle exists anymore.
       cap = policy.evaluate(
           status: ThermalStatus.shutdown,
           now: t0.add(const Duration(seconds: 2)));
       expect(cap.maxFps, NavHazConfig.thermalCapSevereFps);
-      expect(cap.announcementDue, isFalse);
+      expect(cap.announcement, ThermalAnnouncement.none);
     });
   });
 
-  group('acceptance 3.4.2 (2): announcement throttle', () {
-    test('repeated CRITICAL inside the interval announces '
-        'once; after the interval it may announce again', () {
+  group('episode latches (the ruling superseding the '
+      'five-minute throttle)', () {
+    test('a direct NONE -> SEVERE jump speaks ONLY the '
+        'scope text, once; the FPS latch is consumed '
+        'silently', () {
       final ThermalPolicy policy = ThermalPolicy();
       final FakeSpeechSink sink = FakeSpeechSink();
-      void at(Duration offset) {
-        sink.recordDue(policy.evaluate(
-            status: ThermalStatus.critical, now: t0.add(offset)));
+      final ThermalCap cap =
+          policy.evaluate(status: ThermalStatus.severe, now: t0);
+      sink.record(cap);
+      expect(cap.announcement, ThermalAnnouncement.scopeRestricted);
+      // The episode continues: severe and critical
+      // repetitions raise nothing, and the FPS text is
+      // never spoken in this episode at all.
+      sink.record(policy.evaluate(
+          status: ThermalStatus.severe,
+          now: t0.add(const Duration(seconds: 1))));
+      sink.record(policy.evaluate(
+          status: ThermalStatus.critical,
+          now: t0.add(const Duration(seconds: 2))));
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+      ]);
+    });
+
+    test('a direct NONE -> CRITICAL jump speaks the scope '
+        'text once (where the old rule\'s once-only '
+        'critical announcement lands)', () {
+      final ThermalPolicy policy = ThermalPolicy();
+      final FakeSpeechSink sink = FakeSpeechSink();
+      sink.record(policy.evaluate(status: ThermalStatus.critical, now: t0));
+      sink.record(policy.evaluate(
+          status: ThermalStatus.critical,
+          now: t0.add(const Duration(minutes: 1))));
+      sink.record(policy.evaluate(
+          status: ThermalStatus.critical,
+          now: t0.add(const Duration(minutes: 30))));
+      // Exactly one scope announcement, however long the
+      // device stays critical -- the old five-minute
+      // re-announcement is gone.
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+      ]);
+    });
+
+    test('oscillation inside one episode (severe <-> '
+        'critical, moderate reported during the hold) '
+        'repeats no announcement', () {
+      final ThermalPolicy policy = ThermalPolicy();
+      final FakeSpeechSink sink = FakeSpeechSink();
+      void at(ThermalStatus status, Duration offset) {
+        sink.record(policy.evaluate(status: status, now: t0.add(offset)));
       }
 
-      at(Duration.zero); // fires
-      at(const Duration(minutes: 1)); // throttled
-      at(NavHazConfig.thermalCriticalAnnouncementInterval -
-          const Duration(seconds: 1)); // still throttled
-      expect(sink.spoken, hasLength(1));
-      at(NavHazConfig.thermalCriticalAnnouncementInterval); // fires again
-      expect(sink.spoken, hasLength(2));
-      expect(
-          sink.spoken,
-          everyElement(
-              equals(NavHazConfig.thermalCriticalAnnouncementText)));
+      at(ThermalStatus.moderate, Duration.zero); // fpsDrop
+      at(ThermalStatus.severe, const Duration(seconds: 1)); // scope
+      at(ThermalStatus.critical, const Duration(seconds: 2)); // -
+      at(ThermalStatus.severe, const Duration(seconds: 3)); // -
+      at(ThermalStatus.critical, const Duration(seconds: 4)); // -
+      // A MODERATE report during the episode only starts
+      // the recovery hold; the applied tier stays severe
+      // and nothing is announced.
+      at(ThermalStatus.moderate, const Duration(seconds: 5)); // -
+      at(ThermalStatus.severe, const Duration(seconds: 6)); // -
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalCriticalAnnouncementText,
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+      ]);
+    });
+
+    test('a partial recovery speaks no recovery text, and '
+        're-worsening to severe does not re-speak the '
+        'scope text', () {
+      final ThermalPolicy policy = ThermalPolicy();
+      final FakeSpeechSink sink = FakeSpeechSink();
+      // Direct jump to CRITICAL: the scope latch fires
+      // (FPS latch consumed silently).
+      sink.record(policy.evaluate(status: ThermalStatus.critical, now: t0));
+      // Cool: the first hold lands the moderate tier --
+      // a PARTIAL recovery, no recovery text.
+      final DateTime cooled = t0.add(const Duration(seconds: 1));
+      sink.record(policy.evaluate(status: ThermalStatus.none, now: cooled));
+      final DateTime step1 = cooled.add(NavHazConfig.thermalRecoveryHold);
+      final ThermalCap partial =
+          policy.evaluate(status: ThermalStatus.none, now: step1);
+      sink.record(partial);
+      expect(partial.maxFps, NavHazConfig.thermalCapModerateFps);
+      expect(partial.announcement, ThermalAnnouncement.none);
+      // Re-worsen to SEVERE inside the same episode: the
+      // scope latch is already consumed, nothing repeats.
+      final ThermalCap again = policy.evaluate(
+          status: ThermalStatus.severe,
+          now: step1.add(const Duration(seconds: 10)));
+      sink.record(again);
+      expect(again.maxFps, NavHazConfig.thermalCapSevereFps);
+      expect(again.announcement, ThermalAnnouncement.none);
+      // A full recovery now speaks the recovery text
+      // exactly once.
+      final DateTime cooled2 = step1.add(const Duration(seconds: 11));
+      sink.record(policy.evaluate(status: ThermalStatus.none, now: cooled2));
+      final DateTime back1 = cooled2.add(NavHazConfig.thermalRecoveryHold);
+      sink.record(policy.evaluate(status: ThermalStatus.none, now: back1));
+      final ThermalCap done = policy.evaluate(
+          status: ThermalStatus.none,
+          now: back1.add(NavHazConfig.thermalRecoveryHold));
+      sink.record(done);
+      expect(done.announcement, ThermalAnnouncement.recovered);
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+        NavHazConfig.thermalRecoveryAnnouncementText,
+      ]);
+    });
+
+    test('after a full recovery a NEW episode may speak '
+        'both latches and the recovery text again', () {
+      final ThermalPolicy policy = ThermalPolicy();
+      final FakeSpeechSink sink = FakeSpeechSink();
+      DateTime at = t0;
+      void feed(ThermalStatus status) {
+        sink.record(policy.evaluate(status: status, now: at));
+      }
+
+      // Episode 1: moderate (FPS text), then a full
+      // recovery (one hold from the moderate tier).
+      feed(ThermalStatus.moderate);
+      at = at.add(const Duration(seconds: 1));
+      feed(ThermalStatus.none);
+      at = at.add(NavHazConfig.thermalRecoveryHold);
+      feed(ThermalStatus.none); // unconstrained + recovered
+      // Episode 2: both latches are fresh again.
+      at = at.add(const Duration(seconds: 1));
+      feed(ThermalStatus.moderate); // FPS text again
+      at = at.add(const Duration(seconds: 1));
+      feed(ThermalStatus.severe); // scope text again
+      at = at.add(const Duration(seconds: 1));
+      feed(ThermalStatus.none);
+      at = at.add(NavHazConfig.thermalRecoveryHold);
+      feed(ThermalStatus.none); // steps to moderate, silent
+      at = at.add(NavHazConfig.thermalRecoveryHold);
+      feed(ThermalStatus.none); // unconstrained + recovered
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalCriticalAnnouncementText,
+        NavHazConfig.thermalRecoveryAnnouncementText,
+        NavHazConfig.thermalCriticalAnnouncementText,
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+        NavHazConfig.thermalRecoveryAnnouncementText,
+      ]);
+    });
+
+    test('unknown readings between severe readings never '
+        'speak the recovery text and never end the '
+        'episode; the ladder walked under NONE does', () {
+      final ThermalPolicy policy = ThermalPolicy();
+      final FakeSpeechSink sink = FakeSpeechSink();
+      sink.record(policy.evaluate(status: ThermalStatus.severe, now: t0));
+      // Unknown inserted: the cap still reads severe
+      // (the recovery hold only just started), and no
+      // recovery text is spoken.
+      final DateTime dark = t0.add(const Duration(seconds: 1));
+      ThermalCap cap =
+          policy.evaluate(status: ThermalStatus.unknown, now: dark);
+      sink.record(cap);
+      expect(cap.maxFps, NavHazConfig.thermalCapSevereFps);
+      expect(cap.announcement, ThermalAnnouncement.none);
+      // A full hold under unknown steps the LADDER to
+      // the moderate tier (the cap treats unknown as
+      // unconstrained-tier evidence) -- but the episode
+      // is still open and still silent.
+      cap = policy.evaluate(
+          status: ThermalStatus.unknown,
+          now: dark.add(NavHazConfig.thermalRecoveryHold));
+      sink.record(cap);
+      expect(cap.maxFps, NavHazConfig.thermalCapModerateFps);
+      expect(cap.announcement, ThermalAnnouncement.none);
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+      ]);
+      // A real NONE now walks the remaining rung: one
+      // hold later the cap is unconstrained and the
+      // recovery text fires exactly there.
+      final DateTime back = dark
+          .add(NavHazConfig.thermalRecoveryHold)
+          .add(const Duration(seconds: 1));
+      sink.record(policy.evaluate(status: ThermalStatus.none, now: back));
+      final ThermalCap done = policy.evaluate(
+          status: ThermalStatus.none,
+          now: back.add(NavHazConfig.thermalRecoveryHold));
+      sink.record(done);
+      expect(done.maxFps, isNull);
+      expect(done.announcement, ThermalAnnouncement.recovered);
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+        NavHazConfig.thermalRecoveryAnnouncementText,
+      ]);
+    });
+
+    test('unknown readings long enough to relax the cap '
+        'completely still speak no recovery text; the '
+        'first real NONE after that does', () {
+      final ThermalPolicy policy = ThermalPolicy();
+      final FakeSpeechSink sink = FakeSpeechSink();
+      sink.record(policy.evaluate(status: ThermalStatus.severe, now: t0));
+      // Two full holds under unknown: the cap settles
+      // back to unconstrained on sensor silence alone.
+      final DateTime dark = t0.add(const Duration(seconds: 1));
+      sink.record(policy.evaluate(status: ThermalStatus.unknown, now: dark));
+      sink.record(policy.evaluate(
+          status: ThermalStatus.unknown,
+          now: dark.add(NavHazConfig.thermalRecoveryHold)));
+      final ThermalCap relaxed = policy.evaluate(
+          status: ThermalStatus.unknown,
+          now: dark.add(NavHazConfig.thermalRecoveryHold * 2));
+      sink.record(relaxed);
+      expect(relaxed.maxFps, isNull);
+      expect(relaxed.announcement, ThermalAnnouncement.none);
+      // No recovery text, and the latches were NOT
+      // reset: the episode is still open.
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+      ]);
+      // The first genuine NONE reading confirms the
+      // cool-down and speaks the recovery text once.
+      final ThermalCap confirmed = policy.evaluate(
+          status: ThermalStatus.none,
+          now: dark
+              .add(NavHazConfig.thermalRecoveryHold * 2)
+              .add(const Duration(seconds: 1)));
+      sink.record(confirmed);
+      expect(confirmed.announcement, ThermalAnnouncement.recovered);
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalScopeRestrictedAnnouncementText,
+        NavHazConfig.thermalRecoveryAnnouncementText,
+      ]);
+    });
+
+    test('booting straight into MODERATE speaks the FPS '
+        'text once (the first evaluation may open an '
+        'episode)', () {
+      final ThermalPolicy policy = ThermalPolicy();
+      final FakeSpeechSink sink = FakeSpeechSink();
+      sink.record(policy.evaluate(status: ThermalStatus.moderate, now: t0));
+      sink.record(policy.evaluate(
+          status: ThermalStatus.moderate,
+          now: t0.add(const Duration(seconds: 5))));
+      expect(sink.spoken, <String>[
+        NavHazConfig.thermalCriticalAnnouncementText,
+      ]);
     });
   });
 
@@ -286,7 +590,13 @@ void main() {
       expect(caps, hasLength(3));
       expect(caps[0], ThermalCap.unconstrained);
       expect(caps[1].maxFps, NavHazConfig.thermalCapSevereFps);
-      expect(caps[2].announcementDue, isTrue);
+      // REWRITTEN (episode-latch ruling): the old model
+      // flagged the CRITICAL cap with its announcement;
+      // under the latch model the SEVERE cap carries the
+      // scope event (both latches trip there), and the
+      // CRITICAL cap raises nothing new.
+      expect(caps[1].announcement, ThermalAnnouncement.scopeRestricted);
+      expect(caps[2].announcement, ThermalAnnouncement.none);
       await sub.cancel();
       monitor.dispose();
       expect(monitor.disposed, isTrue);
@@ -385,8 +695,13 @@ void main() {
       expect(NavHazConfig.thermalCapSevereFps, 5);
       expect(NavHazConfig.thermalRecoveryHold,
           const Duration(seconds: 30));
-      expect(NavHazConfig.thermalCriticalAnnouncementInterval,
-          const Duration(minutes: 5));
+      // REMOVED (episode-latch ruling): the old surface
+      // also pinned thermalCriticalAnnouncementInterval
+      // at five minutes. That constant no longer exists
+      // -- the re-announcement it throttled was abolished
+      // with the throttle model itself, so there is
+      // nothing left to pin here; the announcement texts
+      // are pinned verbatim in the 3.4.2 (1) group above.
     });
   });
 }

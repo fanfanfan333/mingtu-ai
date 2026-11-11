@@ -590,19 +590,41 @@ static const int thermalCapSevereFps = 5;
 /// not flap the camera rate with it.
 static const Duration thermalRecoveryHold = Duration(seconds: 30);
 
-/// Minimum spacing between two CRITICAL announcements
-/// (spec 3.2): the heat warning is spoken at most once
-/// per this interval, however often the platform repeats
-/// the critical status.
-static const Duration thermalCriticalAnnouncementInterval =
-    Duration(minutes: 5);
-
-/// The CRITICAL heat warning, verbatim (spec 3.2). It
-/// asks the user to slow down and watch their footing; it
-/// makes no claim about the way ahead and passes the
-/// banned-word check (asserted in the thermal tests).
+/// The heat derating warning, verbatim (spec 3.2,
+/// announcement model superseded by the episode-latch
+/// ruling): spoken once per derating episode, at the
+/// moment the applied cap first limits the frame rate
+/// (the FPS latch in thermal_policy.dart), at alert
+/// level. It asks the user to slow down and watch their
+/// footing; it makes no claim about the way ahead and
+/// passes the banned-word check (asserted in the thermal
+/// tests). The constant keeps its section 3.2 name --
+/// it was the CRITICAL-tier text under the original
+/// rule -- but the episode latch, not the critical
+/// status, now decides when it is spoken.
 static const String thermalCriticalAnnouncementText =
     '手机较热，识别已降频，请放慢脚步注意脚下';
+
+/// The scope-restriction warning, verbatim (dictated
+/// wording): spoken once per derating episode, at the
+/// moment the applied cap first restricts detection to
+/// vehicles and pedestrians (the scope latch in
+/// thermal_policy.dart), at alert level. A blind user
+/// cannot see the narrower detection scope on a screen,
+/// so the narrowing is always spoken; the text passes
+/// the banned-word check (asserted in the thermal
+/// tests).
+static const String thermalScopeRestrictedAnnouncementText =
+    '手机过热，暂时只提醒车辆和行人，请放慢脚步';
+
+/// The recovery notice, verbatim (dictated wording):
+/// spoken once when a derating episode fully ends --
+/// the applied cap back to unconstrained on a genuine
+/// NONE reading -- at info level. Partial recoveries
+/// and unknown readings never produce it (see
+/// thermal_policy.dart). Passes the banned-word check
+/// (asserted in the thermal tests).
+static const String thermalRecoveryAnnouncementText = '障碍提醒已恢复';
 
 // ---- Cloud event triggers (M2 section 3.3) ---------------------------
 
