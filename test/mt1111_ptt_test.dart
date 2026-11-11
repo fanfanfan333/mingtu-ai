@@ -4,24 +4,22 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mingtu_ai/adapters/cloud_asr_client.dart';
 import 'package:mingtu_ai/adapters/system_voice_io.dart';
+import 'package:mingtu_ai/adapters/voice_recorder.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart'
     as stt_result;
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:mingtu_ai/core/asr_errors.dart';
-import 'package:mingtu_ai/core/voice_startup.dart';
 import 'package:mingtu_ai/main.dart';
 
-/// MT-1111-PTT real-device fix round, FIRST commit (core
-/// press-and-hold only): app-level behaviour tests for the
-/// Xiaomi sequence (E), the permission-error dedup (a),
-/// the no-automatic-listen counts (e), and the PTT-D core
-/// checks (listenFor=30 s, initialize discipline,
-/// background release, TTS-stop order). The recording +
-/// cloud ASR fallback tests (b, c, d) and the startup-
-/// unavailability direct-fallback test (PTT-D(5)) live in
-/// the second commit's version of this file.
+/// MT-1111-PTT real-device fix round: app-level behaviour
+/// tests for the Xiaomi sequence (E), the permission-error
+/// dedup (a), the recording + cloud ASR fallback (b, c, d),
+/// the no-automatic-listen counts (e), and the PTT-D checks
+/// (listenFor=30 s, initialize discipline, background
+/// release, startup-unavailable fallback, TTS-stop order).
 ///
 /// The channel harness mirrors test/codex_ptt_fix_test.dart
 /// (same plugin contract): the platform's notifyError for a
@@ -279,8 +277,19 @@ Future<TestGesture> startPttGesture(WidgetTester tester) async {
 /// (or the recorder) has started.
 Future<void> pressUntilCapture(WidgetTester tester,
     RecordingVoiceChannels h, TestGesture g,
-    {bool useFakeListen = false}) async {
-  const Duration step = Duration(milliseconds: 50);
+    {required bool expectRecorder,
+    FakeRecorder? recorder,
+    bool useFakeListen = false,
+    bool tightTiming = false}) async {
+  // tightTiming: the caller releases immediately after
+  // capture and must stay under the app's 300 ms
+  // too-short floor. The app measures the hold with
+  // DateTime.now(), which is REAL time in this harness,
+  // so the tight drive burns neither fake nor real time:
+  // no runAsync sleeps, only microtask-flushing pumps
+  // (the cue -> capture chain is microtask-driven).
+  final Duration step =
+      tightTiming ? Duration.zero : const Duration(milliseconds: 50);
   for (int i = 0;
       i < 40 &&
           !h.speakQueue.any(
@@ -288,8 +297,10 @@ Future<void> pressUntilCapture(WidgetTester tester,
       i++) {
     h.completeAllSpeaks();
     await h.deliverAllCloseStatuses();
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    if (!tightTiming) {
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    }
     await tester.pump(step);
   }
   // The cue counts as spoken once it was ISSUED; a drain
@@ -302,6 +313,7 @@ Future<void> pressUntilCapture(WidgetTester tester,
       reason: 'cue spoken: ${h.events}');
   h.completeSpeak('请说');
   bool started() {
+    if (expectRecorder) return recorder != null && recorder.started;
     if (useFakeListen) {
       return processFakeStt != null && processFakeStt!.listenCalls > 0;
     }
@@ -310,8 +322,10 @@ Future<void> pressUntilCapture(WidgetTester tester,
 
   for (int i = 0; i < 40 && !started(); i++) {
     await h.deliverAllCloseStatuses();
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    if (!tightTiming) {
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    }
     await tester.pump(step);
   }
   if (!started()) fail('capture never started: ${h.events}');
@@ -320,10 +334,14 @@ Future<void> pressUntilCapture(WidgetTester tester,
   // the prompt step's tail settle a few microtasks later):
   // give it rounds so deliveries made by the caller land
   // in the listening state, as on device. Zero-duration
-  // pumps flush microtasks without advancing fake time.
+  // pumps flush microtasks without advancing fake time;
+  // in tight mode the real-time sleeps are skipped too
+  // (see above).
   for (int i = 0; i < 6; i++) {
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    if (!tightTiming) {
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    }
     await tester.pump(Duration.zero);
   }
 }
@@ -519,7 +537,75 @@ Future<void> deliverError(
   await tester.pump(const Duration(milliseconds: 50));
 }
 
+/// Fake recorder for the cloud ASR fallback tests.
+class FakeRecorder implements VoiceRecorder {
+  bool permission = true;
+  bool started = false;
+  bool cancelled = false;
+  int startCount = 0;
+  Uint8List? clip = Uint8List.fromList(List<int>.filled(2000, 3));
+
+  @override
+  Future<bool> hasPermission() async => permission;
+
+  @override
+  Future<void> start() async {
+    started = true;
+    startCount++;
+  }
+
+  @override
+  Future<Uint8List?> stop() async {
+    started = false;
+    return clip;
+  }
+
+  @override
+  Future<void> cancel() async {
+    cancelled = true;
+    started = false;
+  }
+
+  @override
+  bool get isRecording => started;
+}
+
 void main() {
+  // PTT-D(5) runs FIRST in this file on purpose: the
+  // speech_to_text plugin object is a process singleton
+  // whose initialize() latches after its first success,
+  // so only the first app instance in the process can
+  // observe a failed startup initialize on the channel.
+  group('PTT-D(5): startup unavailability (first in file)', () {
+    testWidgets(
+        'PTT-D(5): ASR unavailable at startup -- the FIRST '
+        'press records directly, with no asr.listen',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..asrInitResult = false
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+
+      final FakeRecorder recorder = FakeRecorder()..permission = true;
+      mingtuHomeDebugHandle!.setRecorder(recorder);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue,
+          reason: 'startup unavailability must arm the fallback');
+      h.events.clear();
+
+      final TestGesture g = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g,
+          expectRecorder: true, recorder: recorder);
+      expect(recorder.started, isTrue);
+      expect(h.count('asr.listen'), 0, reason: '${h.events}');
+
+      await holdPastThreshold(tester);
+      await g.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await drainVoice(tester, h);
+    });
+  });
+
   group('xiaomi sequence (E): late outcomes after release', () {
     testWidgets(
         'xiaomi sequence: late error7 after stop -- no new listen, '
@@ -537,7 +623,7 @@ void main() {
 
       final TestGesture g = await startPttGesture(tester);
       await pressUntilCapture(tester, h, g,
-          useFakeListen: true);
+          expectRecorder: false, useFakeListen: true);
       expect(processFakeStt!.listenCalls, 1);
 
       // While held, a partial arrives and is cached.
@@ -593,7 +679,7 @@ void main() {
 
       final TestGesture g = await startPttGesture(tester);
       await pressUntilCapture(tester, h, g,
-          useFakeListen: true);
+          expectRecorder: false, useFakeListen: true);
       expect(processFakeStt!.listenCalls, 1);
       await holdPastThreshold(tester);
 
@@ -624,7 +710,7 @@ void main() {
 
       final TestGesture g = await startPttGesture(tester);
       await pressUntilCapture(tester, h, g,
-          useFakeListen: true);
+          expectRecorder: false, useFakeListen: true);
       await holdPastThreshold(tester);
 
       await g.up();
@@ -657,7 +743,7 @@ void main() {
 
       final TestGesture g = await startPttGesture(tester);
       await pressUntilCapture(tester, h, g,
-          useFakeListen: true);
+          expectRecorder: false, useFakeListen: true);
       expect(processFakeStt!.listenCalls, 1);
 
       // The Xiaomi engine's permission failure, three times
@@ -679,13 +765,17 @@ void main() {
       await pumpUntilSpeak(tester, h, asrPermissionSpeechText);
       expect(h.count('tts.speak:$asrPermissionSpeechText'), 1,
           reason: 'deduped per code: ${h.events}');
+      // The error routed the fallback on.
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue);
 
-      // Release and press again: no permanent stop. In
-      // this commit there is no recording fallback yet
-      // (that routing is the second commit's wiring), so
-      // the retry takes the only form core has: the next
-      // press opens a NEW system session and listens
-      // again -- the error never disabled pressing.
+      // Release and press again: no permanent stop. The
+      // error routed later presses to the recording
+      // fallback; with a working recorder injected, the
+      // next press RECORDS (proof it retries) and -- the
+      // ASR proxy being unconfigured in this environment --
+      // ends with the fixed not-configured text.
+      final FakeRecorder recorder = FakeRecorder();
+      mingtuHomeDebugHandle!.setRecorder(recorder);
       await holdPastThreshold(tester);
       await g.up();
       await tester.pump(const Duration(milliseconds: 200));
@@ -693,28 +783,153 @@ void main() {
       await settleReleasedPress(tester, h);
       h.events.clear();
 
-      // No permanent stop at the APP level: a later press
-      // runs the whole press flow again -- vibrate, cue,
-      // start attempt. The adapter, by its own pre-existing
-      // discipline, reports the recogniser unavailable
-      // after a PERMANENT error (claiming availability
-      // would be a lie), so in this commit -- which has no
-      // recording fallback yet; that routing is the second
-      // commit's wiring -- the attempt ends with the fixed
-      // ASR-unavailable notice instead of a new session.
-      // What the error must never do is silence or skip
-      // the press itself.
       final TestGesture g2 = await startPttGesture(tester);
-      await pumpUntilSpeak(tester, h, '请说');
-      h.completeSpeak('请说');
-      await pumpUntilSpeak(
-          tester, h, voiceNoticeText(VoiceNoticeKind.asrUnavailable));
-      expect(h.count('vibrate'), 2,
-          reason: 'press vibrate + failure vibrate: ${h.events}');
-      expect(processFakeStt!.listenCalls, 1,
-          reason: 'the adapter refuses before the platform '
-              'after a permanent error: ${h.events}');
+      await pressUntilCapture(tester, h, g2,
+          expectRecorder: true, recorder: recorder);
+      expect(h.count('asr.listen'), 0,
+          reason: 'recording route, no system session: ${h.events}');
+      await holdPastThreshold(tester);
       await g2.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await pumpUntilSpeak(tester, h, '云端识别未配置，无法识别。');
+      await drainVoice(tester, h);
+    });
+  });
+
+  group('recording + cloud ASR fallback (b, c, d)', () {
+    Future<void> armFallback(WidgetTester tester,
+        RecordingVoiceChannels h, FakeRecorder recorder,
+        {String? asrText}) async {
+      int senderCalls = 0;
+      mingtuHomeDebugHandle!.setRecorder(recorder);
+      mingtuHomeDebugHandle!.setCloudAsrClient(CloudAsrClient(
+        proxyBaseUrl: 'https://fc.example',
+        sender: (Uri url, String body, Map<String, String> headers) async {
+          senderCalls++;
+          return jsonEncode(<String, Object?>{'text': asrText});
+        },
+      ));
+      addTearDown(() {});
+      // Force the broken flag via a permission error on a
+      // first (system-ASR) press. The error is delivered
+      // through the fake-backed adapter (the channel's
+      // plugin object cannot reach this app's adapter).
+      await installFakeBackedInput(tester);
+      final TestGesture g0 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g0,
+          expectRecorder: false, useFakeListen: true);
+      await deliverError(tester, 'error_permission', true);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue);
+      await holdPastThreshold(tester);
+      await g0.up();
+      await tester.pump(const Duration(milliseconds: 200));
+      await deliverFakeStatus(tester, 'notListening');
+      await settleReleasedPress(tester, h);
+      h.events.clear();
+      // Expose the counter through the recorder's clip size
+      // channel: tests read it via the closure below.
+      fallbackSenderCalls = () => senderCalls;
+    }
+
+    testWidgets(
+        '(b) after local ASR breaks, a press records and the '
+        'cloud transcript drives the destination flow',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      h.events.clear();
+
+      final FakeRecorder recorder = FakeRecorder();
+      await armFallback(tester, h, recorder, asrText: '校门口');
+
+      // Put the app into its destination-asking state (the
+      // same state the startup greeting leaves it in when
+      // it asks where to go): the transcript is then
+      // consumed as the destination answer.
+      mingtuHomeDebugHandle!.askDestination();
+      await tester.pump(const Duration(milliseconds: 100));
+      await drainVoice(tester, h, rounds: 4);
+      h.events.clear();
+
+      final TestGesture g = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g,
+          expectRecorder: true, recorder: recorder);
+      // Recording route: the system ASR was never opened.
+      expect(h.count('asr.listen'), 0, reason: '${h.events}');
+      expect(recorder.started, isTrue);
+      await holdPastThreshold(tester);
+      await g.up();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      // The transcript entered the command pipeline as
+      // the destination answer (a bare place name is not a
+      // known command, so it answers the open question):
+      // the destination confirmation was spoken.
+      await pumpUntilSpeak(tester, h, '好的，去校门口。');
+      expect(fallbackSenderCalls!(), 1);
+
+      await drainVoice(tester, h);
+    });
+
+    testWidgets(
+        '(c) a too-short recording is cancelled: 请按住说话 and '
+        'no ASR call', (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      h.events.clear();
+
+      final FakeRecorder recorder = FakeRecorder();
+      await armFallback(tester, h, recorder, asrText: '去图书馆');
+
+      final TestGesture g = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g,
+          expectRecorder: true, recorder: recorder, tightTiming: true);
+      // Release immediately (well under the 300 ms floor;
+      // no real-time hold).
+      await g.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await pumpUntilSpeak(tester, h, '请按住说话');
+      expect(recorder.cancelled, isTrue);
+      expect(fallbackSenderCalls!(), 0);
+
+      await drainVoice(tester, h);
+    });
+
+    testWidgets(
+        '(d) ASR proxy unconfigured: the fixed not-configured '
+        'text is spoken', (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      h.events.clear();
+
+      final FakeRecorder recorder = FakeRecorder();
+      // Arm the fallback with the DEFAULT client (no proxy
+      // URL in the test environment -> unconfigured).
+      mingtuHomeDebugHandle!.setRecorder(recorder);
+      await installFakeBackedInput(tester);
+      final TestGesture g0 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g0,
+          expectRecorder: false, useFakeListen: true);
+      await deliverError(tester, 'error_permission', true);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue);
+      await holdPastThreshold(tester);
+      await g0.up();
+      await tester.pump(const Duration(milliseconds: 200));
+      await deliverFakeStatus(tester, 'notListening');
+      await settleReleasedPress(tester, h);
+      h.events.clear();
+
+      final TestGesture g = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g,
+          expectRecorder: true, recorder: recorder);
+      await holdPastThreshold(tester);
+      await g.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await pumpUntilSpeak(tester, h, '云端识别未配置，无法识别。');
+
       await drainVoice(tester, h);
     });
   });
@@ -741,7 +956,7 @@ void main() {
         // cannot see an uncompleted 请说 until prior speech is
         // completed -- drain first, here inside the press.
         h.completeAllSpeaks();
-        await pressUntilCapture(tester, h, g);
+        await pressUntilCapture(tester, h, g, expectRecorder: false);
         await holdPastThreshold(tester);
         await g.up();
         await tester.pump(const Duration(milliseconds: 200));
@@ -787,7 +1002,7 @@ void main() {
       h.events.clear();
 
       final TestGesture g = await startPttGesture(tester);
-      await pressUntilCapture(tester, h, g);
+      await pressUntilCapture(tester, h, g, expectRecorder: false);
       final int stopIdx = h.events.indexOf('tts.stop');
       final int listenIdx = h.events.indexOf('asr.listen');
       expect(stopIdx, greaterThanOrEqualTo(0),
@@ -812,7 +1027,7 @@ void main() {
       h.events.clear();
 
       final TestGesture g = await startPttGesture(tester);
-      await pressUntilCapture(tester, h, g);
+      await pressUntilCapture(tester, h, g, expectRecorder: false);
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
 
       tester.binding.handleAppLifecycleStateChanged(
@@ -833,3 +1048,7 @@ void main() {
 
   });
 }
+
+/// Set by the fallback-arming helper: reads the fake ASR
+/// sender's call count for the current test.
+int Function()? fallbackSenderCalls;

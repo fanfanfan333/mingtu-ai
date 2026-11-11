@@ -5,7 +5,9 @@ import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
 import 'adapters/camera_frame_source.dart';
+import 'adapters/cloud_asr_client.dart';
 import 'adapters/cloud_vision_client.dart';
+import 'adapters/voice_recorder.dart';
 import 'adapters/cloud_vision_flow.dart';
 import 'adapters/current_location.dart';
 import 'adapters/system_voice_io.dart';
@@ -17,6 +19,7 @@ import 'config/app_config.dart';
 import 'config/verified_locations.dart';
 import 'core/camera_frame.dart';
 import 'core/event_bus.dart';
+import 'core/cloud_asr.dart';
 import 'core/cloud_vision.dart';
 import 'core/health_monitor.dart';
 import 'core/route_scoring.dart';
@@ -246,6 +249,14 @@ class MingtuHomeDebugHandle {
   Future<void> openYoloLive() => _state._openYoloLive();
   void closeYoloLive() => _state._closeYoloLiveView();
   bool get yoloLiveOpen => _state._yoloLiveOpen;
+
+  /// Cloud-ASR fallback seams: substitute the recorder /
+  /// ASR client a press uses (widget tests inject fakes;
+  /// production never calls these).
+  void setRecorder(VoiceRecorder recorder) => _state._recorder = recorder;
+  void setCloudAsrClient(CloudAsrClient client) =>
+      _state._cloudAsrClient = client;
+  bool get localAsrBroken => _state._localAsrBroken;
 }
 
 /// The live home page's debug handle (see above). Assigned
@@ -313,6 +324,29 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     proxyBaseUrl: AppConfig.visionProxyUrl,
     demoToken: AppConfig.visionDemoToken,
   );
+  // Cloud ASR fallback (real-device fix round): records with
+  // the app's own microphone when the system speech engine
+  // cannot (Xiaomi engine permission failure), and sends the
+  // clip to the same FC deployment's /asr route. The recorder
+  // is replaced by the platform implementation at startup;
+  // tests may substitute fakes for both seams.
+  VoiceRecorder _recorder = const UnavailableVoiceRecorder();
+  // ignore: prefer_final_fields -- tests substitute a fake-sender client.
+  CloudAsrClient _cloudAsrClient = CloudAsrClient(
+    proxyBaseUrl: AppConfig.asrProxyUrl,
+    demoToken: AppConfig.visionDemoToken,
+  );
+
+  /// True once the local (system) recogniser has proven
+  /// broken on this device (permission error, unavailable at
+  /// a press, start failure): subsequent presses go straight
+  /// to the recording fallback. Never reset by an error --
+  /// a working press clears nothing; the flag only routes.
+  bool _localAsrBroken = false;
+
+  /// True while the current press is served by the recorder
+  /// instead of the system recogniser.
+  bool _pttRecording = false;
 
   /// Error codes already announced in the current stretch:
   /// the same code is spoken ONCE until a recognition
@@ -603,6 +637,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void initState() {
     super.initState();
     mingtuHomeDebugHandle = MingtuHomeDebugHandle._(this);
+    _recorder = createVoiceRecorder();
     WidgetsBinding.instance.addObserver(this);
     // _initRealIntegrations never throws (every module is
     // guarded inside the production initializer, and startup
@@ -629,15 +664,25 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _visionRuns.cancelActive();
       _cameraOwnership.cancelAllAndRelease();
       // MT-1111-PTT-D(4): backgrounding releases the
-      // microphone. A press in listening is
+      // microphone. A press in listening/recording is
       // CANCELLED (existing cancel semantics: voided,
       // never submitted); a press already in its stopping
       // window is left to settle normally.
       if (_pttState == _PttState.listening) {
         _pushToTalkHeld = false;
-        _pttSessionVoided = true;
-        _pttState = _PttState.idle;
-        unawaited(_cancelListeningInternal());
+        if (_pttRecording) {
+          _pttRecording = false;
+          _pttState = _PttState.idle;
+          unawaited(() async {
+            try {
+              await _recorder.cancel();
+            } catch (_) {}
+          }());
+        } else {
+          _pttSessionVoided = true;
+          _pttState = _PttState.idle;
+          unawaited(_cancelListeningInternal());
+        }
       } else if (_pttState == _PttState.prompting ||
           _pttState == _PttState.starting) {
         _pushToTalkHeld = false;
@@ -1131,6 +1176,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final SystemVoiceInput? asr = init.asr;
     final bool asrOk = init.asrOk;
     if (!mounted) return false;
+    if (!asrOk || asr == null || !asr.isAvailable) {
+      // MT-1111-PTT-D(5): the engine is unavailable AT
+      // STARTUP -- the very first press goes straight to
+      // the recording + cloud ASR fallback instead of
+      // discovering the failure on press one.
+      _localAsrBroken = true;
+    }
     if (asrOk && asr != null) {
       _voiceInput = asr;
       _subscribedVoiceInput = asr;
@@ -1366,6 +1418,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final String code = error.split('|').first;
     final bool isPermission =
         code == 'error_permission' || code == 'error_insufficient_permissions';
+    final bool isEngineUnavailable =
+        code == 'not_available' || code == 'error_server';
+    if (isPermission || isEngineUnavailable) {
+      // The engine cannot record (its own permission is
+      // missing, or the service is absent): later presses
+      // record with the app's own permission instead. This
+      // is ROUTING only -- the error is still announced
+      // (deduped) and no press is ever disabled.
+      _localAsrBroken = true;
+    }
     final String fixedText =
         isPermission ? asrPermissionSpeechText : asrErrorText(code);
     mingtuVoiceLog('语音识别运行出错（$code）：$fixedText');
@@ -1458,13 +1520,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     WidgetsBinding.instance.removeObserver(this);
     // MT-1111-PTT-D(4): dispose releases the microphone. A
     // press still capturing is cancelled (voided, never
-    // submitted). The adapter outlives the page by design,
-    // so this is the app-side release: stop/cancel on the
-    // live session.
+    // submitted); the recorder is cancelled likewise. The
+    // adapter outlives the page by design, so this is the
+    // app-side release: stop/cancel on the live session.
     if (_pttState == _PttState.listening ||
         _pttState == _PttState.starting) {
       _pttSessionVoided = true;
-      unawaited(_cancelListeningInternal());
+      if (_pttRecording) {
+        _pttRecording = false;
+        unawaited(() async {
+          try {
+            await _recorder.cancel();
+          } catch (_) {}
+        }());
+      } else {
+        unawaited(_cancelListeningInternal());
+      }
     }
     _closeYoloLiveView();
     _visionRuns.cancelActive();
@@ -2393,6 +2464,23 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _pttFinishTooShort(sid);
       return;
     }
+    if (_localAsrBroken) {
+      // Cloud ASR fallback: the system recogniser cannot
+      // serve this device (its engine lacks the microphone
+      // permission), so the press records with the APP's
+      // own permission instead. The recording branch never
+      // touches the ASR session machinery. Audio order
+      // (MT-1111-PTT-D(2)): this branch is reached only
+      // AFTER _interruptSpeechForPushToTalk above has run
+      // for this press, so any scheduler-active or
+      // physically playing non-P0 TTS was already stopped
+      // before the recorder opens -- the same pre-capture
+      // stop the local-ASR path gets. (TalkBack speech is
+      // system-level and the app cannot stop it; that
+      // boundary is documented in the README.)
+      await _pttStartRecording(sid);
+      return;
+    }
     _pttState = _PttState.starting;
     final bool started = await _startListening(pushToTalk: true);
     if (!mounted || sid != _pttSession) return;
@@ -2467,10 +2555,158 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         return;
       case _PttState.listening:
         _pushToTalkHeld = false;
-        await _pttReleaseFromListening();
+        if (_pttRecording) {
+          await _pttReleaseFromRecording();
+        } else {
+          await _pttReleaseFromListening();
+        }
         return;
       case _PttState.stopping:
         return;
+    }
+  }
+
+  /// Recording branch of the prompt step (cloud ASR
+  /// fallback): permission first (no permission -> vibrate
+  /// + the fixed recording-permission notice, press over),
+  /// then start the recorder. A start failure ends the
+  /// press with the fixed ASR-unavailable notice. The 10 s
+  /// cap is enforced in the release path by the recorder
+  /// configuration's caller contract -- main arms a 10 s
+  /// timer that ends the press exactly like a release (the
+  /// TalkBack long-press action's own 10 s auto-end lands
+  /// on the same path).
+  Future<void> _pttStartRecording(int sid) async {
+    _pttState = _PttState.starting;
+    bool permitted = false;
+    try {
+      permitted = await _recorder.hasPermission();
+    } catch (_) {
+      permitted = false;
+    }
+    if (!mounted || sid != _pttSession) return;
+    if (!permitted) {
+      _pttState = _PttState.idle;
+      _pushToTalkHeld = false;
+      _pttPendingStop = false;
+      HapticFeedback.vibrate();
+      _logMsg('按住说话：没有麦克风权限，无法录音。');
+      if (_voiceOutput.isAvailable && !_ttsFailed) {
+        _say(_request(
+          id: 'ptt-rec-noperm-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'ptt-rec-noperm-${DateTime.now().millisecondsSinceEpoch}',
+          text: '没有麦克风权限，无法录音。请在系统设置里允许明途使用麦克风。',
+          kind: SpeechKind.alert,
+        ));
+      }
+      return;
+    }
+    try {
+      await _recorder.start();
+    } catch (_) {
+      if (!mounted || sid != _pttSession) return;
+      _pttState = _PttState.idle;
+      _pushToTalkHeld = false;
+      _pttPendingStop = false;
+      _localAsrBroken = true;
+      HapticFeedback.vibrate();
+      if (_voiceOutput.isAvailable && !_ttsFailed) {
+        _say(_request(
+          id: 'ptt-rec-failed-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'ptt-rec-failed-${DateTime.now().millisecondsSinceEpoch}',
+          text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
+          kind: SpeechKind.alert,
+        ));
+      }
+      return;
+    }
+    if (!mounted || sid != _pttSession) return;
+    _pttRecording = true;
+    _pttState = _PttState.listening;
+    if (_pttPendingStop) {
+      // Released while the recorder was starting: the
+      // release was necessarily too short; the recording
+      // release path applies the frozen too-short rule.
+      _pttPendingStop = false;
+      await _pttReleaseFromRecording();
+    }
+  }
+
+  /// Release of a recording press. Settles through the
+  /// SAME single completion discipline as a system-ASR
+  /// press (state stopping -> idle, exactly once), but
+  /// never touches the ASR stopping window: the clip goes
+  /// to the cloud ASR route and its transcript enters the
+  /// ordinary command pipeline via _processPushToTalkFinal.
+  Future<void> _pttReleaseFromRecording() async {
+    final int sid = _pttSession;
+    final DateTime? pressedAt = _pushToTalkPressedAt;
+    _pushToTalkPressedAt = null;
+    final bool tooShort = pressedAt == null ||
+        DateTime.now().difference(pressedAt) <
+            const Duration(milliseconds: 300);
+    _pttState = _PttState.stopping;
+    _pttRecording = false;
+    if (tooShort) {
+      try {
+        await _recorder.cancel();
+      } catch (_) {}
+      if (!mounted || sid != _pttSession) return;
+      _pttState = _PttState.idle;
+      _announcePushToTalkTooShort();
+      return;
+    }
+    Uint8List? bytes;
+    try {
+      bytes = await _recorder.stop();
+    } catch (_) {
+      bytes = null;
+    }
+    if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
+      return;
+    }
+    if (bytes == null || bytes.isEmpty) {
+      _pttState = _PttState.idle;
+      _announcePushToTalkNoContent();
+      return;
+    }
+    if (bytes.length > asrMaxAudioBytes) {
+      _pttState = _PttState.idle;
+      _announceCloudAsrFailure(AsrFailure.tooLarge);
+      return;
+    }
+    if (!_cloudAsrClient.isConfigured) {
+      _pttState = _PttState.idle;
+      _announceCloudAsrFailure(AsrFailure.notConfigured);
+      return;
+    }
+    setState(() {
+      _currentPrompt = '正在识别';
+    });
+    final CloudAsrResult result = await _cloudAsrClient.transcribe(bytes);
+    if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
+      return;
+    }
+    _pttState = _PttState.idle;
+    if (result.ok) {
+      _processPushToTalkFinal(result.text!);
+    } else {
+      _announceCloudAsrFailure(result.failure!);
+    }
+  }
+
+  /// Speak a cloud-ASR failure's FIXED local detail (never
+  /// an exception, never response text).
+  void _announceCloudAsrFailure(AsrFailure failure) {
+    _logMsg('云端识别失败：${asrFailureDetail(failure)}');
+    HapticFeedback.vibrate();
+    if (_voiceOutput.isAvailable && !_ttsFailed) {
+      _say(_request(
+        id: 'cloud-asr-failed-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'cloud-asr-failed-${DateTime.now().millisecondsSinceEpoch}',
+        text: asrFailureDetail(failure),
+        kind: SpeechKind.alert,
+      ));
     }
   }
 
@@ -2777,6 +3013,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// already did; the start paths now match).
   Future<bool> _startListening({bool pushToTalk = false}) async {
     if (!_voiceInput.isAvailable) {
+      // The local recogniser cannot serve a press at all:
+      // route subsequent presses to the recording fallback.
+      _localAsrBroken = true;
       _logMsg('语音识别不可用：${_voiceInput.status}');
       HapticFeedback.vibrate();
       if (_voiceOutput.isAvailable) {
@@ -2999,20 +3238,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
       }
     }
-  }
-
-  /// The demo panel's "start recognition" button no
-  /// longer opens the microphone (press-and-hold only,
-  /// real-device fix round): it points the user at the
-  /// big push-to-talk button instead.
-  void _announceHoldToTalkHint() {
-    _say(_request(
-      id: 'hold-to-talk-hint-${DateTime.now().millisecondsSinceEpoch}',
-      eventId:
-          'hold-to-talk-hint-${DateTime.now().millisecondsSinceEpoch}',
-      text: '请按住说话按钮说话',
-      kind: SpeechKind.info,
-    ));
   }
 
   Future<void> _stopListening() async {
@@ -4470,28 +4695,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _logMsg('演示已重置（重新开始演示，非任务状态迁移）。');
   }
 
-
-  Widget _demoButton({
-    required String label,
-    required String semanticsLabel,
-    required VoidCallback? onPressed,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: Semantics(
-        button: true,
-        label: semanticsLabel,
-        child: ElevatedButton(
-          style: ElevatedButton.styleFrom(
-            minimumSize: const Size(double.infinity, 56),
-          ),
-          onPressed: onPressed,
-          child: Text(label, style: const TextStyle(fontSize: 18)),
-        ),
-      ),
-    );
-  }
-
   /// The one big status line for the companion / TalkBack:
   /// live navigation wins, then the open destination
   /// question, then task state, then camera state.
@@ -4511,51 +4714,26 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   @override
-  @override
   Widget build(BuildContext context) {
-    final TaskState state = _tasks.state;
+    // MT-1111-PTT-C minimal interface: the opened app shows
+    // ONLY two things -- the camera preview area (upper
+    // half) and the big hold-to-talk area (lower half). No
+    // visible text, no other controls: the demo panel, the
+    // status line and even the button's own caption are
+    // gone. All state (_voiceText, _currentPrompt, the big
+    // status value) stays in the logic layer and is spoken
+    // in Chinese through the existing speech path; nothing
+    // is rendered. The button keeps its TalkBack Semantics
+    // label and long-press action, and the physical
+    // press-and-hold gestures are unchanged.
     return Scaffold(
-      appBar: AppBar(title: const Text('明途 AI v0.7（演示原型）')),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          // Step C layout (blind-first): a fixed top zone --
-          // the big status line plus the camera area filling
-          // the upper part of the screen -- then the very
-          // large push-to-talk button, then the original demo
-          // panel in its own scroll region below, so every
-          // review control stays reachable.
-          Padding(
-            padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                // Step 2 voice-first layout: the camera view and
-                // ONE large status line lead the page (this is what
-                // a sighted companion watches); the detailed demo
-                // panel remains below for review. TalkBack reads
-                // the status through the live region.
-                Semantics(
-                  liveRegion: true,
-                  label: '当前状态',
-                  child: Text(
-                    _bigStatusText(),
-                    style: const TextStyle(
-                        fontSize: 30, fontWeight: FontWeight.bold),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          // Camera area: fills the upper part of the screen.
-          // While the live view is open it hosts YoloLiveView;
-          // otherwise a placeholder of the same size explains
-          // the state and offers the EXISTING open flow
-          // (_openYoloLive) -- no parallel camera path.
-          SizedBox(
-            key: const ValueKey('camera-preview-area'),
-            height: MediaQuery.of(context).size.height * 0.38,
+          // Camera preview area (upper half). While the
+          // live view is open it hosts YoloLiveView;
+          // otherwise the area is simply blank.
+          Expanded(
             child: _yoloLiveOpen
                 ? YoloLiveView(
                     modelPath: AppConfig.yoloModelPath,
@@ -4597,494 +4775,52 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                     },
                   )
                 : Container(
+                    key: const ValueKey<String>('camera-preview-area'),
                     color: Colors.black12,
-                    alignment: Alignment.center,
-                    padding: const EdgeInsets.all(16),
-                    // The placeholder content scales down on
-                    // small screens with large text instead of
-                    // overflowing the fixed camera area. (No
-                    // nested scrollable here: the demo panel
-                    // below is the page's single vertical
-                    // scroll region.)
-                    child: FittedBox(
-                      fit: BoxFit.scaleDown,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: <Widget>[
-                          const Text(
-                            '摄像头未开启',
-                            style: TextStyle(
-                                fontSize: 24, fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(height: 4),
-                          const Text('导航开始时会自动开启；也可以点下面按钮开启。'),
-                          const SizedBox(height: 8),
-                          ElevatedButton(
-                            onPressed: () => unawaited(_openYoloLive()),
-                            child: const Text('打开摄像头（YOLO 实时检测）',
-                                style: TextStyle(fontSize: 20)),
-                          ),
-                        ],
-                      ),
-                    ),
                   ),
           ),
-          const SizedBox(height: 12),
-          // Step C: the one very large push-to-talk button.
-          // Hold: vibrate, stop the automatic session and
-          // any non-P0 speech, speak the cue and await it,
-          // then listen while held. Release: stop listening
-          // and submit the result. The button is never
-          // disabled: with no recogniser the press still
-          // produces the vibrated, spoken failure feedback
-          // instead of dead silence. The semantics node
-          // carries a long-press action so TalkBack users
-          // can trigger the same press-and-hold flow.
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
-            child: Semantics(
-              button: true,
-              container: true,
-              label: '按住说话按钮，按住后说话，松开结束',
-              onLongPress: () {
-                _pushToTalkStart();
-                // TalkBack has no physical hold-and-release:
-                // a long-press action starts the turn, and a
-                // generous window later the turn ends and
-                // submits, like a release.
-                Future<void>.delayed(const Duration(seconds: 10), () {
-                  if (mounted && _pushToTalkHeld) {
-                    unawaited(_pushToTalkEnd());
-                  }
-                });
-              },
-              child: GestureDetector(
-                onLongPressStart: (_) => _pushToTalkStart(),
-                onLongPressEnd: (_) => _pushToTalkEnd(),
-                child: Container(
-                  key: const ValueKey('push-to-talk-area'),
-                  height: 132,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.primaryContainer,
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: const Text(
-                    '按住说话',
-                    style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold),
+          // The one very large push-to-talk area (lower
+          // half): a plain colour block with no caption.
+          // Hold: vibrate, stop any non-P0 speech, speak
+          // the cue and await it, then listen while held.
+          // Release: stop listening and submit the result.
+          // The area is never disabled: with no recogniser
+          // the press still produces the vibrated, spoken
+          // failure feedback instead of dead silence. The
+          // semantics node carries a long-press action so
+          // TalkBack users can trigger the same
+          // press-and-hold flow.
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
+              child: Semantics(
+                button: true,
+                container: true,
+                label: '按住说话按钮，按住后说话，松开结束',
+                onLongPress: () {
+                  _pushToTalkStart();
+                  // TalkBack has no physical hold-and-release:
+                  // a long-press action starts the turn, and a
+                  // generous window later the turn ends and
+                  // submits, like a release.
+                  Future<void>.delayed(const Duration(seconds: 10), () {
+                    if (mounted && _pushToTalkHeld) {
+                      unawaited(_pushToTalkEnd());
+                    }
+                  });
+                },
+                child: GestureDetector(
+                  onLongPressStart: (_) => _pushToTalkStart(),
+                  onLongPressEnd: (_) => _pushToTalkEnd(),
+                  child: Container(
+                    key: const ValueKey<String>('push-to-talk-area'),
+                    decoration: BoxDecoration(
+                      color:
+                          Theme.of(context).colorScheme.primaryContainer,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
                   ),
                 ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-          // The original demo panel, unchanged, in its own
-          // scroll region under the button.
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Row(
-                    children: <Widget>[
-                      Expanded(
-                        child: SizedBox(
-                          height: 64,
-                          child: ElevatedButton(
-                            onPressed: () => _handleVoiceCommand('停下'),
-                            child: const Text('停下',
-                                style: TextStyle(fontSize: 22)),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: SizedBox(
-                          height: 64,
-                          child: ElevatedButton(
-                            onPressed: () => _askDestination(),
-                            child: const Text('重新问目的地',
-                                style: TextStyle(fontSize: 22)),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  const Text(
-                    '明途 AI：面向视障人士的校园出行辅助演示原型。',
-                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    '语音是主要交互方式；本页面是演示辅助界面，'
-                    '供有视力的评审查看当前状态和当前提示。'
-                    '当前在网页 / 虚拟机中运行的是模拟流程，'
-                    '不是真实传感器导航，不能用于真实道路，'
-                    '也不能替代盲杖、导盲犬或专业定向行走训练，'
-                    '也未经过真实道路验证。',
-                  ),
-                  const SizedBox(height: 12),
-                  Text('配置状态：地图：${AppConfig.routeProxyStatus}；'
-                      'YOLO：${AppConfig.yoloStatus}；'
-                      '云端模型：${AppConfig.llmStatus}；'
-                      '云端识图：${AppConfig.visionProxyStatus}。'),
-                  const SizedBox(height: 8),
-                  // v0.6 real-integration status: TTS/ASR/YOLO/Amap report
-                  // their own availability; "已接入" only appears when the
-                  // phone's engine actually answered at startup.
-                  Text(_voiceText),
-                  const SizedBox(height: 8),
-                  Text(_amapText),
-                  const SizedBox(height: 8),
-                  Text(_yoloText),
-                  const SizedBox(height: 8),
-                  // Refactor phase 1 health display: only reports services
-                  // that actually reported. Empty means "no degradation
-                  // reported", never "everything is healthy".
-                  Text(_health.announcementText().isEmpty
-                      ? '系统健康：暂无已上报的降级（演示中仅紧急流程会主动上报本地服务状态，未上报的服务不伪造健康）。'
-                      : '系统健康：${_health.announcementText()}'),
-                  const SizedBox(height: 12),
-                  Semantics(
-                    label: '当前任务状态',
-                    // v0.5: show the Chinese state name, never the English
-                    // enum name, so a screen reader reads it correctly.
-                    child: Text('当前任务状态：${_stateText(state)}'),
-                  ),
-                  const SizedBox(height: 8),
-                  Semantics(
-                    liveRegion: true,
-                    label: '当前提示',
-                    child: Text(
-                      '当前提示：$_currentPrompt',
-                      style: const TextStyle(fontSize: 20),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text('路线：$_routeText'),
-                  const SizedBox(height: 8),
-                  Text('障碍：$_obstacleText'),
-                  const SizedBox(height: 8),
-                  Text('入口：$_entranceText'),
-                  const SizedBox(height: 8),
-                  Text('室内：$_indoorText'),
-                  const SizedBox(height: 8),
-                  Text('紧急求助：$_emergencyText'),
-                  const SizedBox(height: 8),
-                  Text('录像：$_recordingText'),
-                  const SizedBox(height: 8),
-                  Text('云端网关：$_llmText'),
-                  Text(_cloudVisionText),
-                  const SizedBox(height: 8),
-                  Text('感知：$_perceptionText'),
-                  const SizedBox(height: 8),
-                  const SizedBox(height: 8),
-                  Text('路口：$_trafficText'),
-                  const SizedBox(height: 8),
-                  Text(
-                      'Skill 注册：${_registry.list().length} 个（车站完整服务未注册；路口只提示不放行；相册导出 NOT_CONFIGURED）。'),
-                  const SizedBox(height: 24),
-                  const Text('语音控制（盲人优先：不用看屏幕点步骤也能控制）',
-                      style:
-                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'v0.6：真机上点“开始语音识别”就是系统语音识别（单次最长 10 秒），'
-                    '识别结果按语音指令解析执行；下面这个输入框是演示代替，'
-                    '在网页 / 没有语音引擎时用。'
-                    '也可以直接点下面的暂停、继续、再说一遍、现在到哪了。',
-                  ),
-                  const SizedBox(height: 8),
-                  Semantics(
-                    label: '语音指令输入，演示用，代替真实语音识别',
-                    child: TextField(
-                      controller: _voiceController,
-                      decoration: const InputDecoration(
-                        hintText: '例如：暂停、继续、再说一遍、现在到哪了、我需要帮助',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  _demoButton(
-                    label: '开始语音识别（真机，单次最长 10 秒）',
-                    semanticsLabel: '开始语音识别',
-                    onPressed: _voiceInput.isAvailable ? _announceHoldToTalkHint : null,
-                  ),
-                  _demoButton(
-                    label: '停止语音识别',
-                    semanticsLabel: '停止语音识别',
-                    onPressed: _voiceInput.isAvailable ? _stopListening : null,
-                  ),
-                  _demoButton(
-                    label: '发送语音指令（演示）',
-                    semanticsLabel: '发送语音指令',
-                    onPressed: () => _handleVoiceCommand(_voiceController.text),
-                  ),
-                  _demoButton(
-                    label: '高德真实路线（真实导航：需已核验目的地与路线代理）',
-                    semanticsLabel: '高德真实路线',
-                    onPressed: _fetchAmapRoute,
-                  ),
-                  _demoButton(
-                    label:
-                        _yoloLiveOpen ? '关闭 YOLO 实时摄像头' : '打开 YOLO 实时摄像头（真机）',
-                    semanticsLabel: '打开或关闭 YOLO 实时摄像头',
-                    onPressed: () {
-                      if (_yoloLiveOpen) {
-                        setState(() {
-                          _closeYoloLiveView();
-                        });
-                      } else {
-                        unawaited(_openYoloLive());
-                      }
-                    },
-                  ),
-                  _demoButton(
-                    label: '模拟 YOLO 检测：前方行人（演示，无摄像头）',
-                    semanticsLabel: '模拟 YOLO 检测前方行人',
-                    onPressed: state == TaskState.navigating
-                        ? () => _onYoloDetections(const <Detection>[
-                              Detection(
-                                  label: 'person',
-                                  confidence: 0.9,
-                                  cx: 0.5,
-                                  cy: 0.5),
-                            ])
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '模拟 YOLO 检测：前方车辆（演示，无摄像头）',
-                    semanticsLabel: '模拟 YOLO 检测前方车辆',
-                    // Enabled while avoiding an obstacle too: a NEW
-                    // danger must be announced even when a risk is
-                    // already active (Codex re-test of f951240), and
-                    // this button exercises that production path.
-                    onPressed: state == TaskState.navigating ||
-                            state == TaskState.avoidingObstacle
-                        ? () => _onYoloDetections(const <Detection>[
-                              Detection(
-                                  label: 'car',
-                                  confidence: 0.9,
-                                  cx: 0.5,
-                                  cy: 0.5),
-                            ])
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '模拟 YOLO：连续 3 帧前方无障碍（演示）',
-                    semanticsLabel: '模拟 YOLO 前方无障碍',
-                    onPressed: state == TaskState.avoidingObstacle
-                        ? () {
-                            for (int i = 0; i < 3; i++) {
-                              _onYoloDetections(const <Detection>[]);
-                            }
-                          }
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '暂停导航（语音）',
-                    semanticsLabel: '暂停导航',
-                    onPressed: _tasks.canTransitionTo(TaskState.paused)
-                        ? () => _handleVoiceCommand('暂停')
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '继续导航（语音，需重新确认直行）',
-                    semanticsLabel: '继续导航',
-                    onPressed: _tasks.state == TaskState.paused
-                        ? () => _handleVoiceCommand('继续')
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '再说一遍',
-                    semanticsLabel: '再说一遍',
-                    onPressed: () => _handleVoiceCommand('再说一遍'),
-                  ),
-                  _demoButton(
-                    label: '现在到哪了',
-                    semanticsLabel: '现在到哪了',
-                    onPressed: () => _handleVoiceCommand('现在到哪了'),
-                  ),
-                  _demoButton(
-                    label: '取消任务（语音）',
-                    semanticsLabel: '取消任务',
-                    onPressed: _tasks.canTransitionTo(TaskState.cancelled)
-                        ? () => _handleVoiceCommand('取消')
-                        : null,
-                  ),
-                  const SizedBox(height: 24),
-                  const Text('演示步骤（按顺序点按）',
-                      style:
-                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 12),
-                  _demoButton(
-                    label: '语音开始（演示输入：带我去图书馆）',
-                    semanticsLabel: '语音开始，演示输入带我去图书馆',
-                    onPressed: state == TaskState.idle ? _startVoice : null,
-                  ),
-                  _demoButton(
-                    label: '理解并规划路线',
-                    semanticsLabel: '理解并规划路线',
-                    onPressed:
-                        state == TaskState.understanding ? _planRoute : null,
-                  ),
-                  _demoButton(
-                    label: '开始导航（直行节奏启动）',
-                    semanticsLabel: '开始导航',
-                    onPressed:
-                        state == TaskState.planning ? _startNavigating : null,
-                  ),
-                  _demoButton(
-                    label: '直行提示（手动，3 秒间隔内不重复）',
-                    semanticsLabel: '直行提示',
-                    onPressed: state == TaskState.navigating &&
-                            _straightConfirmed &&
-                            !_riskActive
-                        ? _manualStraight
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '前方转弯（暂停直行）',
-                    semanticsLabel: '前方转弯',
-                    onPressed: state == TaskState.navigating ? _turn : null,
-                  ),
-                  _demoButton(
-                    label: '重新确认直行路段并恢复',
-                    semanticsLabel: '重新确认直行路段并恢复',
-                    onPressed: state == TaskState.navigating &&
-                            !_straightConfirmed &&
-                            !_riskActive
-                        ? _reconfirmStraight
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '模拟障碍：侧方未确认（应停下，不给步数）',
-                    semanticsLabel: '模拟障碍，侧方未确认',
-                    onPressed: state == TaskState.navigating
-                        ? _obstacleUncertain
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '障碍已移开，重新评估并恢复直行',
-                    semanticsLabel: '障碍已移开，恢复直行',
-                    onPressed:
-                        state == TaskState.avoidingObstacle && _riskActive
-                            ? _obstacleUncertainResolved
-                            : null,
-                  ),
-                  _demoButton(
-                    label: '模拟障碍：侧方已确认（仅演示数据给一步）',
-                    semanticsLabel: '模拟障碍，侧方已确认',
-                    onPressed: state == TaskState.navigating
-                        ? _obstacleConfirmed
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '动作后重新感知，确认后恢复导航',
-                    semanticsLabel: '动作后重新感知',
-                    onPressed: state == TaskState.avoidingObstacle
-                        ? _obstacleConfirmedVerified
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '路口信息提示（只提示，不放行）',
-                    semanticsLabel: '路口信息提示',
-                    onPressed:
-                        state == TaskState.navigating ? _trafficInfo : null,
-                  ),
-                  _demoButton(
-                    label: '模拟行进至接近目的地',
-                    semanticsLabel: '模拟行进至接近目的地',
-                    onPressed: state == TaskState.navigating
-                        ? _destinationApproach
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '寻找入口（先看占位，再看演示已核验候选）',
-                    semanticsLabel: '寻找入口',
-                    onPressed: state == TaskState.findingEntrance
-                        ? _findEntrance
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '进入室内引导',
-                    semanticsLabel: '进入室内引导',
-                    onPressed: state == TaskState.findingEntrance
-                        ? _enterIndoor
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '室内步骤：用演示证据推进',
-                    semanticsLabel: '室内步骤推进',
-                    onPressed:
-                        state == TaskState.indoorGuidance ? _indoorStep : null,
-                  ),
-                  _demoButton(
-                    label: '验证任务（室内全部完成才可）',
-                    semanticsLabel: '验证任务',
-                    onPressed:
-                        state == TaskState.indoorGuidance && _indoor.isCompleted
-                            ? _taskVerify
-                            : null,
-                  ),
-                  _demoButton(
-                    label: '确认任务完成',
-                    semanticsLabel: '确认任务完成',
-                    onPressed: state == TaskState.waitingConfirmation
-                        ? _confirmComplete
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '保留录像（本地）',
-                    semanticsLabel: '保留录像',
-                    onPressed: _recording.current?.status ==
-                            RecordingStatus.pendingConsent
-                        ? _recordingSave
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '删除录像（本地）',
-                    semanticsLabel: '删除录像',
-                    onPressed: _recording.current?.status ==
-                            RecordingStatus.pendingConsent
-                        ? _recordingDelete
-                        : null,
-                  ),
-                  _demoButton(
-                    label: '云端网关演示（只返回决策，无真实调用）',
-                    semanticsLabel: '云端网关演示',
-                    onPressed: _llmDemo,
-                  ),
-                  _demoButton(
-                    label: '云端视觉辅助（低频，经代理，本地检测仍为主）',
-                    semanticsLabel: '云端视觉辅助',
-                    onPressed: _triggerManualVision,
-                  ),
-                  _demoButton(
-                    label: '紧急求助（本地，不依赖网络和大模型）',
-                    semanticsLabel: '紧急求助',
-                    onPressed: _triggerEmergency,
-                  ),
-                  _demoButton(
-                    label: '重置演示',
-                    semanticsLabel: '重置演示',
-                    onPressed: _resetDemo,
-                  ),
-                  const SizedBox(height: 12),
-                  const Text('演示日志（最新在前）',
-                      style:
-                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  for (final String entry in _log.take(15))
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 4),
-                      child: Text('• $entry'),
-                    ),
-                ],
               ),
             ),
           ),

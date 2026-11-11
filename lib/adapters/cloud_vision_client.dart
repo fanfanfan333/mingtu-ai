@@ -42,7 +42,10 @@ typedef VisionSender = Future<String> Function(
   Map<String, String> headers,
 );
 
-Future<String> _defaultSender(
+/// The shared default transport (JSON POST via dart:io).
+/// Public so sibling clients (cloud ASR) reuse the exact same
+/// sender instead of duplicating transport code.
+Future<String> defaultProxySender(
   Uri url,
   String body,
   Map<String, String> headers,
@@ -137,7 +140,7 @@ class CloudVisionClient {
     ImageDownsampler? downsampler,
     VisionRateLimiter? limiter,
     this.requestTimeout = cloudVisionRequestTimeout,
-  })  : sender = sender ?? _defaultSender,
+  })  : sender = sender ?? defaultProxySender,
         downsampler = downsampler ?? codecDownsampler,
         limiter = limiter ?? VisionRateLimiter();
 

@@ -675,17 +675,63 @@ Future<void> holdPastThreshold(WidgetTester tester) async {
 void main() {
   group('step C push-to-talk layout', () {
     testWidgets(
-        'the camera area shows its closed placeholder while '
-        'the live view is closed', (WidgetTester tester) async {
+        'PTT-C: the interface is only the camera area and '
+        'the hold-to-talk area -- zero Text widgets',
+        (WidgetTester tester) async {
+      final SemanticsHandle handle = tester.ensureSemantics();
       await tester.pumpWidget(const MingtuApp());
       await tester.pump();
       await settleStartup(tester);
 
-      // First commit (panel-era layout still in place): the
-      // closed camera area shows its placeholder label. The
-      // blank-area form of this test belongs to the second
-      // commit's zero-Text interface.
-      expect(find.text('摄像头未开启'), findsOneWidget);
+      // No visible text anywhere: no Text widget exists in
+      // the tree at all (Semantics labels are not Text).
+      expect(find.byType(Text), findsNothing);
+      expect(find.text('按住说话'), findsNothing);
+
+      // Structure: exactly the two areas, no scroll view,
+      // no buttons.
+      expect(find.byType(SingleChildScrollView), findsNothing);
+      expect(find.byType(ElevatedButton), findsNothing);
+      final Finder cam =
+          find.byKey(const ValueKey<String>('camera-preview-area'));
+      final Finder ptt =
+          find.byKey(const ValueKey<String>('push-to-talk-area'));
+      expect(cam, findsOneWidget);
+      expect(ptt, findsOneWidget);
+      // The camera area fills the upper half and the PTT
+      // area the lower half; each is large.
+      final Size camSize = tester.getSize(cam);
+      final Size pttSize = tester.getSize(ptt);
+      expect(camSize.height, greaterThan(200),
+          reason: 'camera area: $camSize');
+      expect(pttSize.height, greaterThanOrEqualTo(120),
+          reason: 'ptt area: $pttSize');
+      expect(pttSize.width, greaterThan(200),
+          reason: 'ptt area: $pttSize');
+      expect(tester.getTopLeft(ptt).dy,
+          greaterThan(tester.getTopLeft(cam).dy));
+
+      // TalkBack contract: the PTT semantics node carries
+      // the explicit label AND a long-press action.
+      final SemanticsData data = tester
+          .getSemantics(
+              find.bySemanticsLabel('按住说话按钮，按住后说话，松开结束'))
+          .getSemanticsData();
+      expect(data.label, contains('按住说话按钮，按住后说话，松开结束'));
+      expect(data.hasAction(SemanticsAction.longPress), isTrue);
+      handle.dispose();
+    });
+
+    testWidgets(
+        'the camera area is a blank preview while the live '
+        'view is closed', (WidgetTester tester) async {
+      await tester.pumpWidget(const MingtuApp());
+      await tester.pump();
+      await settleStartup(tester);
+
+      // No placeholder text and no open button anymore:
+      // the closed camera area is simply blank.
+      expect(find.text('摄像头未开启'), findsNothing);
       final Finder area =
           find.byKey(const ValueKey<String>('camera-preview-area'));
       expect(area, findsOneWidget);

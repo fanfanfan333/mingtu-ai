@@ -29,6 +29,16 @@ Contract:
     No DashScope key configured on the server -> 503 (no call).
     Oversize body (> 3 MB) -> 413 (no call).
 
+    POST /asr   (press-and-hold cloud ASR fallback)
+    Same demo-token guard as /vision, but an INDEPENDENT rate
+    limiter and a 1 MB body cap. Body: {"audio": "data:audio/wav;
+    base64,...", "format": "wav"}; the model is pinned here to
+    "qwen3-asr-flash" (a client-sent model is rejected unless it
+    is exactly that). The proxy calls the same pinned Beijing
+    DashScope compatible endpoint; the answer is rebuilt to
+    {"text": ...} only (secret-stripped, trimmed, <= 200 chars).
+    No DashScope key -> 503 "asr_not_configured" (no call).
+
 Environment:
     AMAP_WEB_KEY       (required) Amap Web Service key. Read from
                        the environment only; never logged, never
@@ -794,6 +804,126 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
 
 
 # ------------------------------------------------------------------
+# Cloud ASR (POST /asr): the press-and-hold recording fallback
+# for devices whose system speech engine cannot record (the
+# Xiaomi engine itself lacks the microphone permission). Same
+# guard discipline as /vision -- demo token first, then an
+# INDEPENDENT rate limiter (ASR calls never consume vision
+# quota and vice versa), then the body cap -- and the same
+# whitelist rule: only the transcript text crosses, rebuilt
+# and secret-stripped; upstream prose and errors never do.
+# The model is pinned: qwen3-asr-flash is the cheapest Bailian
+# Beijing tier that accepts a synchronous base64 data-URI
+# (paraformer-v2 is cheaper per second but async-only and
+# URL-only). Env knobs: MINGTU_ASR_PER_MINUTE (default 10),
+# MINGTU_ASR_PER_DAY (default 60).
+# ------------------------------------------------------------------
+
+ASR_MODEL = "qwen3-asr-flash"  # exact lowercase id, pinned
+ASR_UPSTREAM_DEFAULT = VISION_UPSTREAM_DEFAULT  # same endpoint
+ASR_MAX_BODY_BYTES = 1048576  # 1 MB whole-body cap
+ASR_MAX_AUDIO_BYTES = 400000  # decoded clip cap (~10 s of WAV)
+ASR_PER_MINUTE_DEFAULT = 10
+ASR_PER_DAY_DEFAULT = 60
+_ASR_DATA_URI_PREFIX = "data:audio/wav;base64,"
+
+
+def _whitelist_asr_text(raw_body, secrets):
+    """Rebuild an ASR upstream answer as {"text": ...} only.
+
+    The transcript is the user's own speech, so -- unlike the
+    vision scene -- it DOES cross; but it is still treated as
+    untrusted text: secret substrings are stripped, it is
+    trimmed, and it is truncated to 200 chars. Returns None
+    when the body is not the expected chat shape (-> 502).
+    An empty transcript after cleaning is a valid empty text
+    (the client maps it to its no-content outcome)."""
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("error") is not None:
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    cleaned = _strip_secrets(content, secrets).strip()[:200]
+    return json.dumps({"text": cleaned}).encode("utf-8")
+
+
+def handle_asr_body(raw, *, dashscope_key, asr_upstream, poster,
+                    amap_key=""):
+    """Parse, pin, forward and whitelist one /asr request
+    body. Returns (status, body_bytes). Shared by the FC
+    handler and the standalone server, like handle_vision_body."""
+    if asr_upstream != ASR_UPSTREAM_DEFAULT:
+        # The key may ONLY ever go to the pinned endpoint.
+        return 502, json.dumps({"error": "upstream not allowed"}).encode()
+    if not raw:
+        return 400, json.dumps({"error": "empty body"}).encode()
+    if len(raw) > ASR_MAX_BODY_BYTES:
+        return 413, json.dumps({"error": "body too large"}).encode()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return 400, json.dumps({"error": "invalid json"}).encode()
+    if not isinstance(payload, dict):
+        return 400, json.dumps({"error": "invalid json"}).encode()
+    if "model" in payload and payload.get("model") != ASR_MODEL:
+        return 400, json.dumps({"error": "model not allowed"}).encode()
+    audio = payload.get("audio")
+    if not isinstance(audio, str) or not audio.startswith(_ASR_DATA_URI_PREFIX):
+        return 400, json.dumps({"error": "audio required"}).encode()
+    encoded = audio[len(_ASR_DATA_URI_PREFIX):]
+    try:
+        decoded_audio = base64.b64decode(encoded, validate=True)
+    except Exception:
+        return 400, json.dumps({"error": "audio invalid"}).encode()
+    if len(decoded_audio) > ASR_MAX_AUDIO_BYTES:
+        return 400, json.dumps({"error": "audio too large"}).encode()
+    if "format" in payload and payload.get("format") != "wav":
+        return 400, json.dumps({"error": "format not allowed"}).encode()
+    if not dashscope_key:
+        return 503, json.dumps({"error": "asr_not_configured"}).encode()
+    upstream_payload = {
+        "model": ASR_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": audio},
+                    }
+                ],
+            }
+        ],
+        "stream": False,
+        "asr_options": {"language": "zh", "enable_itn": False},
+    }
+    body = json.dumps(upstream_payload).encode("utf-8")
+    try:
+        _status, resp_body = poster(asr_upstream, body, dashscope_key)
+    except (TimeoutError, socket.timeout):
+        return 504, json.dumps({"error": "upstream timeout"}).encode()
+    except Exception:  # no detail: errors may embed headers
+        return 502, json.dumps({"error": "upstream failure"}).encode()
+    cleaned = _whitelist_asr_text(resp_body, [amap_key, dashscope_key])
+    if cleaned is None:
+        return 502, json.dumps({"error": "upstream failure"}).encode()
+    return 200, cleaned
+
+
+# ------------------------------------------------------------------
 # Alibaba Cloud Function Compute entry (HTTP trigger, built-in
 # Python runtime). FC maps the HTTP request into an `event`
 # JSON object (headers / queryParameters / body /
@@ -809,6 +939,7 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
 # ------------------------------------------------------------------
 
 _FC_LIMITER = None
+_FC_ASR_LIMITER = None
 
 
 def _env_positive_int(name, default):
@@ -831,8 +962,21 @@ def _fc_limiter():
     return _FC_LIMITER
 
 
+def _fc_asr_limiter():
+    global _FC_ASR_LIMITER
+    if _FC_ASR_LIMITER is None:
+        _FC_ASR_LIMITER = VisionRateLimiter(
+            _env_positive_int(
+                "MINGTU_ASR_PER_MINUTE", ASR_PER_MINUTE_DEFAULT),
+            _env_positive_int(
+                "MINGTU_ASR_PER_DAY", ASR_PER_DAY_DEFAULT),
+        )
+    return _FC_ASR_LIMITER
+
+
 def fc_handle_event(event, *, dashscope_key=None, expected_token=None,
-                    vision_upstream=None, poster=None, limiter=None):
+                    vision_upstream=None, poster=None, limiter=None,
+                    asr_limiter=None, asr_upstream=None):
     """Handle one FC HTTP-trigger event. The keyword overrides
     exist for tests; production reads the FC environment."""
     if dashscope_key is None:
@@ -845,6 +989,10 @@ def fc_handle_event(event, *, dashscope_key=None, expected_token=None,
         poster = post_upstream
     if limiter is None:
         limiter = _fc_limiter()
+    if asr_limiter is None:
+        asr_limiter = _fc_asr_limiter()
+    if asr_upstream is None:
+        asr_upstream = ASR_UPSTREAM_DEFAULT  # pinned, no env override
     if isinstance(event, (bytes, bytearray)):
         event = json.loads(event.decode("utf-8"))
     if isinstance(event, str):
@@ -863,6 +1011,29 @@ def fc_handle_event(event, *, dashscope_key=None, expected_token=None,
     else:
         body_bytes = (raw_body.encode("utf-8")
                       if isinstance(raw_body, str) else bytes(raw_body))
+    if "asr" in path and "vision" not in path:
+        # /asr: same token guard, ASR's OWN limiter. (Path
+        # check order matters: a /vision path never enters
+        # this branch.)
+        reject = vision_reject_reason(
+            lowered.get(VISION_TOKEN_HEADER), expected_token, asr_limiter)
+        if reject is not None:
+            status, code = reject
+            return _fc_response(status, {"error": code})
+        if len(body_bytes) > ASR_MAX_BODY_BYTES:
+            return _fc_response(413, {"error": "body too large"})
+        status, body = handle_asr_body(
+            body_bytes,
+            dashscope_key=dashscope_key,
+            asr_upstream=asr_upstream,
+            poster=poster,
+        )
+        return {
+            "statusCode": status,
+            "headers": {"Content-Type": "application/json; charset=utf-8"},
+            "isBase64Encoded": False,
+            "body": body.decode("utf-8"),
+        }
     if "vision" not in path:
         return _fc_response(404, {"error": "not found"})
     reject = vision_reject_reason(
@@ -909,6 +1080,8 @@ class WalkingHandler(BaseHTTPRequestHandler):
     poster = staticmethod(post_upstream)
     vision_token = ""
     vision_limiter = None
+    asr_limiter = None
+    asr_upstream = ASR_UPSTREAM_DEFAULT
 
     def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
         # Deliberately path-only: BaseHTTPRequestHandler's default
@@ -964,6 +1137,9 @@ class WalkingHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 - stdlib name
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/asr":
+            self._do_asr_post()
+            return
         if parsed.path != "/vision":
             self._send_json(404, json.dumps({"error": "not found"}).encode())
             return
@@ -1000,6 +1176,38 @@ class WalkingHandler(BaseHTTPRequestHandler):
         )
         self._send_json(status, body)
 
+    def _do_asr_post(self):
+        # Same guard chain as /vision but the ASR limiter and
+        # the 1 MB cap: rejected calls never forward a body.
+        reject = vision_reject_reason(
+            self.headers.get("X-Mingtu-Vision-Token"),
+            self.vision_token,
+            self.asr_limiter,
+        )
+        if reject is not None:
+            status, code = reject
+            self._send_json(status, json.dumps({"error": code}).encode())
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > ASR_MAX_BODY_BYTES:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            self._send_json(413, json.dumps({"error": "body too large"}).encode())
+            return
+        raw = self.rfile.read(length) if length > 0 else b""
+        status, body = handle_asr_body(
+            raw,
+            dashscope_key=self.dashscope_key,
+            asr_upstream=self.asr_upstream,
+            poster=self.poster,
+            amap_key=self.api_key or "",
+        )
+        self._send_json(status, body)
+
 def make_server(
     port,
     api_key,
@@ -1010,6 +1218,7 @@ def make_server(
     poster=None,
     vision_token="",
     vision_limiter=None,
+    asr_limiter=None,
 ):
     handler = type(
         "BoundWalkingHandler",
@@ -1023,6 +1232,7 @@ def make_server(
             "poster": staticmethod(poster or post_upstream),
             "vision_token": vision_token,
             "vision_limiter": vision_limiter,
+            "asr_limiter": asr_limiter,
         },
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -1052,6 +1262,12 @@ def main():
                 "MINGTU_VISION_PER_MINUTE", VISION_PER_MINUTE_DEFAULT),
             _env_positive_int(
                 "MINGTU_VISION_PER_DAY", VISION_PER_DAY_DEFAULT),
+        ),
+        asr_limiter=VisionRateLimiter(
+            _env_positive_int(
+                "MINGTU_ASR_PER_MINUTE", ASR_PER_MINUTE_DEFAULT),
+            _env_positive_int(
+                "MINGTU_ASR_PER_DAY", ASR_PER_DAY_DEFAULT),
         ),
     )
     sys.stderr.write("amap proxy listening on port %d\n" % port)

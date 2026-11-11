@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/adapters/amap_client.dart';
 import 'package:mingtu_ai/adapters/current_location.dart';
+import 'package:mingtu_ai/adapters/voice_recorder.dart';
 import 'package:mingtu_ai/config/verified_locations.dart';
 import 'package:mingtu_ai/core/navigation_tracker.dart';
 import 'package:mingtu_ai/core/real_navigation.dart';
@@ -700,6 +701,36 @@ Future<TestGesture> pressPtt(WidgetTester tester,
   return g;
 }
 
+/// Fake recorder for the cloud ASR fallback route
+/// (MT-1111-PTT-D(5): startup-unavailable presses record).
+class CodexFakeRecorder implements VoiceRecorder {
+  bool started = false;
+  bool cancelled = false;
+
+  @override
+  Future<bool> hasPermission() async => true;
+
+  @override
+  Future<void> start() async {
+    started = true;
+  }
+
+  @override
+  Future<Uint8List?> stop() async {
+    started = false;
+    return Uint8List.fromList(List<int>.filled(2000, 3));
+  }
+
+  @override
+  Future<void> cancel() async {
+    cancelled = true;
+    started = false;
+  }
+
+  @override
+  bool get isRecording => started;
+}
+
 /// Every text actually spoken through the recording TTS
 /// channel anywhere in this file, for the final
 /// forbidden-word sweep.
@@ -708,8 +739,8 @@ final List<String> spokenCorpus = <String>[];
 void main() {
   group('ASR start failure: vibration + fixed notice (behavioural)', () {
     testWidgets(
-        'recogniser unavailable: a press vibrates again and '
-        'speaks the fixed notice verbatim',
+        'recogniser unavailable: startup arms the fallback '
+        'and the FIRST press records directly (PTT-D(5))',
         (WidgetTester tester) async {
       // FIRST widget test in the file: the recogniser
       // singleton has not been initialised successfully
@@ -722,23 +753,40 @@ void main() {
       spokenCorpus.addAll(h.spokenTexts());
       h.events.clear();
 
+      // MT-1111-PTT-D(5): an engine unavailable AT STARTUP
+      // arms the cloud fallback, so the very first press
+      // records with the app's own recorder instead of
+      // attempting (and failing) a system ASR start. (The
+      // old shape of this test asserted the failed-start
+      // vibration + notice; that path is still covered by
+      // 'engine refuses listen' below, where startup
+      // succeeded and the start itself is refused.)
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue,
+          reason: 'startup unavailability must arm the fallback');
+      final CodexFakeRecorder recorder = CodexFakeRecorder();
+      mingtuHomeDebugHandle!.setRecorder(recorder);
+
       final TestGesture gesture = await pressPtt(tester, h);
       expect(h.completeSpeak('请说'), isTrue);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
-
-      // The press vibrated once; the FAILED start vibrates
-      // again and speaks the fixed notice, verbatim from
-      // the production text builder.
-      final String notice = voiceNoticeText(VoiceNoticeKind.asrUnavailable);
-      expect(h.count('vibrate'), 2, reason: '${h.events}');
-      expect(h.events, contains('tts.speak:$notice'),
-          reason: '${h.events}');
-      // No session was ever opened.
+      for (int i = 0; i < 20 && !recorder.started; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(recorder.started, isTrue, reason: '${h.events}');
+      // No system session was ever opened, and the press
+      // vibrated as every press does.
       expect(h.count('asr.listen'), 0, reason: '${h.events}');
-      spokenCorpus.add(notice);
+      expect(h.count('vibrate'), greaterThanOrEqualTo(1),
+          reason: '${h.events}');
 
+      // Release: the clip goes to the cloud route; with no
+      // ASR proxy configured in this environment the press
+      // ends with the fixed not-configured text, verbatim.
+      await holdPastThreshold(tester);
       await gesture.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await pumpUntilSpeak(tester, h, '云端识别未配置，无法识别。');
+      spokenCorpus.addAll(h.spokenTexts());
+
       await drainVoice(tester, h);
       await shutdownVoice(tester, h);
     });

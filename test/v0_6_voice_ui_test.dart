@@ -1,3 +1,4 @@
+import 'package:flutter/material.dart' show Text;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/main.dart';
 
@@ -132,13 +133,9 @@ void main() {
     expect(mingtuHomeDebugHandle!.allStatusText, contains('系统语音合成不可用'));
     expect(mingtuHomeDebugHandle!.allStatusText, contains('系统语音识别不可用'));
 
-    // First commit (panel-era layout still in place): the
-    // panel's start-recognition button still exists as a
-    // widget -- but it no longer opens the microphone (it
-    // speaks the hold-to-talk hint; the PTT tests pin that
-    // behaviour). The zero-Text interface belongs to the
-    // second commit.
-    expect(find.text('开始语音识别（真机，单次最长 10 秒）'), findsOneWidget);
+    // No listen button exists anymore (press-and-hold
+    // only): the interface carries zero Text widgets.
+    expect(find.byType(Text), findsNothing);
 
     await drivePanelAction(
         tester, '高德真实路线（真实导航：需已核验目的地与路线代理）');

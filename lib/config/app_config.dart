@@ -90,6 +90,19 @@ class AppConfig {
   static const String visionDemoToken =
       String.fromEnvironment('MINGTU_VISION_TOKEN');
 
+  /// HTTPS base URL of the cloud-ASR function (the press-and-
+  /// hold recording fallback's /asr route). Optional: when the
+  /// dedicated define is empty the ASR client falls back to
+  /// [visionProxyUrl], because /asr and /vision are routes of
+  /// the SAME FC deployment and share the demo token.
+  static const String _asrProxyUrlDefine =
+      String.fromEnvironment('MINGTU_ASR_PROXY_URL');
+
+  /// Effective ASR proxy base URL (dedicated define first,
+  /// vision proxy as the fallback).
+  static String get asrProxyUrl =>
+      _asrProxyUrlDefine.isNotEmpty ? _asrProxyUrlDefine : visionProxyUrl;
+
   static bool get hasRouteProxy => routeProxyUrl.isNotEmpty;
   static bool get hasAmapDemoKey => amapDemoKey.isNotEmpty;
   static bool get hasYoloModelPath => yoloModelPath.isNotEmpty;

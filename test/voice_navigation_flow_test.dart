@@ -383,14 +383,15 @@ void main() {
       for (int i = 0; i < 20; i++) {
         await tester.pump(const Duration(milliseconds: 1500));
       }
-      // First commit (panel-era layout still in place): the
-      // big status line leads the page and the two big
-      // companion buttons are on it. The zero-Text form of
-      // this test belongs to the second commit.
+      // MT-1111-PTT-C: the big status line and the two big
+      // companion buttons are GONE by design -- the page is
+      // only the camera area and the hold-to-talk area. The
+      // status value survives as state ('明途' at idle), and
+      // the two actions survive as the debug handle's
+      // commands; the assertions now pin exactly that.
       expect(mingtuHomeDebugHandle!.bigStatusText, '明途');
-      expect(find.text('明途'), findsOneWidget);
-      expect(find.text('停下'), findsWidgets);
-      expect(find.text('重新问目的地'), findsWidgets);
+      expect(find.byType(ElevatedButton), findsNothing);
+      expect(find.byType(Text), findsNothing);
       expect(
         find.byKey(const ValueKey<String>('push-to-talk-area')),
         findsOneWidget,
