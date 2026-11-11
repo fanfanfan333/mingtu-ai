@@ -29,6 +29,14 @@
 /// EgoMotion.unknown, no pitch, scale-only -- asserting
 /// its first urgent's frame, true TTC and full sentence
 /// (the no-range form of M2-B item 2).
+/// M2B-FIX1 item 1 then wires the unknown ego into
+/// group (a) itself: its unknown cells now run the
+/// pitched twin of the (a2) dive (pitchDeg 10, the
+/// geometry of Codex's independent reproduction), so
+/// all four (a) cells feed their named ego path for
+/// real. M2B-FIX1A adds the whole-run short-form pin
+/// in group (c) (every urgent of the unknown x T = 1.2
+/// dive, not only the first).
 library;
 
 import 'dart:math' as math;
@@ -121,6 +129,47 @@ class _TrueUnknownAlert {
   return (firstWarning, firstUrgent);
 }
 
+/// (a) M2B-FIX1 item 1: the PITCHED twin of
+/// [_runTrueUnknown] -- the same dive (a car closing
+/// from Z = 12 m at 2.5 m/s, box geometry by [_carAt])
+/// with the same EgoMotion.unknown, but pitchDeg 10, so
+/// a range IS measured and the first urgent carries the
+/// distance segment. This is the construction group
+/// (a)'s unknown cells run on: an unknown ego genuinely
+/// fed into the pipeline, not a still replay under an
+/// 'unknown' label (the M2-B round's label-only cells
+/// are what Codex's PR #4 re-test rejected). Returns
+/// the first warning and the first urgent of the run,
+/// in the shared record shape.
+(_TrueUnknownAlert?, _TrueUnknownAlert?) _runPitchedUnknown(
+    String backend) {
+  final HazardPipeline pipeline =
+      HazardPipeline(tracker: trackerForBackend(backend));
+  final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+  _TrueUnknownAlert? firstWarning;
+  _TrueUnknownAlert? firstUrgent;
+  for (int i = 0; i <= 35; i++) {
+    final HazardPipelineResult r = pipeline.processFrame(
+      <Detection>[_carAt(12.0 - 0.25 * i)],
+      epoch.add(Duration(milliseconds: i * 100)),
+      pitchDeg: 10,
+      ego: EgoMotion.unknown,
+    );
+    if (r.alert != null) {
+      final TrackEstimate chosen = r.estimates.firstWhere(
+          (TrackEstimate e) => e.track.id == r.alert!.trackId);
+      final _TrueUnknownAlert rec =
+          _TrueUnknownAlert(i, r.alert!.phrase, chosen);
+      if (r.alert!.urgent) {
+        firstUrgent ??= rec;
+      } else {
+        firstWarning ??= rec;
+      }
+    }
+  }
+  return (firstWarning, firstUrgent);
+}
+
 _DiveU? _runDiveU(String backend, bool knownEgo, double bigT) {
   final HazardPipeline pipeline =
       HazardPipeline(tracker: trackerForBackend(backend));
@@ -147,36 +196,82 @@ _DiveU? _runDiveU(String backend, bool knownEgo, double bigT) {
   return null;
 }
 
+/// Every urgent of one dive cell, in issuance order
+/// (M2B-FIX1A: the short-form pin for the unknown x
+/// T = 1.2 cell covers the whole run -- first urgent
+/// AND its re-alerts -- not only the first issuance
+/// [_runDiveU] returns).
+List<_DiveU> _runDiveUrgents(String backend, bool knownEgo, double bigT) {
+  final HazardPipeline pipeline =
+      HazardPipeline(tracker: trackerForBackend(backend));
+  final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+  final List<_DiveU> out = <_DiveU>[];
+  for (int i = 0; i <= 14; i++) {
+    final double t = i * 0.1;
+    final HazardPipelineResult r = pipeline.processFrame(
+      (bigT - t) > 0.05
+          ? (knownEgo
+              ? <Detection>[_carAt(6.0 * (bigT - t) / bigT)]
+              : <Detection>[_scaleDive(bigT, t)])
+          : const <Detection>[],
+      epoch.add(Duration(milliseconds: i * 100)),
+      pitchDeg: knownEgo ? 10 : null,
+      ego: knownEgo ? EgoMotion.judge(gpsSpeedMps: 1.2) : EgoMotion.unknown,
+    );
+    if (r.alert != null && r.alert!.urgent) {
+      final TrackEstimate chosen = r.estimates.firstWhere(
+          (TrackEstimate e) => e.track.id == r.alert!.trackId);
+      out.add(_DiveU(
+          i, r.alert!.phrase, (chosen.ttcUrgentS ?? chosen.ttcS)!));
+    }
+  }
+  return out;
+}
+
 void main() {
   group('NH-M1-19 (a): spec 2.7 approaching car, first '
       'urgent is the FULL sentence', () {
-    // HONESTY NOTE (M2-B item 1): the four cells below
-    // are 2 backends x 2 LABELS over ONE ego path. The
-    // fixture harness has no unknown mode at all --
-    // loadFixture's rows carry ego: 'still', and its
+    // PROVENANCE (rewritten by M2B-FIX1 item 1): the
+    // four cells are 2 backends x 2 ego paths, and BOTH
+    // paths are now genuinely fed into the pipeline.
+    // The M2-B round had found the harness limitation --
+    // loadFixture's rows carry ego: 'still' and its
     // parser maps only 'walking' to a judged motion,
-    // everything else to EgoMotion.still -- so the two
-    // cells labelled 'unknown' feed EgoMotion.still into
-    // the pipeline and replay the still estimates frame
-    // for frame; they assert the still path twice per
-    // backend, NOT an unknown-ego path. Per cell:
-    //   bytetrack x 'still'   = still ego, truly fed;
-    //   bytetrack x 'unknown' = still ego (label only);
-    //   sort      x 'still'   = still ego, truly fed;
-    //   sort      x 'unknown' = still ego (label only).
-    // The TRUE unknown-ego approaching assertion lives
-    // in group (a2) below (EgoMotion.unknown, pitchDeg
-    // null, scale-only path). All four cells here share
-    // the issuance frame (t = 3000 ms, true TTC 3.0 s)
-    // and the sentence.
+    // everything else to EgoMotion.still -- and renamed
+    // the two 'unknown' cells unknown-LABELLED while
+    // adding the no-pitch true-unknown group (a2) below;
+    // Codex's PR #4 re-test (S2) still rejected the
+    // loop: renamed is not fed. The unknown cells now
+    // run [_runPitchedUnknown]: the (a2) dive
+    // construction with pitchDeg 10 and the same
+    // EgoMotion.unknown -- Codex's own independent
+    // reproduction geometry (carAt + pitch 10). Per
+    // cell:
+    //   bytetrack x still   = fixture replay, ego
+    //     'still' truly fed; first urgent t = 3000 ms
+    //     (frame 30), true TTC 3.0 s;
+    //   sort      x still   = same, other backend;
+    //   bytetrack x unknown = pitched primitives dive,
+    //     EgoMotion.unknown truly fed (issuance
+    //     estimate proves it: egoSpeedKnown false,
+    //     approaching false, range measured ~= 6.5 m);
+    //     first urgent frame 22, true TTC 2.6 s;
+    //   sort      x unknown = same, other backend.
+    // The pitch is the only construction difference
+    // from (a2): it is what makes the range, and with
+    // it the distance segment of the sentence. The
+    // no-pitch unknown path keeps its own group (a2).
     //
-    // WHAT THE FULL SENTENCE IS (measured): at issuance
-    // the chosen track's range is ~= 6.0-6.04 m -- the
-    // FAR wording band (range > nearWordingRangeM), so
-    // the sentence is the clock form '停，十二点钟方向约五米，
-    // 汽车靠近' -- the far template speaks the LABEL's name
+    // WHAT THE FULL SENTENCE IS (measured): at
+    // issuance the chosen track's range is ~= 6.0-6.04
+    // m (still fixture) / ~= 6.5 m (unknown pitched) --
+    // the FAR wording band (range >
+    // nearWordingRangeM) on both paths, so the sentence
+    // is the clock form '停，十二点钟方向约五米，汽车靠近' --
+    // the far template speaks the LABEL's name
     // （汽车 for 'car'), not the kind name; the item word
-    // Codex's "带物品" refers to is this 汽车.
+    // Codex's "带物品" refers to is this 汽车. Both ego
+    // paths converge on the SAME sentence verbatim.
     // THE "14 CHARACTERS" CHECK (for the lead and
     // Codex): Codex's report calls this sentence 14
     // characters, and by the gate's OWN counting rule it
@@ -187,59 +282,138 @@ void main() {
     // clock segment; the string itself was never in
     // dispute and is asserted verbatim below.)
     // THE GATE ARITHMETIC (for Codex): tauNow measures
-    // 2.7006 (sort) / 2.7311 (bytetrack);
-    //   condition 1: 2.70-2.73 < 1.5  -> FALSE
-    //   condition 2: 2.70-2.73 < 14 x 0.25 = 3.5 -> TRUE
+    // 2.7006 (sort) / 2.7311 (bytetrack) on the still
+    // path and 2.7433 (sort) / 2.7793 (bytetrack) on
+    // the unknown pitched path -- one band, [2.70,
+    // 2.78], all four cells;
+    //   condition 1: 2.70-2.78 < 1.5  -> FALSE
+    //   condition 2: 2.70-2.78 < 14 x 0.25 = 3.5 -> TRUE
     // Condition 1 fails, so the full sentence is kept --
     // exactly the NH-M1-17 defect (its only condition was
     // a duration comparison, which is true here) removed.
     const String fullSentence = '停，十二点钟方向约五米，汽车靠近';
     for (final String backend in kBackends) {
-      for (final bool unknownLabel in <bool>[false, true]) {
-        test('$backend x ${unknownLabel ? 'unknown-LABELLED (still estimates -- see the honesty note)' : 'still'} ego: '
-            'first urgent is the 14-character full sentence, '
-            'item and bearing included', () {
-          final FixtureRun run = runFixture('approaching_car.jsonl', backend);
-          expect(run.urgents, isNotEmpty);
-          final AlertRecord first = run.urgents.first;
-          expect(first.tMs, 3000,
-              reason: 'issuance frame unchanged (true TTC '
-                  '3.0 s at first urgent)');
-          expect(first.phrase, fullSentence,
-              reason: 'verbatim: the full sentence, not '
-                  'the short form');
-          expect(voicedCharCount(first.phrase), 14,
-              reason: 'fourteen voiced characters (runes, '
-                  'punctuation excluded -- the gate\'s own '
-                  'counting rule), matching Codex\'s count '
-                  'of this sentence');
-          expect(first.phrase.contains('汽车'), isTrue,
-              reason: 'the item word is present');
-          expect(first.phrase.contains('十二点钟方向'), isTrue,
-              reason: 'the bearing is present');
-          final List<TrackEstimate> es =
-              run.estimatesByTime[first.tMs]!;
-          final TrackEstimate chosen = es.firstWhere(
-              (TrackEstimate e) => e.track.id == first.trackId);
-          final double tauNow = (chosen.ttcUrgentS ?? chosen.ttcS)!;
-          expect(tauNow, inInclusiveRange(2.70, 2.78),
-              reason: 'the issuance tauNow Codex measured '
-                  '(2.70-2.78 s across the combinations)');
-          expect(shortFormApplies(tauNow, fullSentence), isFalse,
-              reason: 'condition 1 fails at tauNow ~= 2.7 s '
-                  '(>= 1.5 s): the gate keeps the full '
-                  'sentence');
-          expect(
-              tauNow <
-                  voicedCharCount(fullSentence) *
-                      NavHazConfig.shortPhraseSecondsPerChar,
-              isTrue,
-              reason: 'condition 2 alone WOULD pass '
-                  '(2.7 < 3.5) -- NH-M1-17\'s single '
-                  'condition is exactly what NH-M1-19 '
-                  'superseded');
-        });
-      }
+      test('$backend x still ego: first urgent is the '
+          '14-character full sentence, item and bearing '
+          'included', () {
+        final FixtureRun run = runFixture('approaching_car.jsonl', backend);
+        expect(run.urgents, isNotEmpty);
+        final AlertRecord first = run.urgents.first;
+        expect(first.tMs, 3000,
+            reason: 'issuance frame unchanged (true TTC '
+                '3.0 s at first urgent)');
+        expect(first.phrase, fullSentence,
+            reason: 'verbatim: the full sentence, not '
+                'the short form');
+        expect(voicedCharCount(first.phrase), 14,
+            reason: 'fourteen voiced characters (runes, '
+                'punctuation excluded -- the gate\'s own '
+                'counting rule), matching Codex\'s count '
+                'of this sentence');
+        expect(first.phrase.contains('汽车'), isTrue,
+            reason: 'the item word is present');
+        expect(first.phrase.contains('十二点钟方向'), isTrue,
+            reason: 'the bearing is present');
+        final List<TrackEstimate> es =
+            run.estimatesByTime[first.tMs]!;
+        final TrackEstimate chosen = es.firstWhere(
+            (TrackEstimate e) => e.track.id == first.trackId);
+        final double tauNow = (chosen.ttcUrgentS ?? chosen.ttcS)!;
+        expect(tauNow, inInclusiveRange(2.70, 2.78),
+            reason: 'the issuance tauNow Codex measured '
+                '(2.70-2.78 s across the combinations)');
+        expect(shortFormApplies(tauNow, fullSentence), isFalse,
+            reason: 'condition 1 fails at tauNow ~= 2.7 s '
+                '(>= 1.5 s): the gate keeps the full '
+                'sentence');
+        expect(
+            tauNow <
+                voicedCharCount(fullSentence) *
+                    NavHazConfig.shortPhraseSecondsPerChar,
+            isTrue,
+            reason: 'condition 2 alone WOULD pass '
+                '(2.7 < 3.5) -- NH-M1-17\'s single '
+                'condition is exactly what NH-M1-19 '
+                'superseded');
+      });
+
+      test('$backend x unknown ego (pitched, truly fed): '
+          'first urgent at frame 22, true TTC 2.6 s, the '
+          '14-character full sentence with distance, item '
+          'and bearing', () {
+        final (_TrueUnknownAlert? firstWarning,
+            _TrueUnknownAlert? firstUrgent) =
+            _runPitchedUnknown(backend);
+        final _TrueUnknownAlert u = firstUrgent!;
+        // The scene really ran the unknown path: no ego
+        // speed, no approaching test -- proven on the
+        // issuance frame's own estimate, and (the
+        // contrast with (a2)) a range WAS measured,
+        // because this runner feeds pitchDeg 10.
+        expect(u.chosen.egoSpeedKnown, isFalse,
+            reason: 'EgoMotion.unknown truly fed: no ego '
+                'speed on the issuance estimate');
+        expect(u.chosen.approaching, isFalse,
+            reason: 'no approaching test exists without '
+                'an ego speed');
+        expect(u.chosen.rangeM, isNotNull,
+            reason: 'pitched: a range was measured (the '
+                '(a2) no-pitch run has rangeM null)');
+        expect(u.chosen.rangeM!, inInclusiveRange(6.4, 6.6),
+            reason: 'measured issuance range ~= 6.5 m '
+                '(6.5009 sort / 6.5477 bytetrack)');
+        expect(u.frame, 22,
+            reason: 'the first urgent lands at frame 22 '
+                '(same on both backends) -- the frame '
+                'Codex\'s independent reproduction found');
+        expect((12.0 - 0.25 * u.frame) / 2.5,
+            closeTo(2.6, 1e-9),
+            reason: 'true TTC at issuance: Z = 6.5 m '
+                'closing at 2.5 m/s is 2.6 s');
+        expect(u.phrase, fullSentence,
+            reason: 'verbatim: the same 14-character '
+                'full sentence as the still cells -- '
+                'distance （约五米）, item （汽车） and '
+                'bearing （十二点钟方向） all present');
+        expect(voicedCharCount(u.phrase), 14,
+            reason: 'fourteen voiced characters, the '
+                'gate\'s own counting rule');
+        expect(u.phrase.contains('汽车'), isTrue,
+            reason: 'the item word is present');
+        expect(u.phrase.contains('十二点钟方向'), isTrue,
+            reason: 'the bearing is present');
+        expect(u.phrase.contains('约五米'), isTrue,
+            reason: 'the distance segment is present -- '
+                'the pitched form, not the (a2) no-range '
+                'form');
+        final double tauNow =
+            (u.chosen.ttcUrgentS ?? u.chosen.ttcS)!;
+        expect(tauNow, inInclusiveRange(2.70, 2.78),
+            reason: 'the issuance tauNow (2.7433 sort / '
+                '2.7793 bytetrack) sits in the same band '
+                'as the still cells');
+        expect(shortFormApplies(tauNow, fullSentence), isFalse,
+            reason: 'condition 1 fails at tauNow ~= 2.7 s '
+                '(>= 1.5 s): the gate keeps the full '
+                'sentence on the unknown path too');
+        expect(
+            tauNow <
+                voicedCharCount(fullSentence) *
+                    NavHazConfig.shortPhraseSecondsPerChar,
+            isTrue,
+            reason: 'condition 2 alone would pass '
+                '(2.7 < 3.5), as on the still path');
+        // The first warning of the same run (frame 2,
+        // both backends): its measured range ~= 11.5 m
+        // sits in the no-number band, so the warning
+        // renders the same string (a2)'s no-range
+        // warning renders -- same text, different
+        // provenance (a measured range whose band
+        // speaks no number).
+        expect(firstWarning?.frame, 2);
+        expect(firstWarning?.phrase, '注意，十二点钟方向，汽车靠近',
+            reason: 'the warning form of this run');
+      });
     }
   });
 
@@ -424,6 +598,108 @@ void main() {
                 'x 0.25 = 2.25 s > 1.29) BOTH conditions '
                 'are true -- the premise as stated for a '
                 'ranged centre target');
+        // M2B-FIX1A pins (pipeline level, verbatim):
+        // the text the pipeline actually issued for
+        // this cell is the short form itself, spelled
+        // out, and inside the in-vocabulary cap.
+        expect(u.phrase, '停，前方来车',
+            reason: 'verbatim at the pipeline level: '
+                'the short form for a dead-centre car, '
+                'not the 11-character clock sentence');
+        expect(voicedCharCount(u.phrase), 5,
+            reason: 'five voiced characters');
+        expect(voicedCharCount(u.phrase),
+            lessThanOrEqualTo(
+                NavHazConfig.shortPhraseMaxCharsInVocabulary),
+            reason: 'inside the NH-M1-19 in-vocabulary '
+                'short-form cap');
+        // The gate's baseline for this issuance is the
+        // composed normal sentence: with rangeM null
+        // the composition IS the 11-char clock form
+        // (hazardPhrase's null branch) -- the exact
+        // string the condition-2 arithmetic above runs
+        // on. Pinned so a future composition change
+        // cannot silently re-base the gate.
+        expect(
+            hazardPhrase(
+                urgent: true,
+                name: '汽车',
+                isVehicle: true,
+                cx: 0.5,
+                rangeM: null),
+            noRangeFull,
+            reason: 'the gate baseline for a null range '
+                'is the no-range full sentence');
+        // M2B-FIX1A FORENSIC NOTE (why no production
+        // fix accompanies these pins): Codex's PR #4
+        // re-test reported this cell speaking the
+        // 11-char clock sentence. This round re-audited
+        // the whole issuance chain on the cc03c32 tree
+        // (byte-identical to this worktree for the
+        // chain's files): the phrase is composed at
+        // exactly ONE site (HazardPolicy.evaluate hands
+        // hazardPhrase's output to the gate as its
+        // baseline and speaks either it or the short
+        // form; main.dart speaks alert.phrase verbatim),
+        // and the gate's remaining-TTC input is the
+        // issuance estimate's ttcUrgentS ?? ttcS. A
+        // parameter sweep over the unknown-ego
+        // geometries (carAt dives across starting
+        // ranges / closing speeds / pitches, scale
+        // dives across initial sizes / totals / frame
+        // intervals / growth shapes -- 880+ urgent
+        // alerts) found NO issuance that speaks the
+        // no-range full form while both gate conditions
+        // hold on the gate's own inputs: the full-form
+        // urgents of this family occur only where
+        // condition 1 is FALSE (the (a2) dive's frame-
+        // 22 first urgent at tauNow ~= 2.74-2.78 and
+        // its re-alerts at ~= 1.58-1.64). The pins
+        // above and the whole-run test below lock the
+        // cell's behaviour at the pipeline level, so
+        // any future bypass -- in the gate, the
+        // composition, or the branch order -- fails
+        // here first.
+      });
+
+      test('$backend x unknown ego x T=1.2: EVERY urgent '
+          'of the run speaks the short form (M2B-FIX1A '
+          'whole-run pin)', () {
+        final List<_DiveU> urgents =
+            _runDiveUrgents(backend, false, 1.2);
+        expect(urgents.map((_DiveU u) => u.frame).toList(),
+            <int>[2, 7],
+            reason: 'measured issuance frames of this '
+                'cell: the first urgent and its one '
+                're-alert inside the run');
+        for (final _DiveU u in urgents) {
+          expect(u.phrase, '停，前方来车',
+              reason: 'frame ${u.frame}: the pipeline '
+                  'issued the short form verbatim');
+          expect(
+              u.phrase,
+              shortUrgentPhrase(
+                  HazardKind.motorVehicle, '汽车', 0.5),
+              reason: 'frame ${u.frame}: the short-table '
+                  'member for this kind / name / bearing');
+          expect(voicedCharCount(u.phrase),
+              lessThanOrEqualTo(
+                  NavHazConfig.shortPhraseMaxCharsInVocabulary),
+              reason: 'frame ${u.frame}: inside the '
+                  'in-vocabulary cap');
+          expect(u.tauNow, lessThan(NavHazConfig.preVibrationTtcS),
+              reason: 'frame ${u.frame}: condition 1 '
+                  'holds on the gate\'s own input '
+                  '(tauNow ${u.tauNow})');
+          expect(
+              shortFormApplies(u.tauNow, '停，十二点钟方向，汽车靠近'),
+              isTrue,
+              reason: 'frame ${u.frame}: both conditions '
+                  'hold against the no-range full '
+                  'sentence -- the gate selects the '
+                  'short form at every issuance of this '
+                  'cell, not only the first');
+        }
       });
 
       test('$backend x known ego x T=1.2: measured by the '

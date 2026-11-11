@@ -191,10 +191,10 @@ void main() {
       //   label name x three bearings, 18 distinct texts
       //   replacing the 4 kind-only ones): the 3 forms
       //   that already existed stay ('停，前方来车',
-      //   '停，前方有人', '停，前方有杂物'), the one
-      //   NH-M1-17 form that existed only as a short form
-      //   is REPLACED as a short form ('停，前方有杆子' ->
-      //   the pole short '停，前方有杆') -- note the
+      //   '停，前方有人', '停，前方有杂物'); the remaining
+      //   NH-M1-17 form is REPLACED as a short form
+      //   ('停，前方有杆子' -> the pole short '停，前方有杆')
+      //   -- note the
       //   direction of the survival, stated precisely
       //   (M2-B item 3: an earlier draft of this comment
       //   attached it to the wrong form): it is the OLD
