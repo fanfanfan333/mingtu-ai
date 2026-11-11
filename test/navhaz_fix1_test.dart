@@ -22,6 +22,13 @@
 ///  (c) the T = 1.2 grid cells: decided by the formula on
 ///      measured values (unknown ego is the documented
 ///      short-form case; known ego is measured below).
+/// M2-B item 1 adds (a2): group (a)'s "unknown ego"
+/// cells never fed an unknown ego into the pipeline at
+/// all (see the honesty note inside group (a)); (a2) is
+/// the TRUE unknown-ego approaching geometry -- real
+/// EgoMotion.unknown, no pitch, scale-only -- asserting
+/// its first urgent's frame, true TTC and full sentence
+/// (the no-range form of M2-B item 2).
 library;
 
 import 'dart:math' as math;
@@ -67,6 +74,53 @@ class _DiveU {
   const _DiveU(this.frame, this.phrase, this.tauNow);
 }
 
+/// (a2) M2-B item 1: one alert of the TRUE unknown-ego
+/// dive -- frame, phrase and the chosen track's estimate
+/// on the issuance frame.
+class _TrueUnknownAlert {
+  final int frame;
+  final String phrase;
+  final TrackEstimate chosen;
+  const _TrueUnknownAlert(this.frame, this.phrase, this.chosen);
+}
+
+/// The true unknown-ego approaching geometry (M2-B
+/// item 1): the ego test (4) dive -- a car closing from
+/// Z = 12 m at 2.5 m/s (box geometry by [_carAt]) -- but
+/// with pitchDeg NULL and EgoMotion.unknown, so no
+/// range exists at all and the scale leg is the only
+/// evidence: GPS/step evidence both absent, ego speed
+/// unknown, approach unconfirmable. True TTC at frame i
+/// is (12 - 0.25 i) / 2.5 s. Returns the first warning
+/// and the first urgent of the run.
+(_TrueUnknownAlert?, _TrueUnknownAlert?) _runTrueUnknown(String backend) {
+  final HazardPipeline pipeline =
+      HazardPipeline(tracker: trackerForBackend(backend));
+  final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+  _TrueUnknownAlert? firstWarning;
+  _TrueUnknownAlert? firstUrgent;
+  for (int i = 0; i <= 35; i++) {
+    final HazardPipelineResult r = pipeline.processFrame(
+      <Detection>[_carAt(12.0 - 0.25 * i)],
+      epoch.add(Duration(milliseconds: i * 100)),
+      pitchDeg: null,
+      ego: EgoMotion.unknown,
+    );
+    if (r.alert != null) {
+      final TrackEstimate chosen = r.estimates.firstWhere(
+          (TrackEstimate e) => e.track.id == r.alert!.trackId);
+      final _TrueUnknownAlert rec =
+          _TrueUnknownAlert(i, r.alert!.phrase, chosen);
+      if (r.alert!.urgent) {
+        firstUrgent ??= rec;
+      } else {
+        firstWarning ??= rec;
+      }
+    }
+  }
+  return (firstWarning, firstUrgent);
+}
+
 _DiveU? _runDiveU(String backend, bool knownEgo, double bigT) {
   final HazardPipeline pipeline =
       HazardPipeline(tracker: trackerForBackend(backend));
@@ -96,12 +150,25 @@ _DiveU? _runDiveU(String backend, bool knownEgo, double bigT) {
 void main() {
   group('NH-M1-19 (a): spec 2.7 approaching car, first '
       'urgent is the FULL sentence', () {
-    // The fixture runs BOTH ego modes of the harness
-    // (still and unknown -- the unknown-ego scale path
-    // replays the same per-frame estimates): all four
-    // backend x ego combinations share the issuance
-    // frame (t = 3000 ms, true TTC 3.0 s) and the
-    // sentence.
+    // HONESTY NOTE (M2-B item 1): the four cells below
+    // are 2 backends x 2 LABELS over ONE ego path. The
+    // fixture harness has no unknown mode at all --
+    // loadFixture's rows carry ego: 'still', and its
+    // parser maps only 'walking' to a judged motion,
+    // everything else to EgoMotion.still -- so the two
+    // cells labelled 'unknown' feed EgoMotion.still into
+    // the pipeline and replay the still estimates frame
+    // for frame; they assert the still path twice per
+    // backend, NOT an unknown-ego path. Per cell:
+    //   bytetrack x 'still'   = still ego, truly fed;
+    //   bytetrack x 'unknown' = still ego (label only);
+    //   sort      x 'still'   = still ego, truly fed;
+    //   sort      x 'unknown' = still ego (label only).
+    // The TRUE unknown-ego approaching assertion lives
+    // in group (a2) below (EgoMotion.unknown, pitchDeg
+    // null, scale-only path). All four cells here share
+    // the issuance frame (t = 3000 ms, true TTC 3.0 s)
+    // and the sentence.
     //
     // WHAT THE FULL SENTENCE IS (measured): at issuance
     // the chosen track's range is ~= 6.0-6.04 m -- the
@@ -128,8 +195,8 @@ void main() {
     // a duration comparison, which is true here) removed.
     const String fullSentence = '停，十二点钟方向约五米，汽车靠近';
     for (final String backend in kBackends) {
-      for (final bool unknown in <bool>[false, true]) {
-        test('$backend x ${unknown ? 'unknown' : 'still'} ego: '
+      for (final bool unknownLabel in <bool>[false, true]) {
+        test('$backend x ${unknownLabel ? 'unknown-LABELLED (still estimates -- see the honesty note)' : 'still'} ego: '
             'first urgent is the 14-character full sentence, '
             'item and bearing included', () {
           final FixtureRun run = runFixture('approaching_car.jsonl', backend);
@@ -173,6 +240,89 @@ void main() {
                   'superseded');
         });
       }
+    }
+  });
+
+  group('M2-B (a2): TRUE unknown ego (scale-only, no '
+      'pitch) -- the section 2.7 first urgent, asserted '
+      'for real', () {
+    // The construction group (a) never had: the fixture
+    // harness cannot express an unknown ego (its rows
+    // are ego: 'still'), so this scene is built from
+    // primitives -- EgoMotion.unknown (no GPS speed, no
+    // step evidence: EgoMotion.judge with nothing usable
+    // returns exactly this value) and pitchDeg null, so
+    // the estimator has NO range and the scale leg alone
+    // carries the call. Measured on the pre-fix tree and
+    // reconciled with the task brief's given values
+    // BEFORE pinning: first urgent at frame 22, true
+    // TTC at issuance 2.6 s -- both exactly as given.
+    const String noRangeFull = '停，十二点钟方向，汽车靠近';
+    for (final String backend in kBackends) {
+      test('$backend: first urgent at frame 22, true TTC '
+          '2.6 s, the no-range FULL sentence verbatim', () {
+        final (_TrueUnknownAlert? firstWarning,
+            _TrueUnknownAlert? firstUrgent) =
+            _runTrueUnknown(backend);
+        final _TrueUnknownAlert u = firstUrgent!;
+        // The scene really ran the unknown scale-only
+        // path: ego speed unknown, approach untested,
+        // no range measured -- on the issuance frame
+        // itself.
+        expect(u.chosen.egoSpeedKnown, isFalse,
+            reason: 'the scale-only unknown path, proven '
+                'on the issuance estimate');
+        expect(u.chosen.approaching, isFalse,
+            reason: 'no approaching test exists without '
+                'an ego speed');
+        expect(u.chosen.rangeM, isNull,
+            reason: 'no pitch: no range was computed');
+        expect(u.frame, 22,
+            reason: 'the first urgent lands at frame 22 '
+                '(same on both backends)');
+        expect((12.0 - 0.25 * u.frame) / 2.5,
+            closeTo(2.6, 1e-9),
+            reason: 'true TTC at issuance: Z = 6.5 m '
+                'closing at 2.5 m/s is 2.6 s');
+        expect(u.phrase, noRangeFull,
+            reason: 'verbatim: item （汽车） and bearing '
+                '（十二点钟方向） present, distance omitted -- '
+                'the full sentence, not the short form '
+                '(M2-B item 2)');
+        expect(u.phrase.contains('汽车'), isTrue);
+        expect(u.phrase.contains('十二点钟方向'), isTrue);
+        expect(voicedCharCount(u.phrase), 11,
+            reason: 'the no-range full sentence counts '
+                '11 voiced characters');
+        expect(
+            u.phrase,
+            isNot(shortUrgentPhrase(
+                HazardKind.motorVehicle, '汽车', 0.5)),
+            reason: 'and it is NOT the short form -- '
+                'before M2-B item 2 this scene spoke '
+                'exactly that short text as its "full" '
+                'sentence');
+        // The gate agrees it is a full sentence: the
+        // issuance tauNow (2.74 sort / 2.78 bytetrack)
+        // is outside the vibrate-first zone, so
+        // condition 1 fails on both backends.
+        final double tauNow =
+            u.chosen.ttcUrgentS ?? u.chosen.ttcS!;
+        expect(tauNow, inInclusiveRange(2.70, 2.80),
+            reason: 'compensated tauNow at issuance');
+        expect(tauNow < NavHazConfig.preVibrationTtcS,
+            isFalse,
+            reason: 'condition 1 of the NH-M1-19 gate: '
+                'outside the vibrate-first zone');
+        expect(shortFormApplies(tauNow, u.phrase), isFalse,
+            reason: 'the gate keeps the full sentence');
+        // The first warning of the same run is the
+        // no-range warning form (frame 2, both backends).
+        expect(firstWarning?.frame, 2);
+        expect(firstWarning?.phrase, '注意，十二点钟方向，汽车靠近',
+            reason: 'the warning level takes the same '
+                'no-range form');
+      });
     }
   });
 
@@ -236,34 +386,39 @@ void main() {
             reason: 'the cell speaks the short form (the '
                 'documented expectation for this cell)');
         // THE HONEST CONDITION-2 READING (measured, do
-        // not tidy away): the normal sentence THIS
-        // issuance would otherwise speak is dead-centre
-        // with range unknown -- the template's own
-        // minimum, '停，前方来车', 5 voiced characters:
-        // 5 x 0.25 = 1.25 s < tauNow 1.29 s, so condition
-        // 2 evaluated on the template minimum is FALSE
-        // and the gate's verdict rests on the two forms
-        // being textually IDENTICAL here: full and short
-        // are the same string, so the spoken text is the
-        // short form under either verdict. The premise
-        // "the full sentence is longer than 1.29 / 0.25"
-        // holds for the LONGER centre form with a
-        // distance readout (e.g. '停，前方三米有汽车', 9 chars
-        // -> 2.25 s > 1.29) -- that is the sentence shape
-        // this cell would take with a known range, and on
-        // that shape both conditions are true.
-        const String templateMinimum = '停，前方来车';
+        // not tidy away) -- REWRITTEN by M2-B item 2,
+        // which changed the denominator. The FIX1
+        // reading, for the record: the normal sentence
+        // this issuance would otherwise speak was
+        // dead-centre with range unknown -- the
+        // template's own minimum, '停，前方来车', 5 voiced
+        // characters: 5 x 0.25 = 1.25 s < tauNow 1.29 s,
+        // so condition 2 on that sentence was FALSE and
+        // the gate's verdict rested on the two forms
+        // being textually IDENTICAL (full and short the
+        // same string). That coincidence no longer
+        // exists: with no range the full sentence is now
+        // the clock form '停，十二点钟方向，汽车靠近', 11
+        // voiced characters -> threshold 11 x 0.25 =
+        // 2.75 s > tauNow 1.29 s, so condition 2 HOLDS,
+        // and with condition 1 already true the gate's
+        // formal verdict itself is the short form -- the
+        // lead's classification for this cell now
+        // follows from the formula, not from identity.
+        const String noRangeFull = '停，十二点钟方向，汽车靠近';
+        expect(voicedCharCount(noRangeFull), 11,
+            reason: 'the new denominator: the no-range '
+                'full sentence counts 11 voiced characters');
         expect(
-            shortFormApplies(u.tauNow, templateMinimum), isFalse,
-            reason: 'condition 2 on the template minimum: '
-                '1.29 < 5 x 0.25 = 1.25 is FALSE -- the '
-                'gate formally keeps the "full" sentence, '
-                'which IS the short form verbatim on this '
-                'cell');
-        expect(u.phrase, templateMinimum,
-            reason: 'full and short coincide textually '
-                'here -- the expectation "this cell speaks '
-                'the short form" holds on the spoken text');
+            shortFormApplies(u.tauNow, noRangeFull), isTrue,
+            reason: 'condition 2 on the real full '
+                'sentence: 1.29 < 11 x 0.25 = 2.75 is '
+                'TRUE -- BOTH conditions hold, the gate '
+                'itself selects the short form (M2-B)');
+        expect(u.phrase, isNot(noRangeFull),
+            reason: 'the spoken text is the short form, '
+                'NOT the full sentence -- no textual '
+                'coincidence remains');
         expect(shortFormApplies(u.tauNow, '停，前方三米有汽车'), isTrue,
             reason: 'on the longer centre shape (9 chars '
                 'x 0.25 = 2.25 s > 1.29) BOTH conditions '

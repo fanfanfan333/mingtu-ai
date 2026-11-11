@@ -431,6 +431,33 @@ static const double ttsSecondsPerCharUpperBound = 0.30;
 /// measurement behind it yet.
 static const double shortPhraseSecondsPerChar = 0.25;
 
+/// NH-M1-19 voiced-character caps for the short forms
+/// (M2-B item 4: the caps live HERE, once -- the tests
+/// traverse the whole short-form table and read these
+/// constants instead of restating the numbers, so a cap
+/// change is one edit). Characters are counted by
+/// hazard_phrases.voicedCharCount (runes, spoken
+/// punctuation ，。！ excluded) -- the SAME counting the
+/// gate's condition 2 uses; no second counter exists.
+/// - [shortPhraseMaxCharsInVocabulary]: SIX voiced
+///   characters for every short form whose item name
+///   comes from the detector vocabulary (car / truck /
+///   bus / motorcycle / bicycle / person / pole and the
+///   clutter fallback for unlisted labels -- every such
+///   form fits today, the longest being the clutter
+///   centre form at exactly 6).
+/// - [shortPhraseMaxCharsFallback]: EIGHT voiced
+///   characters for the kind-name FALLBACK forms (labels
+///   outside the detector vocabulary speak their kind
+///   name -- 机动车 / 非机动车 -- whose honest item word
+///   is 3 / 4 characters and cannot compress without
+///   misreporting the category). The cap is genuinely
+///   exercised, not headroom: the motor-vehicle centre
+///   form measures 7 and the non-motor centre form
+///   measures exactly 8.
+static const int shortPhraseMaxCharsInVocabulary = 6;
+static const int shortPhraseMaxCharsFallback = 8;
+
 /// NH-M1-17, narrowed by NH-M1-19: NH-M1-17 introduced
 /// the short form (an URGENT whose normal sentence
 /// cannot finish before the physical moment speaks a

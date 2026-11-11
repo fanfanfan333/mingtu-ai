@@ -416,7 +416,12 @@ void main() {
         ]);
       }
       await pumpFrames(tester);
-      final int warnIdx = timeline.indexOf('speak:注意，前方有行人。');
+      // M2-B item 2: the static person's warning has no
+      // range in the widget harness (no pitch), so its
+      // full sentence is the no-range clock form, not
+      // the old null-range zone form.
+      final int warnIdx =
+          timeline.indexOf('speak:注意，十二点钟方向，行人靠近。');
       expect(warnIdx, greaterThanOrEqualTo(0),
           reason: 'timeline: $timeline');
       expect(timeline, contains('vibrate:warning'));

@@ -129,20 +129,26 @@ void main() {
           '注意，十二点钟方向，汽车靠近',
           reason: 'the far form on NaN is the no-number '
               'form, intact');
-      // Honest boundary, recorded not papered over: the
-      // phrase builder's near/far branch keys on
-      // isNearWording(rangeM) == (rangeM == null || rangeM
-      // <= threshold), and a NaN range satisfies NEITHER
-      // disjunct (NaN comparisons are false), so a NaN
-      // range takes the FAR branch where a null range
-      // takes the NEAR branch -- with an abnormal range
-      // the very notion of near/far is undefined, and
-      // hazardPhrase is in production only ever called
-      // with the estimator's rangeM, which is finite or
-      // null (a non-finite raw range never survives the
-      // filter). NH-M1-12's contract -- omit the distance
-      // -- holds on both branches (asserted above); the
-      // branch choice itself is out of this round's scope.
+      // Honest boundary, recorded not papered over --
+      // UPDATED by M2-B item 2: a null range no longer
+      // takes the near branch at all; it takes the
+      // dedicated no-range form (the clock template with
+      // the distance omitted), which lands on the SAME
+      // string a NaN range produces via the far branch
+      // (asserted just above) -- the two cases converge
+      // now instead of diverging. (The NH-M1-12-era note
+      // here described null taking the NEAR branch via
+      // isNearWording's null-inclusive predicate; that
+      // predicate still exists for its other callers, but
+      // hazardPhrase consults it only with a non-null
+      // range.) A NaN range still fails every comparison
+      // and lands far; with an abnormal range the very
+      // notion of near/far is undefined, and hazardPhrase
+      // is in production only ever called with the
+      // estimator's rangeM, which is finite or null (a
+      // non-finite raw range never survives the filter).
+      // NH-M1-12's contract -- omit the distance -- holds
+      // on every branch (asserted above).
     });
 
     test('call site: amapStepSpeechText stands alone on abnormal input',
