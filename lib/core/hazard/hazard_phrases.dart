@@ -444,6 +444,11 @@ List<double> _farRangeSamples() => _enumerationRangeSamples()
 /// hand-listed sample literals, so the enumeration's
 /// range coverage follows the banding definition itself.
 Iterable<String> enumerateAllHazardPhrases() sync* {
+  // NH-M1-17: the short urgent forms are a production
+  // output surface of the policy, so they belong to this
+  // space -- the exhaustion / banned-word corpus covers
+  // them exactly like the templated forms.
+  yield* shortUrgentPhrases();
   final List<double> nearRanges = _nearRangeSamples();
   final List<double> farRanges = _farRangeSamples();
   for (final (String, bool) axis in spokenNameAxes()) {
@@ -526,6 +531,63 @@ Set<String> reachableMetresTexts() {
     lo = hi;
   }
   return out;
+}
+
+/// NH-M1-17: the SHORT form of an urgent announcement,
+/// per hazard kind -- spoken INSTEAD of the normal
+/// [hazardPhrase] when the estimated remaining TTC at
+/// issuance is shorter than the normal phrase's
+/// estimated spoken duration (see NavHazConfig
+/// .ttsSecondsPerCharUpperBound): the normal sentence
+/// would still be speaking when the physical moment
+/// arrives. One form per kind, deliberately minimal:
+/// the stop command plus the category, nothing else --
+/// NO distance figure, NO zone / clock bearing, and NO
+/// step direction (a sideways step still comes only from
+/// the avoidance advisor's three-condition rule, which
+/// the app appends at speech time exactly as for the
+/// normal form). Every form passes the banned-word scan
+/// (asserted in the phrase tests and the exhaustion
+/// corpus: this map is part of [enumerateAllHazardPhrases]'
+/// space via [shortUrgentPhrases]).
+const Map<HazardKind, String> shortUrgentPhraseByKind =
+    <HazardKind, String>{
+  // The vehicle form is deliberately the shortest string
+  // the normal templates themselves can produce for a
+  // vehicle ('停，前方来车', the near-centre vehicle
+  // form): when the remaining TTC is too short even for
+  // THAT, no shorter honest vehicle sentence exists --
+  // the short-form decision then degrades to the
+  // template's own minimum rather than inventing a new
+  // wording, and the long-standing arbitration
+  // expectations on that exact string keep their meaning.
+  HazardKind.motorVehicle: '停，前方来车',
+  HazardKind.nonMotorVehicle: '停，前方来车',
+  HazardKind.person: '停，前方有人',
+  HazardKind.pole: '停，前方有杆子',
+  HazardKind.clutter: '停，前方有杂物',
+};
+
+/// The short form for [kind] (NH-M1-17).
+String shortUrgentPhrase(HazardKind kind) =>
+    shortUrgentPhraseByKind[kind]!;
+
+/// Every short form [shortUrgentPhrase] can produce --
+/// the enumeration axis for the exhaustion tests.
+Iterable<String> shortUrgentPhrases() => shortUrgentPhraseByKind.values;
+
+/// Estimated spoken duration of [text] in seconds
+/// (NH-M1-17): its character count (runes) with the
+/// spoken-punctuation marks excluded -- they shape
+/// pauses but are not characters the TTS voices --
+/// times the conservative per-character upper bound.
+/// This is an UPPER-bound planning figure for the
+/// short-form decision, not a timing promise.
+double estimatedSpeechSeconds(String text) {
+  final int chars = text.runes
+      .where((int r) => r != 0xFF0C && r != 0x3002 && r != 0xFF01)
+      .length;
+  return chars * NavHazConfig.ttsSecondsPerCharUpperBound;
 }
 
 /// Build the spoken text for one alert.

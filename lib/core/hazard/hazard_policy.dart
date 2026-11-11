@@ -180,11 +180,20 @@ class HazardPolicyResult {
 /// or [HazardPolicy.trackRetired] reports its retirement)
 /// scopes steps 2/3; the pre-urgent episode (the
 /// pipeline's latch -- NH-M1-11's exemption reads it)
-/// scopes step 1. The ladder JOINS them only through the
-/// registration [HazardPolicy.notePreVibrated]: when an
-/// urgent OPENS an alert episode, step 1's having fired
-/// earlier in the approach (registration present) is what
-/// suppresses the urgent's own dispatch. NH-M1-11
+/// scopes step 1's FIRING. The ladder JOINS them only
+/// through the registration [HazardPolicy.notePreVibrated]:
+/// when an urgent OPENS an alert episode, step 1's having
+/// fired earlier in the approach (registration present)
+/// is what suppresses the urgent's own dispatch. The
+/// registration itself is APPROACH-scoped (NH-M1-13
+/// residual): it is set when step 1 fires and cleared
+/// ONLY when the pipeline reports the approach over
+/// ([HazardPolicy.trackRetired] from the pipeline's
+/// sustained-absence rule) -- neither the alert episode's
+/// end nor a frame's instantaneous pre-urgent eligibility
+/// may revoke it, or a mid-approach urgent re-vibrates
+/// (the 5280e00 replay: unknown ego, T = 0.9 s, a second
+/// dispatch three frames after the first). NH-M1-11
 /// exemption frames fire NO vibration and are untouched
 /// by this ladder.
 class HazardAlertSteps {
@@ -244,13 +253,20 @@ class HazardPolicy {
 
   /// NH-M1-13: close the alert episodes of every track
   /// NOT in [presentIds] (a frame's estimated tracks).
-  /// The step-1 registration clears on the same boundary:
-  /// an approach that has left the estimates is over.
+  /// The step-1 registration deliberately does NOT clear
+  /// here (NH-M1-13 residual, M2 first commit): it is
+  /// scoped to the APPROACH, whose end the pipeline
+  /// judges on its own sustained-absence rule and reports
+  /// through [trackRetired] -- an alert episode can end
+  /// and reopen inside one approach (a track unestimated
+  /// for a frame, then alerting again) without the
+  /// approach's spent step 1 being forgotten; the old
+  /// same-boundary clearing was exactly what revoked the
+  /// registration mid-approach and let a later urgent
+  /// vibrate a second time.
   void noteAbsentTracks(Set<int> presentIds) {
     _episodeAlertLevel.removeWhere((int id, HazardLevel _) =>
         !presentIds.contains(id));
-    _preVibratedInApproach.removeWhere(
-        (int id) => !presentIds.contains(id));
   }
 
   /// NH-M1-13 step 1 registration: the pipeline reports
@@ -581,19 +597,39 @@ class HazardPolicy {
     if (!commit) {
       return const HazardPolicyResult(alert: null, riskPresent: true);
     }
+    final String normalPhrase = hazardPhrase(
+      urgent: level == HazardLevel.urgent,
+      name: hazardSpokenName(track.label, kind),
+      isVehicle: kind == HazardKind.motorVehicle ||
+          kind == HazardKind.nonMotorVehicle,
+      cx: s.cx,
+      rangeM: chosen.rangeM,
+    );
+    // NH-M1-17: the short-form decision, made ONCE here
+    // at issuance (the alert's text is final from this
+    // point -- nothing downstream re-derives it, so a
+    // replay of this alert speaks the same text). An
+    // URGENT whose issuance frame's remaining TTC (the
+    // published tau_now, falling back to the fused TTC
+    // exactly as the cooldown's like-for-like comparison
+    // does) is strictly below the normal phrase's
+    // estimated spoken duration cannot finish its
+    // sentence before the physical moment: it speaks the
+    // kind's short form instead. Warnings never take the
+    // short form (their horizon is seconds longer and
+    // their wording carries the distance the user needs).
+    final double? remainingTtc =
+        level == HazardLevel.urgent ? (chosen.ttcUrgentS ?? chosen.ttcS) : null;
+    final String phrase = (remainingTtc != null &&
+            remainingTtc < estimatedSpeechSeconds(normalPhrase))
+        ? shortUrgentPhrase(kind)
+        : normalPhrase;
     final HazardAlert alert = HazardAlert(
       level: level,
       trackId: track.id,
       label: track.label,
       kind: kind,
-      phrase: hazardPhrase(
-        urgent: level == HazardLevel.urgent,
-        name: hazardSpokenName(track.label, kind),
-        isVehicle: kind == HazardKind.motorVehicle ||
-            kind == HazardKind.nonMotorVehicle,
-        cx: s.cx,
-        rangeM: chosen.rangeM,
-      ),
+      phrase: phrase,
       ttcS: chosen.ttcS,
       rangeM: chosen.rangeM,
       detection: track.latestDetection!,
@@ -628,3 +664,4 @@ class HazardPolicy {
         alert: alert, riskPresent: true, vibrationAllowed: vibrationAllowed);
   }
 }
+

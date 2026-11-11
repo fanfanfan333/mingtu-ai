@@ -394,6 +394,41 @@ static const double replayMinDistanceM = 3.0;
 /// sequenced speak path in main.dart.
 static const Duration dangerStopWaitCap = Duration(milliseconds: 150);
 
+/// NH-M1-17 (M2 first commit): per-character SPOKEN
+/// duration used to estimate how long an announcement
+/// takes to say -- a CONSERVATIVE UPPER bound per
+/// Chinese character at the app's TTS rate. The voice
+/// output runs at speech rate 0.85 (system_voice_io);
+/// ordinary Mandarin TTS at that rate speaks roughly
+/// 200-240 characters per minute, i.e. about 0.25-0.30 s
+/// per character. 0.30 s/char is the pessimistic end of
+/// that range, chosen so the estimate errs towards
+/// "will not finish in time" (the safe direction for the
+/// short-form decision below). NO real-device
+/// measurement backs this figure yet: it is a
+/// calibration placeholder, to be replaced by measured
+/// per-character timings on a real device (see the
+/// README known-issues note).
+static const double ttsSecondsPerCharUpperBound = 0.30;
+
+/// NH-M1-17: when an URGENT alert is issued, if the
+/// estimated remaining TTC at the issuance frame is
+/// strictly below the NORMAL phrase's estimated spoken
+/// duration (its character count -- runes, punctuation
+/// excluded -- times [ttsSecondsPerCharUpperBound]), the
+/// alert speaks its category's SHORT form instead (see
+/// hazard_phrases.shortUrgentPhrase): a normal sentence
+/// whose speaking time overruns the physical moment
+/// protects nobody, and the measured known-ego dives
+/// land their urgent voice with only 0.1-0.2 s of true
+/// TTC left. The comparison uses the issuance frame's
+/// published urgent TTC (tau_now, already latency
+/// compensated), never the raw surface, so the decision
+/// is made on the same number the urgent judgement
+/// itself used. The short form is a pure text variant of
+/// the SAME alert (same request kind, same priority,
+/// chosen once at issuance); warnings never take it.
+
 // ---- Vibration patterns ---------------------------------------------------
 // VibrationEffect waveform semantics: timings alternate
 // wait/vibrate starting with a wait; amplitudes are

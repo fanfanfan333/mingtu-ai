@@ -170,7 +170,14 @@ void main() {
       }
       // The UNIQUE phrase set is pinned verbatim so a
       // silently shrinking (or growing) entry point fails
-      // loudly: 1,044 distinct phrases. The RAW yield
+      // loudly: 1,045 distinct phrases = the 1,044 of the
+      // NH-M1-14 baseline PLUS exactly ONE phrase NH-M1-17
+      // added ('停，前方有杆子'; every other short form
+      // coincides with a phrase the near template already
+      // produced -- the vehicle short form IS the
+      // template's own vehicle minimum '停，前方来车',
+      // '停，前方有人' is the person near form, and
+      // '停，前方有杂物' the clutter near form). The RAW yield
       // count is deliberately NOT pinned any more
       // (NH-M1-14): the distance axes are now DERIVED
       // from the shared hazardBands table (denser
@@ -179,12 +186,14 @@ void main() {
       // sampling density (3,960 at the current table)
       // while the producible phrase SET -- the quantity
       // the 2,460-combination baseline actually pinned
-      // semantically -- is unchanged, verified byte-for-
-      // byte against the pre-refactor enumeration during
-      // the NH-M1-14 round.
-      expect(all.toSet().length, 1044,
-          reason: 'the producible phrase set is unchanged '
-              'by the shared-table refactor (NH-M1-14)');
+      // semantically -- is unchanged apart from the two
+      // NH-M1-17 additions, verified byte-for-byte against
+      // the pre-refactor enumeration during the NH-M1-14
+      // round.
+      expect(all.toSet().length, 1045,
+          reason: 'the producible phrase set: NH-M1-14 '
+              'baseline 1,044 + the 1 NH-M1-17 short form '
+              'not already in it (pole)');
       expect(all.length, greaterThan(2460),
           reason: 'the table-derived axes sample at least '
               'the old hand-listed coverage');
