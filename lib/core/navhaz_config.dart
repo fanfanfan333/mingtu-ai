@@ -500,4 +500,60 @@ static const List<int> urgentVibrationAmplitudes = <int>[0, 255, 0, 255, 0, 255]
 /// (Spec pattern; amplitude 128 = half strength.)
 static const List<int> warningVibrationTimings = <int>[0, 40, 60, 40];
 static const List<int> warningVibrationAmplitudes = <int>[0, 128, 0, 128];
+
+// ---- Adaptive frame rate (M2 section 3.1) ----------------------------
+
+/// Master switch for the adaptive frame-rate policy
+/// (frame_rate_policy.dart). When false the wiring layer
+/// behaves EXACTLY as before this feature existed: no
+/// streaming config is passed to the live view, no
+/// controller call is made, and the plugin runs at its
+/// own default rate. The policy object itself remains
+/// pure logic either way; the flag is consulted only by
+/// the wiring layer.
+static const bool adaptiveFrameRateEnabled = true;
+
+/// Target inference rate while the user is STILL and the
+/// still gate (below) holds, FPS. (Spec 3.1 still tier.)
+static const int frameRateStillFps = 2;
+
+/// Target inference rate while WALKING, FPS. The spec
+/// band is 8-10 FPS; the UPPER edge is taken so tracking
+/// latency stays at the band's best while the power
+/// saving against the plugin default is still large.
+static const int frameRateWalkingFps = 10;
+
+/// Target inference rate while a confirmed hazard is
+/// NEAR (see [frameRateDangerTtcS]), FPS. The spec band
+/// is 15-20 FPS; the UPPER edge is taken because this
+/// tier exists precisely for the frames where TTC
+/// estimates must refresh fastest.
+static const int frameRateDangerFps = 20;
+
+/// A confirmed track counts as NEAR DANGER for the frame
+/// rate when its TTC is below this, seconds. (Spec 3.1:
+/// "confirmed track with TTC < 5 s, or an approaching
+/// vehicle inside the corridor" -- the corridor branch
+/// needs no threshold and lives in the policy's danger
+/// input definition.)
+static const double frameRateDangerTtcS = 5.0;
+
+/// Downshift hysteresis (spec 3.1): a LOWER tier's
+/// conditions must hold CONTINUOUSLY for this long
+/// before the target actually drops. Upshifts are
+/// immediate -- a danger must never wait out a timer --
+/// but a momentary lull (one quiet frame, a brief GPS
+/// wobble) must not flap the camera rate down and back.
+static const Duration frameRateDownshiftHold = Duration(seconds: 3);
+
+/// Still-gate quiet window (spec 3.1 substitute gating):
+/// the still tier requires, on top of the ego judge
+/// saying still, NO live track AND no new detection for
+/// at least this long. The plugin delivers detections,
+/// not raw frames, so true frame-difference / optical-
+/// flow gating is NOT available at this layer; it is
+/// deferred until the detection pipeline moves off the
+/// plugin (spec section 6 Q1). This detection-quiet
+/// proxy is the spec's own substitute, not an equivalent.
+static const Duration frameRateStillQuietWindow = Duration(seconds: 2);
 }

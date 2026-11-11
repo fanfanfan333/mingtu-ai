@@ -35,6 +35,7 @@ import 'adapters/haptics.dart';
 import 'adapters/pitch_monitor.dart';
 import 'core/haptics.dart';
 import 'core/navhaz_config.dart';
+import 'core/frame_rate_policy.dart';
 import 'core/pitch.dart';
 import 'core/hazard/ego_motion.dart';
 import 'core/hazard/hazard_phrases.dart';
@@ -724,6 +725,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// NAVHAZ M1: tracking + TTC + alert policy pipeline for
   /// geometry-bearing YOLO frames.
   final HazardPipeline _hazardPipeline = HazardPipeline();
+
+  /// NAVHAZ M2 section 3.1: adaptive frame-rate policy for
+  /// the live view. Evaluated once per pipeline frame (see
+  /// _applyFrameRatePolicy); its settled target is applied
+  /// to the plugin at runtime through the adapter. While
+  /// [NavHazConfig.adaptiveFrameRateEnabled] is off the
+  /// policy is never evaluated and nothing is applied --
+  /// the pre-M2 behaviour, byte for byte.
+  final FrameRatePolicy _frameRatePolicy = FrameRatePolicy();
+
+  /// The last frame stamp at which the live view delivered
+  /// a NON-EMPTY detection list (the frame-rate still
+  /// gate's "recent detection" evidence). Empty frames do
+  /// not refresh it: silence is exactly what the gate
+  /// waits for.
+  DateTime? _lastNonEmptyDetectionAt;
   // Cloud-vision cycle merging + 429 backoff (hazard scans).
   final VisionCycleCoordinator _visionCycle = VisionCycleCoordinator();
   final VisionRateBackoff _visionBackoff = VisionRateBackoff();
@@ -4294,6 +4311,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // at delivery (null for simulated / scripted frames,
     // which then stamp no frame-to-callback segment).
     final DateTime now = DateTime.now();
+    // M2 section 3.1 still-gate evidence: a NON-EMPTY
+    // frame refreshes the last-detection stamp; empty
+    // frames deliberately do not (their silence is what
+    // the gate's quiet window measures).
+    if (detections.isNotEmpty) {
+      _lastNonEmptyDetectionAt = now;
+    }
     // Avoidance advisor bookkeeping for EVERY frame: the
     // side-clear streaks behind the three-condition rule and
     // the pending-action tracker (spec 7.7-12: speech
@@ -4400,6 +4424,38 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 
+  /// NAVHAZ M2 section 3.1: evaluate the adaptive
+  /// frame-rate policy for one pipeline frame and apply
+  /// its settled target to the live view at runtime. All
+  /// inputs are evidence this frame already produced --
+  /// the SAME ego judgement the pipeline just consumed
+  /// (no second sensor read), the pipeline's own
+  /// per-frame estimates (danger + live tracks), and the
+  /// detection-activity stamp kept at the callback entry.
+  /// Flag off: returns immediately, nothing is evaluated
+  /// or applied, and the view keeps the plugin defaults.
+  ///
+  /// SECTION 3.2 HOOK: when the thermal monitor lands,
+  /// the value applied below becomes
+  /// min(target, thermalCap) -- the composition point is
+  /// this call, the adapter applier stays a dumb setter.
+  void _applyFrameRatePolicy(
+      HazardPipelineResult result, EgoMotion ego, DateTime now) {
+    if (!NavHazConfig.adaptiveFrameRateEnabled) return;
+    final int target = _frameRatePolicy.evaluate(
+      now: now,
+      motion: ego,
+      dangerPresent:
+          FrameRatePolicy.dangerPresentIn(result.estimates),
+      // Estimates exist only for tracks seen on THIS
+      // frame (the pipeline skips lost-coast tracks), so
+      // any estimate at all means a live track.
+      hasLiveTrack: result.estimates.isNotEmpty,
+      lastDetectionAt: _lastNonEmptyDetectionAt,
+    );
+    unawaited(applyYoloFrameRateTarget(target));
+  }
+
   /// NAVHAZ M1: geometry-bearing frames -- multi-target
   /// tracking, TTC estimation and the hazard policy decide
   /// what (if anything) is announced; the policy also
@@ -4420,6 +4476,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         (String stage, int ms) => _logMsg('NAVHAZ延迟 $stage ${ms}ms');
     final bool navigating = _tasks.state == TaskState.navigating ||
         _tasks.state == TaskState.avoidingObstacle;
+    // The frame's ego judgement, computed ONCE and shared
+    // by the pipeline and the frame-rate policy below
+    // (M2 section 3.1 reuses this very verdict -- it must
+    // never re-judge from a second sensor read).
+    final EgoMotion egoNow = _egoMotionNow(now);
     final HazardPipelineResult result = _hazardPipeline.processFrame(
       detections,
       now,
@@ -4429,9 +4490,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // estimate -> pipeline -> estimator, where the
       // vehicle's relative closing speed must beat v_ego
       // by the configured margin to count as "approaching".
-      ego: _egoMotionNow(now),
+      ego: egoNow,
       commit: navigating,
     );
+    // M2 section 3.1: the adaptive frame rate follows the
+    // pipeline's own frame (danger and live tracks come
+    // from its estimates). No-op while the flag is off.
+    _applyFrameRatePolicy(result, egoNow, now);
     // S3 segment 2 START: the pipeline has returned.
     // (Stamped on the segment clock -- the wall clock in
     // production; a test may install a fake through the

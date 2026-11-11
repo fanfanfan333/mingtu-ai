@@ -36,12 +36,23 @@ class YoloLiveView extends StatelessWidget {
   final void Function(double latencyMs)? onLatencyMs;
   final void Function(Object error)? onError;
 
+  /// Initial streaming configuration for the live view
+  /// (NAVHAZ M2 section 3.1), as an opaque value: the
+  /// plugin's config type exists only on mobile, so the
+  /// facade cannot name it. Callers on the adaptive path
+  /// build it with the mobile adapter's builder (behind
+  /// the same conditional import the view itself uses);
+  /// null -- every caller while the adaptive flag is off
+  /// -- means the plugin's own defaults, unchanged.
+  final Object? streamingConfig;
+
   const YoloLiveView({
     super.key,
     required this.modelPath,
     required this.onDetections,
     this.onLatencyMs,
     this.onError,
+    this.streamingConfig,
   });
 
   @override
@@ -50,8 +61,22 @@ class YoloLiveView extends StatelessWidget {
         onDetections: onDetections,
         onLatencyMs: onLatencyMs,
         onError: onError,
+        streamingConfig: streamingConfig,
       );
 }
+
+/// The frame-rate target most recently applied to the
+/// live view's plugin, or null when none was (always the
+/// case while the adaptive flag is off, and on web).
+int? get appliedYoloFrameRateFps => impl.appliedYoloFrameRateFps;
+
+/// Apply a new target inference rate to the live view at
+/// runtime (mobile: the plugin controller's streaming-
+/// config call; web: no-op). SECTION 3.2 HOOK: the
+/// thermal cap composes at the CALLER -- it will pass
+/// min(scene target, thermal cap) here.
+Future<void> applyYoloFrameRateTarget(int targetFps) =>
+    impl.applyYoloFrameRateTarget(targetFps);
 
 /// Completes when the live view has actually unmounted (mobile)
 /// or immediately (web stub). The camera owner's YOLO release
