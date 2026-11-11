@@ -80,6 +80,58 @@
 项**，不是细节问题；在它有解法之前，即使其余条件都满足也不能
 采用。
 
+## 补充调研：不采用的补强，与后续候选 NAV-NATIVE
+
+以下结论来源：大川另请的 GitHub / Gemini 两位助手的调研，非本仓实测。
+
+### 对 flutter_amap_navi 结论的补强
+
+- **步行模式没有无界面开关**：步行模式一定会拉起它自己的
+  Activity 和 AMapNaviView。上面「界面阻塞项」由此补强——在插件
+  路线内该阻塞无解；本报告原「待查项」在插件层面的问题，到此
+  答复并关闭（下文「待验证项」已改写）。
+- **其内部算路重载是收费接口**：插件内部使用的
+  `calculateWalkRoute(NaviPoi, List<NaviPoi>, NaviPoi, TravelStrategy)`
+  重载，javadoc 标明是收费接口。采用该插件还意味着引入一条收费
+  的算路通道，与「不划算」的结论同向。
+
+### 后续候选：NAV-NATIVE（本阶段不做）
+
+绕开插件、自接高德原生导航 SDK 的桥接路线，编号 NAV-NATIVE。
+本阶段只记录、不实现：
+
+- 自写约 150 行 Kotlin 桥接（MethodChannel + EventChannel）；
+  用免费的 `calculateWalkRoute(NaviLatLng, NaviLatLng)` 算路，
+  然后 `startNavi(GPS)`。
+- `setUseInnerVoice` 保持 false：不让 SDK 自播，只取
+  `onGetNavigationText` 的文本，交给我们自己的仲裁器播。
+- 体积：只保留 arm64，约 +36 MB。
+- **不开 R8**。教训在案：之前 R8 裁掉 `WorkDatabase_Impl` 导致
+  闪退；这条路线若实施，构建须保持 R8 关闭。
+- **采用前提**：先在小米 15 上做最小 Demo，证明不挂 AMapNaviView
+  也能持续收到 `onNaviInfoUpdate` 和文本回调；证不了就不采用。
+- **未验证风险**：`libnui` 内置 TTS 能否排除，未验证；商用授权
+  费用只有非官方来源，未核实。
+
+## 适配层对接核查（本仓核对）
+
+NAV-NATIVE 桥接将来吐出的事件面，与适配层
+（`lib/adapters/amap_navi_source.dart`）的本地输入结构逐字段核对
+如下，**无缺口，未改任何代码**——桥接只需在 `AmapNaviBinding`
+接缝处把 SDK 回调翻译成本地样本，适配层与仲裁层不动：
+
+| 桥接事件面 | 适配层输入 |
+|---|---|
+| `onNaviInfoUpdate` → `NaviInfo.pathRetainDistance` | `AmapNaviInfoSample.pathRetainDistanceM`（映射到 `remainingM`） |
+| `onNaviInfoUpdate` → `NaviInfo.pathRetainTime` | `AmapNaviInfoSample.pathRetainTimeS` |
+| `onNaviInfoUpdate` → `NaviInfo.curStepRetainDistance` | `AmapNaviInfoSample.curStepRetainDistanceM` |
+| `onGetNavigationText` 的文本 | `AmapNaviBinding.textEvents`（`Stream<String>`）→ turnAhead 事件 |
+| 定位 / 到达 / 偏航信号 | `AmapNaviLocationSample` / `arrivedEvents` / `yawEvents` |
+
+样本另含 `curStepRetainTimeS`、道路名（next / current）与步索引
+`curStep`，与 NaviInfo 其余已测字段对应。文本面与适配层既有规则
+直接兼容：文本逐字透传、stepIndex 不从其他流借用。
+
 ## 结论
 
 默认包 +35 MB/ABI、引入专有许可 SDK，只换来一个结构化剩余距离
@@ -87,10 +139,17 @@
 吐事件才采用」——**未变**，且尚未验证（spike 全程只用 fixture 与
 静态源码核查，没有真机事件证据）。保留物（适配层 / mock / 等价
 测试）保证将来若条件变化，映射行为已有测试钉死，绑定只需在接缝
-处把事件翻译成本地样本。
+处把事件翻译成本地样本。补充调研（见上「补充调研」节）进一步
+确认该插件步行模式无无界面开关、其内部算路重载为收费接口，不
+采用的理由进一步成立；后续候选 NAV-NATIVE 已在该节单列，本
+阶段不做。
 
-## 待查项（不在本仓查）
+## 待验证项
 
-- **高德原生 SDK 有没有无界面（后台）导航模式**——大川另请他人
-  查，本仓不查。若有，该模式可能同时解掉界面阻塞项与一部分体积
-  问题，届时可重新评估采用。
+- 插件层面的「有没有无界面（后台）模式」已由补充调研答复：
+  **没有**——该问题关闭，插件路线的界面阻塞项无解。
+- 当前的待验证项是 NAV-NATIVE 的采用前提：小米 15 上的最小
+  Demo 证明不挂 AMapNaviView 也能持续收到 `onNaviInfoUpdate`
+  与文本回调。NAV-NATIVE 本阶段不做，此验证不在本仓本阶段
+  范围内；另有两项未验证风险（`libnui` 内置 TTS 能否排除、商用
+  授权费用只有非官方来源）见「补充调研」节。
