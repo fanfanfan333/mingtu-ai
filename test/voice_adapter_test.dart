@@ -345,6 +345,12 @@ void main() {
         'error_client',
         'error_network',
         'error_audio',
+        // CDX2 / MT-1111-ALIGN: error_server and the two
+        // language codes are RECOVERABLE too -- direct
+        // cloud routing is only for no-engine / permission.
+        'error_server',
+        'error_language_not_supported',
+        'error_language_unavailable',
       ]) {
         final fake = FakeStt();
         final input = SystemVoiceInput(fake);

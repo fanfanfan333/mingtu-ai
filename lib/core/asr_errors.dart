@@ -46,11 +46,14 @@ String asrErrorCode(String raw) =>
 ///
 /// Recoverable codes: the failure ends THIS session only.
 /// The recogniser stays available and the next press MUST
-/// listen again. (error_server / error_cancelled are
-/// deliberately in NEITHER set: server keeps its historic
-/// fallback routing in the app, cancelled stays a
-/// plain error -- both documented, neither is decided by
-/// the permanent flag either.)
+/// listen again (through the recovery sequence). Direct
+/// routing to the cloud fallback is reserved for the
+/// FATAL set below -- ONLY "no engine" and "permission
+/// refused" (MT-1111-ALIGN, the unified final wording):
+/// error_server and the two language codes are therefore
+/// RECOVERABLE here, not direct-to-cloud. (error_cancelled
+/// stays in NEITHER set: a plain error, decided by neither
+/// the permanent flag nor the routing.)
 const Set<String> recoverableAsrErrorCodes = <String>{
   'error_busy',
   'error_client',
@@ -60,19 +63,21 @@ const Set<String> recoverableAsrErrorCodes = <String>{
   'error_network_timeout',
   'error_audio',
   'error_audio_error',
+  'error_server',
+  'error_language_not_supported',
+  'error_language_unavailable',
   asrErrorUnknown,
 };
 
-/// Fatal codes: the engine itself cannot serve (its own
-/// permission missing, no recogniser service, no Chinese
-/// support). Only these may mark the input unavailable and
-/// route presses to the recording + cloud ASR fallback.
+/// Fatal codes: ONLY "no engine" (not_available) and
+/// "permission refused" (the engine's own microphone
+/// permission missing). Only these may mark the input
+/// unavailable and route presses DIRECTLY to the
+/// recording + cloud ASR fallback (MT-1111-ALIGN).
 const Set<String> fatalAsrErrorCodes = <String>{
   'error_permission',
   'error_insufficient_permissions',
   'not_available',
-  'error_language_not_supported',
-  'error_language_unavailable',
 };
 
 /// True when [code] (already normalised by [asrErrorCode])

@@ -60,6 +60,7 @@ class RecordingVoiceChannels {
             return 1;
           case 'speak':
             events.add('tts.speak:${call.arguments}');
+
             final Completer<dynamic> c = Completer<dynamic>();
             speakQueue.add(MapEntry<String, Completer<dynamic>>(
                 '${call.arguments}', c));
@@ -199,6 +200,10 @@ class RecordingVoiceChannels {
 
   int count(String e) => events.where((String x) => x == e).length;
 
+
+
+
+
   bool completeSpeak([String? text]) {
     for (final MapEntry<String, Completer<dynamic>> e in speakQueue) {
       if (!e.value.isCompleted && (text == null || e.key == text)) {
@@ -281,7 +286,8 @@ Future<void> pressUntilCapture(WidgetTester tester,
     {required bool expectRecorder,
     FakeRecorder? recorder,
     bool useFakeListen = false,
-    bool tightTiming = false}) async {
+    bool tightTiming = false,
+    int fakeListenBaseline = 0}) async {
   // tightTiming: the caller releases immediately after
   // capture and must stay under the app's 300 ms
   // too-short floor. The app measures the hold with
@@ -291,6 +297,7 @@ Future<void> pressUntilCapture(WidgetTester tester,
   // (the cue -> capture chain is microtask-driven).
   final Duration step =
       tightTiming ? Duration.zero : const Duration(milliseconds: 50);
+
   for (int i = 0;
       i < 40 &&
           !h.speakQueue.any(
@@ -314,9 +321,21 @@ Future<void> pressUntilCapture(WidgetTester tester,
       reason: 'cue spoken: ${h.events}');
   h.completeSpeak('请说');
   bool started() {
+    // A watchdog-restart notice queued from an earlier
+    // stretch can land inside THIS press's window and
+    // wind it up before its listen registers on the
+    // channel: the press then legitimately ends without
+    // a channel listen (the fake's listen ran, so only
+    // the channel-side started() below is affected).
     if (expectRecorder) return recorder != null && recorder.started;
     if (useFakeListen) {
-      return processFakeStt != null && processFakeStt!.listenCalls > 0;
+      // Baseline-aware (CDX2): with a cumulative counter,
+      // "> 0" would report THIS press started as soon as
+      // ANY earlier press listened -- an error delivered
+      // in that gap lands before this press's listen and
+      // is then (correctly) cleared by the listen start.
+      return processFakeStt != null &&
+          processFakeStt!.listenCalls > fakeListenBaseline;
     }
     return h.count('asr.listen') > 0;
   }
@@ -470,6 +489,11 @@ class FakeStt implements stt.SpeechToText {
   /// recovery init-failure test arms this).
   bool initializeResult = true;
 
+  /// CDX2: when true, cancel() never returns (a platform
+  /// cancel that hangs forever) -- the recovery must bound
+  /// its wait and still reach initialize -> listen.
+  bool cancelHangs = false;
+
   @override
   Future<bool> initialize({
     stt.SpeechErrorListener? onError,
@@ -486,9 +510,13 @@ class FakeStt implements stt.SpeechToText {
   }
 
   @override
-  Future<void> cancel() async {
+  Future<void> cancel() {
     cancelCalls++;
     ops.add('cancel');
+    if (cancelHangs) {
+      return Completer<void>().future; // never completes
+    }
+    return Future<void>.value();
   }
 
   @override
@@ -542,6 +570,7 @@ Future<void> installFakeBackedInput(WidgetTester tester) async {
   processFakeStt!.cancelCalls = 0;
   processFakeStt!.ops.clear();
   processFakeStt!.initializeResult = true;
+  processFakeStt!.cancelHangs = false;
   fakeBackedInput =
       mingtuHomeDebugHandle!.debugVoiceInput as SystemVoiceInput;
   await mingtuHomeDebugHandle!.debugAttachFakeSpeech(processFakeStt!);
@@ -1029,6 +1058,12 @@ void main() {
       'error_client',
       'error_speech_timeout',
       'error_no_match',
+      // CDX2 / MT-1111-ALIGN: error_server and the two
+      // language codes are recoverable too -- only
+      // no-engine / permission routes directly to cloud.
+      'error_server',
+      'error_language_not_supported',
+      'error_language_unavailable',
     ]) {
       testWidgets(
           'PTT-2: $code (permanent=true) -- next press recovers '
@@ -1039,8 +1074,10 @@ void main() {
     }
 
     testWidgets(
-        'PTT-2: the same recoverable code twice in a row -- the '
-        'next press RECORDS and speaks 改用云端识别 exactly once',
+        'CDX2: the same recoverable code twice TRULY '
+        'consecutively (two errors inside one session, no '
+        'successful listen between) -- the next press '
+        'RECORDS and speaks 改用云端识别 exactly once',
         (WidgetTester tester) async {
       final RecordingVoiceChannels h = RecordingVoiceChannels()
         ..install();
@@ -1051,31 +1088,33 @@ void main() {
       mingtuHomeDebugHandle!.setRecorder(recorder);
       h.events.clear();
 
-      Future<void> errorPress() async {
-        final TestGesture g = await startPttGesture(tester);
-        await pressUntilCapture(tester, h, g,
-            expectRecorder: false, useFakeListen: true);
-        await deliverError(tester, 'error_busy', true);
-        await holdPastThreshold(tester);
-        await g.up();
-        await tester.pump(const Duration(milliseconds: 200));
-        await deliverFakeStatus(tester, 'notListening');
-        await settleReleasedPress(tester, h);
-        h.events.clear();
-      }
-
-      await errorPress(); // busy x1: count 1, recovery armed
-      expect(
-          mingtuHomeDebugHandle!.recoverableErrorCounts[
-              'error_busy'],
-          1);
+      // ONE press whose session errors busy TWICE with no
+      // successful listen and no delivered result between
+      // the two errors: that is a truly consecutive pair.
+      // (Changed from the PTT-2 form of this test -- two
+      // erroring PRESSES no longer escalate, because the
+      // second press's recovery listen STARTING clears the
+      // previous streak; see the CDX2 streak tests below.)
+      final TestGesture g1 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g1,
+          expectRecorder: false, useFakeListen: true);
+      await deliverError(tester, 'error_busy', true);
+      expect(mingtuHomeDebugHandle!.asrStreakCode, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 1);
       expect(mingtuHomeDebugHandle!.localAsrBroken, isFalse);
-      await errorPress(); // busy x2 (via recovery): escalate
+      await deliverError(tester, 'error_busy', true);
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 2);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue);
       expect(
           mingtuHomeDebugHandle!.recoverableErrorCounts[
               'error_busy'],
           2);
-      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue);
+      await holdPastThreshold(tester);
+      await g1.up();
+      await tester.pump(const Duration(milliseconds: 200));
+      await deliverFakeStatus(tester, 'notListening');
+      await settleReleasedPress(tester, h);
+      h.events.clear();
       final int listensBefore = processFakeStt!.listenCalls;
 
       // The switching press: recorder, no listen, and the
@@ -1310,6 +1349,7 @@ void main() {
     });
 
   });
+
 }
 
 /// Arm the recording fallback for a test that does not

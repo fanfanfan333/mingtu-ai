@@ -331,6 +331,121 @@ class AsrWavValidationTest(unittest.TestCase):
         resp = _handle(_event(_asr_body(make_wav()[:30])))
         self.assertEqual(resp["statusCode"], 400)
 
+    # --- CDX2: malformed-WAV fixtures that used to reach
+    # the upstream and spend quota. Each must be a fixed
+    # 400 with poster uncalled and the limiter untouched.
+
+    def _assert_rejected_no_upstream_no_quota(self, clip):
+        poster = CapturingPoster()
+        limiter = amap_proxy.VisionRateLimiter(1, 100)
+        resp = _handle(_event(_asr_body(clip)), poster=poster,
+                       asr_limiter=limiter)
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertEqual(json.loads(resp["body"]),
+                         {"error": "audio format not allowed"})
+        self.assertEqual(poster.calls, [])
+        # No quota consumed: the single slot is still free.
+        self.assertTrue(limiter.allow())
+
+    def test_malformed_riff_size_rejected(self):
+        # riff-size: the RIFF declared size disagrees with
+        # the actual file length (here: declared 100 bytes
+        # short; the >1-byte slack is not a pad).
+        clip = bytearray(make_wav(seconds=2.0))
+        declared = struct.unpack("<I", clip[4:8])[0]
+        clip[4:8] = struct.pack("<I", declared - 100)
+        self._assert_rejected_no_upstream_no_quota(bytes(clip))
+
+    def test_malformed_data_truncated_rejected(self):
+        # data-truncated: the data chunk DECLARES more
+        # bytes than are actually present in the file.
+        fmt = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+        actual_data = b"\x00" * 2000
+        declared_data = 20000
+        riff_size = 4 + (8 + len(fmt)) + (8 + actual_data.__len__())
+        clip = (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+                + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+                + b"data" + struct.pack("<I", declared_data)
+                + actual_data)
+        self._assert_rejected_no_upstream_no_quota(clip)
+
+    def test_malformed_data_size_small_rejected(self):
+        # data-size-small: the data chunk DECLARES fewer
+        # bytes than are actually present, and the surplus
+        # bytes cannot form a legal following chunk (they
+        # are PCM silence whose "chunk header" declares a
+        # size far past the end of the file). RIFF size is
+        # consistent with the ACTUAL length, so only the
+        # chunk walk can catch this.
+        fmt = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+        actual_data = b"\x00" * 6400
+        declared_data = 3200
+        riff_size = 4 + (8 + len(fmt)) + (8 + len(actual_data))
+        clip = (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+                + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+                + b"data" + struct.pack("<I", declared_data)
+                + actual_data)
+        self._assert_rejected_no_upstream_no_quota(clip)
+
+    def test_malformed_extra_bad_chunk_rejected(self):
+        # extra-bad-chunk: a structurally broken extra
+        # chunk after data -- its declared size runs far
+        # past the end of the file. RIFF size matches the
+        # actual length; the extra chunk is the defect.
+        good = make_wav(seconds=1.0)
+        extra = b"JUNK" + struct.pack("<I", 100000) + b"\x00" * 4
+        clip = bytearray(good + extra)
+        clip[4:8] = struct.pack("<I", len(clip) - 8)
+        self._assert_rejected_no_upstream_no_quota(bytes(clip))
+
+    # --- MT-1111-ALIGN-B: four more structural defects,
+    # each still a fixed 400 with poster uncalled and the
+    # limiter untouched (the shared assertion above).
+
+    def test_malformed_chunk_pad_overrun_rejected(self):
+        # pad-overrun: an extra chunk declares an ODD size
+        # whose content fits exactly, but the mandatory
+        # pad byte does not fit in the remaining bytes.
+        good = make_wav(seconds=1.0)
+        extra = b"JUNK" + struct.pack("<I", 3) + b"abc"
+        clip = bytearray(good + extra)
+        clip[4:8] = struct.pack("<I", len(clip) - 8)
+        self._assert_rejected_no_upstream_no_quota(bytes(clip))
+
+    def test_malformed_fmt_after_data_rejected(self):
+        # fmt-after-data: both chunks are individually
+        # well-formed, but fmt must precede data.
+        fmt = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+        data = b"\x00" * 3200
+        riff_size = 4 + (8 + len(data)) + (8 + len(fmt))
+        clip = (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+                + b"data" + struct.pack("<I", len(data)) + data
+                + b"fmt " + struct.pack("<I", len(fmt)) + fmt)
+        self._assert_rejected_no_upstream_no_quota(clip)
+
+    def test_malformed_data_not_block_align_multiple_rejected(self):
+        # data size 3 is not a multiple of blockAlign (2).
+        # The odd-size pad byte IS present, so only the
+        # frame-alignment rule can catch this.
+        fmt = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+        data = b"\x00" * 3
+        riff_size = 4 + (8 + len(fmt)) + (8 + len(data) + 1)
+        clip = (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+                + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+                + b"data" + struct.pack("<I", len(data)) + data
+                + b"\x00")
+        self._assert_rejected_no_upstream_no_quota(clip)
+
+    def test_malformed_data_empty_rejected(self):
+        # Empty data chunk: structurally walkable, but a
+        # zero-byte clip carries no audio frame at all.
+        fmt = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+        riff_size = 4 + (8 + len(fmt)) + 8
+        clip = (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+                + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+                + b"data" + struct.pack("<I", 0))
+        self._assert_rejected_no_upstream_no_quota(clip)
+
     def test_validation_failure_consumes_no_quota(self):
         # A stereo clip is rejected BEFORE the limiter: with
         # a 1-per-minute limiter the follow-up VALID clip

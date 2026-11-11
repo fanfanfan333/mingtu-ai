@@ -254,6 +254,14 @@ class SystemVoiceInput implements VoiceInput {
   /// sleep that must land inside a window).
   ({Duration prod, Duration restart})? debugWatchdogLadder;
 
+  /// Test-only: the wall-clock moment this adapter last
+  /// armed its close watchdog or confirmed a pending
+  /// close. App-level widget tests use it to arm a ladder
+  /// delay on EXACTLY the adapter their presses drive
+  /// (several adapters exist per test process; only one
+  /// drives the real plugin channel).
+  DateTime? debugWatchdogTouchedAt;
+
   /// Recognition errors, as they happen (Codex re-test finding).
   /// Before this, the platform onError callback only rewrote a
   /// status string nobody was watching, so a recogniser dying
@@ -397,6 +405,12 @@ class SystemVoiceInput implements VoiceInput {
   /// attempt succeeds again.
   Stream<String> get engineEvents => _engineController.stream;
 
+  /// Test-only log of every engine event this adapter has
+  /// emitted, in order (the broadcast stream drops events
+  /// with no listener; this log does not).
+  final List<String> debugEngineEventsEmitted = <String>[];
+
+
   /// Outcome of the most recent watchdog restart's
   /// platform re-initialize (true also before any
   /// restart). The app reads this when it detects a
@@ -537,6 +551,7 @@ class SystemVoiceInput implements VoiceInput {
   /// above zero. When the last close lands, every waiter
   /// on [awaitSessionClosed] wakes.
   void _consumePendingClose() {
+    debugWatchdogTouchedAt = DateTime.now();
     if (_pendingCloses > 0) _pendingCloses--;
     if (_pendingCloses == 0) {
       // Every close is confirmed: the watchdog ladder is
@@ -695,7 +710,7 @@ class SystemVoiceInput implements VoiceInput {
             : _speech!;
     _speech = fresh;
     _engineSpeech = fresh;
-    _engineIsPluginInstance = true;
+    _engineIsPluginInstance = pluginEngine;
     bool ok = false;
     try {
       ok = await _doInitialize(fresh, epoch, pluginEngine)
@@ -721,6 +736,7 @@ class SystemVoiceInput implements VoiceInput {
     _closeCompleter = null;
     if (c != null && !c.isCompleted) c.complete();
     if (!_engineController.isClosed) {
+      debugEngineEventsEmitted.add(ok ? 'restarted' : 'restart_failed');
       _engineController.add(ok ? 'restarted' : 'restart_failed');
     }
   }
@@ -751,11 +767,12 @@ class SystemVoiceInput implements VoiceInput {
         // error, so trusting the flag permanently disabled
         // recognition after a routine busy / client /
         // speech-timeout / no-match -- the Xiaomi failure.
-        // Only FATAL codes (the engine itself cannot serve:
-        // its own permission missing, no recogniser service,
-        // no Chinese support) mark the input unavailable;
-        // recoverable codes and unknown end this session
-        // only, and the next press listens again.
+        // Only FATAL codes ("no engine" / the engine's own
+        // permission missing -- MT-1111-ALIGN: the language
+        // codes and error_server are RECOVERABLE now) mark
+        // the input unavailable; recoverable codes and
+        // unknown end this session only, and the next press
+        // listens again.
         if (isFatalAsrError(code)) {
           _available = false;
           _listening = false;
@@ -1223,7 +1240,7 @@ class SystemVoiceInput implements VoiceInput {
             : _speech!;
     _speech = fresh;
     _engineSpeech = fresh;
-    _engineIsPluginInstance = true;
+    _engineIsPluginInstance = pluginEngine;
     bool ok = false;
     try {
       ok = await _doInitialize(fresh, epoch, pluginEngine)

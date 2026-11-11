@@ -851,42 +851,119 @@ ASR_MAX_DURATION_S = 10.5
 
 
 def _parse_asr_wav(decoded_audio):
-    """Hand-parse a RIFF/WAVE header (PTT-2: byte-level,
-    not the wave module, so acceptance does not depend on
-    that module's strictness quirks). Returns
-    (sample_rate, data_bytes) for an acceptable clip --
-    PCM (audioFormat 1), 16-bit, mono, sample rate in
-    [8000, 48000] -- or None when the bytes are not such a
-    WAV."""
-    if len(decoded_audio) < 12:
+    """Hand-parse and STRICTLY validate a RIFF/WAVE clip
+    (CDX2: byte-level, not the wave module, and the whole
+    chunk structure must be self-consistent -- Codex's
+    malformed cases riff-size / data-truncated /
+    data-size-small / extra-bad-chunk all previously
+    slipped through to the upstream and spent quota).
+    Returns (sample_rate, data_bytes) for an acceptable
+    clip -- PCM (audioFormat 1), 16-bit, mono, sample rate
+    in [8000, 48000] -- or None when the bytes are not such
+    a WAV. Strictness rules, all mandatory:
+
+    * The RIFF declared size (bytes 4-7, little-endian)
+      must equal len(body) - 8, allowing at most ONE pad
+      byte of slack: len(body) - 8 must be riff_size or
+      riff_size + 1.
+    * EVERY chunk is walked from offset 12 to the end of
+      the file: a chunk header (8 bytes) plus its declared
+      size must never run past the end of the file, and
+      stepping advances by size + 1 pad byte for odd sizes.
+      A trailing remainder too small to be a chunk header
+      (beyond the pad allowance) is malformed.
+    * There must be EXACTLY ONE 'fmt ' chunk and EXACTLY
+      ONE 'data' chunk. Unknown chunks may exist but must
+      be structurally sound (header + declared size inside
+      the file).
+    * The data chunk's declared size must equal the actual
+      bytes present for it (file end minus its content
+      start, minus the bytes of any chunks that follow it),
+      so the duration below is computed from ACTUAL PCM
+      bytes that have been verified equal to the declared
+      size -- never from the declaration alone.
+    * ALIGN-B tightening: a chunk's declared size PLUS its
+      odd-size pad byte must both fit in the remaining
+      bytes; the walk must end exactly at the end of the
+      file (a 1-7 byte tail that cannot be a chunk header
+      is malformed); 'fmt ' must appear BEFORE 'data'; and
+      the data size must be a positive multiple of the
+      fmt blockAlign (2 bytes for the accepted PCM surface).
+    """
+    total = len(decoded_audio)
+    if total < 12:
         return None
     if decoded_audio[0:4] != b"RIFF" or decoded_audio[8:12] != b"WAVE":
         return None
+    riff_size = int.from_bytes(decoded_audio[4:8], "little")
+    # RIFF size counts everything after its own 8-byte
+    # header; at most one trailing pad byte is tolerated.
+    if (total - 8) - riff_size not in (0, 1):
+        return None
     fmt = None
+    fmt_count = 0
     data_size = None
+    data_count = 0
     offset = 12
-    while offset + 8 <= len(decoded_audio):
+    while offset < total:
+        if offset + 8 > total:
+            # A remainder that cannot hold a chunk header
+            # (beyond the single RIFF pad byte, which the
+            # chunk walk itself never produces) is malformed.
+            return None
         chunk_id = decoded_audio[offset:offset + 4]
+        if any(b < 0x20 or b > 0x7E for b in chunk_id):
+            # RIFF chunk ids are four printable ASCII
+            # characters. This is what stops data-size-
+            # small: PCM bytes sitting past the declared
+            # end of the data chunk (e.g. zeroed samples)
+            # can never pose as a following chunk.
+            return None
         chunk_size = int.from_bytes(
             decoded_audio[offset + 4:offset + 8], "little")
         body_start = offset + 8
+        remaining = total - body_start
+        pad = chunk_size & 1
+        if chunk_size > remaining or pad > remaining - chunk_size:
+            # The declared content -- or, for an odd-sized
+            # chunk, its mandatory pad byte -- runs past
+            # the end of the file: truncated chunk (covers
+            # data-truncated, extra-bad-chunk and the
+            # ALIGN-B pad-overrun case).
+            return None
         if chunk_id == b"fmt ":
-            if chunk_size < 16 or body_start + 16 > len(decoded_audio):
+            fmt_count += 1
+            if fmt_count > 1 or chunk_size < 16 or data_count > 0:
+                # Duplicate fmt, undersized fmt, or fmt
+                # arriving AFTER data (ALIGN-B) is malformed.
                 return None
             fmt = decoded_audio[body_start:body_start + chunk_size]
         elif chunk_id == b"data":
+            data_count += 1
+            if data_count > 1 or fmt_count == 0:
+                # Duplicate data, or data before fmt
+                # (ALIGN-B: fmt must come first).
+                return None
             data_size = chunk_size
-            break
         # Chunks are word-aligned: an odd-sized chunk is
-        # followed by one pad byte.
-        offset = body_start + chunk_size + (chunk_size & 1)
+        # followed by one pad byte, whose presence was
+        # bounds-checked above.
+        offset = body_start + chunk_size + pad
     if fmt is None or data_size is None:
         return None
     audio_format = int.from_bytes(fmt[0:2], "little")
     channels = int.from_bytes(fmt[2:4], "little")
     sample_rate = int.from_bytes(fmt[4:8], "little")
+    block_align = int.from_bytes(fmt[12:14], "little")
     bits_per_sample = int.from_bytes(fmt[14:16], "little")
     if audio_format != 1 or channels != 1 or bits_per_sample != 16:
+        return None
+    if block_align != channels * (bits_per_sample // 8):
+        return None
+    if data_size == 0 or data_size % block_align != 0:
+        # ALIGN-B: an empty data chunk, or one whose byte
+        # count is not a whole number of sample frames, is
+        # malformed.
         return None
     if sample_rate < 8000 or sample_rate > 48000:
         return None
