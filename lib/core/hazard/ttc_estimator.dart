@@ -271,6 +271,14 @@ class TrackEstimate {
   /// for hand-built estimates.
   final bool urgentDisagreementExempted;
 
+  /// Whether the underlying track is CONFIRMED
+  /// ([Track.confirmed]: an unbroken run of matched
+  /// frames reached the confirmation count). Read off the
+  /// track so consumers of bare estimates -- the frame-
+  /// rate policy's danger test (M2 section 3.1) in
+  /// particular -- do not need the track object itself.
+  bool get confirmed => track.confirmed;
+
   /// The URGENT judgement's TTC (FIX3B): the agile tier's
   /// one-step PREDICTED TTC (fused like [ttcS] when the
   /// ego speed is known, scale-only when it is not) minus

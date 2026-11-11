@@ -508,11 +508,14 @@ void main() {
       // The victim text never changed.)
       feedStaticPerson(h);
       await pumpFrames(tester);
-      expect(idxOf('speak:注意，前方有行人。'), greaterThanOrEqualTo(0),
+      // M2-B item 2: the static person's warning has no
+      // range in the widget harness (no pitch), so its
+      // full sentence is the no-range clock form.
+      expect(idxOf('speak:注意，十二点钟方向，行人靠近。'), greaterThanOrEqualTo(0),
           reason: 'timeline: ${timeline()}');
       h.debugLiveFix(southOfB(29.5), 5);
       await pumpFrames(tester);
-      await completeSpeak(tester, 'speak:注意，前方有行人。');
+      await completeSpeak(tester, 'speak:注意，十二点钟方向，行人靠近。');
       final int promptIdx = idxOf('speak:前方约30米右转');
       expect(promptIdx, greaterThanOrEqualTo(0),
           reason: 'the literal 30 m prompt is playing. '
@@ -590,7 +593,7 @@ void main() {
       final MingtuHomeDebugHandle h = await startApp(tester);
       feedStaticPerson(h);
       await pumpFrames(tester);
-      final int warnIdx = idxOf('speak:注意，前方有行人。');
+      final int warnIdx = idxOf('speak:注意，十二点钟方向，行人靠近。');
       expect(warnIdx, greaterThanOrEqualTo(0), reason: 'timeline: ${timeline()}');
       expect(timeline(), contains('vibrate:warning'));
       feedApproachingCar(h);

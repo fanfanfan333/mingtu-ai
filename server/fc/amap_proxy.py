@@ -753,6 +753,159 @@ def whitelist_hazard_body(raw_body, secrets):
     ).encode("utf-8")
 
 
+# ------------------------------------------------------------------
+# Cloud event modes (M2 section 3.3): task == "crossing_info" and
+# task == "detour" on /vision. Same discipline as hazard mode --
+# prompts pinned here, answers rebuilt field by field through
+# fixed enums, ANY deviation collapses to the mode's unknown
+# form. There are NO free-text fields in either schema, so no
+# upstream string can cross at all.
+#
+# crossing_info answers a user stopped at a crossing: the light
+# state is reference data only (the client speaks it with a
+# reference-only caveat and never grants passage). countdown_s
+# degradation follows the hazard granularity: the field is
+# either a real integer in 0..99, an explicit null (the model
+# saw no countdown), or the WHOLE answer collapses -- a boolean
+# is not an integer, and an out-of-range / non-integer countdown
+# is a deviation like any other.
+#
+# detour answers whether the forward path looks blocked and
+# which side looks open. It is EVIDENCE for the device, never
+# an instruction: whether a step direction may be spoken is
+# decided on-device. The unknown form's "blocked" is False BY
+# CONSTRUCTION: an anomalous answer must never assert a
+# blockage (the affirmative claim), and "parsed": False tells
+# the client to treat the whole payload as unknown anyway.
+# ------------------------------------------------------------------
+
+CROSSING_PROMPT = (
+    "只输出一个 json 对象，不要输出任何其他文字："
+    '{"light": 信号灯, "countdown_s": 倒计时秒数或null, '
+    '"crosswalk_visible": true或false}。'
+    "信号灯只能是：red、green、yellow、none、unknown。"
+    "倒计时只能是0到99的整数，看不到倒计时就填 null。"
+    "crosswalk_visible 表示画面中是否能看到人行横道。"
+    "看不清或拿不准时，light 一律填 unknown。"
+    "不要做任何通行判断，不要输出 json 以外的任何内容。"
+)
+CROSSING_LIGHTS = frozenset(["red", "green", "yellow", "none", "unknown"])
+
+DETOUR_PROMPT = (
+    "只输出一个 json 对象，不要输出任何其他文字："
+    '{"blocked": true或false, "open_side": 开放侧}。'
+    "blocked 表示正前方通道是否被障碍物堵住。"
+    "开放侧只能是：left、right、none、unknown。"
+    "看不清或拿不准时，open_side 一律填 unknown。"
+    "不要做任何通行判断，不要输出 json 以外的任何内容。"
+)
+DETOUR_SIDES = frozenset(["left", "right", "none", "unknown"])
+
+
+def _crossing_unknown():
+    return json.dumps(
+        {
+            "light": "unknown",
+            "countdown_s": None,
+            "crosswalk_visible": False,
+            "parsed": False,
+        }
+    ).encode("utf-8")
+
+
+def _detour_unknown():
+    return json.dumps(
+        {"blocked": False, "open_side": "unknown", "parsed": False}
+    ).encode("utf-8")
+
+
+def _chat_content(raw_body):
+    """Extract the first choice's message content string
+    from an upstream chat body, or None when the body is
+    not even the expected chat shape (the caller maps
+    None to its generic upstream-failure answer, exactly
+    like the hazard/scene whitelists do)."""
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("error") is not None:
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    return content
+
+
+def whitelist_crossing_body(raw_body, secrets):
+    """Rebuild a crossing_info upstream answer field by
+    field. Returns the structured bytes (the unknown form
+    whenever the content deviates), or None when the
+    upstream body is not the expected chat shape."""
+    content = _chat_content(raw_body)
+    if content is None:
+        return None
+    try:
+        inner = json.loads(content)
+    except Exception:
+        return _crossing_unknown()
+    if not isinstance(inner, dict):
+        return _crossing_unknown()
+    light = _coerce_enum(inner.get("light"), CROSSING_LIGHTS)
+    if not light:
+        return _crossing_unknown()
+    countdown = inner.get("countdown_s")
+    if countdown is not None:
+        if isinstance(countdown, bool) or not isinstance(countdown, int):
+            return _crossing_unknown()
+        if countdown < 0 or countdown > 99:
+            return _crossing_unknown()
+    crosswalk = inner.get("crosswalk_visible")
+    if not isinstance(crosswalk, bool):
+        return _crossing_unknown()
+    return json.dumps(
+        {
+            "light": light,
+            "countdown_s": countdown,
+            "crosswalk_visible": crosswalk,
+            "parsed": True,
+        }
+    ).encode("utf-8")
+
+
+def whitelist_detour_body(raw_body, secrets):
+    """Rebuild a detour upstream answer field by field.
+    Same contract as whitelist_crossing_body; the unknown
+    form never asserts a blockage."""
+    content = _chat_content(raw_body)
+    if content is None:
+        return None
+    try:
+        inner = json.loads(content)
+    except Exception:
+        return _detour_unknown()
+    if not isinstance(inner, dict):
+        return _detour_unknown()
+    blocked = inner.get("blocked")
+    if not isinstance(blocked, bool):
+        return _detour_unknown()
+    side = _coerce_enum(inner.get("open_side"), DETOUR_SIDES)
+    if not side:
+        return _detour_unknown()
+    return json.dumps(
+        {"blocked": blocked, "open_side": side, "parsed": True}
+    ).encode("utf-8")
+
+
 def handle_vision_body(raw, *, dashscope_key, vision_upstream,
                        poster, amap_key=""):
     """Parse, pin, clamp, forward and whitelist one /vision
@@ -779,10 +932,24 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
         return 400, json.dumps({"error": "messages required"}).encode()
     if not dashscope_key:
         return 503, json.dumps({"error": "vision not configured"}).encode()
-    hazard_mode = payload.pop("task", None) == "hazard_scan"
+    task = payload.pop("task", None)
+    hazard_mode = task == "hazard_scan"
+    crossing_mode = task == "crossing_info"
+    detour_mode = task == "detour"
+    # The strict-JSON modes share the hazard decoding pin
+    # (json_object response format, temperature 0, the
+    # hazard token clamp); scene mode is untouched.
+    strict_mode = hazard_mode or crossing_mode or detour_mode
     # Pin the instruction server-side: any text part the client
     # sent is replaced with the mode's JSON-only prompt.
-    pinned_prompt = HAZARD_PROMPT if hazard_mode else VISION_PROMPT
+    if hazard_mode:
+        pinned_prompt = HAZARD_PROMPT
+    elif crossing_mode:
+        pinned_prompt = CROSSING_PROMPT
+    elif detour_mode:
+        pinned_prompt = DETOUR_PROMPT
+    else:
+        pinned_prompt = VISION_PROMPT
     for message in payload["messages"]:
         if not isinstance(message, dict):
             continue
@@ -797,7 +964,7 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
     requested = payload.get("max_tokens")
     if not isinstance(requested, int) or requested <= 0:
         requested = VISION_MAX_TOKENS
-    if hazard_mode:
+    if strict_mode:
         payload["max_tokens"] = min(requested, HAZARD_MAX_TOKENS)
         payload["response_format"] = {"type": "json_object"}
         payload["temperature"] = 0
@@ -813,6 +980,11 @@ def handle_vision_body(raw, *, dashscope_key, vision_upstream,
         return 502, json.dumps({"error": "upstream failure"}).encode()
     if hazard_mode:
         cleaned = whitelist_hazard_body(resp_body, [amap_key, dashscope_key])
+    elif crossing_mode:
+        cleaned = whitelist_crossing_body(
+            resp_body, [amap_key, dashscope_key])
+    elif detour_mode:
+        cleaned = whitelist_detour_body(resp_body, [amap_key, dashscope_key])
     else:
         cleaned = whitelist_vision_body(resp_body, [amap_key, dashscope_key])
     if cleaned is None:

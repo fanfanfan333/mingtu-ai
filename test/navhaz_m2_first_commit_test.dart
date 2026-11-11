@@ -315,8 +315,9 @@ void main() {
     });
 
     test('every short form passes the banned-word scan, '
-        'fits six voiced characters and is inside the '
-        'enumerated phrase space (NH-M1-19 forms)', () {
+        'fits its category voiced-character cap (config '
+        'constants) and is inside the enumerated phrase '
+        'space (NH-M1-19 forms)', () {
       final Set<String> enumerated = enumerateAllHazardPhrases().toSet();
       final Set<String> forms = shortUrgentPhrases().toSet();
       expect(forms.length, 18,
@@ -334,27 +335,85 @@ void main() {
             reason: 'a short form never carries a step '
                 'direction');
       }
-      // NH-M1-19's six-character cap, with its ONE
-      // documented exception class: the kind-name
-      // fallback entries （机动车 / 非机动车 -- labels
-      // outside the detector vocabulary) keep their full
-      // kind name because compressing it would misreport
-      // the category; they run 6-8 voiced characters.
-      // Every form for a label IN the vocabulary fits.
-      for (final String s in forms) {
-        if (s.contains('机动车')) continue; // the fallback pair
-        expect(voicedCharCount(s), lessThanOrEqualTo(6),
-            reason: 'NH-M1-19: short forms fit six voiced '
-                'characters (kind-name fallbacks '
-                'excepted): "$s"');
+      // NH-M1-19's voiced-character caps, asserted over
+      // the WHOLE table by category (M2-B item 4: the
+      // caps are NavHazConfig constants --
+      // shortPhraseMaxCharsInVocabulary /
+      // shortPhraseMaxCharsFallback -- and this test
+      // reads them; the numbers live in exactly one
+      // place). This replaces the previous shape, which
+      // skipped ('exempted') any form containing the
+      // kind-name substring: forms are now classified by
+      // their (kind, name) key -- a name the detector
+      // vocabulary produces is in-vocabulary; the two
+      // kind-name entries （机动车 / 非机动车, reached
+      // only by labels outside the vocabulary) are the
+      // fallback class. The fallback entries keep their
+      // full kind name because compressing it would
+      // misreport the category.
+      final Set<String> inVocabularyNames = <String>{
+        for (final String label in <String>[
+          'car', 'truck', 'bus', 'motorcycle', 'bicycle',
+          'person', 'pole', 'mystery-box',
+        ])
+          hazardSpokenName(
+              label, hazardKindForLabel(label) ?? HazardKind.clutter),
+      };
+      int tableEntries = 0;
+      final List<int> fallbackCounts = <int>[];
+      int inVocabularyMax = 0;
+      for (final MapEntry<(HazardKind, String), String> entry
+          in shortUrgentPhraseByKindAndName.entries) {
+        final bool fallback =
+            !inVocabularyNames.contains(entry.key.$2);
+        for (final String form in entry.value.split('|')) {
+          tableEntries++;
+          final int chars = voicedCharCount(form);
+          if (fallback) {
+            fallbackCounts.add(chars);
+            expect(chars,
+                lessThanOrEqualTo(
+                    NavHazConfig.shortPhraseMaxCharsFallback),
+                reason: 'NH-M1-19 fallback cap (config '
+                    'constant): "$form"');
+          } else {
+            if (chars > inVocabularyMax) inVocabularyMax = chars;
+            expect(chars,
+                lessThanOrEqualTo(
+                    NavHazConfig.shortPhraseMaxCharsInVocabulary),
+                reason: 'NH-M1-19 in-vocabulary cap (config '
+                    'constant): "$form"');
+          }
+        }
       }
+      expect(tableEntries, 30,
+          reason: 'the whole table: 10 (kind, name) '
+              'entries x three bearings');
+      expect(inVocabularyMax,
+          NavHazConfig.shortPhraseMaxCharsInVocabulary,
+          reason: 'the in-vocabulary cap is genuinely '
+              'reached (the clutter centre form), not '
+              'headroom');
+      // The fallback cap is genuinely exercised, not a
+      // vacuous allowance: the motor centre form
+      // measures 7 and the non-motor centre form
+      // measures exactly the fallback cap.
+      expect(fallbackCounts, contains(7),
+          reason: 'the motor-vehicle kind-name centre '
+              'form （停，前方有机动车） measures 7');
+      expect(
+          fallbackCounts,
+          contains(NavHazConfig.shortPhraseMaxCharsFallback),
+          reason: 'the non-motor kind-name centre form '
+              '（停，前方有非机动车） measures exactly the '
+              'fallback cap');
       expect(
           voicedCharCount(
               shortUrgentPhrase(HazardKind.motorVehicle, '机动车', 0.1)),
           6,
-          reason: 'the motor fallback even fits at a side '
-              'bearing; its centre form (7) is the cap\'s '
-              'documented exception');
+          reason: 'the motor fallback at a side bearing '
+              'measures 6 (inside even the in-vocabulary '
+              'cap)');
       // The bearing is selected by the same zone rule as
       // the normal templates (one probe per zone edge).
       expect(shortUrgentPhrase(HazardKind.motorVehicle, '汽车', 0.5),

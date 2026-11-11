@@ -1456,8 +1456,26 @@ void main() {
       final String src = File('lib/main.dart').readAsStringSync();
       expect(src.contains('ego: EgoMotion.still'), isFalse,
           reason: 'the hardcoded still ego is gone');
-      expect(src.contains('ego: _egoMotionNow(now)'), isTrue,
-          reason: 'frames carry the judged ego estimate');
+      // M2B-FIX1 item 4: the original literal
+      // 'ego: _egoMotionNow(now)' expired when M2
+      // section 3.1 hoisted the per-frame judgement
+      // into a shared local -- the pipeline and the
+      // frame-rate policy must read ONE judgement of
+      // the frame, never two sensor reads. The guard's
+      // INTENT is unchanged (the pipeline eats the
+      // per-frame judged ego, never a hardcoded
+      // still); the literal is now a DUAL assertion
+      // covering both halves of the hoisting: the
+      // per-frame assignment AND the pipeline call
+      // consuming exactly that local.
+      expect(
+          src.contains('final EgoMotion egoNow = _egoMotionNow(now);'),
+          isTrue,
+          reason: 'the frame\'s ego is judged once, '
+              'into the shared egoNow local');
+      expect(src.contains('ego: egoNow,'), isTrue,
+          reason: 'the pipeline call consumes that '
+              'per-frame judgement');
       expect(src.contains('EgoMotion.judge('), isTrue);
     });
   });

@@ -366,7 +366,34 @@ Set<String> enumerateNavigationDistanceTexts() {
   return out;
 }
 
-/// Whether the near (three-zone) wording applies.
+/// The no-range full sentence (M2-B item 2): the far
+/// (clock) template with the distance segment omitted --
+/// item and bearing kept, no metre readout. Spoken when
+/// no range could be measured (scale-only evidence);
+/// also exactly what the far template itself renders
+/// for a range in the no-number band, so this form is
+/// not a new shape, just the far form with the distance
+/// left out. Never the short form: the short form is
+/// the NH-M1-19 gate's decision at issuance, not a
+/// fallback for missing geometry.
+String hazardPhraseNoRange({
+  required bool urgent,
+  required String name,
+  required double cx,
+}) {
+  final String clock = '${_hourNames[clockHour(cx) - 1]}点钟方向';
+  return urgent ? '停，$clock，$name靠近' : '注意，$clock，$name靠近';
+}
+
+/// Whether the near (three-zone) wording applies to a
+/// MEASURED range. A null range is not "near": since
+/// M2-B item 2 it takes the no-range full sentence (see
+/// [hazardPhraseNoRange]), so this predicate is only
+/// ever consulted with a non-null range inside
+/// [hazardPhrase]; it keeps its null-inclusive shape
+/// for its other callers, whose semantics (an unmeasured
+/// target is treated cautiously, like a near one) are
+/// unchanged.
 bool isNearWording(double? rangeM) =>
     rangeM == null || rangeM <= NavHazConfig.nearWordingRangeM;
 
@@ -545,9 +572,11 @@ Set<String> reachableMetresTexts() {
 /// not a reason to throw away direction the user can
 /// still act on); the forms below keep the shortest
 /// bearing the wording system offers while staying
-/// within SIX voiced characters (runes, punctuation
-/// excluded) each -- the kind-name fallback entries
-/// excepted, see the last bullet:
+/// within the voiced-character caps in NavHazConfig
+/// ([NavHazConfig.shortPhraseMaxCharsInVocabulary] for
+/// in-vocabulary labels,
+/// [NavHazConfig.shortPhraseMaxCharsFallback] for the
+/// kind-name fallback entries, see the last bullet):
 /// - bearing: the near templates' own zone words -- the
 ///   LEFT / RIGHT zones compress to their first character
 ///   (左 / 右, unambiguous next to 停), the centre zone
@@ -680,22 +709,38 @@ String hazardPhrase({
   required double cx,
   required double? rangeM,
 }) {
+  // M2-B item 2: NO measured range (rangeM == null --
+  // scale-only evidence, e.g. no pitch): the full
+  // sentence keeps the item AND the bearing and omits
+  // ONLY the distance segment -- it takes the FAR
+  // (clock) template with an empty metre readout, the
+  // ranged far form minus its distance, exactly the
+  // shape a >= 10 m range already produces. The near
+  // branch below previously swallowed this case
+  // (isNearWording(null) is true): a dead-centre vehicle
+  // collapsed to '停，前方来车' -- textually the SHORT
+  // form, with the item name and the clock bearing
+  // thrown away even though the alert was never gated
+  // as a short form -- and every other kind collapsed
+  // to a zone form with no distance segment to remove.
+  // An unknown range asserts no distance; it must not
+  // silently demote a full sentence to the short form.
+  if (rangeM == null) {
+    return hazardPhraseNoRange(urgent: urgent, name: name, cx: cx);
+  }
   if (isNearWording(rangeM)) {
     final String zone = zoneName(cx);
     if (urgent) {
-      if (rangeM != null && rangeM <= 3) {
+      if (rangeM <= 3) {
         return '停，$zone${metresText(rangeM)}有$name';
       }
       if (isVehicle && zone == '前方') return '停，前方来车';
       return '停，$zone有$name';
     }
-    if (rangeM != null) {
-      return '注意，$zone${metresText(rangeM)}有$name';
-    }
-    return '注意，$zone有$name';
+    return '注意，$zone${metresText(rangeM)}有$name';
   }
   final String clock = '${_hourNames[clockHour(cx) - 1]}点钟方向';
-  final String metres = metresText(rangeM!);
+  final String metres = metresText(rangeM);
   if (urgent) {
     return '停，$clock$metres，$name靠近';
   }

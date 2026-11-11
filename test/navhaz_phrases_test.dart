@@ -18,6 +18,7 @@ import 'dart:io';
 import 'dart:math' show Random;
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mingtu_ai/core/avoidance_advisor.dart';
 import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
 
 import 'navhaz_fixture_harness.dart';
@@ -190,16 +191,41 @@ void main() {
       //   label name x three bearings, 18 distinct texts
       //   replacing the 4 kind-only ones): the 3 forms
       //   that already existed stay ('停，前方来车',
-      //   '停，前方有人', '停，前方有杂物'), the one
-      //   NH-M1-17 form that existed only as a short form
-      //   is REPLACED ('停，前方有杆子' -> the pole short
-      //   '停，前方有杆', which still exists as a template
-      //   phrase, so nothing is lost), and 15 forms are
-      //   genuinely new (every side-bearing form plus the
-      //   two kind-name centre forms). => 1,045 + 15 =
-      //   1,060, verified by set difference against the
-      //   rebuilt pre-NH-M1-19 set this round (gained 15,
-      //   lost 0).
+      //   '停，前方有人', '停，前方有杂物'); the remaining
+      //   NH-M1-17 form is REPLACED as a short form
+      //   ('停，前方有杆子' -> the pole short '停，前方有杆')
+      //   -- note the
+      //   direction of the survival, stated precisely
+      //   (M2-B item 3: an earlier draft of this comment
+      //   attached it to the wrong form): it is the OLD
+      //   form '停，前方有杆子' that still exists as a
+      //   template phrase (the pole near form verbatim,
+      //   per the NH-M1-17 bullet above), so nothing is
+      //   lost from the set when the short form changes;
+      //   '停，前方有杆' itself is genuinely new (one of
+      //   the 15 below). 15 forms are genuinely new
+      //   (every side-bearing form plus the two kind-name
+      //   centre forms and the new pole centre form).
+      //   => 1,045 + 15 = 1,060, verified by set
+      //   difference against the rebuilt pre-NH-M1-19 set
+      //   that round (gained 15, lost 0).
+      // - M2-B item 2 (no-range full sentence): a null
+      //   range no longer takes the near branch -- it
+      //   renders the clock form with the distance
+      //   omitted ('停，十二点钟方向，汽车靠近'), a string the
+      //   far no-number band already produced, so item 2
+      //   ADDS no string. What leaves the space is the
+      //   30 warning zone forms with no distance segment
+      //   ('注意，{左边/前方/右边}有{name}' x the 10 spoken
+      //   names): they were producible ONLY through a
+      //   null range (a measured near range always
+      //   carries a readout), and a null range now takes
+      //   the clock form instead. The urgent zone forms
+      //   lose nothing (every one stays producible via a
+      //   measured range in the (3, 5] near band, and the
+      //   centre vehicle form via the short table too).
+      //   => 1,060 - 30 = 1,030, verified by set
+      //   difference this round (gained 0, lost 30).
       // The RAW yield count is deliberately NOT pinned
       // any more (NH-M1-14): the distance axes are now
       // DERIVED from the shared hazardBands table (denser
@@ -209,10 +235,12 @@ void main() {
       // while the producible phrase SET -- the quantity
       // the 2,460-combination baseline actually pinned
       // semantically -- is what the pin above tracks.
-      expect(all.toSet().length, 1060,
+      expect(all.toSet().length, 1030,
           reason: 'the producible phrase set: NH-M1-14 '
               'baseline 1,044 + 1 NH-M1-17 short form '
-              '(person) + 15 NH-M1-19 bearing forms');
+              '(person) + 15 NH-M1-19 bearing forms '
+              '- 30 M2-B no-range warning forms (see the '
+              'composition account above)');
       expect(all.length, greaterThan(2460),
           reason: 'the table-derived axes sample at least '
               'the old hand-listed coverage');
@@ -359,6 +387,80 @@ void main() {
       expect(metresText(13.0), '',
           reason: 'FIX3B band: >= 10 m speaks no number '
               '(was: 15米)');
+    });
+
+    test('no-range full sentence (M2-B item 2): item and '
+        'bearing kept, distance omitted, never the short '
+        'form', () {
+      // Scale-only evidence (rangeM == null -- no pitch,
+      // so no range can be computed): the FULL sentence
+      // must still name the item and the bearing; only
+      // the distance segment is omitted. Before this
+      // fix the null case fell into the near branch and
+      // a dead-centre vehicle collapsed to the short
+      // form's text verbatim.
+      const String urgentCar = '停，十二点钟方向，汽车靠近';
+      expect(
+          hazardPhrase(
+              urgent: true, name: '汽车', isVehicle: true, cx: 0.5, rangeM: null),
+          urgentCar,
+          reason: 'verbatim: the far (clock) form minus '
+              'its distance segment');
+      expect(voicedCharCount(urgentCar), 11,
+          reason: '11 voiced characters -- the count the '
+              'NH-M1-19 gate\'s condition 2 now uses for '
+              'a no-range car sentence (was 5, when the '
+              'full sentence coincided with the short '
+              'form)');
+      expect(urgentCar.contains('汽车'), isTrue,
+          reason: 'the item word is present');
+      expect(urgentCar.contains('十二点钟方向'), isTrue,
+          reason: 'the bearing is present');
+      expect(urgentCar.contains(RegExp(r'[0-9]')), isFalse,
+          reason: 'no distance figure');
+      for (final String readout in reachableMetresTexts()) {
+        expect(urgentCar.contains(readout), isFalse,
+            reason: 'no metre readout "$readout" either');
+      }
+      expect(
+          urgentCar,
+          isNot(shortUrgentPhrase(HazardKind.motorVehicle, '汽车', 0.5)),
+          reason: 'the no-range full sentence is NOT the '
+              'short form -- missing geometry must not '
+              'demote it');
+      // The warning level takes the same no-range form.
+      expect(
+          hazardPhrase(
+              urgent: false, name: '汽车', isVehicle: true, cx: 0.5, rangeM: null),
+          '注意，十二点钟方向，汽车靠近');
+      // Other bearings / kinds follow the same rule
+      // (clock bearing from the same geometry).
+      expect(
+          hazardPhrase(
+              urgent: true, name: '行人', isVehicle: false, cx: 0.9, rangeM: null),
+          '停，一点钟方向，行人靠近',
+          reason: 'right-of-centre reads 1 o-clock, item '
+              'kept');
+      expect(
+          hazardPhrase(
+              urgent: true, name: '杆子', isVehicle: false, cx: 0.1, rangeM: null),
+          '停，十一点钟方向，杆子靠近');
+      // The no-range form is not a new shape: it is
+      // byte-identical to what the ranged far template
+      // renders inside the no-number band.
+      expect(
+          hazardPhrase(
+              urgent: true, name: '汽车', isVehicle: true, cx: 0.5, rangeM: 25),
+          urgentCar,
+          reason: 'a 25 m range (no-number band) renders '
+              'the same string -- ranged form minus '
+              'distance IS this form');
+      // And it belongs to the enumerated output space.
+      expect(enumerateAllHazardPhrases().toSet().contains(urgentCar),
+          isTrue,
+          reason: 'the no-range form is enumerated '
+              '(completeness follows the builder)');
+      expect(containsBannedWord(urgentCar), isFalse);
     });
 
     test('the fallback sentence itself is clean', () {

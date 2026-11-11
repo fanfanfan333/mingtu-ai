@@ -14,6 +14,12 @@ Widget buildYoloLiveView({
       onDetections,
   void Function(double latencyMs)? onLatencyMs,
   void Function(Object error)? onError,
+  // Accepted for signature parity with the mobile adapter
+  // (M2 section 3.1): there is no camera or plugin on this
+  // platform, so there is nothing to configure. The type is
+  // Object? because the plugin's config class does not
+  // exist off-device.
+  Object? streamingConfig,
 }) {
   return const Center(
     child: Text(
@@ -27,3 +33,14 @@ Widget buildYoloLiveView({
 /// No live view exists on this platform, so there is nothing to
 /// wait for: the "disposed" future is already complete.
 Future<void> get yoloLiveViewDisposed => Future<void>.value();
+
+/// No camera exists on this platform, so no rate was ever
+/// applied (parity with the mobile adapter's record).
+int? get appliedYoloFrameRateFps => null;
+
+/// No-op on this platform: there is no plugin to retarget.
+/// The signature mirrors the mobile adapter so the wiring
+/// layer in main.dart stays platform-free (the section 3.2
+/// 720p ceiling flag included -- equally a no-op here).
+Future<void> applyYoloFrameRateTarget(int targetFps,
+    {bool capAnalysisAt720p = false}) async {}

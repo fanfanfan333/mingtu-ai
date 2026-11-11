@@ -431,6 +431,33 @@ static const double ttsSecondsPerCharUpperBound = 0.30;
 /// measurement behind it yet.
 static const double shortPhraseSecondsPerChar = 0.25;
 
+/// NH-M1-19 voiced-character caps for the short forms
+/// (M2-B item 4: the caps live HERE, once -- the tests
+/// traverse the whole short-form table and read these
+/// constants instead of restating the numbers, so a cap
+/// change is one edit). Characters are counted by
+/// hazard_phrases.voicedCharCount (runes, spoken
+/// punctuation ，。！ excluded) -- the SAME counting the
+/// gate's condition 2 uses; no second counter exists.
+/// - [shortPhraseMaxCharsInVocabulary]: SIX voiced
+///   characters for every short form whose item name
+///   comes from the detector vocabulary (car / truck /
+///   bus / motorcycle / bicycle / person / pole and the
+///   clutter fallback for unlisted labels -- every such
+///   form fits today, the longest being the clutter
+///   centre form at exactly 6).
+/// - [shortPhraseMaxCharsFallback]: EIGHT voiced
+///   characters for the kind-name FALLBACK forms (labels
+///   outside the detector vocabulary speak their kind
+///   name -- 机动车 / 非机动车 -- whose honest item word
+///   is 3 / 4 characters and cannot compress without
+///   misreporting the category). The cap is genuinely
+///   exercised, not headroom: the motor-vehicle centre
+///   form measures 7 and the non-motor centre form
+///   measures exactly 8.
+static const int shortPhraseMaxCharsInVocabulary = 6;
+static const int shortPhraseMaxCharsFallback = 8;
+
 /// NH-M1-17, narrowed by NH-M1-19: NH-M1-17 introduced
 /// the short form (an URGENT whose normal sentence
 /// cannot finish before the physical moment speaks a
@@ -473,4 +500,190 @@ static const List<int> urgentVibrationAmplitudes = <int>[0, 255, 0, 255, 0, 255]
 /// (Spec pattern; amplitude 128 = half strength.)
 static const List<int> warningVibrationTimings = <int>[0, 40, 60, 40];
 static const List<int> warningVibrationAmplitudes = <int>[0, 128, 0, 128];
+
+// ---- Adaptive frame rate (M2 section 3.1) ----------------------------
+
+/// Master switch for the adaptive frame-rate policy
+/// (frame_rate_policy.dart). When false the wiring layer
+/// behaves EXACTLY as before this feature existed: no
+/// streaming config is passed to the live view, no
+/// controller call is made, and the plugin runs at its
+/// own default rate. The policy object itself remains
+/// pure logic either way; the flag is consulted only by
+/// the wiring layer.
+static const bool adaptiveFrameRateEnabled = true;
+
+/// Target inference rate while the user is STILL and the
+/// still gate (below) holds, FPS. (Spec 3.1 still tier.)
+static const int frameRateStillFps = 2;
+
+/// Target inference rate while WALKING, FPS. The spec
+/// band is 8-10 FPS; the UPPER edge is taken so tracking
+/// latency stays at the band's best while the power
+/// saving against the plugin default is still large.
+static const int frameRateWalkingFps = 10;
+
+/// Target inference rate while a confirmed hazard is
+/// NEAR (see [frameRateDangerTtcS]), FPS. The spec band
+/// is 15-20 FPS; the UPPER edge is taken because this
+/// tier exists precisely for the frames where TTC
+/// estimates must refresh fastest.
+static const int frameRateDangerFps = 20;
+
+/// A confirmed track counts as NEAR DANGER for the frame
+/// rate when its TTC is below this, seconds. (Spec 3.1:
+/// "confirmed track with TTC < 5 s, or an approaching
+/// vehicle inside the corridor" -- the corridor branch
+/// needs no threshold and lives in the policy's danger
+/// input definition.)
+static const double frameRateDangerTtcS = 5.0;
+
+/// Downshift hysteresis (spec 3.1): a LOWER tier's
+/// conditions must hold CONTINUOUSLY for this long
+/// before the target actually drops. Upshifts are
+/// immediate -- a danger must never wait out a timer --
+/// but a momentary lull (one quiet frame, a brief GPS
+/// wobble) must not flap the camera rate down and back.
+static const Duration frameRateDownshiftHold = Duration(seconds: 3);
+
+/// Still-gate quiet window (spec 3.1 substitute gating):
+/// the still tier requires, on top of the ego judge
+/// saying still, NO live track AND no new detection for
+/// at least this long. The plugin delivers detections,
+/// not raw frames, so true frame-difference / optical-
+/// flow gating is NOT available at this layer; it is
+/// deferred until the detection pipeline moves off the
+/// plugin (spec section 6 Q1). This detection-quiet
+/// proxy is the spec's own substitute, not an equivalent.
+static const Duration frameRateStillQuietWindow = Duration(seconds: 2);
+
+// ---- Thermal derating (M2 section 3.2) -------------------------------
+
+/// Master switch for thermal derating (thermal_policy.dart
+/// + the thermal_monitor adapter). When false the wiring
+/// layer never subscribes to the platform thermal stream
+/// and imposes no cap: the pre-3.2 behaviour, exactly. The
+/// policy object itself remains pure logic either way; the
+/// flag is consulted only by the wiring layer.
+static const bool thermalDeratingEnabled = true;
+
+/// FPS ceiling while the device reports LIGHT or MODERATE
+/// thermal status (spec 3.2). The same tier also caps the
+/// camera analysis resolution at 720p (the adapter maps
+/// that to the plugin's Size(1280, 720) convention).
+static const int thermalCapModerateFps = 10;
+
+/// FPS ceiling while the device reports SEVERE thermal
+/// status or worse (spec 3.2). This tier additionally
+/// restricts detection input to vehicle and pedestrian
+/// classes only.
+static const int thermalCapSevereFps = 5;
+
+/// Stepwise recovery hold (spec 3.2): after the reported
+/// status improves, it must HOLD below the applied tier
+/// continuously for this long before the cap rises ONE
+/// step (severe tier -> moderate tier -> unconstrained).
+/// Derating is always immediate; recovery is always
+/// hysteretic -- the same asymmetry as the frame-rate
+/// policy's up/down shifts (section 3.1), because a
+/// device oscillating around a thermal threshold must
+/// not flap the camera rate with it.
+static const Duration thermalRecoveryHold = Duration(seconds: 30);
+
+/// The heat derating warning, verbatim (spec 3.2,
+/// announcement model superseded by the episode-latch
+/// ruling): spoken once per derating episode, at the
+/// moment the applied cap first limits the frame rate
+/// (the FPS latch in thermal_policy.dart), at alert
+/// level. It asks the user to slow down and watch their
+/// footing; it makes no claim about the way ahead and
+/// passes the banned-word check (asserted in the thermal
+/// tests). The constant keeps its section 3.2 name --
+/// it was the CRITICAL-tier text under the original
+/// rule -- but the episode latch, not the critical
+/// status, now decides when it is spoken.
+static const String thermalCriticalAnnouncementText =
+    '手机较热，识别已降频，请放慢脚步注意脚下';
+
+/// The scope-restriction warning, verbatim (dictated
+/// wording): spoken once per derating episode, at the
+/// moment the applied cap first restricts detection to
+/// vehicles and pedestrians (the scope latch in
+/// thermal_policy.dart), at alert level. A blind user
+/// cannot see the narrower detection scope on a screen,
+/// so the narrowing is always spoken; the text passes
+/// the banned-word check (asserted in the thermal
+/// tests).
+static const String thermalScopeRestrictedAnnouncementText =
+    '手机过热，暂时只提醒车辆和行人，请放慢脚步';
+
+/// The recovery notice, verbatim (dictated wording):
+/// spoken once when a derating episode fully ends --
+/// the applied cap back to unconstrained on a genuine
+/// NONE reading -- at info level. Partial recoveries
+/// and unknown readings never produce it (see
+/// thermal_policy.dart). Passes the banned-word check
+/// (asserted in the thermal tests).
+static const String thermalRecoveryAnnouncementText = '障碍提醒已恢复';
+
+// ---- Cloud event triggers (M2 section 3.3) ---------------------------
+
+/// Master switch for the AUTOMATIC cloud triggers
+/// (cloud_trigger_policy.dart). When false the wiring
+/// layer never evaluates the trigger policy and no
+/// automatic cloud call is ever made; MANUAL cloud
+/// vision (the user's own "看看前面") is not governed by
+/// this flag at all. The policy and budget objects stay
+/// pure logic either way.
+static const bool cloudAutoTriggerEnabled = true;
+
+/// Step-text keywords that mark a navigation step as a
+/// crossing step for the crossingStop trigger (spec
+/// 3.3): a step whose text contains ANY of these is a
+/// step at which the user may have to cross or turn at
+/// an intersection.
+static const List<String> cloudCrossingStepKeywords = <String>[
+  '人行横道',
+  '过马路',
+  '路口',
+];
+
+/// crossingStop distance gate (spec 3.3): the user must
+/// be within this many metres of the crossing step's
+/// START point.
+static const double cloudCrossingMaxStepDistanceM = 15.0;
+
+/// crossingStop stillness gate (spec 3.3): the user
+/// must have been still CONTINUOUSLY for at least this
+/// long before a crossing frame is worth sending.
+static const Duration cloudCrossingStillHold = Duration(seconds: 2);
+
+/// pathBlocked persistence gate (spec 3.3): a confirmed
+/// static obstacle inside the forward channel must have
+/// persisted CONTINUOUSLY for at least this long.
+static const Duration cloudBlockedObstacleHold = Duration(seconds: 4);
+
+/// Static-obstacle closing slack for the pathBlocked
+/// evidence (wiring layer): an obstacle counts as
+/// STATIC when it closes no faster than the user's own
+/// measured motion explains, plus this slack -- i.e.
+/// the obstacle itself is not approaching; the closing
+/// is the user walking toward it. While the user stands
+/// still this reduces to "closes at most this fast".
+static const double cloudBlockedStaticClosingSlackMps = 0.3;
+
+/// Automatic-call budget (spec 3.3): two automatic
+/// cloud calls are at least this far apart...
+static const Duration cloudAutoMinInterval = Duration(seconds: 60);
+
+/// ...and at most [cloudAutoMaxPerWindow] automatic
+/// calls land in any sliding window of this length.
+/// The window is the HARD constraint (it caps the
+/// average at 0.5 calls/minute over any 10 minutes);
+/// the interval above is its corollary and is enforced
+/// explicitly as well.
+static const Duration cloudAutoWindow = Duration(minutes: 10);
+
+/// See [cloudAutoWindow].
+static const int cloudAutoMaxPerWindow = 5;
 }
