@@ -1,8 +1,12 @@
 /// Cloud hazard assessment: the STRICT JSON mode of the
 /// cloud vision channel (project-lead spec, 2026-11-09),
-/// used by the low-frequency walking scan for the things
-/// local YOLO cannot see -- stairs, curbs, pits and tactile
-/// paving -- and as a second opinion on people and vehicles.
+/// built for the things local YOLO cannot see -- stairs,
+/// curbs, pits and tactile paving -- and as a second
+/// opinion on people and vehicles. (Its automatic walking
+/// scan was deleted in M2 section 3.3; the hazard task
+/// itself remains on the proxy and in the client for the
+/// manual path. The same strict-JSON discipline carries
+/// the section 3.3 crossing_info / detour modes below.)
 ///
 /// Wire format (validated identically on the client here
 /// and on the FC proxy; anything nonconforming collapses to
@@ -278,12 +282,12 @@ String hazardDescriptionSpeech(HazardAssessment a) {
 const String cloudVisionDowngradeSpeech = '云端识图暂不可用，请慢行。';
 
 /// Announce-once + rate limit for
-/// [cloudVisionDowngradeSpeech]. A scan that keeps failing
-/// (for example against an old FC deployment) must tell the
-/// user ONCE that cloud vision is unavailable and then stay
-/// quiet for [announceCooldown]; without the gate, the
-/// 8-second walking scan would repeat the sentence forever.
-/// A successful scan resets the gate, so the next failure
+/// [cloudVisionDowngradeSpeech]. A cloud path that keeps
+/// failing (for example against an old FC deployment) must
+/// tell the user ONCE that cloud vision is unavailable and
+/// then stay quiet for [announceCooldown]; without the gate,
+/// a repeating trigger would repeat the sentence forever.
+/// A successful call resets the gate, so the next failure
 /// episode may speak once again.
 class CloudVisionDowngradeGate {
   final Duration announceCooldown;
@@ -352,53 +356,245 @@ class VisionRateBackoff {
   int get strikes => _strikes;
 }
 
-enum VisionTrigger { periodic, yoloHazard, manual }
+/// What can start a cloud-vision request (M2 section
+/// 3.3). Exactly three starters exist:
+/// - [crossingStop]: the AUTOMATIC crossing trigger --
+///   the user has stopped at the start of a crossing
+///   step; one frame goes out with task=crossing_info;
+/// - [pathBlocked]: the AUTOMATIC blockage trigger --
+///   a confirmed static obstacle has blocked the forward
+///   channel for a while and the user has stopped; one
+///   frame goes out with task=detour;
+/// - [manual]: the user's own explicit request (voice
+///   "看看前面" or the assist button), the scene-mode
+///   on-demand flow.
+///
+/// History: this enum used to carry `periodic` (an
+/// 8-second walking-scan timer) and `yoloHazard` (a
+/// per-alert automatic hazard frame). Section 3.3
+/// deleted BOTH automatic hazard starters: automatic
+/// cloud calls now happen only at the two event
+/// triggers above, under the CloudAutoTriggerBudget.
+/// The old cycle-merging coordinator went with them --
+/// its merge-into-one-request discipline is superseded
+/// by the budget's single shared in-flight slot (see
+/// cloud_trigger_policy.dart): any starter arriving
+/// while a request is in flight is dropped, never
+/// merged into a second call.
+enum VisionTrigger { crossingStop, pathBlocked, manual }
 
-enum CycleStart { hazardRun, manualRun, joined, coalesced, busy }
+enum CrossingLight { red, green, yellow, none, unknown }
 
-/// Merging rule for cloud-vision requests (project-lead
-/// spec): the periodic walking frame, a YOLO-triggered
-/// hazard frame and a manual "看看前面" frame that fall in
-/// the same cycle merge into ONE request -- they never stack
-/// into extra calls. Whoever starts the cycle picks the
-/// mode; a manual trigger joining a hazard cycle is answered
-/// by that cycle's result; scan triggers arriving during any
-/// run are coalesced away; a second manual trigger during a
-/// manual run is busy (the existing refusal path).
-class VisionCycleCoordinator {
-  bool _inFlight = false;
-  VisionTrigger? _inFlightKind;
-  bool _manualJoined = false;
+const Map<String, CrossingLight> _lightByWire = <String, CrossingLight>{
+  'red': CrossingLight.red,
+  'green': CrossingLight.green,
+  'yellow': CrossingLight.yellow,
+  'none': CrossingLight.none,
+  'unknown': CrossingLight.unknown,
+};
 
-  bool get inFlight => _inFlight;
-  bool get manualJoined => _manualJoined;
+/// One crossing_info answer, strictly parsed. The light
+/// state is REFERENCE data only: the spoken form (see
+/// [crossingSpeechText]) reports what the light LOOKS
+/// like and always carries the reference-only caveat;
+/// it never grants or implies passage.
+class CrossingInfo {
+  final CrossingLight light;
 
-  CycleStart trigger(VisionTrigger kind) {
-    if (_inFlight) {
-      if (kind == VisionTrigger.manual) {
-        if (_inFlightKind == VisionTrigger.manual) {
-          return CycleStart.busy;
-        }
-        _manualJoined = true;
-        return CycleStart.joined;
-      }
-      return CycleStart.coalesced;
+  /// Model-reported countdown, seconds, already range-
+  /// checked to 0..99 by the parser; null when the
+  /// model gave none (or an unusable one collapsed the
+  /// whole answer to [CrossingInfo.unknown]).
+  final int? countdownS;
+
+  /// Whether a crosswalk is visible in the frame. Data
+  /// only; no speech is derived from it in M2.
+  final bool crosswalkVisible;
+
+  /// False when the payload did not conform and this is
+  /// the collapsed all-unknown answer.
+  final bool parsed;
+
+  const CrossingInfo({
+    required this.light,
+    required this.countdownS,
+    required this.crosswalkVisible,
+    required this.parsed,
+  });
+
+  static const CrossingInfo unknown = CrossingInfo(
+    light: CrossingLight.unknown,
+    countdownS: null,
+    crosswalkVisible: false,
+    parsed: false,
+  );
+}
+
+/// Strictly parse one crossing_info payload. Same
+/// discipline as [parseHazardAssessment]: ANY deviation
+/// -- a missing key, an out-of-domain light, a countdown
+/// that is not an integer in 0..99 (a JSON boolean is
+/// not an integer), a non-boolean crosswalk flag --
+/// collapses the whole answer to [CrossingInfo.unknown].
+CrossingInfo parseCrossingInfo(Object? decoded) {
+  if (decoded is! Map) return CrossingInfo.unknown;
+  if (decoded['parsed'] != true) return CrossingInfo.unknown;
+  final Object? lightRaw = decoded['light'];
+  if (lightRaw is! String || !_lightByWire.containsKey(lightRaw)) {
+    return CrossingInfo.unknown;
+  }
+  final Object? countdownRaw = decoded['countdown_s'];
+  int? countdown;
+  if (countdownRaw != null) {
+    if (countdownRaw is! int || countdownRaw < 0 || countdownRaw > 99) {
+      return CrossingInfo.unknown;
     }
-    _inFlight = true;
-    _inFlightKind = kind;
-    _manualJoined = false;
-    return kind == VisionTrigger.manual
-        ? CycleStart.manualRun
-        : CycleStart.hazardRun;
+    countdown = countdownRaw;
   }
+  final Object? crosswalkRaw = decoded['crosswalk_visible'];
+  if (crosswalkRaw is! bool) return CrossingInfo.unknown;
+  return CrossingInfo(
+    light: _lightByWire[lightRaw]!,
+    countdownS: countdown,
+    crosswalkVisible: crosswalkRaw,
+    parsed: true,
+  );
+}
 
-  /// Close the cycle; returns whether a manual request had
-  /// joined it (and must be answered from its result).
-  bool complete() {
-    final bool joined = _manualJoined;
-    _inFlight = false;
-    _inFlightKind = null;
-    _manualJoined = false;
-    return joined;
+/// The pinned crossing prompt. The FC proxy pins the
+/// same text server-side (the client's copy is replaced
+/// there); it fixes every field and orders unknown
+/// answers whenever the frame is unclear.
+const String cloudCrossingPrompt = '只输出一个 json 对象，不要输出任何其他文字：'
+    '{"light": 信号灯, "countdown_s": 倒计时秒数或null, '
+    '"crosswalk_visible": true或false}。'
+    '信号灯只能是：red、green、yellow、none、unknown。'
+    '倒计时只能是0到99的整数，看不到倒计时就填 null。'
+    'crosswalk_visible 表示画面中是否能看到人行横道。'
+    '看不清或拿不准时，light 一律填 unknown。'
+    '不要做任何通行判断，不要输出 json 以外的任何内容。';
+
+/// Reference-only speech for a parsed crossing answer,
+/// or null when the answer carries nothing speakable
+/// (unparsed / light unknown -- the caller announces
+/// the fixed downgrade sentence instead). Every form
+/// states what the light LOOKS like, folds a countdown
+/// in as reference data only, and carries the
+/// reference-only caveat plus the instruction to confirm
+/// by the user's own familiar means. No form grants or
+/// implies passage, and none is derived from model
+/// prose: the light word comes from the enum alone.
+String? crossingSpeechText(CrossingInfo info) {
+  if (!info.parsed || info.light == CrossingLight.unknown) return null;
+  final String lead = switch (info.light) {
+    CrossingLight.red => '信号灯看起来是红灯',
+    CrossingLight.green => '信号灯看起来是绿灯',
+    CrossingLight.yellow => '信号灯看起来是黄灯',
+    CrossingLight.none => '画面里没有看到信号灯',
+    CrossingLight.unknown => '',
+  };
+  // A countdown rides along as reference data -- except
+  // with light=none, where "no light seen" and a live
+  // countdown would contradict each other in one breath;
+  // the countdown claim is dropped, never the caveat.
+  final String countdown = info.countdownS == null ||
+          info.light == CrossingLight.none
+      ? ''
+      : '，倒计时约${info.countdownS}秒';
+  return '$lead$countdown，仅供参考，请用你熟悉的方式确认。';
+}
+
+/// Outcome of one crossing_info call: either a strictly
+/// parsed [CrossingInfo] or the shared failure
+/// vocabulary. Mirrors [HazardScanOutcome].
+class CrossingScanOutcome {
+  final CrossingInfo? info;
+  final CloudVisionFailure? failure;
+  const CrossingScanOutcome.ok(CrossingInfo i)
+      : info = i,
+        failure = null;
+  const CrossingScanOutcome.failed(CloudVisionFailure f)
+      : info = null,
+        failure = f;
+  bool get ok => failure == null && info != null;
+}
+
+enum DetourOpenSide { left, right, none, unknown }
+
+const Map<String, DetourOpenSide> _sideByWire = <String, DetourOpenSide>{
+  'left': DetourOpenSide.left,
+  'right': DetourOpenSide.right,
+  'none': DetourOpenSide.none,
+  'unknown': DetourOpenSide.unknown,
+};
+
+/// One detour answer, strictly parsed. EVIDENCE ONLY:
+/// [openSide] is one input the device may weigh later;
+/// whether a step direction is spoken is decided
+/// on-device by the avoidance advisor's three-condition
+/// rule, never by this payload, and M2 wires no speech
+/// to this answer at all (see the wiring layer).
+class DetourInfo {
+  final bool blocked;
+  final DetourOpenSide openSide;
+
+  /// False when the payload did not conform and this is
+  /// the collapsed unknown-evidence answer. Its
+  /// [blocked] is false BY CONSTRUCTION: an anomalous
+  /// answer must never assert a blockage.
+  final bool parsed;
+
+  const DetourInfo({
+    required this.blocked,
+    required this.openSide,
+    required this.parsed,
+  });
+
+  static const DetourInfo unknown = DetourInfo(
+    blocked: false,
+    openSide: DetourOpenSide.unknown,
+    parsed: false,
+  );
+}
+
+/// Strictly parse one detour payload; any deviation
+/// (non-boolean blocked, out-of-domain side, missing
+/// keys) collapses to [DetourInfo.unknown].
+DetourInfo parseDetourInfo(Object? decoded) {
+  if (decoded is! Map) return DetourInfo.unknown;
+  if (decoded['parsed'] != true) return DetourInfo.unknown;
+  final Object? blockedRaw = decoded['blocked'];
+  if (blockedRaw is! bool) return DetourInfo.unknown;
+  final Object? sideRaw = decoded['open_side'];
+  if (sideRaw is! String || !_sideByWire.containsKey(sideRaw)) {
+    return DetourInfo.unknown;
   }
+  return DetourInfo(
+    blocked: blockedRaw,
+    openSide: _sideByWire[sideRaw]!,
+    parsed: true,
+  );
+}
+
+/// The pinned detour prompt. The FC proxy pins the
+/// same text server-side.
+const String cloudDetourPrompt = '只输出一个 json 对象，不要输出任何其他文字：'
+    '{"blocked": true或false, "open_side": 开放侧}。'
+    'blocked 表示正前方通道是否被障碍物堵住。'
+    '开放侧只能是：left、right、none、unknown。'
+    '看不清或拿不准时，open_side 一律填 unknown。'
+    '不要做任何通行判断，不要输出 json 以外的任何内容。';
+
+/// Outcome of one detour call. Mirrors
+/// [HazardScanOutcome].
+class DetourScanOutcome {
+  final DetourInfo? info;
+  final CloudVisionFailure? failure;
+  const DetourScanOutcome.ok(DetourInfo i)
+      : info = i,
+        failure = null;
+  const DetourScanOutcome.failed(CloudVisionFailure f)
+      : info = null,
+        failure = f;
+  bool get ok => failure == null && info != null;
 }

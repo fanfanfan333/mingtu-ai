@@ -158,6 +158,19 @@ class NavigationTracker {
 
   int get totalPoints => _points.length;
 
+  /// Distance in metres from [p] to the START point of
+  /// step [stepIndex] (the first polyline point of that
+  /// step), or null when the index names no step. Read-
+  /// only: the M2 section 3.3 crossing trigger gates on
+  /// the user standing near the start of a crossing
+  /// step, which is exactly this distance.
+  double? distanceToStepStartM(GeoPoint p, int stepIndex) {
+    if (stepIndex < 0 || stepIndex >= _stepStartPointIndex.length) {
+      return null;
+    }
+    return haversineMeters(p, _points[_stepStartPointIndex[stepIndex]]);
+  }
+
   /// NAVHAZ M1 arbitration (spec section 2.6): regenerate an
   /// interrupted turn-ahead prompt for [stepIndex] from the
   /// LATEST fix -- the distance is recomputed against the

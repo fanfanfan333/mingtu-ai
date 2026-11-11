@@ -29,6 +29,7 @@ import 'core/asr_errors.dart';
 import 'core/danger_alerts.dart';
 import 'core/avoidance_advisor.dart';
 import 'core/cloud_vision_hazard.dart';
+import 'core/cloud_trigger_policy.dart';
 import 'core/orientation.dart';
 import 'adapters/orientation_monitor.dart';
 import 'adapters/haptics.dart';
@@ -43,6 +44,7 @@ import 'core/pitch.dart';
 import 'core/hazard/ego_motion.dart';
 import 'core/hazard/hazard_phrases.dart';
 import 'core/hazard/hazard_pipeline.dart';
+import 'core/hazard/ttc_estimator.dart';
 import 'core/hazard/hazard_policy.dart';
 import 'core/destination_dialogue.dart';
 import 'core/entrance_guidance.dart';
@@ -312,6 +314,15 @@ class MingtuHomeDebugHandle {
 
   /// NAVHAZ M1 seam: the installed live tracker, if any.
   NavigationTracker? get debugLiveNav => _state._liveNav;
+
+  /// M2 section 3.3 seams: the latest automatic cloud
+  /// answers, recorded as evidence by the wiring layer.
+  /// The detour record is evidence only -- no speech or
+  /// step is ever derived from it in M2.
+  CrossingInfo? get debugLastCrossingInfo => _state._lastCrossingInfo;
+  DetourInfo? get debugLastDetourInfo => _state._lastDetourInfo;
+  DateTime? get debugLastDetourAt => _state._lastDetourAt;
+  bool get debugCloudAutoInFlight => _state._cloudAutoBudget.inFlight;
 
   /// NAVHAZ M1 seam: feed one live-navigation fix through
   /// the production fix handler.
@@ -765,11 +776,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// value immediately instead of waiting for the next
   /// pipeline frame.
   int? _lastSceneTargetFps;
-  // Cloud-vision cycle merging + 429 backoff (hazard scans).
-  final VisionCycleCoordinator _visionCycle = VisionCycleCoordinator();
+  // Cloud-vision 429 backoff + downgrade gate, shared by
+  // every cloud starter (manual and the M2 section 3.3
+  // automatic event triggers alike).
   final VisionRateBackoff _visionBackoff = VisionRateBackoff();
   final CloudVisionDowngradeGate _visionDowngrade = CloudVisionDowngradeGate();
-  Timer? _hazardScanTimer;
   GeoPoint? _lastFixPoint;
   double? _lastFixAccuracyM;
   // Latest GPS ground speed carried by a live fix, and
@@ -777,9 +788,46 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // round; freshness is judged against the frame time).
   double? _lastFixSpeedMps;
   DateTime? _lastFixSpeedAt;
-  GeoPoint? _scanAnchorPoint;
-  DateTime? _lastVisionCallAt;
-  bool _manualCycleOwned = false;
+  // True while THIS page's manual cloud-vision run holds
+  // the budget's shared in-flight slot (section 3.3);
+  // the run releases it in its finally block.
+  bool _manualSlotOwned = false;
+
+  // ---- M2 section 3.3: automatic cloud event triggers ----
+  // The pure policy + budget (core/cloud_trigger_policy
+  // .dart). The fields below are the wiring layer's
+  // continuously-measured evidence the policy reads:
+  // stillness and corridor-obstacle holds are tracked
+  // per pipeline frame, never accumulated across breaks.
+  final CloudTriggerPolicy _cloudTriggerPolicy = const CloudTriggerPolicy();
+  final CloudAutoTriggerBudget _cloudAutoBudget = CloudAutoTriggerBudget();
+
+  /// When the current unbroken stillness began (ego
+  /// judge not walking); null while walking.
+  DateTime? _stillSince;
+
+  /// The confirmed static corridor obstacle currently
+  /// being tracked for the pathBlocked hold, and when
+  /// its unbroken persistence began.
+  int? _corridorObstacleTrackId;
+  DateTime? _corridorObstacleSince;
+
+  /// The avoidance advisor's most recent decision
+  /// (either decide() call site records it).
+  StepAdvice? _lastAdvisorAdvice;
+
+  /// Whether the latest YOLO frame contained a traffic
+  /// light detection.
+  bool _trafficLightVisible = false;
+
+  /// The latest AUTOMATIC cloud answers, kept as
+  /// evidence records (debug-visible below). The detour
+  /// record is evidence only: nothing in M2 speaks or
+  /// steps from it; the crossing record backs the
+  /// reference-only announcement already made.
+  CrossingInfo? _lastCrossingInfo;
+  DetourInfo? _lastDetourInfo;
+  DateTime? _lastDetourAt;
   String _perceptionText = '尚未模拟感知帧。';
   // v0.6 real integrations. Defaults are the unavailable fallbacks;
   // _initRealIntegrations replaces them only when the phone's own
@@ -1172,11 +1220,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     HapticsFailureLog.listener = () {
       _logMsg('振动未执行：设备报告振动失败（累计 ${HapticsFailureLog.count} 次）。');
     };
-    _hazardScanTimer?.cancel();
-    _hazardScanTimer = Timer.periodic(
-      const Duration(seconds: 8),
-      (_) => _hazardScanTick(),
-    );
     _announceStartupFailures(speechUsable: speechUsable);
     unawaited(_kickoffVoiceNavFlow(speechUsable));
   }
@@ -2102,7 +2145,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _visionRuns.cancelActive();
     _cameraOwnership.cancelAllAndRelease();
     _straightTimer?.cancel();
-    _hazardScanTimer?.cancel();
     _orientation.dispose();
     _pitchMonitor.dispose();
     _thermalSub?.cancel();
@@ -4346,6 +4388,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // at delivery (null for simulated / scripted frames,
     // which then stamp no frame-to-callback segment).
     final DateTime now = DateTime.now();
+    // M2 section 3.3 evidence: whether THIS frame shows
+    // a traffic light (COCO label). Read off the raw
+    // frame, before any downstream gating.
+    _trafficLightVisible =
+        detections.any((Detection d) => d.label == 'traffic light');
     // M2 section 3.2 class restriction: while the thermal
     // cap's severe tier holds, detection INPUT is limited
     // to vehicle and pedestrian classes BEFORE anything
@@ -4584,6 +4631,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // pipeline's own frame (danger and live tracks come
     // from its estimates). No-op while the flag is off.
     _applyFrameRatePolicy(result, egoNow, now);
+    // M2 section 3.3: the automatic cloud event triggers
+    // are evaluated on the pipeline's own frame too --
+    // stillness and the corridor-obstacle hold are
+    // measured from these very estimates, so the trigger
+    // can never fire on staler evidence than the hazard
+    // path itself used. No-op while the flag is off or
+    // no live navigation is running.
+    _updateCloudTriggerEvidence(result, egoNow, now);
+    _evaluateCloudAutoTriggers(now);
     // S3 segment 2 START: the pipeline has returned.
     // (Stamped on the segment clock -- the wall clock in
     // production; a test may install a fake through the
@@ -4655,14 +4711,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         hazard: alert.detection,
         orientationStable: _orientation.isStable,
       );
+      // M2 section 3.3 evidence: the advisor's most
+      // recent verdict feeds the pathBlocked trigger.
+      _lastAdvisorAdvice = decision.advice;
       if (decision.advice == StepAdvice.stepLeft) {
         text = '$text，向左迈一步';
       } else if (decision.advice == StepAdvice.stepRight) {
         text = '$text，向右迈一步';
       }
-      if (alert.nearCenter) {
-        unawaited(_triggerHazardScan(VisionTrigger.yoloHazard));
-      }
+      // (The pre-3.3 automatic cloud hazard frame that
+      // used to fire here on a near-centre alert is
+      // deleted: automatic cloud calls are now only the
+      // two event triggers of section 3.3.)
     }
     final String requestId = 'navhaz-${alert.urgent ? 'urgent' : 'warning'}-'
         '${now.millisecondsSinceEpoch}';
@@ -4755,13 +4815,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             hazard: representative,
             orientationStable: _orientation.isStable,
           );
+          // M2 section 3.3 evidence, as on the pipeline
+          // path: record the advisor's latest verdict.
+          _lastAdvisorAdvice = decision.advice;
           text = decision.speech;
-          if (decision.nearCenterHazard) {
-            // A near hazard in the corridor also triggers a
-            // cloud hazard frame, merged into the current
-            // vision cycle (never an extra request).
-            unawaited(_triggerHazardScan(VisionTrigger.yoloHazard));
-          }
+          // (The pre-3.3 automatic cloud hazard frame
+          // that used to fire here on a near-centre hazard
+          // is deleted with the rest of the automatic
+          // hazard scan; see the pipeline call site.)
         } else {
           text = dangerTextFor(chosen);
         }
@@ -5365,54 +5426,270 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// only in the proxy's server environment; this device sends
   /// one downsampled frame to the proxy and nothing else.
   /// Manual cloud-vision entry (voice command and button):
-  /// routes through the cycle coordinator so a tap during a
-  /// hazard scan JOINS that cycle's single request instead of
-  /// starting a second one, and a tap during a 429 backoff is
-  /// skipped silently (local detection continues).
+  /// takes the section 3.3 budget's shared in-flight slot
+  /// first -- a tap while ANY cloud request is in flight
+  /// (an automatic event call included) is answered with
+  /// the existing busy sentence instead of starting a
+  /// second request -- and a tap during a 429 backoff is
+  /// skipped with a log line (local detection continues).
+  /// The run releases the slot in its finally block.
+  /// Manual calls never consume the automatic budget.
   void _triggerManualVision() {
-    if (!_visionBackoff.allow(DateTime.now())) {
+    final DateTime now = DateTime.now();
+    if (!_visionBackoff.allow(now)) {
       _logMsg('云端视觉：429 退避中，手动识图已跳过，只用本地检测。');
       return;
     }
-    final CycleStart start = _visionCycle.trigger(VisionTrigger.manual);
-    if (start == CycleStart.joined) {
-      _logMsg('云端视觉：手动请求已合并到正在进行的扫描，完成后播报结果。');
+    if (!_cloudAutoBudget.tryBegin(VisionTrigger.manual, now)) {
+      _logMsg('云端视觉：已有云端请求在进行中，手动识图已跳过。');
+      _say(_request(
+        id: 'cloud-vision-busy-${now.millisecondsSinceEpoch}',
+        eventId: 'cloud-vision-busy-${now.millisecondsSinceEpoch}',
+        text: CloudVisionResult.failed(CloudVisionFailure.busy).speechText,
+        kind: SpeechKind.alert,
+      ));
       return;
     }
-    if (start == CycleStart.busy) {
-      // A manual run is already in flight; the existing
-      // refusal inside _runCloudVisionAssist speaks for it.
-      unawaited(_runCloudVisionAssist());
-      return;
-    }
-    _manualCycleOwned = true;
+    _manualSlotOwned = true;
     unawaited(_runCloudVisionAssist());
   }
 
-  /// The 8-second walking-scan tick: only while walking, and
-  /// during live navigation only after the user has actually
-  /// moved (>= 2 m since the last scan's fix). Stationary or
-  /// not navigating -> no automatic cloud calls at all.
-  void _hazardScanTick() {
-    if (!mounted) return;
-    final bool walking = _liveNav != null ||
-        _tasks.state == TaskState.navigating ||
-        _tasks.state == TaskState.avoidingObstacle;
-    if (!walking) return;
-    if (_liveNav != null) {
-      final GeoPoint? fix = _lastFixPoint;
-      if (fix == null) return;
-      final GeoPoint? anchor = _scanAnchorPoint;
-      if (anchor != null && haversineMeters(anchor, fix) < 2) return;
+  /// M2 section 3.3 evidence upkeep, run on every pipeline
+  /// frame: the stillness hold and the corridor-obstacle
+  /// hold the trigger policy reads. Both are CONTINUOUS
+  /// holds -- any break resets them to zero; nothing here
+  /// accumulates across a break.
+  void _updateCloudTriggerEvidence(
+      HazardPipelineResult result, EgoMotion ego, DateTime now) {
+    // Stillness: the ego judge not walking (its unknown
+    // verdict also reads still -- no source confirmed
+    // walking). Accumulates from the first still frame;
+    // any walking frame clears it.
+    if (ego.isWalking) {
+      _stillSince = null;
+    } else {
+      _stillSince ??= now;
     }
-    unawaited(_triggerHazardScan(VisionTrigger.periodic));
+    // Corridor obstacle: a CONFIRMED track whose
+    // extrapolated landing point is inside the forward
+    // channel and which is not itself approaching -- it
+    // closes no faster than the user's own motion
+    // explains (plus the configured slack), i.e. the
+    // obstacle is static and any closing is the user
+    // walking toward it. The currently-held track keeps
+    // its hold while it still qualifies (it need not be
+    // the first qualifying estimate); a different track
+    // starts a fresh hold.
+    final double egoSpeed = ego.vEgoMps ?? 0;
+    TrackEstimate? held;
+    TrackEstimate? first;
+    for (final TrackEstimate e in result.estimates) {
+      if (!e.confirmed || !e.willHit || e.approaching) continue;
+      final double? closing = e.closingSpeedMps;
+      if (closing != null &&
+          closing >
+              egoSpeed + NavHazConfig.cloudBlockedStaticClosingSlackMps) {
+        continue;
+      }
+      first ??= e;
+      if (e.track.id == _corridorObstacleTrackId) {
+        held = e;
+        break;
+      }
+    }
+    final TrackEstimate? blocker = held ?? first;
+    if (blocker == null) {
+      _corridorObstacleTrackId = null;
+      _corridorObstacleSince = null;
+    } else if (_corridorObstacleTrackId != blocker.track.id) {
+      _corridorObstacleTrackId = blocker.track.id;
+      _corridorObstacleSince = now;
+    }
+  }
+
+  /// M2 section 3.3: evaluate the automatic cloud event
+  /// triggers against the current evidence. Runs on
+  /// pipeline frames during live navigation only: both
+  /// triggers are navigation-context events, and the
+  /// step / distance facts exist only there. Gate order:
+  /// flag -> navigation -> configured -> policy -> 429
+  /// backoff -> client limiter peek -> budget. The
+  /// budget records a dispatch only when a request will
+  /// actually go out.
+  void _evaluateCloudAutoTriggers(DateTime now) {
+    if (!NavHazConfig.cloudAutoTriggerEnabled) return;
+    final NavigationTracker? nav = _liveNav;
+    if (nav == null) return;
+    if (!_cloudVisionClient.isConfigured) return;
+    final int stepIndex = nav.currentStepIndex;
+    final String? stepText =
+        stepIndex >= 0 && stepIndex < nav.stepTexts.length
+            ? nav.stepTexts[stepIndex]
+            : null;
+    final GeoPoint? fix = _lastFixPoint;
+    final CloudTriggerSnapshot snapshot = CloudTriggerSnapshot(
+      currentStepText: stepText,
+      distanceToStepStartM:
+          fix == null ? null : nav.distanceToStepStartM(fix, stepIndex),
+      trafficLightVisible: _trafficLightVisible,
+      currentlyStill: _stillSince != null,
+      stillFor:
+          _stillSince == null ? Duration.zero : now.difference(_stillSince!),
+      corridorStaticObstacleFor: _corridorObstacleSince == null
+          ? Duration.zero
+          : now.difference(_corridorObstacleSince!),
+      lastAdvisorAdvice: _lastAdvisorAdvice,
+      now: now,
+    );
+    final VisionTrigger? kind = _cloudTriggerPolicy.evaluate(snapshot);
+    if (kind == null) return;
+    // Shared 429 backoff: inside a backoff window no
+    // automatic call goes out (and none is recorded).
+    if (!_visionBackoff.allow(now)) return;
+    // The client's own rate limiter (shared with manual
+    // calls) is only PEEKED here: a limiter refusal must
+    // not consume automatic budget for a request that
+    // will never be sent.
+    if (!_cloudVisionClient.limiter.isAvailable(now)) return;
+    if (!_cloudAutoBudget.tryBegin(kind, now)) return;
+    unawaited(_runCloudAutoTrigger(kind));
+  }
+
+  /// One automatic cloud event call (section 3.3). The
+  /// budget slot is already held by the caller and is
+  /// released in the finally block whatever happens.
+  /// Failure discipline mirrors the old automatic scan:
+  /// a 429 feeds the shared backoff (announced once per
+  /// episode), every other failure or unusable answer
+  /// announces the fixed downgrade sentence through its
+  /// gate, and nothing fails silently. A crossing answer
+  /// is spoken reference-only; a detour answer is
+  /// recorded as evidence and NEVER spoken.
+  Future<void> _runCloudAutoTrigger(VisionTrigger kind) async {
+    try {
+      if (!_cloudVisionClient.tryReserve(DateTime.now())) return;
+      final CameraFrameCapture capture =
+          await _frameSource.captureSingleFrame();
+      if (!capture.ok || capture.bytes == null) {
+        if (mounted) {
+          _logMsg('云端识图：自动触发取帧失败，已降级为本地检测。');
+        }
+        _announceVisionDowngrade();
+        return;
+      }
+      if (kind == VisionTrigger.crossingStop) {
+        await _runCrossingTrigger(capture.bytes!);
+      } else if (kind == VisionTrigger.pathBlocked) {
+        await _runDetourTrigger(capture.bytes!);
+      }
+    } catch (_) {
+      // A trigger failure is announced via the downgrade
+      // sentence (rate-limited by the gate): an automatic
+      // call must never fail silently. The log uses a
+      // fixed category text only: the caught object
+      // itself is never written anywhere.
+      if (mounted) {
+        _logMsg('云端识图：自动触发出现异常，已降级为本地检测。');
+      }
+      _announceVisionDowngrade();
+    } finally {
+      _cloudAutoBudget.end();
+    }
+  }
+
+  /// Shared failure handling for the two automatic
+  /// triggers. Returns true when [failure] was non-null
+  /// and has been fully handled: a 429 records a backoff
+  /// strike (and speaks the once-per-episode notice when
+  /// the policy allows), anything else announces the
+  /// fixed downgrade sentence through its gate.
+  bool _handleAutoVisionFailure(CloudVisionFailure? failure) {
+    if (failure == null) return false;
+    if (failure == CloudVisionFailure.rateLimited) {
+      if (mounted) {
+        _logMsg('云端识图：请求过于频繁，已按退避策略处理，其间只用本地检测。');
+      }
+      if (_visionBackoff.onRateLimited(DateTime.now())) {
+        _say(_request(
+          id: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
+          text: '识图暂时繁忙，稍后会自动重试，其间继续用本地检测。',
+          kind: SpeechKind.alert,
+        ));
+      }
+      return true;
+    }
+    if (mounted) {
+      _logMsg('云端识图：自动触发请求失败，已降级为本地检测。');
+    }
+    _announceVisionDowngrade();
+    return true;
+  }
+
+  /// The crossingStop call: one frame, task=crossing_info,
+  /// and the answer spoken as REFERENCE ONLY (the
+  /// template states what the light looks like and
+  /// always carries the reference-only caveat; it never
+  /// grants passage). An unusable answer (unparsed or
+  /// light unknown) announces the fixed downgrade
+  /// sentence instead.
+  Future<void> _runCrossingTrigger(Uint8List bytes) async {
+    final CrossingScanOutcome outcome =
+        await _cloudVisionClient.describeCrossingReserved(imageBytes: bytes);
+    if (_handleAutoVisionFailure(outcome.failure)) return;
+    if (!outcome.ok) return;
+    final CrossingInfo info = outcome.info!;
+    _visionBackoff.onSuccess();
+    _visionDowngrade.noteSuccess();
+    _lastCrossingInfo = info;
+    final String? speech = crossingSpeechText(info);
+    if (speech == null) {
+      if (mounted) {
+        _logMsg('云端识图：路口信号无法确认，已按未知处理并降级为本地检测。');
+      }
+      _announceVisionDowngrade();
+      return;
+    }
+    if (!mounted) return;
+    _say(_request(
+      id: 'crossing-info-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'crossing-info-${DateTime.now().millisecondsSinceEpoch}',
+      text: speech,
+      kind: SpeechKind.info,
+    ));
+  }
+
+  /// The pathBlocked call: one frame, task=detour. The
+  /// answer is EVIDENCE ONLY (spec 3.3): it is recorded
+  /// on the state (debug-visible through the handle) and
+  /// logged; it produces NO speech and NO step direction
+  /// in M2. Whether a direction may be spoken remains
+  /// the on-device avoidance advisor's three-condition
+  /// decision, and no existing path consumes this record
+  /// yet -- the seam is the record itself, not a new
+  /// behaviour.
+  Future<void> _runDetourTrigger(Uint8List bytes) async {
+    final DetourScanOutcome outcome =
+        await _cloudVisionClient.describeDetourReserved(imageBytes: bytes);
+    if (_handleAutoVisionFailure(outcome.failure)) return;
+    if (!outcome.ok) return;
+    final DetourInfo info = outcome.info!;
+    _visionBackoff.onSuccess();
+    _visionDowngrade.noteSuccess();
+    _lastDetourInfo = info;
+    _lastDetourAt = DateTime.now();
+    if (mounted) {
+      _logMsg('云端识图：绕行证据已记录 blocked=${info.blocked}，'
+          'open_side=${info.openSide.name}，parsed=${info.parsed}'
+          '（仅记录，不改变播报）。');
+    }
   }
 
   /// Speak the fixed cloud-vision downgrade sentence,
-  /// rate-limited by [_visionDowngrade]: repeated scan
-  /// failures (for example while the FC still runs the
-  /// pre-hazard build) announce ONCE per cooldown window,
-  /// never on every 8-second tick.
+  /// rate-limited by [_visionDowngrade]: repeated cloud
+  /// failures (for example while the FC still runs an
+  /// older build) announce ONCE per cooldown window,
+  /// never on every trigger.
   void _announceVisionDowngrade() {
     if (!mounted) return;
     if (!_visionDowngrade.shouldAnnounce(DateTime.now())) return;
@@ -5424,144 +5701,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
-  /// One hazard-scan cycle (periodic or YOLO-triggered; the
-  /// coordinator merges overlapping triggers into this one
-  /// request). Ground hazards and a tactile-paving
-  /// identification are spoken from the parsed result, a 429
-  /// gets the single notice per backoff episode, and EVERY
-  /// failure or unknown-format outcome announces the fixed
-  /// downgrade sentence (cloudVisionDowngradeSpeech),
-  /// rate-limited by the downgrade gate so it cannot repeat
-  /// on every tick. A manual request that joined the cycle
-  /// is answered with the result description, or with the
-  /// downgrade sentence when the cycle produced no usable
-  /// assessment. Only the rate limiter's own slot refusal
-  /// (tryReserve) stays silent: expected throttling, not a
-  /// failure.
-  Future<void> _triggerHazardScan(VisionTrigger kind) async {
-    if (!_cloudVisionClient.isConfigured) return;
-    final DateTime now = DateTime.now();
-    if (!_visionBackoff.allow(now)) return;
-    if (_lastVisionCallAt != null &&
-        now.difference(_lastVisionCallAt!) < const Duration(seconds: 8)) {
-      return;
-    }
-    final CycleStart start = _visionCycle.trigger(kind);
-    if (start != CycleStart.hazardRun) return;
-    _scanAnchorPoint = _lastFixPoint;
-    _lastVisionCallAt = now;
-    HazardAssessment? assessment;
-    try {
-      if (!_cloudVisionClient.tryReserve(now)) return;
-      final CameraFrameCapture capture =
-          await _frameSource.captureSingleFrame();
-      if (!capture.ok || capture.bytes == null) {
-        if (mounted) {
-          _logMsg('云端识图：本轮自动扫描取帧失败，已降级为本地检测。');
-        }
-        _announceVisionDowngrade();
-        return;
-      }
-      final HazardScanOutcome outcome = await _cloudVisionClient
-          .describeHazardReserved(imageBytes: capture.bytes!);
-      if (outcome.failure == CloudVisionFailure.rateLimited) {
-        if (mounted) {
-          _logMsg('云端识图：请求过于频繁，已按退避策略处理，其间只用本地检测。');
-        }
-        if (_visionBackoff.onRateLimited(DateTime.now())) {
-          _say(_request(
-            id: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
-            eventId: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
-            text: '识图暂时繁忙，稍后会自动重试，其间继续用本地检测。',
-            kind: SpeechKind.alert,
-          ));
-        }
-        return;
-      }
-      if (outcome.failure != null) {
-        // Any other failure (network, timeout, upstream,
-        // unconfigured, unparseable body) is spoken via the
-        // downgrade sentence, never silent. The log line is
-        // a fixed category text, written even when the
-        // downgrade gate mutes the announcement.
-        if (mounted) {
-          _logMsg('云端识图：本轮自动扫描请求失败，已降级为本地检测。');
-        }
-        _announceVisionDowngrade();
-        return;
-      }
-      if (!outcome.ok) return;
-      final HazardAssessment a = outcome.assessment!;
-      assessment = a;
-      if (!a.parsed) {
-        // Not a conforming hazard payload -- most likely
-        // the FC still runs the pre-hazard build and
-        // answered in the old scene shape. Unknown result:
-        // announce the downgrade sentence (rate-limited)
-        // and do NOT count this as a success.
-        if (mounted) {
-          _logMsg('云端识图：响应格式无法识别（可能仍是旧版服务），已按未知处理并降级为本地检测。');
-        }
-        _announceVisionDowngrade();
-        return;
-      }
-      _visionBackoff.onSuccess();
-      _visionDowngrade.noteSuccess();
-      if (!mounted) return;
-      final String? ground = hazardGroundSpeech(a);
-      if (ground != null) {
-        _say(_request(
-          id: 'hazard-ground-${DateTime.now().millisecondsSinceEpoch}',
-          eventId: 'hazard-ground-${DateTime.now().millisecondsSinceEpoch}',
-          text: ground,
-          kind: SpeechKind.danger,
-        ));
-      } else {
-        final String? paving = hazardPavingSpeech(a);
-        if (paving != null) {
-          _say(_request(
-            id: 'hazard-paving-${DateTime.now().millisecondsSinceEpoch}',
-            eventId: 'hazard-paving-${DateTime.now().millisecondsSinceEpoch}',
-            text: paving,
-            kind: SpeechKind.info,
-          ));
-        }
-      }
-    } catch (_) {
-      // A scan failure is announced via the downgrade
-      // sentence (rate-limited by the gate): an automatic
-      // scan must never fail silently. Local detection is
-      // the primary channel and keeps running either way.
-      // The log uses a fixed category text only: the caught
-      // object itself is never written anywhere.
-      if (mounted) {
-        _logMsg('云端识图：本轮自动扫描出现异常，已降级为本地检测。');
-      }
-      _announceVisionDowngrade();
-    } finally {
-      final bool joined = _visionCycle.complete();
-      if (joined && mounted) {
-        // A joined manual request is always answered: with
-        // the result description when the cycle produced a
-        // usable assessment, and with the fixed downgrade
-        // sentence when it did not (a failure, a capture
-        // problem, or an unknown-format answer) -- it never
-        // goes unanswered. This answer is spoken directly,
-        // not through the rate-limit gate: the user asked
-        // once, explicitly.
-        final HazardAssessment? joinedAssessment = assessment;
-        _say(_request(
-          id: 'hazard-join-${DateTime.now().millisecondsSinceEpoch}',
-          eventId: 'hazard-join-${DateTime.now().millisecondsSinceEpoch}',
-          text: joinedAssessment != null && joinedAssessment.parsed
-              ? hazardDescriptionSpeech(joinedAssessment)
-              : cloudVisionDowngradeSpeech,
-          kind: SpeechKind.alert,
-        ));
-      }
-    }
-  }
-
   Future<void> _runCloudVisionAssist() async {
     // Duplicate trigger: refuse WITHOUT creating a token. The
     // run in flight keeps its token, so background/dispose can
@@ -5569,10 +5708,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // field on every call and orphaned the running run).
     final CloudVisionCancellation? token = _visionRuns.begin();
     if (token == null) {
-      if (_manualCycleOwned) {
-        // Defensive: never leak a coordinator cycle.
-        _manualCycleOwned = false;
-        _visionCycle.complete();
+      if (_manualSlotOwned) {
+        // Defensive: never leak the budget's shared slot.
+        _manualSlotOwned = false;
+        _cloudAutoBudget.end();
       }
       _say(_request(
         id: 'cloud-vision-busy-${DateTime.now().millisecondsSinceEpoch}',
@@ -5583,7 +5722,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     _cameraOwnership.registerCancellation(token);
-    _lastVisionCallAt = DateTime.now();
     CloudVisionFailure? runFailure;
     bool runCompleted = false;
     int seq = 0;
@@ -5633,9 +5771,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       } else if (runCompleted && runFailure == null) {
         _visionBackoff.onSuccess();
       }
-      if (_manualCycleOwned) {
-        _manualCycleOwned = false;
-        _visionCycle.complete();
+      if (_manualSlotOwned) {
+        // Release the section 3.3 budget's shared
+        // in-flight slot exactly once, whatever the run
+        // did (this is the manual slot the entry point
+        // took; automatic runs release their own).
+        _manualSlotOwned = false;
+        _cloudAutoBudget.end();
       }
       _cameraOwnership.unregisterCancellation(token);
       _visionRuns.end(token);

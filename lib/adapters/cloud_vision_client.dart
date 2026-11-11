@@ -213,7 +213,54 @@ class CloudVisionClient {
     return HazardScanOutcome.ok(parseHazardAssessment(reply.decoded));
   }
 
-  /// Shared transport for both vision modes: downscale,
+  /// Crossing-mode counterpart of [describeHazardReserved]
+  /// (M2 section 3.3; the slot must already be reserved):
+  /// sends task=crossing_info and parses the answer with
+  /// the strict crossing validator. A nonconforming body
+  /// collapses to [CrossingInfo.unknown] inside the
+  /// outcome -- unknown data, never an error and never
+  /// prose; structured proxy errors were already mapped
+  /// to failures by the shared transport.
+  Future<CrossingScanOutcome> describeCrossingReserved({
+    required Uint8List imageBytes,
+  }) async {
+    if (!hasProxyUrl || !isConfigured) {
+      return const CrossingScanOutcome.failed(
+          CloudVisionFailure.notConfigured);
+    }
+    final ({Map<String, Object?>? decoded, CloudVisionResult? failure}) reply =
+        await _decodedResponse(
+            imageBytes: imageBytes,
+            prompt: cloudCrossingPrompt,
+            task: 'crossing_info');
+    if (reply.failure != null) {
+      return CrossingScanOutcome.failed(reply.failure!.failure!);
+    }
+    return CrossingScanOutcome.ok(parseCrossingInfo(reply.decoded));
+  }
+
+  /// Detour-mode counterpart (M2 section 3.3): sends
+  /// task=detour and parses with the strict detour
+  /// validator. The answer is evidence only; see
+  /// [DetourInfo].
+  Future<DetourScanOutcome> describeDetourReserved({
+    required Uint8List imageBytes,
+  }) async {
+    if (!hasProxyUrl || !isConfigured) {
+      return const DetourScanOutcome.failed(CloudVisionFailure.notConfigured);
+    }
+    final ({Map<String, Object?>? decoded, CloudVisionResult? failure}) reply =
+        await _decodedResponse(
+            imageBytes: imageBytes,
+            prompt: cloudDetourPrompt,
+            task: 'detour');
+    if (reply.failure != null) {
+      return DetourScanOutcome.failed(reply.failure!.failure!);
+    }
+    return DetourScanOutcome.ok(parseDetourInfo(reply.decoded));
+  }
+
+  /// Shared transport for the vision modes: downscale,
   /// POST, decode, and map a structured proxy error to a
   /// fixed-text failure. Returns exactly one of the two
   /// record fields.

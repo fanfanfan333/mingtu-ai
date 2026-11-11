@@ -603,4 +603,65 @@ static const Duration thermalCriticalAnnouncementInterval =
 /// banned-word check (asserted in the thermal tests).
 static const String thermalCriticalAnnouncementText =
     '手机较热，识别已降频，请放慢脚步注意脚下';
+
+// ---- Cloud event triggers (M2 section 3.3) ---------------------------
+
+/// Master switch for the AUTOMATIC cloud triggers
+/// (cloud_trigger_policy.dart). When false the wiring
+/// layer never evaluates the trigger policy and no
+/// automatic cloud call is ever made; MANUAL cloud
+/// vision (the user's own "看看前面") is not governed by
+/// this flag at all. The policy and budget objects stay
+/// pure logic either way.
+static const bool cloudAutoTriggerEnabled = true;
+
+/// Step-text keywords that mark a navigation step as a
+/// crossing step for the crossingStop trigger (spec
+/// 3.3): a step whose text contains ANY of these is a
+/// step at which the user may have to cross or turn at
+/// an intersection.
+static const List<String> cloudCrossingStepKeywords = <String>[
+  '人行横道',
+  '过马路',
+  '路口',
+];
+
+/// crossingStop distance gate (spec 3.3): the user must
+/// be within this many metres of the crossing step's
+/// START point.
+static const double cloudCrossingMaxStepDistanceM = 15.0;
+
+/// crossingStop stillness gate (spec 3.3): the user
+/// must have been still CONTINUOUSLY for at least this
+/// long before a crossing frame is worth sending.
+static const Duration cloudCrossingStillHold = Duration(seconds: 2);
+
+/// pathBlocked persistence gate (spec 3.3): a confirmed
+/// static obstacle inside the forward channel must have
+/// persisted CONTINUOUSLY for at least this long.
+static const Duration cloudBlockedObstacleHold = Duration(seconds: 4);
+
+/// Static-obstacle closing slack for the pathBlocked
+/// evidence (wiring layer): an obstacle counts as
+/// STATIC when it closes no faster than the user's own
+/// measured motion explains, plus this slack -- i.e.
+/// the obstacle itself is not approaching; the closing
+/// is the user walking toward it. While the user stands
+/// still this reduces to "closes at most this fast".
+static const double cloudBlockedStaticClosingSlackMps = 0.3;
+
+/// Automatic-call budget (spec 3.3): two automatic
+/// cloud calls are at least this far apart...
+static const Duration cloudAutoMinInterval = Duration(seconds: 60);
+
+/// ...and at most [cloudAutoMaxPerWindow] automatic
+/// calls land in any sliding window of this length.
+/// The window is the HARD constraint (it caps the
+/// average at 0.5 calls/minute over any 10 minutes);
+/// the interval above is its corollary and is enforced
+/// explicitly as well.
+static const Duration cloudAutoWindow = Duration(minutes: 10);
+
+/// See [cloudAutoWindow].
+static const int cloudAutoMaxPerWindow = 5;
 }

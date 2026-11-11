@@ -388,22 +388,42 @@ void main() {
     });
   });
 
-  group('vision cycle merging: one request per cycle', () {
-    test('periodic + YOLO + manual triggers merge into one run', () {
-      final VisionCycleCoordinator c = VisionCycleCoordinator();
-      expect(c.trigger(VisionTrigger.periodic), CycleStart.hazardRun);
-      expect(c.trigger(VisionTrigger.yoloHazard), CycleStart.coalesced);
-      expect(c.trigger(VisionTrigger.manual), CycleStart.joined);
-      expect(c.complete(), isTrue); // the manual join is answered
-      expect(c.inFlight, isFalse);
+  // REWRITTEN for M2 section 3.3 (reason recorded per the
+  // round's old-test rule): this group used to pin the
+  // VisionCycleCoordinator's merge rule (periodic + YOLO +
+  // manual triggers merging into one hazard cycle). Section
+  // 3.3 deleted BOTH automatic hazard starters -- the
+  // 8-second periodic scan and the per-alert YOLO trigger --
+  // and with them the cycle coordinator itself; the "never
+  // two cloud requests at once" discipline now lives in
+  // CloudAutoTriggerBudget's single shared in-flight slot,
+  // covered by test/navhaz_cloud_trigger_test.dart. What
+  // remains to pin HERE is the trigger surface itself: the
+  // enum is exactly the two automatic event triggers plus
+  // manual, and the deleted starters do not exist anywhere.
+  group('vision triggers after section 3.3: event triggers + manual', () {
+    test('the trigger enum is exactly crossingStop, pathBlocked, manual',
+        () {
+      expect(
+        VisionTrigger.values,
+        <VisionTrigger>[
+          VisionTrigger.crossingStop,
+          VisionTrigger.pathBlocked,
+          VisionTrigger.manual,
+        ],
+      );
     });
 
-    test('a manual run makes scans coalesce and a second manual busy', () {
-      final VisionCycleCoordinator c = VisionCycleCoordinator();
-      expect(c.trigger(VisionTrigger.manual), CycleStart.manualRun);
-      expect(c.trigger(VisionTrigger.periodic), CycleStart.coalesced);
-      expect(c.trigger(VisionTrigger.manual), CycleStart.busy);
-      expect(c.complete(), isFalse);
+    test('the deleted starters and the cycle coordinator are gone', () {
+      final String hazardDart =
+          File('lib/core/cloud_vision_hazard.dart').readAsStringSync();
+      expect(hazardDart, isNot(contains('VisionCycleCoordinator')));
+      expect(hazardDart, isNot(contains('CycleStart')));
+      // (The enum's own doc comment still NAMES the two
+      // deleted starters in prose, as history; what must
+      // not exist is any code surface for them.)
+      expect(hazardDart, isNot(contains('VisionTrigger.yoloHazard')));
+      expect(hazardDart, isNot(contains('VisionTrigger.periodic')));
     });
   });
 
@@ -547,10 +567,24 @@ void main() {
       expect(mainDart, contains('_avoidance.decide('));
       expect(mainDart, contains('_avoidance.observeFrame(detections)'));
       expect(mainDart, contains('createOrientationMonitor()'));
-      expect(mainDart, contains('_triggerHazardScan(VisionTrigger.periodic)'));
-      expect(
-          mainDart, contains('_triggerHazardScan(VisionTrigger.yoloHazard)'));
-      expect(mainDart, contains('describeHazardReserved'));
+      // M2 section 3.3 rewiring (reason recorded per the
+      // round's old-test rule): the automatic hazard scan
+      // this test used to pin -- the 8-second periodic
+      // trigger and the per-alert YOLO trigger, both
+      // routed through _triggerHazardScan -- is DELETED.
+      // Automatic cloud calls are now only the two event
+      // triggers, evaluated per pipeline frame and sent
+      // through the budget; the hazard task call itself
+      // (describeHazardReserved) remains in the client
+      // for the manual path and is pinned at client level
+      // by the 'hazard client call' group above.
+      expect(mainDart, isNot(contains('_triggerHazardScan')));
+      expect(mainDart, isNot(contains('_hazardScanTick')));
+      expect(mainDart, isNot(contains('VisionTrigger.yoloHazard')));
+      expect(mainDart, isNot(contains('VisionTrigger.periodic')));
+      expect(mainDart, contains('_evaluateCloudAutoTriggers'));
+      expect(mainDart, contains('describeCrossingReserved'));
+      expect(mainDart, contains('describeDetourReserved'));
       expect(mainDart, contains('_visionBackoff.onRateLimited'));
       expect(mainDart, contains('_triggerManualVision()'));
     });
