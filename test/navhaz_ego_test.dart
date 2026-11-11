@@ -253,8 +253,11 @@ void main() {
         final double uTrueTtc = (12.0 - 0.25 * uFrame) / 2.5;
         expect(wTrueTtc, inInclusiveRange(3.0, 5.2),
             reason: 'first warning at true TTC $wTrueTtc');
-        expect(uTrueTtc, inInclusiveRange(2.3, 3.3),
-            reason: 'first urgent at true TTC $uTrueTtc');
+        expect(uTrueTtc, inInclusiveRange(2.4, 3.3),
+            reason: 'first urgent at true TTC $uTrueTtc '
+                '(FIX3B acceptance grid: [2.4, 3.3] for all '
+                'four backend x ego combinations; measured '
+                '3.00 here)');
         expect(wFrame, lessThan(uFrame));
       });
 
@@ -317,14 +320,19 @@ void main() {
             run.alertFrames[run.alerts.indexOf(urgents.first)];
         expect((12.0 - 0.25 * wFrame) / 2.5, inInclusiveRange(3.0, 5.2),
             reason: 'first warning inside the W band');
-        expect((12.0 - 0.25 * uFrame) / 2.5, inInclusiveRange(2.0, 3.3),
-            reason: 'first urgent inside the U band (lower '
-                'edge widened for the 6 s unknown-ego '
-                'cooldown: the W -> U upgrade speaks at '
-                'once, but its stored TTC then holds bare '
-                'same-level re-alerts until the >= 40% drop, '
-                'so the first SPOKEN urgent lands deeper '
-                'than the known-ego window of group (2))');
+        expect((12.0 - 0.25 * uFrame) / 2.5, inInclusiveRange(2.4, 3.3),
+            reason: 'first urgent inside the FIX3B '
+                'acceptance grid [2.4, 3.3] (measured 2.60 '
+                'here). The EGOUNK/FIX2 round had widened '
+                'this lower edge to 2.0 because the single '
+                'normal-tier filter read TTC_s ~+0.87 s '
+                'high at the crossing; FIX3B retired that '
+                'widening -- the urgent judgement now runs '
+                'on the agile tier\'s predicted, '
+                'latency-compensated tau_now with 2-of-3 '
+                'urgent confirmation, so the first spoken '
+                'urgent lands inside the grid without any '
+                'assertion relief.');
         expect(wFrame, lessThan(uFrame));
       });
     }
@@ -362,6 +370,11 @@ void main() {
         ttcS: fused ?? ttcScale,
         ttcScaleS: ttcScale,
         ttcRangeS: ttcRange,
+        // FIX3B: the urgent judgement reads ttcUrgentS;
+        // these hand-built estimates mirror the scale TTC
+        // into it (the estimator's own tier behaviour is
+        // covered by the pipeline tests).
+        ttcUrgentS: ttcScale,
         rangeM: range,
         closingSpeedMps: null,
         approaching: false,
@@ -404,6 +417,130 @@ void main() {
         atMs(0),
       );
       expect(r.alert?.level, HazardLevel.urgent);
+    });
+
+    test('Codex near constant size no range must remain silent', () {
+      // Codex CDX3 counterexample, verbatim: a confirmed
+      // car, box bottom near the frame bottom (cy .8 +
+      // h .3 -> bottom .95), with NO range and NO scale
+      // TTC and zero growth must NOT warn on frame position
+      // alone (ego unknown degradation).
+      final track = Track(id: 938, label: 'car');
+      for (int i = 0; i < 5; i++) {
+        track.recordMatch(
+            const Detection(
+                label: 'car', confidence: .9, cx: .5, cy: .8, w: .2, h: .3),
+            DateTime.fromMillisecondsSinceEpoch(i * 100));
+      }
+      final result =
+          HazardPolicy().levelFor(est(track, ttcScale: null, scaleRate: 0));
+      expect(result, isNull);
+    });
+
+    test('CDX3 item 2: the near rule survives where it is '
+        'pinned -- a near person (arbitration (d) geometry) '
+        'still warns; a vehicle WITH a range still warns '
+        'via the Z rule', () {
+      // The (d) scenario's evidence source, at policy
+      // level: person, bottom 0.9, no range, no TTC, ego
+      // unknown -> the legacy near warning.
+      final Track person = Track(id: 941, label: 'person');
+      for (int i = 0; i < 5; i++) {
+        person.recordMatch(
+            const Detection(
+                label: 'person',
+                confidence: .9,
+                cx: .5,
+                cy: .7,
+                w: .2,
+                h: .4),
+            DateTime.fromMillisecondsSinceEpoch(i * 100));
+      }
+      expect(
+        HazardPolicy().levelFor(est(person, ttcScale: null, scaleRate: 0)),
+        HazardLevel.warning,
+        reason: 'non-vehicle near obstacle: the near '
+            'rule is its pinned evidence source',
+      );
+      // A vehicle at a MEASURED close range: the static Z
+      // rule (not position) warns, exactly as CDX3 keeps.
+      final Track car = Track(id: 942, label: 'car');
+      for (int i = 0; i < 5; i++) {
+        car.recordMatch(
+            const Detection(
+                label: 'car', confidence: .9, cx: .5, cy: .8, w: .2, h: .3),
+            DateTime.fromMillisecondsSinceEpoch(i * 100));
+      }
+      expect(
+        HazardPolicy()
+            .levelFor(est(car, ttcScale: null, scaleRate: 0, range: 2.5)),
+        HazardLevel.warning,
+        reason: 'range 2.5 m <= 3 m: the static Z rule',
+      );
+    });
+
+    test('CDX3 item 2: the same vehicle scoping on the '
+        'KNOWN path -- car bottom-only silent, person '
+        'bottom-only warns', () {
+      final Track car = Track(id: 943, label: 'car');
+      final Track person = Track(id: 944, label: 'person');
+      for (int i = 0; i < 5; i++) {
+        car.recordMatch(
+            const Detection(
+                label: 'car', confidence: .9, cx: .5, cy: .8, w: .2, h: .3),
+            DateTime.fromMillisecondsSinceEpoch(i * 100));
+        person.recordMatch(
+            const Detection(
+                label: 'person',
+                confidence: .9,
+                cx: .5,
+                cy: .7,
+                w: .2,
+                h: .4),
+            DateTime.fromMillisecondsSinceEpoch(i * 100));
+      }
+      expect(
+        HazardPolicy().levelFor(
+            est(car, ttcScale: null, scaleRate: 0, known: true)),
+        isNull,
+      );
+      expect(
+        HazardPolicy().levelFor(
+            est(person, ttcScale: null, scaleRate: 0, known: true)),
+        HazardLevel.warning,
+      );
+    });
+
+    test('CDX3 item 3: known ego, crossing target whose '
+        'box currently overlaps the corridor: extrapolated '
+        'landing outside -> zero alerts', () {
+      // The pre-CDX3 willHit counted CURRENT overlap as a
+      // hit, so this growing crossing target (TTC_s in the
+      // warning band) warned mid-crossing on the known
+      // path. The unified rule reads only the extrapolated
+      // landing point, which is far outside the channel.
+      final HazardPipeline pipeline = HazardPipeline();
+      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      for (int i = 0; i < 20; i++) {
+        final double g = math.exp(0.025 * i);
+        final HazardPipelineResult r = pipeline.processFrame(
+          <Detection>[
+            Detection(
+                label: 'person',
+                confidence: 0.9,
+                cx: 0.1 + 0.8 * i / 19,
+                cy: 0.55,
+                w: 0.18 * g,
+                h: 0.36 * g),
+          ],
+          epoch.add(Duration(milliseconds: i * 100)),
+          pitchDeg: null,
+          ego: EgoMotion.still,
+        );
+        expect(r.alert, isNull,
+            reason: 'frame $i: crossing, landing outside '
+                'the channel (known ego)');
+      }
     });
 
     test('FIX2 conjunction: TTC_s in band but scale NOT '
@@ -579,6 +716,7 @@ void main() {
             ttcS: ttc,
             ttcScaleS: ttc,
             ttcRangeS: ttc,
+            ttcUrgentS: ttc,
             rangeM: 5.8,
             closingSpeedMps: 2.0,
             approaching: true,
@@ -678,12 +816,13 @@ void main() {
             reason: 'W precedes U; no direct jump to U');
         expect(6.0 - frames[wIdx] * 0.1, inInclusiveRange(3.0, 5.2),
             reason: 'first W inside the (3, 5] band');
-        expect(6.0 - frames[uIdx] * 0.1, inInclusiveRange(2.0, 3.3),
-            reason: 'first U inside the <= 3 band (the lower '
-                'edge allows the 6 s unknown-ego cooldown to '
-                'hold a bare-3.0 s re-alert until the TTC has '
-                'fallen further; group (4) with pitch shows '
-                'the un-cooldowned window)');
+        expect(6.0 - frames[uIdx] * 0.1, inInclusiveRange(2.4, 3.3),
+            reason: 'first U inside the FIX3B acceptance '
+                'grid [2.4, 3.3] (measured 2.60 here). The '
+                'FIX2 round\'s 2.0 lower edge is retired by '
+                'the same FIX3B change as group (4): the '
+                'urgent signal is the compensated tau_now, '
+                'not the lagging normal-tier TTC_s.');
       });
 
       test('$backend pipeline: ego unknown, crossing '
@@ -814,6 +953,271 @@ void main() {
             reason: 'no fusion -> no disagreement');
         expect(estLast.ttcS!, greaterThan(5.0),
             reason: 'and it is the slow leg, ~8 s');
+      });
+    }
+  });
+
+  group('FIX3B acceptance grid + urgent tiering', () {
+    // The grid, independent of the contrast groups above
+    // (the lag regression the FIX3 round asked to stand on
+    // its own): the SAME approaching geometry family as
+    // groups (2)/(4) -- Z 12 -> 2 m at 2.5 m/s under pitch
+    // 10 -- run in all four backend x ego combinations.
+    // First W: true TTC <= 5.5 (and not later than the
+    // urgent). First U: true TTC in [2.4, 3.3].
+    for (final String backend in kBackends) {
+      for (final (String, EgoMotion) egoCase in <(String, EgoMotion)>[
+        ('known', EgoMotion.still),
+        ('unknown', EgoMotion.unknown),
+      ]) {
+        test('$backend x ego ${egoCase.$1}: first W <= 5.5, '
+            'first U in [2.4, 3.3]', () {
+          final List<Detection?> frames = <Detection?>[
+            for (int i = 0; i <= 40; i++) carAt(12.0 - 0.25 * i),
+          ];
+          final EgoRun run = runEgo(backend, frames, egoCase.$2);
+          final List<HazardAlert> warnings =
+              run.alerts.where((HazardAlert a) => !a.urgent).toList();
+          final List<HazardAlert> urgents =
+              run.alerts.where((HazardAlert a) => a.urgent).toList();
+          expect(warnings, isNotEmpty);
+          expect(urgents, isNotEmpty);
+          final int wFrame =
+              run.alertFrames[run.alerts.indexOf(warnings.first)];
+          final int uFrame =
+              run.alertFrames[run.alerts.indexOf(urgents.first)];
+          final double wTrueTtc = (12.0 - 0.25 * wFrame) / 2.5;
+          final double uTrueTtc = (12.0 - 0.25 * uFrame) / 2.5;
+          expect(wTrueTtc, lessThanOrEqualTo(5.5),
+              reason: 'first W at frame $wFrame, true TTC '
+                  '$wTrueTtc (grid: <= 5.5)');
+          expect(wFrame, lessThan(uFrame),
+              reason: 'W precedes U');
+          expect(uTrueTtc, inInclusiveRange(2.4, 3.3),
+              reason: 'first U at frame $uFrame, true TTC '
+                  '$uTrueTtc (grid: [2.4, 3.3]; measured '
+                  'known 3.00 / unknown 2.60 at the FIX3B '
+                  'calibration)');
+        });
+      }
+    }
+
+    test('urgentConfirmed is 2-of-3 with the current frame '
+        'a hit; confirmed stays the 3-frame latch', () {
+      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      Detection det() => const Detection(
+          label: 'car', confidence: .9, cx: .5, cy: .55, w: .2, h: .3);
+      final Track t = Track(id: 77, label: 'car');
+      t.recordMatch(det(), epoch);
+      expect(t.urgentConfirmed, isFalse,
+          reason: 'a single hit is not 2-of-3');
+      t.recordMatch(det(), epoch.add(const Duration(milliseconds: 100)));
+      expect(t.urgentConfirmed, isTrue,
+          reason: 'two hits, current a hit: urgent tier '
+              'confirmed one frame before the warning tier');
+      expect(t.confirmed, isFalse,
+          reason: 'the warning tier still wants 3');
+      t.recordMiss();
+      expect(t.urgentConfirmed, isFalse,
+          reason: 'current frame a miss: never urgent-'
+              'confirmed, whatever the window holds');
+      t.recordMatch(det(), epoch.add(const Duration(milliseconds: 300)));
+      expect(t.urgentConfirmed, isTrue,
+          reason: 'hit-miss-hit: 2 of the last 3, current '
+              'a hit');
+      expect(t.confirmed, isFalse,
+          reason: 'the miss broke the consecutive run: '
+              'the warning latch is still open');
+    });
+
+    test('pre-urgent vibration: tau_now < 1.5 before '
+        'confirmation vibrates once, speech waits for '
+        'confirmation (pipeline timeline)', () {
+      // Sparse hits (frames 0, 3, 6, 9, 12, 13): each hit
+      // is isolated by two misses, so the 2-of-3 window
+      // never confirms -- until the back-to-back hit at
+      // frame 13. The box grows across the gaps (x1.25 a
+      // gap, faster at the end): the agile seed promotes
+      // at the 3rd estimate, the raw tau_now runs in-band
+      // from then, the jitter guard issues it at the 3rd
+      // consecutive in-band estimate (frame 12, issued
+      // tau 1.42 < 1.5), and the track is STILL
+      // unconfirmed there -- that is the pre-urgent
+      // frame. Measured on the SORT backend: the
+      // ByteTrack backend re-ids a target that vanishes
+      // for two frames (its internal association drops
+      // the track), so a sparse-reappearance scenario
+      // cannot develop estimator state there -- a
+      // pre-existing backend difference, recorded in the
+      // FIX3B report; the mechanism itself is one code
+      // path for both backends.
+      final HazardPipeline pipeline =
+          HazardPipeline(tracker: trackerForBackend('sort'));
+      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      Detection car(double s) => Detection(
+          label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s);
+      final Map<int, List<Detection>> frames = <int, List<Detection>>{
+        0: <Detection>[car(0.30)],
+        3: <Detection>[car(0.375)],
+        6: <Detection>[car(0.47)],
+        9: <Detection>[car(0.59)],
+        12: <Detection>[car(0.80)],
+        13: <Detection>[car(0.95)],
+      };
+      int preUrgentAt = -1;
+      int urgentSpeechAt = -1;
+      for (int i = 0; i <= 13; i++) {
+        final HazardPipelineResult r = pipeline.processFrame(
+          frames[i] ?? const <Detection>[],
+          epoch.add(Duration(milliseconds: i * 100)),
+          pitchDeg: null,
+          ego: EgoMotion.unknown,
+        );
+        if (r.preUrgentTrackIds.isNotEmpty && preUrgentAt < 0) {
+          preUrgentAt = i;
+        }
+        if (r.alert != null && r.alert!.urgent && urgentSpeechAt < 0) {
+          urgentSpeechAt = i;
+        }
+        if (i < 13) {
+          expect(r.alert, isNull,
+              reason: 'frame $i: no speech of any level '
+                  'before urgent confirmation (the sparse '
+                  'hits never confirm the warning tier '
+                  'either)');
+        }
+      }
+      expect(preUrgentAt, 12,
+          reason: 'frame 12: tau_now issued below 1.5 '
+              'with the track still unconfirmed -> the '
+              'pre-urgent vibration fires (and only there)');
+      expect(urgentSpeechAt, 13,
+          reason: 'frame 13: the back-to-back hit '
+              'confirms (2-of-3), the urgent speaks AFTER '
+              'the vibration on the timeline');
+    });
+
+    test('pre-urgent one-shot: without confirmation the '
+        'speech is never made up', () {
+      final HazardPipeline pipeline =
+          HazardPipeline(tracker: trackerForBackend('sort'));
+      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      Detection car(double s) => Detection(
+          label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s);
+      // Same sparse dive as above through frame 12 (the
+      // pre-urgent fires), then the track VANISHES for
+      // good: no urgent speech may ever follow.
+      final Map<int, List<Detection>> frames = <int, List<Detection>>{
+        0: <Detection>[car(0.30)],
+        3: <Detection>[car(0.375)],
+        6: <Detection>[car(0.47)],
+        9: <Detection>[car(0.59)],
+        12: <Detection>[car(0.80)],
+      };
+      int preCount = 0;
+      for (int i = 0; i <= 16; i++) {
+        final HazardPipelineResult r = pipeline.processFrame(
+          frames[i] ?? const <Detection>[],
+          epoch.add(Duration(milliseconds: i * 100)),
+          pitchDeg: null,
+          ego: EgoMotion.unknown,
+        );
+        preCount += r.preUrgentTrackIds.length;
+        expect(r.alert, isNull,
+            reason: 'frame $i: confirmation never arrives, '
+                'so the urgent speech is never made up '
+                '(the spent vibration is the accepted '
+                'false-alarm cost)');
+      }
+      expect(preCount, 1,
+          reason: 'exactly one pre-urgent vibration for '
+              'the whole unbroken condition run');
+    });
+
+    test('main wiring: pre-urgent ids vibrate without '
+        'speech; latency stamps wired', () {
+      final String src = File('lib/main.dart').readAsStringSync();
+      expect(src.contains('result.preUrgentTrackIds'), isTrue,
+          reason: 'the app consumes the pipeline\'s '
+              'pre-urgent set');
+      expect(src.contains('_hazardPipeline.onLatency'), isTrue,
+          reason: 'the end-to-end latency stamp is wired '
+              'to the app log');
+    });
+
+    for (final String backend in kBackends) {
+      test('$backend U=0 grid: side-pass car under KNOWN '
+          'and UNKNOWN ego stays silent', () {
+        // The car grows (it is genuinely approaching its
+        // closest point) but its extrapolated landing stays
+        // 0.56 * Z metres off-axis -- outside the 1.0 m
+        // channel at every Z in range (blocking condition:
+        // the channel-intersection conjunct).
+        for (final EgoMotion ego in <EgoMotion>[
+          EgoMotion.still,
+          EgoMotion.unknown,
+        ]) {
+          final HazardPipeline pipeline =
+              HazardPipeline(tracker: trackerForBackend(backend));
+          final DateTime epoch =
+              DateTime.fromMillisecondsSinceEpoch(0);
+          for (int i = 0; i < 25; i++) {
+            final double z = 12.0 - 0.3 * i;
+            final double s = 0.96 / z;
+            final double bottom = bottomForRange(z);
+            final HazardPipelineResult r = pipeline.processFrame(
+              <Detection>[
+                Detection(
+                    label: 'car',
+                    confidence: 0.9,
+                    cx: 0.5 + 0.56 * 0.714,
+                    cy: bottom - s / 2,
+                    w: s,
+                    h: s),
+              ],
+              epoch.add(Duration(milliseconds: i * 100)),
+              pitchDeg: 10,
+              ego: ego,
+            );
+            expect(r.alert, isNull,
+                reason: 'frame $i (ego known: '
+                    '${ego.speedKnown}): side-pass, landing '
+                    'outside the channel');
+          }
+        }
+      });
+
+      test('$backend U=0 grid: flicker person under '
+          'UNKNOWN ego stays silent (no growth conjunct)',
+          () {
+        // Two frames on, three off, constant size: TTC_s
+        // never exists, so the scale path's growth
+        // conjunct (ii) blocks every level; the flicker
+        // can also never satisfy urgent confirmation with
+        // an in-band tau (there is no tau at all).
+        final HazardPipeline pipeline =
+            HazardPipeline(tracker: trackerForBackend(backend));
+        final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+        for (int i = 0; i < 30; i++) {
+          final bool on = i % 5 < 2;
+          final HazardPipelineResult r = pipeline.processFrame(
+            <Detection>[
+              if (on)
+                const Detection(
+                    label: 'person',
+                    confidence: 0.9,
+                    cx: 0.5,
+                    cy: 0.55,
+                    w: 0.18,
+                    h: 0.36),
+            ],
+            epoch.add(Duration(milliseconds: i * 100)),
+            pitchDeg: null,
+            ego: EgoMotion.unknown,
+          );
+          expect(r.alert, isNull, reason: 'frame $i');
+          expect(r.preUrgentTrackIds, isEmpty, reason: 'frame $i');
+        }
       });
     }
   });

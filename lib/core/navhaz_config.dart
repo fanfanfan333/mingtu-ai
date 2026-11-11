@@ -93,10 +93,50 @@ static const double groundPlaneMaxBottom = 0.98;
 
 // ---- TTC estimation ----------------------------------------------
 
-/// Alpha-beta filter gains for the scale / range series.
-/// (spec values).
-static const double alphaBetaAlpha = 0.5;
-static const double alphaBetaBeta = 0.1;
+/// Two-tier alpha-beta filtering (FIX3B). The NORMAL
+/// tier (alpha 0.3) feeds the warning judgement and the
+/// general estimate outputs; the AGILE tier (alpha 0.7)
+/// exists only for the urgent judgement, whose one-step
+/// prediction compensates the filter lag the CDX3 delay
+/// ledger measured (the old single tier -- alpha 0.5 with
+/// a hand-filled beta 0.1 -- read TTC_s about +0.87 s
+/// high at the urgent crossing).
+///
+/// Beta is NOT hand-filled any more: it is derived from
+/// alpha by the Kalata relation
+///   beta = 2(2 - alpha) - 4 * sqrt(1 - alpha)
+/// alpha 0.3 -> beta ~= 0.0534; alpha 0.7 -> beta ~=
+/// 0.4091. The derivation lives in AlphaBetaFilter.
+static const double alphaBetaAlphaNormal = 0.3;
+static const double alphaBetaAlphaAgile = 0.7;
+
+/// Pipeline latency subtracted from the agile tier's
+/// one-step predicted TTC before the urgent judgement
+/// (tau_now = tau_pred - pipelineLatencyS): detection ->
+/// tracking -> policy -> speech/haptics dispatch.
+/// PROVISIONAL value; to be calibrated on a real device
+/// against the end-to-end latency stamps the pipeline
+/// emits (see HazardPipeline.onLatency). Calibration
+/// note (FIX3B): the lead's initial provisional 0.5 s
+/// overshot the acceptance grid on the range-leg path --
+/// that leg is essentially unbiased, so the full 0.5 s
+/// came straight off the crossing point and the first
+/// urgent landed at true TTC 3.5 s, past the grid's 3.3 s
+/// upper bound. The grid measurements put the total
+/// effective compensation (prediction step + latency) at
+/// about 0.3 s; 0.2 s here plus the 0.1 s prediction
+/// step lands all four backend x ego combinations
+/// inside [2.4, 3.3]. The device stamps refine this.
+static const double pipelineLatencyS = 0.2;
+
+/// Pre-emptive urgent vibration (FIX3B): on any frame
+/// whose urgent-predicted tau_now drops below this, the
+/// pipeline fires the urgent vibration immediately --
+/// before urgent confirmation -- while the urgent
+/// SPEECH still waits for confirmation. One shot per
+/// track until the condition clears or the urgent speech
+/// is actually delivered.
+static const double preVibrationTtcS = 1.5;
 
 /// TTC fusion consistency rule (spec 2.2, tightened by
 /// the M1 fix round): when BOTH TTC estimates are valid
@@ -160,32 +200,48 @@ static const Duration accelWindow = Duration(milliseconds: 2500);
 /// than this margin, m/s. (Spec value.)
 static const double approachingMarginMps = 1.0;
 
-// ---- Ego-unknown scale path (lead's ruling, 2026-11-11) ------------
-// When the ego speed is UNKNOWN (GPS too inaccurate AND
-// no step-frequency estimate), the policy runs a dedicated
-// scale-only path: no approaching judgement at all, levels
-// come from the box-scale TTC alone, gated by an
-// intersection test -- the box bottom-centre, extrapolated
-// laterally to t + TTC_s, must land inside the user's
-// forward channel. The channel is metric when a range Z
-// is available and a centre fraction of the frame when it
-// is not. Both values are PROVISIONAL (the lead's ruling
-// fixes the defaults; field calibration may tune them).
+// ---- Forward channel (intersection test, ALL paths) ----------------
+// Every will-hit / intersection judgement in the hazard
+// pipeline -- the known-ego corridor test and the
+// ego-unknown scale path alike (unified in the CDX3
+// round) -- asks ONE question: does the box bottom-centre,
+// extrapolated laterally to the TTC horizon, land inside
+// the user's forward channel? The channel is metric when
+// a range Z is available and a centre fraction of the
+// frame when it is not. There is NO second way in: a box
+// that merely OVERLAPS the channel in the current frame
+// does not count (a crossing target's box sweeps through
+// the channel while its extrapolated landing point is far
+// outside it). Both values are PROVISIONAL (the lead's
+// ruling fixes the defaults; field calibration may tune
+// them).
+//
+// This channel is a HIT JUDGEMENT, a different thing from
+// the wording / advisor corridor [corridorLeft,
+// corridorRight] below (three-zone wording edges, shared
+// with the avoidance advisor's three-condition rule):
+// neither may be tuned by editing the other.
 
 /// Half width of the forward channel, metres, for the
-/// ego-unknown intersection test when the target's range
-/// can be converted to metres. Default +/-1.0 m per the
-/// lead's ruling. 【暂定】
-static const double egoUnknownChannelHalfWidthM = 1.0;
+/// intersection test when the target's range can be
+/// converted to metres. Default +/-1.0 m per the lead's
+/// ruling. 【暂定】
+static const double channelHalfWidthM = 1.0;
 
 /// Width of the forward channel as a fraction of the
-/// frame width, centred, for the ego-unknown intersection
-/// test when no metric range is available: the channel is
+/// frame width, centred, for the intersection test when
+/// no metric range is available: the channel is
 /// [0.5 - f/2, 0.5 + f/2] = [0.30, 0.70] at the default.
-/// (This is a DIFFERENT band from the known-ego corridor
-/// [corridorLeft, corridorRight]; neither may be tuned by
-/// editing the other.) 【暂定】
-static const double egoUnknownChannelCenterFraction = 0.40;
+/// 【暂定】
+static const double channelCenterFraction = 0.40;
+
+/// Legacy names for the two channel values above, kept
+/// for the ego-unknown path's call sites and tests: the
+/// channel is ONE definition (see the section header), so
+/// these are aliases, not a second pair of values.
+static const double egoUnknownChannelHalfWidthM = channelHalfWidthM;
+static const double egoUnknownChannelCenterFraction =
+    channelCenterFraction;
 
 // ---- Corridor ----------------------------------------------------
 
@@ -228,6 +284,41 @@ static const double warningStaticRangeM = 3.0;
 /// Wording switches from three-zone to clock+distance
 /// beyond this range, metres. (Spec value.)
 static const double nearWordingRangeM = 5.0;
+
+/// Navigation distance wording bands (FIX3B; the
+/// rounding HABITS follow OsmAnd's Chinese announcements
+/// -- rule reference only, independently implemented, no
+/// OsmAnd code or text tables used; OsmAnd is GPL). Used
+/// by navigationDistanceText for turn prompts and route
+/// announcements -- NOT by entrance guidance, which
+/// keeps its own Step D 10 m bands.
+///   d < navWholeMetresBelow   -> whole metres
+///   d < navRound50Below       -> floored to 10 m
+///   d < navKilometreFrom      -> rounded to 50 m
+///   d < navAboutOneKmBelow    -> "about 1 km"
+///   d < navFixedBeyondFrom    -> "about X km"
+///   d >= navFixedBeyondFrom   -> fixed "beyond 10 km"
+static const double navWholeMetresBelow = 17;
+static const double navRound50Below = 100;
+static const double navKilometreFrom = 1000;
+static const double navAboutOneKmBelow = 1500;
+static const double navFixedBeyondFrom = 10000;
+
+/// Hazard distance wording bands (FIX3B), used by
+/// metresText for obstacle / danger announcements:
+///   Z < hazardVeryCloseBelow    -> "very close", no
+///                                  number
+///   Z < hazardWholeMetresBelow  -> whole metres
+///   Z < hazardNumberedBelow     -> "about 5 m" / "about
+///                                  10 m", split at
+///                                  hazardAboutSplit
+///   Z >= hazardNumberedBelow    -> no number at all
+///                                  (category + bearing
+///                                  only)
+static const double hazardVeryCloseBelow = 1.5;
+static const double hazardWholeMetresBelow = 5;
+static const double hazardNumberedBelow = 10;
+static const double hazardAboutSplit = 7.5;
 
 // ---- Cooldown / dedup ------------------------------------------------
 

@@ -47,6 +47,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../core/hazard/hazard_phrases.dart';
 import '../core/route_scoring.dart';
 import '../modules/map_navigation.dart';
 
@@ -192,7 +193,9 @@ String amapStepSpeechText({
     act = action;
   }
   final String head = direction.isEmpty ? act : '$direction$act';
-  return '$head，约 ${distanceM.toStringAsFixed(0)} 米';
+  // Step distance wording: the FIX3B navigation bands
+  // (announcement-ready form from navigationDistanceText).
+  return '$head，${navigationDistanceText(distanceM)}';
 }
 
 class AmapWalkingResult {

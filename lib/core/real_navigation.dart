@@ -37,6 +37,7 @@ import 'dart:math' as math;
 
 import '../adapters/amap_client.dart';
 import '../adapters/current_location.dart';
+import 'hazard/hazard_phrases.dart';
 import '../config/verified_locations.dart';
 import '../modules/map_navigation.dart';
 
@@ -267,8 +268,9 @@ String realRouteReadyAnnouncement({
   required double distanceM,
   required int stepsCount,
 }) =>
-    '已获取到$destinationName的真实步行路线，距离 '
-    '${distanceM.toStringAsFixed(0)} 米，共 $stepsCount 段。'
+    '已获取到$destinationName的真实步行路线，距离'
+    // Route distance wording: the FIX3B navigation bands.
+    '${navigationDistanceText(distanceM)}，共 $stepsCount 段。'
     '注意：高德不提供盲道信息，这条路线没有经过无障碍核查。'
     '接下来我会按你的实时位置播报转向和偏航，'
     '到达时会提醒你。';

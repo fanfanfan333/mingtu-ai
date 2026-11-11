@@ -267,13 +267,13 @@ class MingtuHomeDebugHandle {
   List<String> get debugExpired =>
       List<String>.unmodifiable(_state._scheduler.droppedExpiredLog);
 
-  /// NAVHAZ M1 seam: inject a short arbitration replay
-  /// window for tests (e.g. Duration.zero makes any
-  /// interrupted prompt expire at the next arbitration
-  /// pass). Production never calls this; the production
-  /// window stays NavHazConfig.replayExpiry (15 s).
-  void debugSetReplayExpiry(Duration expiry) =>
-      _state._replayExpiryOverride = expiry;
+  /// NAVHAZ M1 seam (CDX3): install a fake clock for the
+  /// speech-arbitration timeline (see _speechNow in the
+  /// state). Tests drive the 15 s replay-expiry boundary
+  /// by advancing the fake clock; passing null restores
+  /// the wall clock. Production never calls this.
+  void debugSetSpeechClock(DateTime Function()? clock) =>
+      _state._speechNow = clock ?? DateTime.now;
 
   /// NAVHAZ M1 seam (EGOUNK round): inject a fixed camera
   /// pitch for tests. The widget environment has no
@@ -453,10 +453,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   TaskManager _tasks = TaskManager();
   SpeechScheduler _scheduler = SpeechScheduler();
 
-  /// Test-only override of the arbitration replay window
-  /// (see _buildInterruptedReplay); null in production,
-  /// where NavHazConfig.replayExpiry (15 s) always applies.
-  Duration? _replayExpiryOverride;
+  /// The clock every speech-arbitration timestamp runs on
+  /// (CDX3): request creation / expiry stamps, the
+  /// scheduler's submit stamps -- which is where an
+  /// interruption's timestamp comes from -- and the
+  /// replay-expiry judgement in _buildInterruptedReplay
+  /// all read time through here, so a test can install ONE
+  /// fake clock and drive the 15 s boundary exactly
+  /// (14.999 s alive, 15.000 s expired) instead of
+  /// short-circuiting the window. Production never
+  /// replaces it: it stays DateTime.now and the window
+  /// stays NavHazConfig.replayExpiry (15 s). (The earlier
+  /// zero-window override seam is gone: two coexisting
+  /// time bases for the same judgement invited exactly
+  /// the confusion the CDX3 round removed.)
+  DateTime Function() _speechNow = DateTime.now;
 
   /// Test-only override of the camera pitch reading (see
   /// debugSetPitchDeg); null in production, where the
@@ -2025,7 +2036,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     int? navStepIndex,
     NavReplay? replay,
   }) {
-    final DateTime now = DateTime.now();
+    final DateTime now = _speechNow();
     // Critical delivery: emergencies, danger prompts and alerts
     // (safety/failure announcements) NEVER expire -- a dropped
     // safety message is worse than a late one. Ordinary prompts
@@ -2113,7 +2124,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _logMsg('一条播报含禁词，已改写为固定兜底句，未播报原文。');
       request = _withText(request, bannedWordFallbackPhrase);
     }
-    final DateTime now = DateTime.now();
+    final DateTime now = _speechNow();
     if (request.kind == SpeechKind.danger) {
       // A danger prompt pauses straight guidance (the pacing
       // machine's persistent hold + the scheduler's straight
@@ -2154,16 +2165,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// intersection is behind the user / too close): an old
   /// navigation text is never spoken late.
   SpeechRequest? _buildInterruptedReplay() {
-    final DateTime now = DateTime.now();
-    // Production window: NavHazConfig.replayExpiry (15 s).
-    // The override exists only so widget tests can inject
-    // a short-circuited window (the 15 s expiry case); it
-    // is never set outside the debug handle.
-    final Duration expiry = _replayExpiryOverride ?? NavHazConfig.replayExpiry;
+    // The judgement and the interruption stamps it is
+    // measured against share ONE clock (_speechNow), so
+    // the boundary is exact: an interruption is expired
+    // once its age REACHES the window (14.999 s alive,
+    // 15.000 s expired at the production 15 s window).
+    final DateTime now = _speechNow();
+    const Duration expiry = NavHazConfig.replayExpiry;
     for (final SpeechRequest r
         in _scheduler.interruptedNavigationRequests()) {
       final DateTime? at = _scheduler.interruptedAtOf(r);
-      if (at != null && now.difference(at) > expiry) {
+      if (at != null && now.difference(at) >= expiry) {
         _scheduler.discardInterrupted(r);
         _scheduler.droppedExpiredLog.add(r.id);
         continue;
@@ -2249,7 +2261,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (replay != null) _say(replay);
       }
       final SpeechRequest? next = _scheduler.promoteNext(
-        DateTime.now(),
+        _speechNow(),
         straightSegmentConfirmed: _straightSegmentConfirmedNow,
         riskActive: _riskActive,
       );
@@ -4302,6 +4314,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// drives the risk state (three consecutive risk-free
   /// frames clear it, same as the legacy chain).
   void _onYoloDetectionsPipeline(List<Detection> detections, DateTime now) {
+    // End-to-end latency stamps (FIX3B): frame timestamp
+    // -> alert / pre-urgent emission, milliseconds and
+    // stage name only, through the existing app log.
+    _hazardPipeline.onLatency ??=
+        (String stage, int ms) => _logMsg('NAVHAZ延迟 $stage ${ms}ms');
     final bool navigating = _tasks.state == TaskState.navigating ||
         _tasks.state == TaskState.avoidingObstacle;
     final HazardPipelineResult result = _hazardPipeline.processFrame(
@@ -4316,6 +4333,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       ego: _egoMotionNow(now),
       commit: navigating,
     );
+    // Pre-emptive urgent vibration (FIX3B): the urgent
+    // vibration fires the moment tau_now crosses the
+    // pre-vibration threshold, BEFORE urgent confirmation;
+    // no speech accompanies it -- the urgent speech still
+    // comes only through the confirmed alert path below.
+    if (navigating) {
+      for (final int _ in result.preUrgentTrackIds) {
+        unawaited(_haptics.vibrateUrgent());
+      }
+    }
     if (result.riskPresent) {
       _yoloEmptyFrames = 0;
       if (navigating && !_yoloRiskActive) {

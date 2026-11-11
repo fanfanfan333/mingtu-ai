@@ -11,14 +11,16 @@
 ///   danger-speech-start are stamped from a TEST-CONTROLLED
 ///   clock (the fake TTS stop advances it by a fixed
 ///   simulated latency), never from real waiting;
-/// - the 15 s expiry case (Codex arb-15s): an interrupted
-///   navigation prompt older than the replay window is
-///   dropped into the expired log and never replayed. The
-///   window itself is injected through the debug handle
-///   (production stays at NavHazConfig.replayExpiry =
-///   15 s; the production logic is NOT bent to "expire on
-///   danger completion" -- the test short-circuits the
-///   window, the arbitration code path is the real one);
+/// - the 15 s expiry cases (Codex arb-15s + the CDX3
+///   boundary pair): an interrupted navigation prompt
+///   older than the replay window is dropped into the
+///   expired log and never replayed. Since CDX3 the
+///   suite drives the REAL production window
+///   (NavHazConfig.replayExpiry = 15 s) through an
+///   injected arbitration CLOCK (debugSetSpeechClock):
+///   the test advances fake time by 14.999 / 15.000 /
+///   16 s and the production judgement runs unbent --
+///   no shortened window is injected anywhere any more;
 /// - every spoken text on the timeline is asserted free
 ///   of banned words (spec 2.7.10 aggregation point).
 library;
@@ -107,21 +109,72 @@ void main() {
       final SpeechRequest turn =
           req('turn-1', SpeechKind.turn, replay: NavReplay.regenerate, step: 1);
       s.submit(turn, DateTime.now());
+      expect(s.active?.id, 'turn-1');
       s.submit(req('danger-1', SpeechKind.danger), DateTime.now());
       expect(s.active?.id, 'danger-1');
+      expect(s.interruptedRequests, hasLength(1));
       expect(s.interruptedRequests.single.navStepIndex, 1);
-      expect(s.interruptedLog, <String>['turn-1']);
+      expect(s.interruptedRequests.single.replay, NavReplay.regenerate);
+      expect(s.interruptedLog, <String>['turn-1'],
+          reason: 'the legacy id view is derived from the objects');
+      expect(s.interruptedAtOf(turn), isNotNull);
+    });
+
+    test('only navigation items with a replay policy are arbitrable', () {
+      final SpeechScheduler s = SpeechScheduler();
+      s.submit(req('info-1', SpeechKind.info), DateTime.now());
+      s.submit(req('danger-1', SpeechKind.danger), DateTime.now());
+      // info has replay=drop: not arbitrable, but the
+      // interruption itself stays on record.
+      expect(s.interruptedNavigationRequests(), isEmpty);
+      expect(s.interruptedLog, contains('info-1'));
+      final SpeechRequest straight = req('straight-1', SpeechKind.straight,
+          replay: NavReplay.shortenedReplay);
+      s.completeActive();
+      s.submit(straight, DateTime.now());
+      s.submit(req('danger-2', SpeechKind.danger), DateTime.now());
+      final List<SpeechRequest> nav = s.interruptedNavigationRequests();
+      expect(nav.map((SpeechRequest r) => r.id), <String>['straight-1']);
+      s.discardInterrupted(straight);
+      expect(s.interruptedNavigationRequests(), isEmpty);
+      expect(s.interruptedAtOf(straight), isNull);
     });
   });
 
   group('NavigationTracker.regenerateTurnPrompt', () {
-    test('regenerates with a fresh distance; drops past / too close', () {
+    test('an emitted (even interrupted) turn regenerates with a fresh distance',
+        () {
+      final NavigationTracker tracker = buildTracker();
+      final List<NavEvent> events = tracker.onFix(fixAt(southOfB(25)));
+      final List<NavEvent> turns = events
+          .where((NavEvent e) => e.kind == NavEventKind.turnAhead)
+          .toList();
+      expect(turns, hasLength(1));
+      expect(turns.single.stepIndex, 1);
+      // The spam guard still holds: no second event.
+      expect(
+        tracker
+            .onFix(fixAt(southOfB(20)))
+            .where((NavEvent e) => e.kind == NavEventKind.turnAhead),
+        isEmpty,
+      );
+      // ...but regeneration does not consult that guard --
+      // this is the fix for the swallowed-turn defect.
+      final String? prompt =
+          tracker.regenerateTurnPrompt(1, fixAt(southOfB(12)));
+      expect(prompt, '前方约12米右转进入林荫道');
+    });
+
+    test('drops when the intersection is passed or too close', () {
       final NavigationTracker tracker = buildTracker();
       tracker.onFix(fixAt(southOfB(25)));
-      expect(tracker.regenerateTurnPrompt(1, fixAt(southOfB(12))),
-          '前方约12米右转进入林荫道');
+      // 65 m east of B: nearest route point is C, beyond the
+      // step start -> the turn is behind the user.
       expect(tracker.regenerateTurnPrompt(1, fixAt(eastOfB(65))), isNull);
+      // 2 m from the step start: too close to be useful.
       expect(tracker.regenerateTurnPrompt(1, fixAt(southOfB(2))), isNull);
+      // No such step.
+      expect(tracker.regenerateTurnPrompt(7, fixAt(southOfB(12))), isNull);
     });
   });
 
@@ -139,6 +192,12 @@ void main() {
     int clockMs = 0;
     int stopLatencyMs = 80;
     bool stopNeverCompletes = false;
+    // The arbitration clock (CDX3): installed into the app
+    // through debugSetSpeechClock, it is the ONLY clock
+    // the replay-expiry judgement and the interruption
+    // stamps run on, so the 15 s boundary tests advance
+    // THIS -- never a shortened window.
+    DateTime fakeNow = DateTime.fromMillisecondsSinceEpoch(0);
 
     List<String> timeline() =>
         events.map(((int, String) e) => e.$2).toList();
@@ -326,6 +385,7 @@ void main() {
       clockMs = 0;
       stopLatencyMs = 80;
       stopNeverCompletes = false;
+      fakeNow = DateTime.now();
       installMocks();
     });
     tearDown(clearMocks);
@@ -365,26 +425,34 @@ void main() {
       // Step text is the bare action, so the DISTANCE form
       // is the tracker's own regeneration wording.
       installTracker(h, stepTexts: const <String>['直行', '右转']);
-      // 29.5 m out: inside the 30 m announce distance, and
-      // the regenerated wording rounds it to 约30米. The
-      // turn fires and its (bare) text starts playing.
+      // 29.5 m out: inside the 30 m announce distance.
+      // The turn fires and its (bare) text starts playing.
       h.debugLiveFix(southOfB(29.5), 5);
       await pumpFrames(tester);
       expect(idxOf('speak:右转'), greaterThanOrEqualTo(0),
           reason: 'timeline: ${timeline()}');
-      // A warning interrupts it; when the warning finishes
-      // the arbitration regenerates the turn from the same
-      // ~30 m fix -- and THAT distance-form prompt,
+      // A warning interrupts it. While the warning plays,
+      // the freshest fix reads ~35 m out (successive GPS
+      // fixes vary; the regeneration honestly uses the
+      // LATEST fix). When the warning finishes, the
+      // arbitration regenerates the turn from that fix --
+      // and under the FIX3B navigation bands 35 m floors
+      // to the 30 m readout, so THAT distance-form prompt,
       // 「前方约30米右转」, is what is playing when the
       // urgent alert arrives. (Construction note: in this
       // codebase the distance form is produced by the
       // regeneration path, so the scenario stages it
       // through one interruption; the victim prompt below
-      // is the literal spec text.)
+      // is the literal spec text. The pre-FIX3B staging
+      // regenerated from the 29.5 m fix itself, whose
+      // rounded readout was also 30 m; the band change is
+      // what moved the staging fix, not the victim text.)
       feedStaticPerson(h);
       await pumpFrames(tester);
       expect(idxOf('speak:注意，前方有行人。'), greaterThanOrEqualTo(0),
           reason: 'timeline: ${timeline()}');
+      h.debugLiveFix(southOfB(35), 5);
+      await pumpFrames(tester);
       await completeSpeak(tester, 'speak:注意，前方有行人。');
       final int promptIdx = idxOf('speak:前方约30米右转');
       expect(promptIdx, greaterThanOrEqualTo(0),
@@ -556,24 +624,85 @@ void main() {
       expectTimelineClean();
     });
 
-    testWidgets(
-        'temporary 15s expired interrupted navigation (Codex arb-15s)',
-        (tester) async {
+    /// Install the fake arbitration clock (CDX3): from
+    /// here on, request stamps, interruption stamps and
+    /// the replay-expiry judgement all read [fakeNow];
+    /// the test advances it by hand. The production 15 s
+    /// window is never shortened.
+    void installFakeClock(MingtuHomeDebugHandle h) {
+      h.debugSetSpeechClock(() => fakeNow);
+    }
+
+    /// The shared 15 s scenario: a turn prompt is playing,
+    /// a danger interrupts it (the interruption is stamped
+    /// on the fake clock), then the test advances the
+    /// clock by [advance] and finishes the danger.
+    Future<MingtuHomeDebugHandle> interruptedTurnScenario(
+        WidgetTester tester, Duration advance) async {
       final MingtuHomeDebugHandle h = await startApp(tester);
+      installFakeClock(h);
       installTracker(h);
       h.debugLiveFix(southOfB(25), 5);
       await pumpFrames(tester);
       expect(timeline(), contains('speak:右转进入林荫道'));
-      // Inject the short-circuited replay window (the
-      // production 15 s default is untouched; in the
-      // Codex scenario the interruption is already older
-      // than the window when the danger finishes).
-      h.debugSetReplayExpiry(Duration.zero);
+      // The user keeps walking while the turn plays (the
+      // replay, if it comes, must use THIS fix).
+      h.debugLiveFix(southOfB(12), 5);
+      await pumpFrames(tester);
       feedApproachingCar(h);
       await pumpFrames(tester);
       expect(timeline(), contains('speak:停，前方来车。'));
+      fakeNow = fakeNow.add(advance);
       await completeSpeak(tester, 'speak:停，前方来车。');
       await pumpFrames(tester, 5);
+      return h;
+    }
+
+    testWidgets(
+        '15s boundary: at 14.999 s the interrupted turn is '
+        'still replayed', (tester) async {
+      final MingtuHomeDebugHandle h = await interruptedTurnScenario(
+          tester, const Duration(milliseconds: 14999));
+      expect(h.debugExpired, isEmpty,
+          reason: 'inside the window nothing expires');
+      expect(timeline(), contains('speak:前方约12米右转进入林荫道'),
+          reason: 'the turn replays, regenerated from the '
+              '12 m fix. timeline: ${timeline()}');
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets(
+        '15s boundary: at exactly 15.000 s the interrupted '
+        'turn is expired', (tester) async {
+      final MingtuHomeDebugHandle h = await interruptedTurnScenario(
+          tester, const Duration(milliseconds: 15000));
+      expect(
+        h.debugExpired
+            .where((String id) => id.startsWith('nav-turn'))
+            .length,
+        1,
+        reason: 'the window is reached: the interrupted '
+            'turn itself expired: ${h.debugExpired}',
+      );
+      expect(
+        timeline().where((String e) => e.startsWith('speak:前方约')).length,
+        0,
+        reason: 'no replay at the boundary. timeline: ${timeline()}',
+      );
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets(
+        'temporary 15s expired interrupted navigation (Codex arb-15s)',
+        (tester) async {
+      // CDX3 form: the scenario runs on the injectable
+      // arbitration clock and the clock is advanced PAST
+      // the production window (16 s > 15 s) -- no
+      // shortened window is injected anywhere.
+      final MingtuHomeDebugHandle h = await interruptedTurnScenario(
+          tester, const Duration(seconds: 16));
       // Assertion strength vs the Codex original (lead's
       // EGOUNK ruling: the in-repo assertions must not be
       // weaker than the original's semantics):

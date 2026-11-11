@@ -47,6 +47,11 @@ TrackEstimate estimate(
     ttcS: ttc,
     ttcScaleS: ttc,
     ttcRangeS: ttc,
+    // FIX3B: the urgent judgement reads ttcUrgentS; these
+    // unit estimates name ONE ttc for every tier (they
+    // test the policy's band logic, not the estimator's
+    // tiers, which the pipeline tests cover).
+    ttcUrgentS: ttc,
     rangeM: range,
     closingSpeedMps: closing,
     approaching: approaching,
@@ -237,17 +242,34 @@ void main() {
       expect(r.alert?.trackId, 1);
     });
 
-    test('unconfirmed tracks never alert', () {
+    test('unconfirmed tracks: warnings still need 3 frames; '
+        'urgent fires on the 2-of-3 predicate (FIX3B)', () {
       final HazardPolicy policy = HazardPolicy();
       final Track car = confirmedTrack(1, 'car', frames: 2);
-      final HazardPolicyResult r = policy.evaluate(
+      // Warning-grade estimate on a 2-frame track: the
+      // latched 3-frame confirmation still gates every
+      // warning-level rule (FIX3B did NOT relax it).
+      HazardPolicyResult r = policy.evaluate(
         <TrackEstimate>[
-          estimate(car, ttc: 1.0, range: 2, closing: 3, approaching: true),
+          estimate(car, ttc: 4.0, range: 8, closing: 2, approaching: true),
         ],
         at(0),
       );
       expect(r.alert, isNull);
       expect(r.riskPresent, isFalse);
+      // Urgent-grade estimate on the same 2-frame track:
+      // 2-of-3 with the current frame a hit IS the urgent
+      // confirmation (FIX3B), so the urgent fires one
+      // frame earlier than any warning could. (The
+      // pre-FIX3B form of this test expected silence here;
+      // that premise is exactly what the tiering retired.)
+      r = policy.evaluate(
+        <TrackEstimate>[
+          estimate(car, ttc: 1.0, range: 2, closing: 3, approaching: true),
+        ],
+        at(100),
+      );
+      expect(r.alert?.level, HazardLevel.urgent);
     });
 
     test('crossing target that will not hit stays silent', () {

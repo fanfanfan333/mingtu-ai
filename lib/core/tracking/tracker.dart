@@ -83,6 +83,30 @@ class Track {
   /// retires it.
   int lostFrames = 0;
 
+  /// Hit/miss outcome of the most recent (up to) three
+  /// frames, oldest first -- the raw material of the
+  /// urgent confirmation predicate below.
+  final List<bool> _recentOutcomes = <bool>[];
+
+  /// URGENT confirmation (FIX3B): at least two hits among
+  /// the most recent three frames AND the current frame a
+  /// hit. This is deliberately a SEPARATE predicate from
+  /// [confirmed] (an unbroken run of
+  /// [NavHazConfig.confirmFrames]): the urgent judgement
+  /// may fire one frame earlier than a warning, but the
+  /// warning's 3-frame rule and everything built on it are
+  /// untouched.
+  bool get urgentConfirmed {
+    if (_recentOutcomes.isEmpty || !_recentOutcomes.last) {
+      return false;
+    }
+    int hits = 0;
+    for (final bool outcome in _recentOutcomes) {
+      if (outcome) hits += 1;
+    }
+    return hits >= 2;
+  }
+
   Track({required this.id, required this.label});
 
   TrackSample? get latest => samples.isEmpty ? null : samples.last;
@@ -121,12 +145,20 @@ class Track {
     if (consecutiveHits >= NavHazConfig.confirmFrames) {
       confirmed = true;
     }
+    _recentOutcomes.add(true);
+    while (_recentOutcomes.length > 3) {
+      _recentOutcomes.removeAt(0);
+    }
   }
 
   /// Record a frame with no match for this track.
   void recordMiss() {
     lostFrames += 1;
     consecutiveHits = 0;
+    _recentOutcomes.add(false);
+    while (_recentOutcomes.length > 3) {
+      _recentOutcomes.removeAt(0);
+    }
   }
 }
 

@@ -21,6 +21,7 @@ library;
 
 import '../adapters/amap_client.dart';
 import '../modules/map_navigation.dart';
+import 'hazard/hazard_phrases.dart';
 import 'navhaz_config.dart';
 import 'real_navigation.dart' show haversineMeters;
 
@@ -189,7 +190,10 @@ class NavigationTracker {
     final double d =
         haversineMeters(latestFix.point, _points[startPointIdx]);
     if (d < NavHazConfig.replayMinDistanceM) return null;
-    return '前方约${d.round()}米${stepTexts[stepIndex]}';
+    // Distance wording: the FIX3B navigation bands (the
+    // function returns the announcement-ready form,
+    // leading "about" included).
+    return '前方${navigationDistanceText(d)}${stepTexts[stepIndex]}';
   }
 
   /// Nearest route point to [p]: (index, distance in metres).

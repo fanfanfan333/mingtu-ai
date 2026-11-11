@@ -105,13 +105,74 @@ String _smallNumber(int n) {
   return '$n';
 }
 
-/// Metres for speech: whole metres (rounded), 5 m steps
-/// beyond 10 m, never below 1.
+/// Hazard distance wording (FIX3B bands; thresholds in
+/// NavHazConfig): below 1.5 m the distance is "very
+/// close" and NO number is spoken (a sub-1.5 m number
+/// would pretend to a precision the geometry does not
+/// have); 1.5-5 m whole metres; 5-10 m one of two coarse
+/// readouts split at 7.5 m ("about 5" / "about 10"); at
+/// 10 m and beyond NO number at all -- the phrase carries
+/// category and bearing only. The empty string is a real
+/// output (the >= 10 m band), not an error.
 String metresText(double rangeM) {
-  int m = rangeM.round();
-  if (m > 10) m = (m / 5).round() * 5;
-  if (m < 1) m = 1;
-  return '${_smallNumber(m)}米';
+  if (rangeM < NavHazConfig.hazardVeryCloseBelow) return '很近';
+  if (rangeM < NavHazConfig.hazardWholeMetresBelow) {
+    return '${_smallNumber(rangeM.round())}米';
+  }
+  if (rangeM < NavHazConfig.hazardNumberedBelow) {
+    return rangeM < NavHazConfig.hazardAboutSplit ? '约五米' : '约十米';
+  }
+  return '';
+}
+
+/// Navigation distance wording (FIX3B; thresholds in
+/// NavHazConfig): whole metres under 17 m; floored DOWN
+/// to a 10 m multiple from 17 to 100 m (a turn prompt
+/// must never name a distance LONGER than the real one
+/// by rounding up); rounded to the nearest 50 m from 100
+/// to 1000 m; "about 1 km" from 1000 to 1500 m; "about
+/// X km" (X = kilometres rounded to the nearest integer)
+/// up to 10 km; the fixed "beyond 10 km" form past that.
+/// The rounding HABITS follow OsmAnd's Chinese
+/// announcements -- rule reference only, independently
+/// implemented (OsmAnd is GPL; no code or text tables
+/// taken). Returns the announcement-ready form, leading
+/// "about" included, so templates embed it directly.
+/// NOT used by entrance guidance, which keeps its own
+/// Step D 10 m bands.
+String navigationDistanceText(double d) {
+  if (d < NavHazConfig.navWholeMetresBelow) return '约${d.round()}米';
+  if (d < NavHazConfig.navRound50Below) {
+    return '约${(d / 10).floor() * 10}米';
+  }
+  if (d < NavHazConfig.navKilometreFrom) {
+    return '约${(d / 50).round() * 50}米';
+  }
+  if (d < NavHazConfig.navAboutOneKmBelow) return '约1公里';
+  if (d < NavHazConfig.navFixedBeyondFrom) {
+    return '约${(d / 1000).round()}公里';
+  }
+  return '10公里以外';
+}
+
+/// Every readout [navigationDistanceText] can produce,
+/// enumerated by sweeping its domain across every band
+/// (the banned-word exhaustion and the property tests
+/// consume this set).
+Set<String> enumerateNavigationDistanceTexts() {
+  final Set<String> out = <String>{};
+  for (double d = 0; d < 100; d += 1) {
+    out.add(navigationDistanceText(d));
+  }
+  for (double d = 100; d < 1000; d += 25) {
+    out.add(navigationDistanceText(d));
+  }
+  for (double d = 1000; d < 10000; d += 250) {
+    out.add(navigationDistanceText(d));
+  }
+  out.add(navigationDistanceText(10000));
+  out.add(navigationDistanceText(99999));
+  return out;
 }
 
 /// Whether the near (three-zone) wording applies.
@@ -136,27 +197,24 @@ Iterable<String> enumerateAllHazardPhrases() sync* {
     final (String name, bool isVehicle) = axis;
     for (final bool urgent in <bool>[true, false]) {
       // Near forms: three zones (one cx per zone) x the
-      // near range domain (unknown + the half-metre steps
-      // whose readout stays near) -- ranges are INPUTS
-      // here; the reachable READOUTS are asserted against
-      // reachableMetresTexts() by the exhaustion test.
+      // near range domain (unknown + samples across every
+      // FIX3B band the near wording can render: very
+      // close, whole metres, and the 5.0 edge).
       for (final double cx in <double>[0.1, 0.5, 0.9]) {
         yield hazardPhrase(
             urgent: urgent, name: name, isVehicle: isVehicle, cx: cx, rangeM: null);
-        for (double r = 0.5; r <= 5.0; r += 0.5) {
+        for (final double r in <double>[0.5, 1.0, 1.4, 1.5, 2.5, 3.5, 4.5, 5.0]) {
           yield hazardPhrase(
               urgent: urgent, name: name, isVehicle: isVehicle, cx: cx, rangeM: r);
         }
       }
       // Far forms: twelve clock hours (one cx per hour
-      // offset) x the far range domain.
+      // offset) x the far range domain across the
+      // remaining bands: the about-5 / about-10 split and
+      // the no-number domain (>= 10 m) at several depths.
       for (int offset = -5; offset <= 6; offset++) {
         final double cx = 0.5 + offset * 30.0 / NavHazConfig.horizontalFovDeg;
-        for (double r = 5.5; r <= 10.0; r += 0.5) {
-          yield hazardPhrase(
-              urgent: urgent, name: name, isVehicle: isVehicle, cx: cx, rangeM: r);
-        }
-        for (double r = 12.5; r <= 100.0; r += 2.5) {
+        for (final double r in <double>[5.5, 6.5, 7.5, 8.5, 9.9, 10.0, 25.0, 100.0]) {
           yield hazardPhrase(
               urgent: urgent, name: name, isVehicle: isVehicle, cx: cx, rangeM: r);
         }
@@ -188,16 +246,21 @@ List<(String, bool)> spokenNameAxes() {
   ];
 }
 
-/// The set of metre READOUTS [metresText] can produce,
-/// derived by sweeping its input domain finely (0.05 m
-/// steps over 0..200 m) rather than by copying the
-/// rounding rules into a second list: if the rounding
-/// changes, this set changes with it and the exhaustion
-/// test's equality assertion follows the implementation.
+/// The set of NON-EMPTY metre readouts [metresText] can
+/// produce under the FIX3B bands, derived by sweeping its
+/// input domain finely (0.05 m steps over 0..30 m, which
+/// covers every band including the no-number domain)
+/// rather than by copying the band rules into a second
+/// list: if the bands change, this set changes with them
+/// and the exhaustion test follows the implementation.
+/// The empty readout (range >= 10 m) is deliberately not
+/// a member: it asserts nothing and is contained in every
+/// string.
 Set<String> reachableMetresTexts() {
   final Set<String> out = <String>{};
-  for (double r = 0.05; r <= 200.0; r += 0.05) {
-    out.add(metresText(r));
+  for (double r = 0.05; r <= 30.0; r += 0.05) {
+    final String text = metresText(r);
+    if (text.isNotEmpty) out.add(text);
   }
   return out;
 }

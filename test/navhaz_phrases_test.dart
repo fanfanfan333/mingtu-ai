@@ -15,6 +15,7 @@
 /// clean by construction).
 library;
 import 'dart:io';
+import 'dart:math' show Random;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
@@ -134,38 +135,112 @@ void main() {
       for (int h = 1; h <= 12; h++) {
         expect(all.any((String p) => p.contains('点钟方向')), isTrue);
       }
-      // Metre coverage, pinned against the implementation
-      // (CDX2-6a): the set of metre readouts the
-      // enumeration actually produced must EQUAL the set
-      // metresText can produce at all -- the reachable set
-      // is derived from metresText itself
-      // (reachableMetresTexts sweeps its input domain), so
-      // this is an equality with the implementation, not
-      // with a hand-copied list. (The numeric per-metre
-      // assertions live in 'zone and clock wording'.)
-      final Set<String> produced = <String>{
-        for (final String p in all)
-          for (final String m in reachableMetresTexts())
-            if (p.contains(m)) m,
-      };
-      // Every reachable readout that the phrase grammar
-      // can embed (near readouts are capped by the near
-      // wording limit; far readouts cover the rest) appears
-      // in some enumerated phrase; readouts beyond the far
-      // domain cap (100 m) are not phrase-reachable and are
-      // excluded by construction of the sweep below.
-      final Set<String> reachableInPhrases = <String>{
-        for (double r = 0.05; r <= 100.0; r += 0.05) metresText(r),
-      };
-      expect(produced, reachableInPhrases,
-          reason: 'enumerated metre readouts == reachable '
-              'metre readouts up to the phrase domain cap');
+      // Metre coverage under the FIX3B bands: every
+      // reachable (non-empty) readout appears in some
+      // enumerated phrase, and -- the stronger direction --
+      // EVERY phrase the production builder produces over
+      // a fine input sweep (plus very large ranges, whose
+      // readout is the no-number form) is a member of the
+      // enumerated set. The enumeration IS the producible
+      // space, not a sample of it.
+      final Set<String> enumerated = all.toSet();
+      for (final String m in reachableMetresTexts()) {
+        expect(all.any((String p) => p.contains(m)), isTrue,
+            reason: 'readout "$m" appears in the enumeration');
+      }
+      for (double r = 0.05; r <= 30.0; r += 0.05) {
+        for (final bool urgent in <bool>[true, false]) {
+          final String phrase = hazardPhrase(
+              urgent: urgent,
+              name: '汽车',
+              isVehicle: true,
+              cx: 0.5,
+              rangeM: r);
+          expect(enumerated.contains(phrase), isTrue,
+              reason: 'range $r: "$phrase" is enumerated');
+        }
+      }
+      for (final double r in <double>[105, 1234, 99999]) {
+        final String phrase = hazardPhrase(
+            urgent: false, name: '汽车', isVehicle: true, cx: 0.5, rangeM: r);
+        expect(enumerated.contains(phrase), isTrue,
+            reason: 'range $r (no-number band): "$phrase" '
+                'is enumerated');
+        expect(containsBannedWord(phrase), isFalse);
+      }
       // The count is pinned so a silently shrinking entry
       // point fails loudly.
       final int names = spokenNameAxes().length;
-      expect(all.length, names * 2 * (3 * 11 + 12 * (10 + 36)),
-          reason: 'names x levels x (near 3 zones x 11 '
-              'ranges + far 12 hours x 46 ranges)');
+      expect(all.length, names * 2 * (3 * 9 + 12 * 8),
+          reason: 'names x levels x (near 3 zones x 9 '
+              'ranges + far 12 hours x 8 ranges) -- the '
+              'FIX3B band space is deliberately compact: '
+              'distance wording no longer has hundreds of '
+              'numeric gradations');
+    });
+
+    test('distance wording bands (FIX3B)', () {
+      // Hazard bands.
+      expect(metresText(0.8), '很近');
+      expect(metresText(1.49), '很近');
+      expect(metresText(1.5), '二米');
+      expect(metresText(4.4), '四米');
+      expect(metresText(6.0), '约五米');
+      expect(metresText(7.49), '约五米');
+      expect(metresText(7.5), '约十米');
+      expect(metresText(9.9), '约十米');
+      expect(metresText(10.0), '',
+          reason: 'at 10 m and beyond: no number at all');
+      expect(metresText(1234), '');
+      // Navigation bands.
+      expect(navigationDistanceText(12), '约12米');
+      expect(navigationDistanceText(16.6), '约17米');
+      expect(navigationDistanceText(29.5), '约20米',
+          reason: '17-100 m floors DOWN to a 10 m '
+              'multiple (a turn prompt never names a '
+              'distance longer than the real one)');
+      expect(navigationDistanceText(35), '约30米');
+      expect(navigationDistanceText(99), '约90米');
+      expect(navigationDistanceText(100), '约100米');
+      expect(navigationDistanceText(120), '约100米');
+      expect(navigationDistanceText(130), '约150米',
+          reason: '100-1000 m rounds to the nearest 50 m');
+      expect(navigationDistanceText(999), '约1000米');
+      expect(navigationDistanceText(1000), '约1公里');
+      expect(navigationDistanceText(1499), '约1公里');
+      expect(navigationDistanceText(1500), '约2公里');
+      expect(navigationDistanceText(2400), '约2公里');
+      expect(navigationDistanceText(2600), '约3公里');
+      expect(navigationDistanceText(9999), '约10公里');
+      expect(navigationDistanceText(10000), '10公里以外');
+    });
+
+    test('property: large distances land in the enumerated '
+        'sets, both wordings (FIX3B)', () {
+      final Set<String> navSet = enumerateNavigationDistanceTexts();
+      final Set<String> hazardReachable = reachableMetresTexts();
+      final List<double> samples = <double>[105, 1234, 99999];
+      final Random rng = Random(20261111);
+      for (int i = 0; i < 24; i++) {
+        samples.add(100 + rng.nextDouble() * 200000);
+      }
+      for (final double d in samples) {
+        expect(navSet.contains(navigationDistanceText(d)), isTrue,
+            reason: 'navigation wording for $d m is enumerated');
+        expect(containsBannedWord(navigationDistanceText(d)), isFalse);
+        final String hazard = metresText(d);
+        expect(hazard.isEmpty || hazardReachable.contains(hazard),
+            isTrue,
+            reason: 'hazard wording for $d m is a reachable '
+                'readout (or the no-number form)');
+        expect(containsBannedWord(hazard), isFalse);
+      }
+      // Every enumerated navigation readout is itself
+      // banned-word free (the navigation space joins the
+      // section 2.7.10 exhaustion this round).
+      for (final String text in navSet) {
+        expect(containsBannedWord(text), isFalse, reason: text);
+      }
     });
 
     test('zone and clock wording follow the geometry', () {
@@ -177,10 +252,16 @@ void main() {
       expect(clockHour(0.15), 11, reason: 'left of centre reads 11 o-clock');
       expect(clockHour(1.0), 1,
           reason: 'the frame edge is +35 deg at HFOV 70, still 1 o-clock');
-      expect(metresText(9.6), '十米');
-      expect(metresText(12.0), '十米',
-          reason: 'beyond 10 m the readout steps by 5');
-      expect(metresText(13.0), '15米');
+      expect(metresText(9.6), '约十米',
+          reason: 'FIX3B band: 5-10 m reads about-5 / '
+              'about-10 split at 7.5 (was: 十米 under the '
+              'pre-FIX3B 5 m stepping)');
+      expect(metresText(12.0), '',
+          reason: 'FIX3B band: >= 10 m speaks no number '
+              '(was: 十米)');
+      expect(metresText(13.0), '',
+          reason: 'FIX3B band: >= 10 m speaks no number '
+              '(was: 15米)');
     });
 
     test('the fallback sentence itself is clean', () {
@@ -246,6 +327,37 @@ void main() {
         for (final String word in banned) {
           expect(src.contains(word), isFalse,
               reason: '${f.path} contains a banned phrase outside comments');
+        }
+      }
+    });
+
+    test('no lib source contains a contiguous banned phrase '
+        'INCLUDING comments (CDX3 item 6)', () {
+      // The stricter CDX3口径: comments are NOT stripped.
+      // Quoting a banned phrase in a comment -- even to
+      // forbid it -- is itself a finding now; comments
+      // must paraphrase. (The banned-word LIST in
+      // hazard_phrases.dart is assembled from adjacent
+      // literals, which never forms the contiguous
+      // string, so it does not trip this scan.)
+      final List<String> banned = <String>[
+        <String>['安', '全'].join(),
+        <String>['可以', '通行'].join(),
+        <String>['放', '心'].join(),
+        <String>['可以', '过马路'].join(),
+      ];
+      final List<File> files = Directory('lib')
+          .listSync(recursive: true)
+          .whereType<File>()
+          .where((File f) => f.path.endsWith('.dart'))
+          .toList();
+      expect(files, isNotEmpty);
+      for (final File f in files) {
+        final String src = f.readAsStringSync();
+        for (final String word in banned) {
+          expect(src.contains(word), isFalse,
+              reason: '${f.path} contains a banned phrase '
+                  '(comments included)');
         }
       }
     });

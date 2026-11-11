@@ -142,6 +142,109 @@ void main() {
     }
   });
 
+  group('channel intersection (CDX3: one rule for every path)', () {
+    test('normalised channel: landing on 0.30 / 0.70 is in, '
+        'just outside is out', () {
+      expect(
+        TtcEstimator.channelIntersects(
+            cx: 0.30, cxVelocity: 0, horizonS: 2.0, rangeM: null),
+        isTrue,
+      );
+      expect(
+        TtcEstimator.channelIntersects(
+            cx: 0.70, cxVelocity: 0, horizonS: 2.0, rangeM: null),
+        isTrue,
+      );
+      expect(
+        TtcEstimator.channelIntersects(
+            cx: 0.299, cxVelocity: 0, horizonS: 2.0, rangeM: null),
+        isFalse,
+      );
+      expect(
+        TtcEstimator.channelIntersects(
+            cx: 0.701, cxVelocity: 0, horizonS: 2.0, rangeM: null),
+        isFalse,
+      );
+      // The LANDING point decides, not the current centre:
+      expect(
+        TtcEstimator.channelIntersects(
+            cx: 0.5, cxVelocity: 0.3, horizonS: 1.0, rangeM: null),
+        isFalse,
+        reason: 'currently dead centre, landing at 0.80',
+      );
+    });
+
+    test('metric channel: landing within +/-1.0 m of the '
+        'axis at the measured range', () {
+      final double cxStar =
+          0.5 + TtcEstimator.focalX * NavHazConfig.channelHalfWidthM / 10.0;
+      expect(
+        TtcEstimator.channelIntersects(
+            cx: cxStar - 0.002, cxVelocity: 0, horizonS: 2.0, rangeM: 10.0),
+        isTrue,
+      );
+      expect(
+        TtcEstimator.channelIntersects(
+            cx: cxStar + 0.002, cxVelocity: 0, horizonS: 2.0, rangeM: 10.0),
+        isFalse,
+      );
+    });
+
+    test('willHit: a wide box OVERLAPPING the corridor but '
+        'extrapolating out of the channel does not hit', () {
+      // Box spans 0.25..0.75 (overlaps both the old
+      // [0.33, 0.67] corridor and the new channel) while
+      // sweeping right at 0.4 /s; with no TTC the horizon
+      // is 1 s, so the landing point is ~0.9 -- outside.
+      // The pre-CDX3 overlap clause said willHit == true.
+      final TtcEstimator estimator = TtcEstimator();
+      final Track track = Track(id: 55, label: 'person');
+      final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      TrackEstimate? last;
+      for (int i = 0; i < 6; i++) {
+        track.recordMatch(
+          Detection(
+              label: 'person',
+              confidence: 0.9,
+              cx: 0.5 + 0.04 * i,
+              cy: 0.55,
+              w: 0.5,
+              h: 0.4),
+          epoch.add(Duration(milliseconds: i * 100)),
+        );
+        last = estimator.estimate(track,
+            at: epoch.add(Duration(milliseconds: i * 100)),
+            pitchDeg: null,
+            ego: EgoMotion.still);
+      }
+      expect(last!.willHit, isFalse,
+          reason: 'overlap is not a hit any more; only the '
+              'extrapolated landing point counts');
+      // Same wide box, stationary and centred: the landing
+      // point IS the centre -> hit.
+      final TtcEstimator estimator2 = TtcEstimator();
+      final Track still = Track(id: 56, label: 'person');
+      TrackEstimate? last2;
+      for (int i = 0; i < 4; i++) {
+        still.recordMatch(
+          const Detection(
+              label: 'person',
+              confidence: 0.9,
+              cx: 0.5,
+              cy: 0.55,
+              w: 0.5,
+              h: 0.4),
+          epoch.add(Duration(milliseconds: i * 100)),
+        );
+        last2 = estimator2.estimate(still,
+            at: epoch.add(Duration(milliseconds: i * 100)),
+            pitchDeg: null,
+            ego: EgoMotion.still);
+      }
+      expect(last2!.willHit, isTrue);
+    });
+  });
+
   group('TTC fusion consistency rule (fix round, spec 2.2)', () {
     test('difference 30% -> consistent, fused is the smaller', () {
       // |4.0 - 2.8| / 4.0 = 30%.

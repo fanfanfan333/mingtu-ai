@@ -16,7 +16,11 @@
 /// estimate only the inherited near-corridor rule applies
 /// (box bottom low in the frame inside the corridor ->
 /// warning), matching the pre-M1 behaviour for close
-/// obstacles without geometry history. That holds for a
+/// obstacles without geometry history -- except that the
+/// CDX3 round scoped that position-only rule to
+/// NON-vehicle kinds in both degradations: a vehicle with
+/// no TTC and no measured range behind it stays silent
+/// (see [HazardPolicy.levelFor]). That holds for a
 /// TTC null by DISAGREEMENT too (see
 /// [TrackEstimate.ttcDisagreement]): when the two ranging
 /// legs contradict each other, no TTC branch below may
@@ -152,7 +156,17 @@ class HazardPolicy {
   /// the frame's risk presence.
   HazardLevel? levelFor(TrackEstimate e) {
     final Track track = e.track;
-    if (!track.confirmed || track.lostFrames > 0) return null;
+    if (track.lostFrames > 0) return null;
+    // Tiered confirmation (FIX3B): WARNINGS and every
+    // warning-level rule require the latched 3-frame
+    // [Track.confirmed]; the URGENT branches may fire on
+    // [Track.urgentConfirmed] (2-of-3 with the current
+    // frame a hit) -- one frame earlier, and only for
+    // urgent, whose TTC input is the compensated
+    // [TrackEstimate.ttcUrgentS].
+    final bool confirmedW = track.confirmed;
+    final bool confirmedU = track.urgentConfirmed;
+    if (!confirmedW && !confirmedU) return null;
     // Ego speed unknown: the dedicated scale path judges
     // the estimate on its own rules (no willHit corridor,
     // no approaching test) -- see the library doc. When
@@ -162,12 +176,37 @@ class HazardPolicy {
     // approaching and TTC-band branches stay off because
     // the (scale-only) TTC is null in that case.
     if (!e.egoSpeedKnown) {
-      final HazardLevel? scaleLevel = _levelForEgoUnknownScalePath(e);
+      final HazardLevel? scaleLevel = _levelForEgoUnknownScalePath(e,
+          urgentOk: confirmedU, warningOk: confirmedW);
       if (scaleLevel != null || e.ttcScaleS != null) return scaleLevel;
+      if (!confirmedW) return null;
       if (!e.willHit) return null;
+      // A measured range still speaks for every kind: the
+      // static-obstacle rule is a Z rule, not a position
+      // guess (CDX3 item 2 leaves it untouched).
       if (e.rangeM != null &&
           e.rangeM! <= NavHazConfig.warningStaticRangeM) {
         return HazardLevel.warning;
+      }
+      // CDX3 item 2: with range AND scale TTC both invalid
+      // the near-bottom courtesy rule below must NOT fire
+      // for a VEHICLE. Every vehicle alert in M1 is
+      // motion-evidence based (the approaching test, scale
+      // growth, or a measured range); a vehicle with zero
+      // closing evidence of any kind -- constant size, no
+      // range, no TTC -- stays silent on frame position
+      // alone (Codex counterexample: a near-bottom car at
+      // constant size with no range must remain silent).
+      // The rule itself survives for NON-vehicle near
+      // obstacles: a pedestrian standing in the corridor
+      // with no ranging is exactly the legacy near warning
+      // the arbitration scenarios (d) / (a-literal)
+      // encode.
+      final HazardKind kind =
+          hazardKindForLabel(track.label) ?? HazardKind.clutter;
+      if (kind == HazardKind.motorVehicle ||
+          kind == HazardKind.nonMotorVehicle) {
+        return null;
       }
       final TrackSample? s = track.latest;
       if (s != null && s.bottom > NavHazConfig.nearBottom) {
@@ -181,30 +220,39 @@ class HazardPolicy {
     final bool isVehicle = kind == HazardKind.motorVehicle ||
         kind == HazardKind.nonMotorVehicle;
     final double? ttc = e.ttcS;
-    // Urgent.
-    if (isVehicle && e.approaching && ttc != null && ttc <= NavHazConfig.urgentTtcS) {
-      return HazardLevel.urgent;
+    // Urgent (FIX3B): judged on tau_now -- the agile
+    // tier's predicted, latency-compensated TTC -- and
+    // gated on URGENT confirmation. The branch structure
+    // (which targets may go urgent) is unchanged; only
+    // the TTC input and the confirmation tier changed, so
+    // the prediction can never pull a WARNING early: the
+    // warning bands below still read the normal [ttc].
+    final double? tauNow = e.ttcUrgentS;
+    if (confirmedU && tauNow != null) {
+      if (isVehicle && e.approaching && tauNow <= NavHazConfig.urgentTtcS) {
+        return HazardLevel.urgent;
+      }
+      if (e.rangeM != null &&
+          e.rangeM! <= NavHazConfig.urgentCloseRangeM &&
+          tauNow <= NavHazConfig.urgentCloseTtcS) {
+        return HazardLevel.urgent;
+      }
+      // Without ranging (no pitch), a fast-expanding
+      // vehicle in the corridor cannot be PROVEN closing
+      // in m/s terms; the scale prediction alone then
+      // carries the urgent call. (With ranging available
+      // the measured test above is the only urgent
+      // vehicle path.) This branch is the KNOWN-ego case;
+      // the unknown-ego case never reaches here -- it is
+      // judged by _levelForEgoUnknownScalePath.
+      if (isVehicle &&
+          e.closingSpeedMps == null &&
+          tauNow <= NavHazConfig.urgentTtcS) {
+        return HazardLevel.urgent;
+      }
     }
-    if (e.rangeM != null &&
-        e.rangeM! <= NavHazConfig.urgentCloseRangeM &&
-        ttc != null &&
-        ttc <= NavHazConfig.urgentCloseTtcS) {
-      return HazardLevel.urgent;
-    }
-    // Without ranging (no pitch), a fast-expanding confirmed
-    // vehicle in the corridor cannot be PROVEN closing in
-    // m/s terms; the scale TTC alone then carries the urgent
-    // call. (With ranging available the measured test above
-    // is the only urgent vehicle path.) This branch is the
-    // KNOWN-ego case; the unknown-ego case never reaches
-    // here -- it is judged by _levelForEgoUnknownScalePath.
-    if (isVehicle &&
-        e.closingSpeedMps == null &&
-        ttc != null &&
-        ttc <= NavHazConfig.urgentTtcS) {
-      return HazardLevel.urgent;
-    }
-    // Warning: TTC band.
+    if (!confirmedW) return null;
+    // Warning: TTC band (normal tier, unchanged).
     if (ttc != null && ttc > NavHazConfig.urgentTtcS && ttc <= NavHazConfig.warningTtcS) {
       return HazardLevel.warning;
     }
@@ -214,9 +262,15 @@ class HazardPolicy {
       return HazardLevel.warning;
     }
     // Warning: no usable TTC -- the inherited near-corridor
-    // rule (box bottom low in frame). Never urgent.
+    // rule (box bottom low in frame). Never urgent. CDX3
+    // item 2 scopes it to NON-vehicle kinds, exactly as in
+    // the ego-unknown degradation above: frame position
+    // alone, with no TTC and no range behind it, is not
+    // evidence a vehicle is a hazard; the range-based
+    // static rule above still covers near vehicles WITH a
+    // measured range.
     final TrackSample? s = track.latest;
-    if (ttc == null && s != null && s.bottom > NavHazConfig.nearBottom) {
+    if (ttc == null && !isVehicle && s != null && s.bottom > NavHazConfig.nearBottom) {
       return HazardLevel.warning;
     }
     return null;
@@ -267,14 +321,37 @@ class HazardPolicy {
   /// TtcEstimator.estimate), so there is nothing to
   /// distrust and [TrackEstimate.ttcDisagreement] is
   /// always false here.
-  HazardLevel? _levelForEgoUnknownScalePath(TrackEstimate e) {
+  HazardLevel? _levelForEgoUnknownScalePath(TrackEstimate e,
+      {required bool urgentOk, required bool warningOk}) {
     final double? ttcS = e.ttcScaleS;
-    if (ttcS == null) return null;
+    final double? tauNow = e.ttcUrgentS;
+    if (ttcS == null && tauNow == null) return null;
     // Condition (ii): measurable scale growth, asserted
     // independently of the TTC value (FIX2 conjunction).
     if (e.scaleRate <= 0) return null;
     final TrackSample? s = e.track.latest;
     if (s == null) return null;
+    // URGENT (FIX3B tiering): tau_now -- the agile
+    // prediction minus pipeline latency -- at or under
+    // the urgent band, the intersection gate evaluated at
+    // tau_now's own horizon, and URGENT confirmation
+    // (2-of-3). The other conjunction conditions are the
+    // FIX2 ones, unchanged.
+    if (urgentOk &&
+        tauNow != null &&
+        tauNow <= NavHazConfig.urgentTtcS &&
+        TtcEstimator.channelIntersects(
+          cx: s.cx,
+          cxVelocity: e.cxVelocity,
+          horizonS: tauNow,
+          rangeM: e.rangeM,
+        )) {
+      return HazardLevel.urgent;
+    }
+    // WARNING: full 3-frame confirmation and the NORMAL
+    // scale TTC, exactly as before -- the prediction
+    // never grades a warning.
+    if (!warningOk || ttcS == null) return null;
     // Condition (iii): extrapolated intersection only.
     if (!TtcEstimator.scalePathIntersects(
       cx: s.cx,
@@ -284,8 +361,16 @@ class HazardPolicy {
     )) {
       return null;
     }
-    // Condition (iv): the plain scale-TTC bands.
-    if (ttcS <= NavHazConfig.urgentTtcS) return HazardLevel.urgent;
+    // Condition (iv): the plain scale-TTC bands. The
+    // urgent band here is reachable only when the urgent
+    // tier above did not fire (e.g. tau_now not yet
+    // available on a hand-built estimate); it still
+    // requires urgent confirmation -- an urgent-band TTC
+    // on a merely warning-confirmed track grades nothing
+    // rather than understating itself as a warning.
+    if (ttcS <= NavHazConfig.urgentTtcS) {
+      return urgentOk ? HazardLevel.urgent : null;
+    }
     if (ttcS <= NavHazConfig.warningTtcS) return HazardLevel.warning;
     return null;
   }
@@ -301,7 +386,16 @@ class HazardPolicy {
         seconds: e.egoSpeedKnown
             ? NavHazConfig.cooldownSeconds
             : NavHazConfig.cooldownSecondsEgoUnknown);
-    final double? ttc = e.ttcS;
+    // Like-for-like comparison (FIX3B): an urgent
+    // candidate's drop is measured on the urgent signal
+    // (tau_now) against the tau_now stored when the last
+    // urgent was spoken -- the earlier first-urgent now
+    // fires at a NORMAL ttcS that is still high, and
+    // comparing normal-to-normal would manufacture a
+    // phantom 40% drop (and a duplicate urgent) as the
+    // normal tier converged.
+    final double? ttc =
+        level == HazardLevel.urgent ? (e.ttcUrgentS ?? e.ttcS) : e.ttcS;
     if (now.difference(last.at) >= cd) return true;
     if (level == HazardLevel.urgent && last.level == HazardLevel.warning) {
       return true; // upgrade W -> U is never held back
@@ -392,7 +486,10 @@ class HazardPolicy {
           s.cx <= NavHazConfig.corridorRight &&
           s.bottom > NavHazConfig.nearBottom,
     );
-    _lastByTrack[track.id] = _LastAlert(now, level, chosen.ttcS);
+    _lastByTrack[track.id] = _LastAlert(now, level,
+        level == HazardLevel.urgent
+            ? (chosen.ttcUrgentS ?? chosen.ttcS)
+            : chosen.ttcS);
     _lastEmitted = _Emitted(now, kind, zone, level);
     return HazardPolicyResult(alert: alert, riskPresent: true);
   }

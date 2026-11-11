@@ -125,13 +125,25 @@ void main() {
     }
 
     // The corpus is substantive, not a token sample: the
-    // template space alone is in the thousands, and the
-    // fixture/ego runs add their distinct spoken forms.
-    expect(templateCount, greaterThan(5000),
-        reason: 'the enumerable phrase space');
-    expect(corpus.length, greaterThan(templateCount),
-        reason: 'fixture + ego phrases add distinct texts '
-            'beyond the template space: ${corpus.length} total');
+    // template space alone is in the thousands RAW, and
+    // the fixture/ego runs add their distinct spoken
+    // forms. (FIX3B: the floor drops from 5000 to 1000 --
+    // the banded distance wording collapses the unique
+    // phrase space by design, from 11,700 raw phrases to
+    // 2,460, of which 1,044 are unique texts; the old
+    // floor counted numeric gradations the wording no
+    // longer has.)
+    expect(templateCount, greaterThan(1000),
+        reason: 'the enumerable phrase space (FIX3B bands)');
+    expect(corpus.length, greaterThanOrEqualTo(templateCount),
+        reason: 'FIX3B: the fixture + ego runs now add NO '
+            'texts beyond the enumerated template space '
+            '(1044 == 1044) -- under the banded wording '
+            'every producible phrase is already enumerated, '
+            'which is the completeness property itself; the '
+            'pre-FIX3B strict-greater premise relied on '
+            'out-of-template numeric readouts. '
+            '${corpus.length} total');
 
     for (final MapEntry<String, String> e in corpus.entries) {
       expect(containsBannedWord(e.key), isFalse,

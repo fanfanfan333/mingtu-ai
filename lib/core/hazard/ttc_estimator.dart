@@ -76,8 +76,25 @@ class AlphaBetaFilter {
   bool _seeded = false;
 
   AlphaBetaFilter({double? alpha, double? beta})
-      : alpha = alpha ?? NavHazConfig.alphaBetaAlpha,
-        beta = beta ?? NavHazConfig.alphaBetaBeta;
+      : alpha = alpha ?? NavHazConfig.alphaBetaAlphaNormal,
+        beta = beta ?? kalataBeta(alpha ?? NavHazConfig.alphaBetaAlphaNormal);
+
+  /// The Kalata relation (FIX3B): beta derived from
+  /// alpha, never hand-filled --
+  ///   beta = 2(2 - alpha) - 4 * sqrt(1 - alpha)
+  /// alpha 0.3 -> 0.0534; alpha 0.7 -> 0.4091; the old
+  /// hand-filled pair (0.5 / 0.1) sat far below its
+  /// Kalata beta (0.172), which is exactly the velocity
+  /// lag the CDX3 delay ledger measured.
+  static double kalataBeta(double alpha) =>
+      2 * (2 - alpha) - 4 * math.sqrt(1 - alpha);
+
+  /// One-step-ahead predicted value (state extrapolated
+  /// by the nominal frame interval): the agile tier's
+  /// urgent TTC is derived from THIS state, so the
+  /// prediction lead is part of the lag compensation.
+  double get predictedNext =>
+      _x + _v * (NavHazConfig.nominalFrameInterval.inMilliseconds / 1000.0);
 
   bool get seeded => _seeded;
   double get value => _x;
@@ -185,8 +202,12 @@ class TrackEstimate {
   /// user walks toward is handled by the range rules).
   final bool approaching;
 
-  /// True when the target's extrapolated path intersects
-  /// the walking corridor within its TTC horizon.
+  /// True when the target's extrapolated bottom-centre
+  /// LANDING POINT at its TTC horizon is inside the
+  /// forward channel ([TtcEstimator.channelIntersects]:
+  /// +/- the channel half width in metres with a range,
+  /// the central frame fraction without one). Current-box
+  /// overlap with the channel does NOT count (CDX3).
   final bool willHit;
 
   /// Centre-x velocity, normalised units per second.
@@ -212,6 +233,16 @@ class TrackEstimate {
   /// (no growth) for hand-built estimates.
   final double scaleRate;
 
+  /// The URGENT judgement's TTC (FIX3B): the agile tier's
+  /// one-step PREDICTED TTC (fused like [ttcS] when the
+  /// ego speed is known, scale-only when it is not) minus
+  /// [NavHazConfig.pipelineLatencyS]. Null when no
+  /// predicted leg is usable. ONLY the urgent branches of
+  /// the policy read this; warnings and every other
+  /// consumer keep the normal-tier [ttcS] / [ttcScaleS],
+  /// so the prediction can never pull a warning early.
+  final double? ttcUrgentS;
+
   const TrackEstimate({
     required this.track,
     required this.ttcS,
@@ -222,6 +253,7 @@ class TrackEstimate {
     required this.approaching,
     required this.willHit,
     required this.cxVelocity,
+    this.ttcUrgentS,
     this.ttcDisagreement = false,
     this.egoSpeedKnown = true,
     this.scaleRate = 0,
@@ -229,14 +261,33 @@ class TrackEstimate {
 }
 
 class _FilterPair {
+  /// Normal tier: feeds warnings and the general outputs.
   final AlphaBetaFilter scale = AlphaBetaFilter();
   final AlphaBetaFilter range = AlphaBetaFilter();
+
+  /// Agile tier (FIX3B): the same two series filtered at
+  /// the higher alpha, existing only so the urgent
+  /// judgement can read a one-step prediction with far
+  /// less velocity lag. The differential-seed form (seed
+  /// held one frame, promoted through one update before
+  /// use) applies to this tier exactly as to the normal
+  /// one -- the tiers differ only in their gains.
+  final AlphaBetaFilter scaleAgile =
+      AlphaBetaFilter(alpha: NavHazConfig.alphaBetaAlphaAgile);
+  final AlphaBetaFilter rangeAgile =
+      AlphaBetaFilter(alpha: NavHazConfig.alphaBetaAlphaAgile);
 }
 
 /// Stateful estimator: one pair of filters per track id,
 /// fed frame by frame by the hazard pipeline.
 class TtcEstimator {
   final Map<int, _FilterPair> _filters = <int, _FilterPair>{};
+
+  /// Per-track run length of consecutive estimates whose
+  /// RAW tau_now (before the persistence guard below) sat
+  /// at or under the urgent band -- the jitter guard's
+  /// counter.
+  final Map<int, int> _tauNowInBandRun = <int, int>{};
 
   /// Focal length in normalised units, from the configured
   /// vertical FOV: f_y = 0.5 / tan(VFOV/2).
@@ -257,33 +308,56 @@ class TtcEstimator {
   static double lateralOffsetM(double cx, double rangeM) =>
       (cx - 0.5) / focalX * rangeM;
 
-  /// Intersection gate for the ego-unknown scale path
-  /// (lead's ruling, 2026-11-11): extrapolate the box
-  /// bottom-centre's lateral position (its centre-x [cx],
-  /// moving at [cxVelocity]) to t + [ttcScaleS] and ask
-  /// whether it lands inside the user's forward channel.
-  /// With a metric range the channel is
-  /// +/-[NavHazConfig.egoUnknownChannelHalfWidthM] metres
-  /// (via [lateralOffsetM] at [rangeM]); without one it is
-  /// the central [NavHazConfig.egoUnknownChannelCenterFraction]
+  /// THE intersection test for every hazard path (the
+  /// CDX3 round unified the known-ego corridor test and
+  /// the ego-unknown scale-path gate into this one):
+  /// extrapolate the box bottom-centre's lateral position
+  /// (its centre-x [cx], moving at [cxVelocity]) to
+  /// t + [horizonS] and ask whether the LANDING POINT is
+  /// inside the user's forward channel. With a metric
+  /// range the channel is +/-[NavHazConfig.channelHalfWidthM]
+  /// metres (via [lateralOffsetM] at [rangeM]); without
+  /// one it is the central [NavHazConfig.channelCenterFraction]
   /// of the frame. A crossing target extrapolates OUT of
   /// the channel and never intersects, however small its
-  /// TTC. This gate belongs to the ego-unknown path only;
-  /// the known-ego corridor test ([TrackEstimate.willHit])
-  /// is a separate rule and is not reused here.
+  /// TTC -- and however much its CURRENT box overlaps the
+  /// channel: there is deliberately no "current box
+  /// overlaps" clause (the pre-CDX3 willHit had one, and
+  /// it let crossing targets in on frames where the box
+  /// swept through the corridor).
+  static bool channelIntersects({
+    required double cx,
+    required double cxVelocity,
+    required double horizonS,
+    required double? rangeM,
+  }) {
+    final double cxAtHit = cx + cxVelocity * horizonS;
+    if (rangeM != null) {
+      return lateralOffsetM(cxAtHit, rangeM).abs() <=
+          NavHazConfig.channelHalfWidthM;
+    }
+    const double half = NavHazConfig.channelCenterFraction / 2;
+    return cxAtHit >= 0.5 - half && cxAtHit <= 0.5 + half;
+  }
+
+  /// Intersection gate for the ego-unknown scale path
+  /// (lead's ruling, 2026-11-11): [channelIntersects] with
+  /// the scale TTC as the horizon. Kept as a named entry
+  /// because the policy's scale path (and its tests) speak
+  /// in scale-TTC terms; the channel definition itself is
+  /// the shared one.
   static bool scalePathIntersects({
     required double cx,
     required double cxVelocity,
     required double ttcScaleS,
     required double? rangeM,
   }) {
-    final double cxAtHit = cx + cxVelocity * ttcScaleS;
-    if (rangeM != null) {
-      return lateralOffsetM(cxAtHit, rangeM).abs() <=
-          NavHazConfig.egoUnknownChannelHalfWidthM;
-    }
-    const double half = NavHazConfig.egoUnknownChannelCenterFraction / 2;
-    return cxAtHit >= 0.5 - half && cxAtHit <= 0.5 + half;
+    return channelIntersects(
+      cx: cx,
+      cxVelocity: cxVelocity,
+      horizonS: ttcScaleS,
+      rangeM: rangeM,
+    );
   }
 
   /// Raw (unfiltered) ground-plane range for one detection,
@@ -304,9 +378,15 @@ class TtcEstimator {
     return NavHazConfig.cameraHeightM / denom;
   }
 
-  void forget(int trackId) => _filters.remove(trackId);
+  void forget(int trackId) {
+    _filters.remove(trackId);
+    _tauNowInBandRun.remove(trackId);
+  }
 
-  void reset() => _filters.clear();
+  void reset() {
+    _filters.clear();
+    _tauNowInBandRun.clear();
+  }
 
   /// Whether two valid TTC legs contradict each other:
   /// relative difference |a-b| / max(a,b) strictly above
@@ -349,11 +429,22 @@ class TtcEstimator {
     if (scaleV > 1e-6 && scaleF > 0) {
       ttcScale = scaleF / scaleV;
     }
+    // Agile tier, same raw series (FIX3B): its one-step
+    // predicted TTC (predicted scale over the agile
+    // velocity) is the scale leg of the urgent judgement.
+    pair.scaleAgile.update(scaleRaw, at);
+    double? ttcScalePred;
+    if (pair.scaleAgile.velocity > 1e-6 &&
+        pair.scaleAgile.predictedNext > 0) {
+      ttcScalePred =
+          pair.scaleAgile.predictedNext / pair.scaleAgile.velocity;
+    }
 
     // --- range series ---
     double? rangeF;
     double? ttcRange;
     double? closing;
+    double? ttcRangePred;
     final double? zRaw =
         pitchDeg == null ? null : groundRangeM(bottom: s.bottom, pitchDeg: pitchDeg);
     if (zRaw != null) {
@@ -362,6 +453,14 @@ class TtcEstimator {
       closing = -vz;
       if (closing > 1e-6) {
         ttcRange = rangeF / closing;
+      }
+      // Agile range leg: predicted range over the agile
+      // closing speed.
+      pair.rangeAgile.update(zRaw, at);
+      final double closingAgile = -pair.rangeAgile.velocity;
+      if (closingAgile > 1e-6 && pair.rangeAgile.predictedNext > 0) {
+        ttcRangePred =
+            pair.rangeAgile.predictedNext / closingAgile;
       }
     } else {
       // No ranging this frame: the range estimate is
@@ -411,15 +510,57 @@ class TtcEstimator {
         vEgo != null &&
         closing - vEgo > NavHazConfig.approachingMarginMps;
 
-    // --- corridor intersection ---
+    // --- intersection (CDX3: ONE rule for every path) ---
+    // The extrapolated bottom-centre landing point at the
+    // TTC horizon must land inside the forward channel
+    // (metric +/- channel half width with a range, the
+    // central frame fraction without one). The pre-CDX3
+    // "extrapolated in OR current box overlaps the
+    // [0.33, 0.67] corridor" rule is gone: overlap alone
+    // let crossing targets count as will-hit on the frames
+    // where their box swept through the corridor.
     final double cxVel = _cxVelocity(track);
     final double horizon = ttc ?? 1.0;
-    final double cxAtHit = s.cx + cxVel * horizon;
-    final bool extrapolatedIn = cxAtHit >= NavHazConfig.corridorLeft &&
-        cxAtHit <= NavHazConfig.corridorRight;
-    final bool boxOverlaps = (s.cx + s.w / 2) >= NavHazConfig.corridorLeft &&
-        (s.cx - s.w / 2) <= NavHazConfig.corridorRight;
-    final bool willHit = extrapolatedIn || boxOverlaps;
+    final bool willHit = channelIntersects(
+      cx: s.cx,
+      cxVelocity: cxVel,
+      horizonS: horizon,
+      rangeM: rangeF,
+    );
+
+    // --- urgent TTC (FIX3B) ---
+    // tau_now = tau_pred - pipelineLatencyS, where
+    // tau_pred fuses the two agile predicted legs exactly
+    // like the normal TTC (consistency rule included)
+    // when the ego speed is known, and is the predicted
+    // SCALE leg alone when it is not (the unknown path
+    // never fuses). Read ONLY by the policy's urgent
+    // branches.
+    final double? ttcPred = ego.speedKnown
+        ? TtcEstimator.fuseLegs(ttcScalePred, ttcRangePred)
+        : ttcScalePred;
+    final double? tauNowRaw = ttcPred == null
+        ? null
+        : math.max(0, ttcPred - NavHazConfig.pipelineLatencyS);
+    // Jitter guard (spec 2.7.4): the agile tier's gain
+    // turns a box-size glitch into a SHORT tau plunge --
+    // measured on jitter_car: one frame at true TTC 4.9 s
+    // through the SORT backend (tau_now 2.2, neighbours
+    // 4.5 / 4.2), two frames through ByteTrack (its own
+    // smoothing stretches the whip). tau_now is therefore
+    // ISSUED only from the THIRD consecutive in-band
+    // estimate: the raw tau_now must sit at or under the
+    // urgent band for three estimates in a row, the same
+    // sustain-the-evidence philosophy as the 3-frame
+    // track confirmation. A genuine crossing pays two
+    // frames (0.2 s), which the latency calibration
+    // absorbs; a glitch whip never reaches the policy.
+    final int inBandRun = (tauNowRaw != null &&
+            tauNowRaw <= NavHazConfig.urgentTtcS)
+        ? (_tauNowInBandRun[track.id] ?? 0) + 1
+        : 0;
+    _tauNowInBandRun[track.id] = inBandRun;
+    final double? ttcUrgent = inBandRun >= 3 ? tauNowRaw : null;
 
     return TrackEstimate(
       track: track,
@@ -431,6 +572,7 @@ class TtcEstimator {
       approaching: approaching,
       willHit: willHit,
       cxVelocity: cxVel,
+      ttcUrgentS: ttcUrgent,
       ttcDisagreement: disagreement,
       egoSpeedKnown: ego.speedKnown,
       scaleRate: scaleV,
