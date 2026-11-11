@@ -444,10 +444,10 @@ List<double> _farRangeSamples() => _enumerationRangeSamples()
 /// hand-listed sample literals, so the enumeration's
 /// range coverage follows the banding definition itself.
 Iterable<String> enumerateAllHazardPhrases() sync* {
-  // NH-M1-17: the short urgent forms are a production
-  // output surface of the policy, so they belong to this
-  // space -- the exhaustion / banned-word corpus covers
-  // them exactly like the templated forms.
+  // NH-M1-17 / NH-M1-19: the short urgent forms are a
+  // production output surface of the policy, so they
+  // belong to this space -- the exhaustion / banned-word
+  // corpus covers them exactly like the templated forms.
   yield* shortUrgentPhrases();
   final List<double> nearRanges = _nearRangeSamples();
   final List<double> farRanges = _farRangeSamples();
@@ -533,62 +533,141 @@ Set<String> reachableMetresTexts() {
   return out;
 }
 
-/// NH-M1-17: the SHORT form of an urgent announcement,
-/// per hazard kind -- spoken INSTEAD of the normal
-/// [hazardPhrase] when the estimated remaining TTC at
-/// issuance is shorter than the normal phrase's
-/// estimated spoken duration (see NavHazConfig
-/// .ttsSecondsPerCharUpperBound): the normal sentence
-/// would still be speaking when the physical moment
-/// arrives. One form per kind, deliberately minimal:
-/// the stop command plus the category, nothing else --
-/// NO distance figure, NO zone / clock bearing, and NO
-/// step direction (a sideways step still comes only from
-/// the avoidance advisor's three-condition rule, which
-/// the app appends at speech time exactly as for the
-/// normal form). Every form passes the banned-word scan
-/// (asserted in the phrase tests and the exhaustion
-/// corpus: this map is part of [enumerateAllHazardPhrases]'
-/// space via [shortUrgentPhrases]).
-const Map<HazardKind, String> shortUrgentPhraseByKind =
-    <HazardKind, String>{
-  // The vehicle form is deliberately the shortest string
-  // the normal templates themselves can produce for a
-  // vehicle ('停，前方来车', the near-centre vehicle
-  // form): when the remaining TTC is too short even for
-  // THAT, no shorter honest vehicle sentence exists --
-  // the short-form decision then degrades to the
-  // template's own minimum rather than inventing a new
-  // wording, and the long-standing arbitration
-  // expectations on that exact string keep their meaning.
-  HazardKind.motorVehicle: '停，前方来车',
-  HazardKind.nonMotorVehicle: '停，前方来车',
-  HazardKind.person: '停，前方有人',
-  HazardKind.pole: '停，前方有杆子',
-  HazardKind.clutter: '停，前方有杂物',
+/// NH-M1-17, forms reshaped by NH-M1-19: the SHORT form
+/// of an urgent announcement, per hazard kind AND
+/// bearing -- spoken INSTEAD of the normal [hazardPhrase]
+/// only when the NH-M1-19 gate passes (see
+/// [shortFormApplies]): inside the vibrate-first zone
+/// AND too little time even at the fastest plausible
+/// reading speed. NH-M1-17's original kind-only forms
+/// carried no bearing at all, which the NH-M1-19 review
+/// rejected (the short form is a last-resort fallback,
+/// not a reason to throw away direction the user can
+/// still act on); the forms below keep the shortest
+/// bearing the wording system offers while staying
+/// within SIX voiced characters (runes, punctuation
+/// excluded) each -- the kind-name fallback entries
+/// excepted, see the last bullet:
+/// - bearing: the near templates' own zone words -- the
+///   LEFT / RIGHT zones compress to their first character
+///   (左 / 右, unambiguous next to 停), the centre zone
+///   keeps 前方 (a bare 前 reads as part of a compound);
+/// - item: the shortest honest word per label -- vehicle
+///   labels keep their verb 来车 / 有车 (the template's
+///   own words: a vehicle approaching vs a static item
+///   present -- the short form never invents a motion
+///   claim), person compresses 行人 to 人 (the NH-M1-17
+///   form's word), bicycle keeps 车 like every vehicle
+///   label, pole keeps 杆 (杆子's first character; a
+///   standalone 杆 is a complete word for a pole).
+/// The squeezes, each forced by the six-character cap:
+/// - clutter's two-character name 杂物 cannot fit beside
+///   a side bearing inside six characters (停，左有杂物
+///   would be seven), so a SIDE clutter short form
+///   drops the 有 and reads 停，左杂物 / 停，右杂物; the
+///   centre form keeps 停，前方有杂物.
+/// - the kind-name FALLBACK entries (机动车 / 非机动车,
+///   reachable only for labels outside the detector
+///   vocabulary) cannot fit AT ALL: their names are 3 /
+///   4 characters, so even the centre form is 7 / 8
+///   voiced characters and a side form 6 / 7. A fallback
+///   target's kind name is its ONLY honest item word --
+///   compressing 机动车 to 车 would misreport the
+///   category -- so these two entries exceed the cap
+///   rather than lie; every label in the current
+///   detector vocabulary fits the cap.
+/// NO distance figure and NO step direction, as before
+/// (a sideways step still comes only from the avoidance
+/// advisor's three-condition rule, appended at speech
+/// time exactly as for the normal form). Every form
+/// passes the banned-word scan (asserted in the phrase
+/// tests and the exhaustion corpus: this table is part
+/// of [enumerateAllHazardPhrases]' space via
+/// [shortUrgentPhrases]).
+const Map<(HazardKind, String), String> shortUrgentPhraseByKindAndName =
+    <(HazardKind, String), String>{
+  // (kind, spoken name) -> the short form. Vehicles are
+  // keyed per LABEL name because 机动车 alone covers car /
+  // truck / bus / motorcycle with different shortest
+  // honest item words; the kind-name entries are the
+  // fallback for labels outside the detector vocabulary.
+  (HazardKind.motorVehicle, '汽车'): '停，前方来车|停，左来车|停，右来车',
+  (HazardKind.motorVehicle, '卡车'): '停，前方来车|停，左来车|停，右来车',
+  (HazardKind.motorVehicle, '公交车'): '停，前方来车|停，左来车|停，右来车',
+  (HazardKind.motorVehicle, '摩托车'): '停，前方来车|停，左来车|停，右来车',
+  (HazardKind.nonMotorVehicle, '自行车'): '停，前方来车|停，左来车|停，右来车',
+  (HazardKind.motorVehicle, '机动车'): '停，前方有机动车|停，左有机动车|停，右有机动车',
+  (HazardKind.nonMotorVehicle, '非机动车'):
+      '停，前方有非机动车|停，左有非机动车|停，右有非机动车',
+  (HazardKind.person, '行人'): '停，前方有人|停，左有人|停，右有人',
+  (HazardKind.pole, '杆子'): '停，前方有杆|停，左有杆|停，右有杆',
+  (HazardKind.clutter, '杂物'): '停，前方有杂物|停，左杂物|停，右杂物',
 };
 
-/// The short form for [kind] (NH-M1-17).
-String shortUrgentPhrase(HazardKind kind) =>
-    shortUrgentPhraseByKind[kind]!;
+/// Bearing slots of a [shortUrgentPhraseByKindAndName]
+/// entry, in order: 0 = ahead （前方）, 1 = left （左）,
+/// 2 = right （右）. The bearings are the near templates'
+/// three zones ([zoneName]).
+const List<String> _shortBearingHeads = <String>['前方', '左', '右'];
+
+/// The short form for an urgent alert (NH-M1-17,
+/// reshaped by NH-M1-19): [kind] and the alert's spoken
+/// [name] (see [hazardSpokenName]) select the item word,
+/// and [cx] selects the bearing via the SAME zone rule
+/// the normal templates use, so the short form's bearing
+/// can never contradict the full sentence's.
+String shortUrgentPhrase(HazardKind kind, String name, double cx) {
+  final String packed =
+      shortUrgentPhraseByKindAndName[(kind, name)] ??
+          shortUrgentPhraseByKindAndName[(kind, hazardKindName(kind))]!;
+  final List<String> forms = packed.split('|');
+  final String zone = zoneName(cx);
+  final int slot = zone == _shortBearingHeads[0]
+      ? 0
+      : (zone.startsWith(_shortBearingHeads[1]) ? 1 : 2);
+  return forms[slot];
+}
 
 /// Every short form [shortUrgentPhrase] can produce --
 /// the enumeration axis for the exhaustion tests.
-Iterable<String> shortUrgentPhrases() => shortUrgentPhraseByKind.values;
+Iterable<String> shortUrgentPhrases() sync* {
+  for (final String packed in shortUrgentPhraseByKindAndName.values) {
+    yield* packed.split('|');
+  }
+}
+
+/// The voiced character count of [text] (NH-M1-17):
+/// runes with the spoken-punctuation marks excluded --
+/// they shape pauses but are not characters the TTS
+/// voices. The single counting rule the speech-duration
+/// estimate and the NH-M1-19 gate share.
+int voicedCharCount(String text) => text.runes
+    .where((int r) => r != 0xFF0C && r != 0x3002 && r != 0xFF01)
+    .length;
 
 /// Estimated spoken duration of [text] in seconds
-/// (NH-M1-17): its character count (runes) with the
-/// spoken-punctuation marks excluded -- they shape
-/// pauses but are not characters the TTS voices --
-/// times the conservative per-character upper bound.
-/// This is an UPPER-bound planning figure for the
-/// short-form decision, not a timing promise.
-double estimatedSpeechSeconds(String text) {
-  final int chars = text.runes
-      .where((int r) => r != 0xFF0C && r != 0x3002 && r != 0xFF01)
-      .length;
-  return chars * NavHazConfig.ttsSecondsPerCharUpperBound;
-}
+/// (NH-M1-17): its voiced character count (see
+/// [voicedCharCount]) times the conservative
+/// per-character upper bound. This is an UPPER-bound
+/// planning figure, not a timing promise.
+double estimatedSpeechSeconds(String text) =>
+    voicedCharCount(text) * NavHazConfig.ttsSecondsPerCharUpperBound;
+
+/// The NH-M1-19 short-form gate: BOTH conditions must
+/// hold for the short form, otherwise the alert keeps
+/// its full sentence (see the rule's full statement at
+/// NavHazConfig.shortPhraseSecondsPerChar):
+///   condition 1: [remainingTtcS] < the vibrate-first
+///     threshold (NavHazConfig.preVibrationTtcS);
+///   condition 2: [remainingTtcS] < the normal phrase's
+///     voiced character count x
+///     NavHazConfig.shortPhraseSecondsPerChar.
+/// Both comparisons are strict.
+bool shortFormApplies(double remainingTtcS, String normalPhrase) =>
+    remainingTtcS < NavHazConfig.preVibrationTtcS &&
+    remainingTtcS <
+        voicedCharCount(normalPhrase) *
+            NavHazConfig.shortPhraseSecondsPerChar;
 
 /// Build the spoken text for one alert.
 ///

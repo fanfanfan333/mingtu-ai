@@ -597,32 +597,37 @@ class HazardPolicy {
     if (!commit) {
       return const HazardPolicyResult(alert: null, riskPresent: true);
     }
+    final String spokenName = hazardSpokenName(track.label, kind);
     final String normalPhrase = hazardPhrase(
       urgent: level == HazardLevel.urgent,
-      name: hazardSpokenName(track.label, kind),
+      name: spokenName,
       isVehicle: kind == HazardKind.motorVehicle ||
           kind == HazardKind.nonMotorVehicle,
       cx: s.cx,
       rangeM: chosen.rangeM,
     );
-    // NH-M1-17: the short-form decision, made ONCE here
-    // at issuance (the alert's text is final from this
-    // point -- nothing downstream re-derives it, so a
-    // replay of this alert speaks the same text). An
-    // URGENT whose issuance frame's remaining TTC (the
-    // published tau_now, falling back to the fused TTC
-    // exactly as the cooldown's like-for-like comparison
-    // does) is strictly below the normal phrase's
-    // estimated spoken duration cannot finish its
-    // sentence before the physical moment: it speaks the
-    // kind's short form instead. Warnings never take the
-    // short form (their horizon is seconds longer and
-    // their wording carries the distance the user needs).
+    // NH-M1-17, narrowed by NH-M1-19: the short-form
+    // decision, made ONCE here at issuance (the alert's
+    // text is final from this point -- nothing downstream
+    // re-derives it, so a replay of this alert speaks the
+    // same text). NH-M1-17's original rule (remaining TTC
+    // below the normal phrase's estimated duration at
+    // the 0.30 s/char upper bound) fired far too early --
+    // a normal urgent at tau_now ~= 2.7 s already lost
+    // its item and bearing to the short form. NH-M1-19
+    // gates the short form on BOTH conditions of
+    // shortFormApplies: inside the vibrate-first zone
+    // (tau_now < preVibrationTtcS) AND unable to finish
+    // even at the fastest plausible reading speed
+    // (0.25 s/char); either failing keeps the FULL
+    // sentence. Warnings never take the short form (their
+    // horizon is seconds longer and their wording carries
+    // the distance the user needs).
     final double? remainingTtc =
         level == HazardLevel.urgent ? (chosen.ttcUrgentS ?? chosen.ttcS) : null;
     final String phrase = (remainingTtc != null &&
-            remainingTtc < estimatedSpeechSeconds(normalPhrase))
-        ? shortUrgentPhrase(kind)
+            shortFormApplies(remainingTtc, normalPhrase))
+        ? shortUrgentPhrase(kind, spokenName, s.cx)
         : normalPhrase;
     final HazardAlert alert = HazardAlert(
       level: level,

@@ -12,6 +12,14 @@
 ///     issuance is shorter than its normal phrase's
 ///     estimated spoken duration speaks the kind's short
 ///     form instead, at the SAME issuance frame.
+///     NH-M1-19 (M2-FIX1) NARROWS that rule: the short
+///     form now needs BOTH tauNow < preVibrationTtcS
+///     (inside the vibrate-first zone) AND tauNow <
+///     chars x 0.25 s (shortPhraseSecondsPerChar), and
+///     the short forms themselves carry a bearing (see
+///     navhaz_fix1_test for the gate's three named tests;
+///     this file keeps the dives and the boundary in the
+///     NH-M1-19 form).
 /// (NH-M1-18 is a README line; NH-M1-16's vibration
 /// assertion for the impossible cell lives in
 /// navhaz_grid16_test and is untouched.)
@@ -151,7 +159,8 @@ void main() {
     }
   });
 
-  group('NH-M1-17: the short urgent form', () {
+  group('NH-M1-17 as narrowed by NH-M1-19: the short '
+      'urgent form', () {
     for (final String backend in kBackends) {
       test('$backend x known ego x T=0.9: the frame-7 '
           'urgent speaks the SHORT form, same frame', () {
@@ -160,28 +169,42 @@ void main() {
             reason: 'issuance timing is unchanged -- the '
                 'short form rescues the utterance\'s '
                 'completion, not its start');
-        expect(r.urgPhrase, shortUrgentPhrase(HazardKind.motorVehicle),
-            reason: 'the remaining TTC at issuance '
-                '(published tau ~0.32-0.35 s) is shorter '
-                'than the normal phrase\'s estimated spoken '
-                'duration, so the short form is chosen');
+        expect(r.urgPhrase,
+            shortUrgentPhrase(HazardKind.motorVehicle, '汽车', 0.5),
+            reason: 'the NH-M1-19 gate at issuance: the '
+                'published tau (~0.32-0.35 s) is inside '
+                'the vibrate-first zone (< 1.5 s, '
+                'condition 1) and below the normal '
+                'phrase\'s fastest-reading time '
+                '(condition 2), so the bearing short form '
+                'is chosen');
       });
     }
 
-    test('direct boundary: remaining TTC just above the '
-        'normal phrase\'s estimate keeps the normal '
-        'phrase; just below takes the short form', () {
+    test('direct boundary (NH-M1-19 gate): condition 1 '
+        'at exactly 1.5 s keeps the normal phrase even '
+        'when condition 2 holds; both conditions true '
+        'takes the short form', () {
       // Hand-built estimates through the policy: a car
       // track graded urgent via the approaching-vehicle
       // branch (tau <= 3.0 s). This geometry's normal
       // phrase is '停，前方很近有汽车' (8 voiced
-      // characters: the near template inserts the
-      // very-close readout '很近' at range 1.2 m --
-      // estimate 2.4 s), so the boundary sits inside the
-      // branch's own tau cap: tau 2.5 s (above 2.4) keeps
-      // the normal phrase, tau 2.3 s (below 2.4) takes
-      // the short form, tau exactly 2.4 s keeps it (the
-      // comparison is strict).
+      // characters -- the near template inserts the
+      // very-close readout '很近' at range 1.2 m), so
+      // condition 2's threshold is 8 x 0.25 = 2.0 s.
+      // NH-M1-17's boundary cases (tau 2.3 / 2.4 / 2.5
+      // against the old 0.30 s/char estimate) all sit
+      // ABOVE condition 1's 1.5 s line under NH-M1-19 and
+      // therefore keep the normal phrase now; the cases
+      // below pin the narrowed gate itself:
+      //   tau 1.5 exactly: condition 1 FALSE (strict) ->
+      //     normal, even though 1.5 < 2.0 (condition 2
+      //     true);
+      //   tau 1.4: both true (1.4 < 1.5 and 1.4 < 2.0) ->
+      //     the bearing short form.
+      // (Condition 1 true + condition 2 false keeping the
+      // normal phrase is pinned in navhaz_fix1_test with
+      // the 14-character spec-2.7 sentence.)
       String? phraseAt(double tau) {
         final HazardPolicy policy = HazardPolicy();
         final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
@@ -222,20 +245,24 @@ void main() {
       final String normal = hazardPhrase(
           urgent: true, name: '汽车', isVehicle: true, cx: 0.5, rangeM: 1.2);
       expect(normal, '停，前方很近有汽车');
-      expect(estimatedSpeechSeconds(normal), closeTo(2.4, 1e-9),
-          reason: 'the boundary arithmetic: 8 voiced '
-              'characters x 0.30 s');
+      expect(voicedCharCount(normal), 8,
+          reason: 'the gate arithmetic: 8 voiced '
+              'characters x 0.25 s = 2.0 s for condition 2');
       expect(phraseAt(2.5), normal,
-          reason: 'tau 2.5 s >= estimate 2.4 s: the '
-              'normal phrase can finish, so it is kept');
-      expect(phraseAt(2.3), shortUrgentPhrase(HazardKind.motorVehicle),
-          reason: 'tau 2.3 s < estimate 2.4 s: the normal '
-              'phrase cannot finish; the short form is '
-              'issued instead');
-      expect(phraseAt(2.4), normal,
-          reason: 'tau exactly AT the estimate is not '
-              '"shorter than" it: the normal phrase is kept '
-              '(the comparison is strict)');
+          reason: 'tau 2.5 s: outside the vibrate-first '
+              'zone -- NH-M1-19 keeps the full sentence '
+              '(this tau took the short form under the '
+              'NH-M1-17 rule)');
+      expect(phraseAt(1.5), normal,
+          reason: 'tau exactly AT condition 1\'s 1.5 s '
+              'line is not "inside" the zone (strict): '
+              'the normal phrase is kept even though '
+              'condition 2 (1.5 < 2.0) holds');
+      expect(phraseAt(1.4),
+          shortUrgentPhrase(HazardKind.motorVehicle, '汽车', 0.5),
+          reason: 'tau 1.4 s: BOTH conditions hold '
+              '(1.4 < 1.5 and 1.4 < 8 x 0.25 = 2.0), so '
+              'the bearing short form is issued');
     });
 
     test('warnings never take the short form, even with '
@@ -287,28 +314,74 @@ void main() {
               'phrase verbatim');
     });
 
-    test('every short form passes the banned-word scan '
-        'and is inside the enumerated phrase space', () {
+    test('every short form passes the banned-word scan, '
+        'fits six voiced characters and is inside the '
+        'enumerated phrase space (NH-M1-19 forms)', () {
       final Set<String> enumerated = enumerateAllHazardPhrases().toSet();
-      for (final HazardKind kind in HazardKind.values) {
-        final String s = shortUrgentPhrase(kind);
+      final Set<String> forms = shortUrgentPhrases().toSet();
+      expect(forms.length, 18,
+          reason: 'NH-M1-19: 10 (kind, name) entries x '
+              'three bearings, with the five vehicle-label '
+              'entries sharing their three forms: 18 '
+              'distinct texts');
+      for (final String s in forms) {
         expect(containsBannedWord(s), isFalse, reason: s);
         expect(assertNoBannedWords(s), isTrue, reason: s);
         expect(enumerated.contains(s), isTrue,
-            reason: 'the short form for $kind is part of '
-                'the enumerable output space');
+            reason: 'the short form "$s" is part of the '
+                'enumerable output space');
         expect(s.contains('迈步'), isFalse,
             reason: 'a short form never carries a step '
                 'direction');
       }
+      // NH-M1-19's six-character cap, with its ONE
+      // documented exception class: the kind-name
+      // fallback entries （机动车 / 非机动车 -- labels
+      // outside the detector vocabulary) keep their full
+      // kind name because compressing it would misreport
+      // the category; they run 6-8 voiced characters.
+      // Every form for a label IN the vocabulary fits.
+      for (final String s in forms) {
+        if (s.contains('机动车')) continue; // the fallback pair
+        expect(voicedCharCount(s), lessThanOrEqualTo(6),
+            reason: 'NH-M1-19: short forms fit six voiced '
+                'characters (kind-name fallbacks '
+                'excepted): "$s"');
+      }
+      expect(
+          voicedCharCount(
+              shortUrgentPhrase(HazardKind.motorVehicle, '机动车', 0.1)),
+          6,
+          reason: 'the motor fallback even fits at a side '
+              'bearing; its centre form (7) is the cap\'s '
+              'documented exception');
+      // The bearing is selected by the same zone rule as
+      // the normal templates (one probe per zone edge).
+      expect(shortUrgentPhrase(HazardKind.motorVehicle, '汽车', 0.5),
+          '停，前方来车');
+      expect(shortUrgentPhrase(HazardKind.motorVehicle, '汽车', 0.1),
+          '停，左来车');
+      expect(shortUrgentPhrase(HazardKind.motorVehicle, '汽车', 0.9),
+          '停，右来车');
     });
 
     test('estimated spoken duration: punctuation is not '
         'voiced, characters are', () {
-      expect(estimatedSpeechSeconds('停，前方有车'),
-          closeTo(5 * NavHazConfig.ttsSecondsPerCharUpperBound, 1e-9));
       expect(estimatedSpeechSeconds('停，前方来车'),
-          closeTo(5 * NavHazConfig.ttsSecondsPerCharUpperBound, 1e-9));
+          closeTo(5 * NavHazConfig.ttsSecondsPerCharUpperBound, 1e-9),
+          reason: 'the duration estimate keeps the 0.30 '
+              's/char planning bound (NH-M1-19 moved only '
+              'the short-form GATE to its own 0.25 '
+              'coefficient)');
+      expect(
+          voicedCharCount('停，十二点钟方向约五米，汽车靠近'), 14,
+          reason: 'the spec-2.7 first-urgent sentence: '
+              '14 voiced characters (16 runes minus its '
+              'two commas), matching Codex\'s count of the '
+              'sentence; gate arithmetic in '
+              'navhaz_fix1_test (14 x 0.25 = 3.5 > tauNow '
+              '2.70-2.73, but condition 1 keeps the full '
+              'sentence)');
     });
   });
 }
