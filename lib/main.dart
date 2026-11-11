@@ -33,9 +33,12 @@ import 'core/orientation.dart';
 import 'adapters/orientation_monitor.dart';
 import 'adapters/haptics.dart';
 import 'adapters/pitch_monitor.dart';
+import 'adapters/thermal_monitor.dart';
 import 'core/haptics.dart';
 import 'core/navhaz_config.dart';
 import 'core/frame_rate_policy.dart';
+import 'core/thermal.dart';
+import 'core/thermal_policy.dart';
 import 'core/pitch.dart';
 import 'core/hazard/ego_motion.dart';
 import 'core/hazard/hazard_phrases.dart';
@@ -741,6 +744,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// not refresh it: silence is exactly what the gate
   /// waits for.
   DateTime? _lastNonEmptyDetectionAt;
+
+  /// NAVHAZ M2 section 3.2: device thermal monitor (the
+  /// platform PowerManager feed on mobile, unavailable
+  /// elsewhere) and the pure derating policy it feeds. The
+  /// settled cap composes with the frame-rate policy's
+  /// scene target at the single apply point
+  /// (_applyFrameRatePolicy). While
+  /// [NavHazConfig.thermalDeratingEnabled] is off the
+  /// monitor is never created or subscribed and the cap
+  /// stays unconstrained -- the pre-3.2 behaviour, exactly.
+  ThermalMonitor _thermalMonitor = const UnavailableThermalMonitor();
+  final ThermalPolicy _thermalPolicy = ThermalPolicy();
+  ThermalCap _thermalCap = ThermalCap.unconstrained;
+  StreamSubscription<ThermalStatus>? _thermalSub;
+
+  /// The frame-rate policy's most recent settled scene
+  /// target (before the thermal composition), remembered
+  /// so a thermal status change can re-apply the composed
+  /// value immediately instead of waiting for the next
+  /// pipeline frame.
+  int? _lastSceneTargetFps;
   // Cloud-vision cycle merging + 429 backoff (hazard scans).
   final VisionCycleCoordinator _visionCycle = VisionCycleCoordinator();
   final VisionRateBackoff _visionBackoff = VisionRateBackoff();
@@ -1133,6 +1157,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _orientation = createOrientationMonitor()..start();
     _pitchMonitor = createPitchMonitor()..start();
     _haptics = createHaptics();
+    // NAVHAZ M2 section 3.2: subscribe to the device
+    // thermal feed. Flag off: no monitor is created, no
+    // subscription exists, and the thermal cap stays
+    // unconstrained forever.
+    if (NavHazConfig.thermalDeratingEnabled) {
+      _thermalMonitor = createThermalMonitor();
+      _thermalSub = _thermalMonitor.statuses.listen(_onThermalStatus);
+      _thermalMonitor.start();
+    }
     // Vibration failures reported by the device channel
     // (M1 fix round) surface in the app log: a pattern the
     // device did not execute must never pass unnoticed.
@@ -2072,6 +2105,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _hazardScanTimer?.cancel();
     _orientation.dispose();
     _pitchMonitor.dispose();
+    _thermalSub?.cancel();
+    _thermalMonitor.dispose();
     _transcriptSub?.cancel();
     _partialSub?.cancel();
     _pttNoContentTimer?.cancel();
@@ -4311,6 +4346,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // at delivery (null for simulated / scripted frames,
     // which then stamp no frame-to-callback segment).
     final DateTime now = DateTime.now();
+    // M2 section 3.2 class restriction: while the thermal
+    // cap's severe tier holds, detection INPUT is limited
+    // to vehicle and pedestrian classes BEFORE anything
+    // downstream (avoidance bookkeeping, perception,
+    // tracking pipeline) sees the frame -- a held-back
+    // detection leaves no track, no event and no speech.
+    // Tracks already confirmed keep their existing alert
+    // logic untouched; only new input is gated. The cap is
+    // unconstrained unless the device is genuinely hot, so
+    // this is a pass-through in normal operation.
+    if (_thermalCap.restrictClasses) {
+      detections = detections
+          .where((Detection d) =>
+              ThermalPolicy.keepsLabelUnderRestriction(d.label))
+          .toList();
+    }
     // M2 section 3.1 still-gate evidence: a NON-EMPTY
     // frame refreshes the last-detection stamp; empty
     // frames deliberately do not (their silence is what
@@ -4424,6 +4475,38 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 
+  /// NAVHAZ M2 section 3.2: one thermal status event from
+  /// the device monitor. The pure policy settles the cap
+  /// (immediate derating, hysteretic stepwise recovery,
+  /// the throttled CRITICAL announcement); this handler
+  /// stores it, speaks the announcement when the policy
+  /// says one is due -- through the SAME speech scheduler
+  /// as every other prompt, at alert level -- and
+  /// re-applies the composed frame rate at once when a
+  /// scene target is already known, so a heat spike does
+  /// not wait for the next pipeline frame to slow the
+  /// camera down.
+  void _onThermalStatus(ThermalStatus status) {
+    final DateTime now = DateTime.now();
+    final ThermalCap cap = _thermalPolicy.evaluate(status: status, now: now);
+    _thermalCap = cap;
+    if (cap.announcementDue) {
+      _say(_request(
+        id: 'thermal-critical-${now.millisecondsSinceEpoch}',
+        eventId: 'thermal-critical-${now.millisecondsSinceEpoch}',
+        text: NavHazConfig.thermalCriticalAnnouncementText,
+        kind: SpeechKind.alert,
+      ));
+    }
+    final int? scene = _lastSceneTargetFps;
+    if (NavHazConfig.adaptiveFrameRateEnabled && scene != null) {
+      unawaited(applyYoloFrameRateTarget(
+        ThermalPolicy.composeFps(scene, cap),
+        capAnalysisAt720p: cap.analysisResolution720p,
+      ));
+    }
+  }
+
   /// NAVHAZ M2 section 3.1: evaluate the adaptive
   /// frame-rate policy for one pipeline frame and apply
   /// its settled target to the live view at runtime. All
@@ -4435,9 +4518,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// Flag off: returns immediately, nothing is evaluated
   /// or applied, and the view keeps the plugin defaults.
   ///
-  /// SECTION 3.2 HOOK: when the thermal monitor lands,
-  /// the value applied below becomes
-  /// min(target, thermalCap) -- the composition point is
+  /// SECTION 3.2 COMPOSITION: the value applied below is
+  /// min(scene target, thermal cap) with the thermal 720p
+  /// ceiling riding along -- the composition point is
   /// this call, the adapter applier stays a dumb setter.
   void _applyFrameRatePolicy(
       HazardPipelineResult result, EgoMotion ego, DateTime now) {
@@ -4453,7 +4536,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       hasLiveTrack: result.estimates.isNotEmpty,
       lastDetectionAt: _lastNonEmptyDetectionAt,
     );
-    unawaited(applyYoloFrameRateTarget(target));
+    _lastSceneTargetFps = target;
+    unawaited(applyYoloFrameRateTarget(
+      ThermalPolicy.composeFps(target, _thermalCap),
+      capAnalysisAt720p: _thermalCap.analysisResolution720p,
+    ));
   }
 
   /// NAVHAZ M1: geometry-bearing frames -- multi-target

@@ -40,5 +40,7 @@ int? get appliedYoloFrameRateFps => null;
 
 /// No-op on this platform: there is no plugin to retarget.
 /// The signature mirrors the mobile adapter so the wiring
-/// layer in main.dart stays platform-free.
-Future<void> applyYoloFrameRateTarget(int targetFps) async {}
+/// layer in main.dart stays platform-free (the section 3.2
+/// 720p ceiling flag included -- equally a no-op here).
+Future<void> applyYoloFrameRateTarget(int targetFps,
+    {bool capAnalysisAt720p = false}) async {}

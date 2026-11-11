@@ -556,4 +556,51 @@ static const Duration frameRateDownshiftHold = Duration(seconds: 3);
 /// plugin (spec section 6 Q1). This detection-quiet
 /// proxy is the spec's own substitute, not an equivalent.
 static const Duration frameRateStillQuietWindow = Duration(seconds: 2);
+
+// ---- Thermal derating (M2 section 3.2) -------------------------------
+
+/// Master switch for thermal derating (thermal_policy.dart
+/// + the thermal_monitor adapter). When false the wiring
+/// layer never subscribes to the platform thermal stream
+/// and imposes no cap: the pre-3.2 behaviour, exactly. The
+/// policy object itself remains pure logic either way; the
+/// flag is consulted only by the wiring layer.
+static const bool thermalDeratingEnabled = true;
+
+/// FPS ceiling while the device reports LIGHT or MODERATE
+/// thermal status (spec 3.2). The same tier also caps the
+/// camera analysis resolution at 720p (the adapter maps
+/// that to the plugin's Size(1280, 720) convention).
+static const int thermalCapModerateFps = 10;
+
+/// FPS ceiling while the device reports SEVERE thermal
+/// status or worse (spec 3.2). This tier additionally
+/// restricts detection input to vehicle and pedestrian
+/// classes only.
+static const int thermalCapSevereFps = 5;
+
+/// Stepwise recovery hold (spec 3.2): after the reported
+/// status improves, it must HOLD below the applied tier
+/// continuously for this long before the cap rises ONE
+/// step (severe tier -> moderate tier -> unconstrained).
+/// Derating is always immediate; recovery is always
+/// hysteretic -- the same asymmetry as the frame-rate
+/// policy's up/down shifts (section 3.1), because a
+/// device oscillating around a thermal threshold must
+/// not flap the camera rate with it.
+static const Duration thermalRecoveryHold = Duration(seconds: 30);
+
+/// Minimum spacing between two CRITICAL announcements
+/// (spec 3.2): the heat warning is spoken at most once
+/// per this interval, however often the platform repeats
+/// the critical status.
+static const Duration thermalCriticalAnnouncementInterval =
+    Duration(minutes: 5);
+
+/// The CRITICAL heat warning, verbatim (spec 3.2). It
+/// asks the user to slow down and watch their footing; it
+/// makes no claim about the way ahead and passes the
+/// banned-word check (asserted in the thermal tests).
+static const String thermalCriticalAnnouncementText =
+    '手机较热，识别已降频，请放慢脚步注意脚下';
 }

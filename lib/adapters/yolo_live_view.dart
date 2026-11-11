@@ -72,11 +72,14 @@ int? get appliedYoloFrameRateFps => impl.appliedYoloFrameRateFps;
 
 /// Apply a new target inference rate to the live view at
 /// runtime (mobile: the plugin controller's streaming-
-/// config call; web: no-op). SECTION 3.2 HOOK: the
-/// thermal cap composes at the CALLER -- it will pass
-/// min(scene target, thermal cap) here.
-Future<void> applyYoloFrameRateTarget(int targetFps) =>
-    impl.applyYoloFrameRateTarget(targetFps);
+/// config call; web: no-op). The thermal cap composes at
+/// the CALLER (section 3.2): it passes
+/// min(scene target, thermal cap) as [targetFps] and its
+/// 720p ceiling as [capAnalysisAt720p].
+Future<void> applyYoloFrameRateTarget(int targetFps,
+        {bool capAnalysisAt720p = false}) =>
+    impl.applyYoloFrameRateTarget(targetFps,
+        capAnalysisAt720p: capAnalysisAt720p);
 
 /// Completes when the live view has actually unmounted (mobile)
 /// or immediately (web stub). The camera owner's YOLO release
