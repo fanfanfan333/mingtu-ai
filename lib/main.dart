@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
+import 'adapters/amap_navi_source.dart';
 import 'adapters/camera_frame_source.dart';
 import 'adapters/cloud_asr_client.dart';
 import 'adapters/cloud_vision_client.dart';
@@ -826,6 +827,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // captures, no merges -- and behaviour is pre-M3.
   PotholeScanner? _potholeScanner;
 
+  // ---- M3: Amap TBT navigation source (spike) ----
+  // Non-null ONLY while a live trip runs with the
+  // build-time switch on (AppConfig.amapNaviEnabled,
+  // default off) AND the source started successfully
+  // for that trip. While _amapNaviActive is set, the
+  // TBT source owns turn-ahead prompts (its navi text
+  // IS the turn prompt) and the tracker's own turn-
+  // ahead events are suppressed in _onLiveNavFix --
+  // every other tracker event (arrival hand-over,
+  // off-route + re-plan, weak signal) and ALL trip
+  // state stay tracker-owned. A failed start leaves
+  // both fields null/false: the trip runs purely on the
+  // Web source, exactly as before, with one log line
+  // and no new announcement. In this build a start
+  // ALWAYS fails: the spike's final ruling adopted no
+  // navi binding (docs/amap_navi_spike_report.md), so
+  // the stub binding's initialize throws by design.
+  AmapNaviSource? _amapNaviSource;
+  StreamSubscription<NavEvent>? _amapNaviSub;
+  bool _amapNaviActive = false;
+
   /// The latest completed scan's pothole detections and
   /// when its frame was taken. A completed scan REPLACES
   /// the list (an empty scan clears it); the merge at the
@@ -1388,6 +1410,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _onLiveNavFix,
           onError: (Object e) => mingtuVoiceLog('定位流出错，实时导航提示暂停'),
         );
+    // M3 TBT spike: with the switch on, also start the
+    // Amap navi source for this trip (fire-and-forget:
+    // its start outcome never blocks or breaks the Web
+    // source trip that is already running above).
+    if (AppConfig.amapNaviEnabled) {
+      unawaited(_startAmapNaviSource(destinationName));
+    }
     // Live straight prompts: the shared 3 s tick reads its
     // confirmation from the tracker while live nav runs.
     if (_pacing.isPaused) {
@@ -1408,6 +1437,43 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _startStraightTimer();
     }
     _logMsg('实时导航已开始：GPS 跟踪中（转向/偏航/到达自动播报）。');
+  }
+
+  /// M3 TBT spike: start the Amap navi source for the
+  /// trip whose tracker was just installed. Any failure
+  /// (in this build: the stub binding always fails --
+  /// no binding is adopted; also trip already over)
+  /// falls back to the Web source: one fixed log line,
+  /// no new
+  /// announcement, no crash, and the tracker trip above
+  /// is untouched. The trip-generation guard (the
+  /// tracker instance captured before the await) keeps
+  /// a late completion from attaching itself to a
+  /// DIFFERENT trip that started in the meantime.
+  Future<void> _startAmapNaviSource(String destinationName) async {
+    if (_amapNaviActive) return;
+    final NavigationTracker? tripTracker = _liveNav;
+    if (tripTracker == null) return;
+    final AmapNaviSource source =
+        AmapNaviSource(binding: createAmapNaviBinding());
+    final StreamSubscription<NavEvent> sub =
+        source.events.listen(_handleNavEvent);
+    final bool started = await source.start(
+      destination: tripTracker.destination,
+      destinationName: destinationName,
+    );
+    if (!started || !mounted || !identical(_liveNav, tripTracker)) {
+      await sub.cancel();
+      await source.dispose();
+      if (!started) {
+        mingtuVoiceLog('高德 TBT 导航源启动失败，已回退 Web 源导航');
+      }
+      return;
+    }
+    _amapNaviSource = source;
+    _amapNaviSub = sub;
+    _amapNaviActive = true;
+    mingtuVoiceLog('高德 TBT 导航源已启动（试验）');
   }
 
   void _onLiveNavFix(LocationResult r) {
@@ -1450,6 +1516,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _liveNavRemainingM = _liveNav!.remainingM;
     });
     for (final NavEvent e in events) {
+      // M3 TBT spike: while the Amap navi source is
+      // live it owns turn-ahead prompts; the tracker's
+      // own turn-ahead for the same intersections would
+      // double-speak. Every other tracker event still
+      // flows unchanged.
+      if (_amapNaviActive && e.kind == NavEventKind.turnAhead) continue;
       _handleNavEvent(e);
     }
     if (_pacing.isPaused && !_rerouting) {
@@ -1686,6 +1758,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _endLiveNavigation() {
     _gpsSub?.cancel();
     _gpsSub = null;
+    // M3 TBT spike: the TBT source dies with the trip.
+    _amapNaviSub?.cancel();
+    _amapNaviSub = null;
+    final AmapNaviSource? naviSource = _amapNaviSource;
+    _amapNaviSource = null;
+    _amapNaviActive = false;
+    if (naviSource != null) unawaited(naviSource.stop());
     _liveNav = null;
     _liveNavRemainingM = null;
     _entrance = null;
