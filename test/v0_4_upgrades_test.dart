@@ -1,7 +1,5 @@
-import 'package:mingtu_ai/adapters/bailian_client.dart';
 import 'package:mingtu_ai/adapters/voice_io.dart';
 import 'package:mingtu_ai/core/contracts.dart';
-import 'package:mingtu_ai/core/llm_gateway.dart';
 import 'package:mingtu_ai/core/risk_engine.dart';
 import 'package:mingtu_ai/core/speech_scheduler.dart';
 import 'package:mingtu_ai/core/task_manager.dart';
@@ -119,31 +117,6 @@ void main() {
     expect(wakeWordStatus, contains('轮流对话'));
   });
 
-  test('bailian vision sends nothing and returns NOT_CONFIGURED', () async {
-    var sent = 0;
-    final client = BailianClient(
-      apiKey: 'test-key',
-      modelId: 'qwen3-vl-flash',
-      sender: (_, __, ___) async {
-        sent++;
-        return '{}';
-      },
-    );
-    final gateway = LlmGateway(modelId: 'qwen3-vl-flash', budgetCapRmb: 100);
-    final decision = gateway.requestOnDemand(
-      type: LlmCallType.textPlanning,
-      reason: 'test vision',
-      localAttempted: true,
-      localInsufficient: true,
-      estimatedCostRmb: 0.001,
-      input: const {},
-    );
-    final result =
-        await client.callVision(gateway: gateway, decision: decision);
-    expect(result.status, 'NOT_CONFIGURED');
-    expect(sent, 0);
-  });
-
   test('learning backlog records only and never applies a rule', () {
     final backlog = LearningBacklog();
     backlog.record('f1', 'uncertain-side-space', 'demo', DateTime(2026, 11, 5));
@@ -152,12 +125,14 @@ void main() {
     expect(RiskEngine.minSpatialConfidenceForStep, 0.6);
   });
 
-  test('registry has 13 skills, traffic info in, station out', () {
+  test('registry has 12 skills, traffic info in, station and hospital out', () {
     final registry = defaultSkillRegistry();
-    expect(registry.list().length, 13);
+    expect(registry.list().length, 12);
     expect(registry.get('traffic_scene_info'), isNotNull);
     expect(registry.get('station_assistance'), isNull);
-    expect(registry.get('hospital_registration'), isNotNull);
+    // The user's flow is navigation + obstacle avoidance
+    // only: the hospital skill is out of the registry.
+    expect(registry.get('hospital_registration'), isNull);
   });
 
   test('task context snapshot follows the one task manager', () {

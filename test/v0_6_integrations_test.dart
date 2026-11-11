@@ -17,15 +17,15 @@ const String _amapOkBody = '''
         "duration": "150",
         "steps": [
           {
-            "instruction": "向北步行80米",
-            "road": "校园路",
+            "action": "直行",
+            "orientation": "北",
             "polyline": "116.400000,39.900000;116.400100,39.900800",
             "distance": "80",
             "duration": "60"
           },
           {
-            "instruction": "向东步行106米到达目的地",
-            "road": "",
+            "action": "左转",
+            "orientation": "东",
             "polyline": "116.400100,39.900800;116.401000,39.900900",
             "distance": "106",
             "duration": "90"
@@ -51,10 +51,15 @@ void main() {
   test('amap walking route parses distance, steps and polyline', () async {
     bool called = false;
     final AmapWalkingClient client = AmapWalkingClient(
-      apiKey: 'test-key',
+      proxyBaseUrl: 'https://proxy.example.test',
       sender: (Uri url) async {
         called = true;
-        expect(url.host, 'restapi.amap.com');
+        // Proxy contract (navigation P0): the app talks to its own
+        // proxy and the request carries NO key parameter at all --
+        // the key exists only in the proxy's server environment.
+        expect(url.host, 'proxy.example.test');
+        expect(url.path, '/walking');
+        expect(url.queryParameters.containsKey('key'), isFalse);
         expect(url.queryParameters['origin'], '116.400000,39.900000');
         expect(url.queryParameters['destination'], '116.401000,39.900900');
         expect(url.queryParameters['output'], 'json');
@@ -70,7 +75,8 @@ void main() {
     expect(result.distanceM, 186);
     expect(result.durationS, 150);
     expect(result.steps.length, 2);
-    expect(result.steps.first.instruction, '向北步行80米');
+    expect(result.steps.first.action, '直行');
+    expect(result.steps.first.orientation, '北');
     expect(result.polyline.length, 4);
     // The real route is still UNKNOWN accessibility by construction:
     // Amap gives no blind-path data, so it must never score as safe.
@@ -81,11 +87,11 @@ void main() {
     expect(candidate.dataConfidence, 0.8);
   });
 
-  test('amap without a key makes no network call', () async {
+  test('amap without a configured proxy makes no network call', () async {
     final AmapWalkingClient client = AmapWalkingClient(
-      apiKey: '',
+      proxyBaseUrl: '',
       sender: (Uri url) async {
-        fail('must not call the network without a key');
+        fail('must not call the network without a proxy');
       },
     );
     final AmapWalkingResult result = await client.walkingRoute(
@@ -96,11 +102,13 @@ void main() {
     expect(result.candidate, isNull);
   });
 
-  test('amap error status is reported and the key is never leaked', () async {
+  test('amap transport error is reported; no key exists to leak', () async {
     final AmapWalkingClient client = AmapWalkingClient(
-      apiKey: 'secret-key-123',
+      proxyBaseUrl: 'https://proxy.example.test',
       sender: (Uri url) async {
-        // Simulate a transport failure whose message contains the URL.
+        // The client holds no credential by construction, so even
+        // a transport error embedding the URL cannot contain a key:
+        // the URL itself has no key parameter (asserted above).
         throw Exception('GET $url failed');
       },
     );
@@ -109,13 +117,13 @@ void main() {
       to: parseLonLat('116.401,39.9009')!,
     );
     expect(result.status, 'ERROR');
-    expect(result.error, isNot(contains('secret-key-123')));
-    expect(result.error, contains('[REDACTED]'));
+    expect(result.error, isNot(contains('key=')));
   });
 
-  test('amap status 0 returns the provider info, not a route', () async {
+  test('amap status 0 returns a fixed generic error, not a route '
+      'and NOT the provider free-text info', () async {
     final AmapWalkingClient client = AmapWalkingClient(
-      apiKey: 'k',
+      proxyBaseUrl: 'https://proxy.example.test',
       sender: (Uri url) async => jsonEncode(<String, Object>{
         'status': '0',
         'info': 'INVALID_USER_KEY',
@@ -126,7 +134,10 @@ void main() {
       to: parseLonLat('116.401,39.9009')!,
     );
     expect(result.ok, isFalse);
-    expect(result.error, contains('INVALID_USER_KEY'));
+    // Structured-output rule (both route modes): upstream free
+    // text is never copied into results or announcements.
+    expect(result.error, contains('失败状态'));
+    expect(result.error, isNot(contains('INVALID_USER_KEY')));
   });
 
   test('yolo result mapping uses the normalised box centre', () {
@@ -151,7 +162,8 @@ void main() {
     expect(clamped.cy, 0.0);
   });
 
-  test('unavailable yolo detector returns no detections, never fakes', () async {
+  test('unavailable yolo detector returns no detections, never fakes',
+      () async {
     final YoloDetector detector = UnavailableYoloDetector();
     expect(detector.isAvailable, isFalse);
     expect(await detector.detectImage(<int>[1, 2, 3]), isEmpty);

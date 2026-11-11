@@ -7,21 +7,51 @@
 /// [completeActive].
 ///
 /// Priority: lower number = higher priority.
-///   P0 emergency, P1 high-risk avoidance, P2 turn, P3 straight, P4 info.
-enum SpeechKind { emergency, obstacleAvoidance, turn, straight, info }
+///   P0 emergency, P1 high-risk avoidance AND critical alerts
+///   (safety/failure announcements that must be delivered:
+///   recognition results, failures, permission denials),
+///   P2 turn, P3 straight, P4 info.
+///
+/// Delivery guarantee for critical speech: requests of kind
+/// emergency / obstacleAvoidance / alert are submitted with
+/// [SpeechRequest.neverExpires] by the app layer, so neither
+/// submission nor promotion can drop them as "expired" -- for a
+/// blind user a silently dropped safety/failure message is worse
+/// than a late one. An alert (P1) can be interrupted ONLY by a
+/// strictly higher priority (an emergency, P0); the user's own
+/// "停下" is not an interruption but an explicit cancelAll(),
+/// which is the one sanctioned way to clear everything.
+enum SpeechKind {
+  emergency,
+  danger,
+  obstacleAvoidance,
+  alert,
+  turn,
+  straight,
+  info
+}
 
 int priorityOf(SpeechKind kind) {
   switch (kind) {
     case SpeechKind.emergency:
       return 0;
-    case SpeechKind.obstacleAvoidance:
+    case SpeechKind.danger:
+      // Imminent-danger alerts (a vehicle/person directly
+      // ahead) sit ABOVE every navigation prompt and above
+      // general alerts: they interrupt whatever is playing
+      // (see SpeechScheduler.submit's interruption rule and
+      // the caller's physical playback stop).
       return 1;
-    case SpeechKind.turn:
+    case SpeechKind.obstacleAvoidance:
       return 2;
-    case SpeechKind.straight:
+    case SpeechKind.alert:
+      return 2;
+    case SpeechKind.turn:
       return 3;
-    case SpeechKind.info:
+    case SpeechKind.straight:
       return 4;
+    case SpeechKind.info:
+      return 5;
   }
 }
 
@@ -34,6 +64,14 @@ class SpeechRequest {
   final DateTime expiresAt;
   final String navigationStateVersion;
   final bool requiresStraightSegment;
+
+  /// Critical-delivery flag: when true the request NEVER expires
+  /// -- submission and promotion must not drop it, however much
+  /// time passed. Reserved for safety and failure announcements
+  /// (see the SpeechKind documentation). Ordinary prompts keep
+  /// the default false and expire as before: a stale "直走" must
+  /// never be spoken late.
+  final bool neverExpires;
   const SpeechRequest({
     required this.id,
     required this.eventId,
@@ -43,10 +81,11 @@ class SpeechRequest {
     required this.expiresAt,
     required this.navigationStateVersion,
     this.requiresStraightSegment = false,
+    this.neverExpires = false,
   });
 
   int get priority => priorityOf(kind);
-  bool isExpired(DateTime now) => now.isAfter(expiresAt);
+  bool isExpired(DateTime now) => !neverExpires && now.isAfter(expiresAt);
 }
 
 class SpeechScheduler {
@@ -61,6 +100,10 @@ class SpeechScheduler {
   // v0.4: conflicting action instructions (a turn vs an avoidance
   // step) are dropped, never played one after the other.
   final List<String> droppedConflictLog = [];
+  // P0 follow-up: requests cancelled by an explicit stop (voice
+  // pause / cancel command). A stopped prompt must never be played
+  // afterwards, so cancellation is recorded, not silent.
+  final List<String> cancelledLog = [];
   DateTime? _lastStraightPlayedAt;
 
   SpeechRequest? get active => _active;
@@ -118,6 +161,31 @@ class SpeechScheduler {
       _activate(request);
       return true;
     }
+    if (request.kind == _active!.kind &&
+        (request.kind == SpeechKind.emergency ||
+            request.kind == SpeechKind.danger)) {
+      // Same-level urgent prompt, different event (a true
+      // duplicate of the SAME event was already dropped
+      // above): the new danger REPLACES the playing one. It
+      // interrupts immediately -- same-level dangers never
+      // queue behind each other -- and the interrupted
+      // prompt is never replayed.
+      interruptedLog.add(_active!.id);
+      _active = null;
+      _activate(request);
+      return true;
+    }
+    if (request.kind == SpeechKind.emergency ||
+        request.kind == SpeechKind.danger) {
+      // A QUEUED same-kind urgent prompt is replaced too:
+      // only the newest event of that level stays pending.
+      for (final SpeechRequest q in _queue
+          .where((SpeechRequest q) => q.kind == request.kind)
+          .toList()) {
+        _queue.remove(q);
+        interruptedLog.add(q.id);
+      }
+    }
     _queue.add(request);
     _queue.sort((a, b) {
       final p = a.priority.compareTo(b.priority);
@@ -153,15 +221,17 @@ class SpeechScheduler {
     _lastStraightPlayedAt = now;
   }
 
-  /// Pause a straight prompt (e.g. a higher-priority event arrived, a turn
-  /// is coming, or the segment is no longer confirmed straight). This
-  /// clears the active straight prompt and its timer; it does NOT queue it
-  /// for later replay.
+  /// Disarm the straight 3-second clock ONLY. This
+  /// deliberately does NOT touch the active request: whether
+  /// a playing prompt is interrupted is the submit()
+  /// priority rule's decision, and the physical playback
+  /// stop is the caller's sequenced stop before a
+  /// high-priority prompt speaks. An earlier version cleared
+  /// the active straight prompt here, which destroyed the
+  /// very state the preemption logic then inspected -- the
+  /// physical stop silently never happened (Codex re-tests
+  /// of f951240 and d01a081).
   void pauseStraight() {
-    if (_active?.kind == SpeechKind.straight) {
-      interruptedLog.add(_active!.id);
-      _active = null;
-    }
     _lastStraightPlayedAt = null;
   }
 
@@ -189,6 +259,28 @@ class SpeechScheduler {
   /// separate concern handled by risk / task code.
   void completeActive() {
     _active = null;
+  }
+
+  /// Cancel everything: the active prompt and every queued prompt.
+  ///
+  /// P0 follow-up: a voice "停下 / 取消" must cancel pending
+  /// navigation speech, not only the currently playing straight
+  /// prompt -- before this, a turn prompt queued behind another
+  /// prompt could still be spoken after the user said stop. The
+  /// caller stops the actual TTS playback separately and then
+  /// submits its own confirmation prompt AFTER calling this, so the
+  /// confirmation itself is not cancelled. Returns the cancelled
+  /// request ids (active first, then queued in queue order).
+  List<String> cancelAll() {
+    final List<String> cancelled = <String>[
+      if (_active != null) _active!.id,
+      for (final SpeechRequest q in _queue) q.id,
+    ];
+    cancelledLog.addAll(cancelled);
+    _active = null;
+    _queue.clear();
+    _lastStraightPlayedAt = null;
+    return cancelled;
   }
 
   /// Promote the highest-priority queued request that is still valid.

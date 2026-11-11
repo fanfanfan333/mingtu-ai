@@ -1,0 +1,153 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:mingtu_ai/adapters/cloud_vision_client.dart';
+import 'package:mingtu_ai/core/cloud_vision.dart';
+
+/// FC vision client contract (user decision 2026-11-09):
+/// Bailian via the server function only. Fixtures only -- the
+/// "token" here is a fixture string, no real key exists in tests.
+
+CloudVisionClient _client({
+  String proxy = 'https://fc.example.test',
+  String token = 'fixture-demo-token',
+  VisionSender? sender,
+}) =>
+    CloudVisionClient(
+      proxyBaseUrl: proxy,
+      demoToken: token,
+      sender: sender ??
+          (Uri u, String b, Map<String, String> h) async =>
+              '{"scene":"室内","obstacles":[],"parsed":true}',
+      downsampler: (Uint8List bytes, int max) async => bytes,
+      limiter: VisionRateLimiter(),
+    );
+
+final Uint8List _img = Uint8List.fromList(<int>[1, 2, 3]);
+
+void main() {
+  test(
+      'the demo token travels as a header, never in the URL '
+      'or the body', () async {
+    Map<String, String>? seenHeaders;
+    Uri? seenUrl;
+    String? seenBody;
+    final CloudVisionResult result = await _client(
+      sender: (Uri u, String b, Map<String, String> h) async {
+        seenUrl = u;
+        seenBody = b;
+        seenHeaders = h;
+        return '{"scene":"室内","obstacles":[],"parsed":true}';
+      },
+    ).describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.ok, isTrue);
+    expect(seenHeaders![visionTokenHeader], 'fixture-demo-token');
+    expect(seenUrl.toString(), isNot(contains('fixture-demo-token')));
+    expect(seenBody, isNot(contains('fixture-demo-token')));
+  });
+
+  test(
+      'an http (non-https) proxy address is refused before '
+      'any send, announced as not configured', () async {
+    int sends = 0;
+    final CloudVisionResult result = await _client(
+      proxy: 'http://fc.example.test',
+      sender: (Uri u, String b, Map<String, String> h) async {
+        sends += 1;
+        return '{}';
+      },
+    ).describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(sends, 0);
+    expect(result.failure, CloudVisionFailure.notConfigured);
+    expect(result.speechText, contains('识图未配置'));
+  });
+
+  test('no proxy address: 识图未配置, nothing sent', () async {
+    final CloudVisionResult result = await _client(proxy: '')
+        .describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.failure, CloudVisionFailure.notConfigured);
+    expect(result.speechText, contains('识图未配置'));
+  });
+
+  test('401 unauthorized maps to 识图暂时不可用', () async {
+    final CloudVisionResult result = await _client(
+      sender: (Uri u, String b, Map<String, String> h) async =>
+          jsonEncode(<String, String>{'error': 'unauthorized'}),
+    ).describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.failure, CloudVisionFailure.unavailable);
+    expect(result.speechText, contains('识图暂时不可用'));
+    expect(result.speechText, isNot(contains('安全')));
+  });
+
+  test(
+      '429 rate_limited maps to the dedicated rateLimited '
+      'failure (the hazard-scan backoff keys on it)', () async {
+    final CloudVisionResult result = await _client(
+      sender: (Uri u, String b, Map<String, String> h) async =>
+          jsonEncode(<String, String>{'error': 'rate_limited'}),
+    ).describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.failure, CloudVisionFailure.rateLimited);
+    expect(result.speechText, contains('太频繁'));
+    expect(result.speechText, isNot(contains('安全')));
+  });
+
+  test(
+      'a transport exception never leaks the token, the URL '
+      'or request details into detail or speech', () async {
+    final CloudVisionClient client = _client(
+      sender: (Uri url, String body, Map<String, String> headers) async =>
+          throw Exception(
+              'test-token-not-real via https://fc.example.test/vision'),
+    );
+    final CloudVisionResult result =
+        await client.describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.ok, isFalse);
+    expect(result.failure, CloudVisionFailure.network);
+    expect(result.detail, isNot(contains('test-token-not-real')));
+    expect(result.detail, isNot(contains('fc.example.test')));
+    expect(result.speechText, isNot(contains('test-token-not-real')));
+    expect(result.speechText, isNot(contains('fc.example.test')));
+  });
+
+  test(
+      'an unknown server error is NEVER copied into detail, '
+      'speech or logs: fixed text only', () async {
+    final CloudVisionClient client = _client(
+      sender: (Uri url, String body, Map<String, String> headers) async =>
+          '{"error":"test-credential-not-real '
+          'https://evil.example.com/?key=test-credential-not-real"}',
+    );
+    final CloudVisionResult result =
+        await client.describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.ok, isFalse);
+    expect(result.failure, CloudVisionFailure.upstream);
+    expect(result.detail, '云端识图服务返回了未识别的错误。');
+    expect(result.detail, isNot(contains('test-credential-not-real')));
+    expect(result.detail, isNot(contains('evil.example.com')));
+    expect(result.speechText, isNot(contains('test-credential-not-real')));
+    expect(result.speechText, isNot(contains('evil.example.com')));
+  });
+
+  test(
+      'a proxy 413 (body too large) maps to unavailable: '
+      '识图暂时不可用', () async {
+    final CloudVisionClient client = _client(
+      sender: (Uri url, String body, Map<String, String> headers) async =>
+          '{"error":"body too large"}',
+    );
+    final CloudVisionResult result =
+        await client.describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.ok, isFalse);
+    expect(result.failure, CloudVisionFailure.unavailable);
+    expect(result.speechText, contains('识图暂时不可用'));
+  });
+
+  test('an unrecognised proxy error stays the upstream failure', () async {
+    final CloudVisionResult result = await _client(
+      sender: (Uri u, String b, Map<String, String> h) async =>
+          '{"error":"upstream failure"}',
+    ).describe(imageBytes: _img, now: DateTime(2026, 1, 1));
+    expect(result.failure, CloudVisionFailure.upstream);
+  });
+}

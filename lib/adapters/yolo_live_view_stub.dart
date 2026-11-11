@@ -2,6 +2,8 @@
 /// inference is phone-only. Never fakes a camera feed.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/widgets.dart';
 
 import '../modules/visual_perception.dart';
@@ -20,3 +22,7 @@ Widget buildYoloLiveView({
     ),
   );
 }
+
+/// No live view exists on this platform, so there is nothing to
+/// wait for: the "disposed" future is already complete.
+Future<void> get yoloLiveViewDisposed => Future<void>.value();

@@ -23,9 +23,12 @@ void main() {
     var received = 0;
     bus.subscribe(MingtuEventType.riskUpdated, (_) => received++);
     final now = DateTime(2026, 11, 5, 12, 0, 0);
-    expect(bus.publish(_event('e1', MingtuEventType.riskUpdated, 2, now), now), isTrue);
-    expect(bus.publish(_event('e1', MingtuEventType.riskUpdated, 3, now), now), isFalse);
-    expect(bus.publish(_event('e2', MingtuEventType.riskUpdated, 1, now), now), isFalse);
+    expect(bus.publish(_event('e1', MingtuEventType.riskUpdated, 2, now), now),
+        isTrue);
+    expect(bus.publish(_event('e1', MingtuEventType.riskUpdated, 3, now), now),
+        isFalse);
+    expect(bus.publish(_event('e2', MingtuEventType.riskUpdated, 1, now), now),
+        isFalse);
     final expired = MingtuEvent(
       eventId: 'e3',
       type: MingtuEventType.riskUpdated,
@@ -41,7 +44,8 @@ void main() {
     expect(bus.droppedExpired, 1);
   });
 
-  test('environment event without distance is not reliable spatial evidence', () {
+  test('environment event without distance is not reliable spatial evidence',
+      () {
     final event = EnvironmentEvent(
       eventId: 'env1',
       timestamp: DateTime(2026, 11, 5, 12, 0, 0),
@@ -70,9 +74,18 @@ void main() {
       navigationStateVersion: 'nav-v0',
       confidence: 0.8,
     );
-    expect(instruction.isValidFor(now: now, currentNavigationVersion: 'nav-v0', riskActive: false), isTrue);
-    expect(instruction.isValidFor(now: now, currentNavigationVersion: 'nav-v0', riskActive: true), isFalse);
-    expect(instruction.isValidFor(now: now, currentNavigationVersion: 'nav-v1', riskActive: false), isFalse);
+    expect(
+        instruction.isValidFor(
+            now: now, currentNavigationVersion: 'nav-v0', riskActive: false),
+        isTrue);
+    expect(
+        instruction.isValidFor(
+            now: now, currentNavigationVersion: 'nav-v0', riskActive: true),
+        isFalse);
+    expect(
+        instruction.isValidFor(
+            now: now, currentNavigationVersion: 'nav-v1', riskActive: false),
+        isFalse);
   });
 
   test('health monitor announces degraded services, empty when healthy', () {
@@ -86,9 +99,11 @@ void main() {
     expect(monitor.announcementText(), isNot(contains('location')));
   });
 
-  test('skill registry denies disabled, unmet preconditions and high-risk without risk-ok', () {
+  test(
+      'skill registry denies disabled, unmet preconditions and high-risk without risk-ok',
+      () {
     final registry = defaultSkillRegistry();
-    expect(registry.list().length, 13);
+    expect(registry.list().length, 12);
     expect(registry.get('station_assistance'), isNull);
     final denied = registry.execute(
       'obstacle_assistance',
@@ -105,10 +120,16 @@ void main() {
     );
     expect(ok.status, SkillExecutionStatus.ok);
     registry.disable('route_planning');
-    expect(registry.execute('route_planning', preconditionsMet: true, riskOk: true, runner: () => {}).status, SkillExecutionStatus.denied);
+    expect(
+        registry
+            .execute('route_planning',
+                preconditionsMet: true, riskOk: true, runner: () => {})
+            .status,
+        SkillExecutionStatus.denied);
   });
 
-  test('task manager accepts preparing and executing without breaking old flow', () {
+  test('task manager accepts preparing and executing without breaking old flow',
+      () {
     final tasks = TaskManager();
     expect(tasks.startTask(id: 't1', goalText: 'library'), isTrue);
     expect(tasks.transitionTo(TaskState.understanding), isTrue);

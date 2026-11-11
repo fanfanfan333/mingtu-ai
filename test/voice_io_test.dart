@@ -2,7 +2,8 @@ import 'package:mingtu_ai/adapters/voice_io.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test('unavailable voice IO reports NOT_CONFIGURED, never fakes speech', () async {
+  test('unavailable voice IO reports NOT_CONFIGURED, never fakes speech',
+      () async {
     final output = UnavailableVoiceOutput();
     final input = UnavailableVoiceInput();
     expect(output.isAvailable, isFalse);

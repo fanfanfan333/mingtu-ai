@@ -32,11 +32,16 @@ void main() {
     expect(s2.active?.id, 'avoid-2');
   });
 
-  test('voice parser understands stop, where-am-I, confirm, environment and recording', () {
+  test(
+      'voice parser understands stop, where-am-I, confirm, environment and recording',
+      () {
     expect(parseVoiceCommand('停下'), VoiceCommand.pause);
     expect(parseVoiceCommand('小途，别走了'), VoiceCommand.pause);
     expect(parseVoiceCommand('我在哪'), VoiceCommand.status);
     expect(parseVoiceCommand('前面有什么'), VoiceCommand.environment);
+    expect(parseVoiceCommand('看看前面'), VoiceCommand.cloudVision);
+    expect(parseVoiceCommand('小途，看一下前方'), VoiceCommand.cloudVision);
+    expect(parseVoiceCommand('看一下前面有什么'), VoiceCommand.cloudVision);
     expect(parseVoiceCommand('确认'), VoiceCommand.confirmStep);
     expect(parseVoiceCommand('我到了'), VoiceCommand.confirmStep);
     expect(parseVoiceCommand('下一步'), VoiceCommand.confirmStep);

@@ -12,6 +12,8 @@
 /// left/right is not a walking direction.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/widgets.dart';
 
 import '../modules/visual_perception.dart';
@@ -43,3 +45,8 @@ class YoloLiveView extends StatelessWidget {
         onError: onError,
       );
 }
+
+/// Completes when the live view has actually unmounted (mobile)
+/// or immediately (web stub). The camera owner's YOLO release
+/// waits on this future.
+Future<void> get yoloLiveViewDisposed => impl.yoloLiveViewDisposed;

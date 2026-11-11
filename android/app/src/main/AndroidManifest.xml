@@ -2,15 +2,15 @@
     <!-- v0.6 real integrations (Android only; see docs/REAL_INTEGRATIONS_V06.md):
          INTERNET for Amap walking routes + Bailian; RECORD_AUDIO for
          speech_to_text; CAMERA for the YOLO live view; location for a
-         future GPS provider (no GPS code yet -- the Amap route still
-         needs coordinates supplied by --dart-define). -->
+         future GPS provider (no GPS code yet; the Amap route still
+         needs coordinates supplied via dart-define). -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <application
-        android:label="mingtu_ai"
+        android:label="明途"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
@@ -50,6 +50,17 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- Android 11+ package visibility: without these, the
+             app cannot SEE the system TTS engine or the speech
+             recognition service (Xiaomi/HyperOS included), and
+             flutter_tts / speech_to_text report unavailable
+             even when the services exist. -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE"/>
+        </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService"/>
         </intent>
     </queries>
 </manifest>

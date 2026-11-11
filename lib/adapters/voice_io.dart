@@ -36,10 +36,32 @@ abstract class VoiceOutput {
   Future<void> speak(String text);
 }
 
+/// One recognition result, tagged with the id of the
+/// listening session that produced it. The platform
+/// recogniser has no session concept, so the adapter mints
+/// an id per listen session and stamps every event from
+/// that session's callback closure with it; consumers
+/// validate the id against their own current session and
+/// drop anything stale.
+class AsrResultEvent {
+  const AsrResultEvent(this.sessionId, this.text);
+  final int sessionId;
+  final String text;
+}
+
+/// One session-status event ('done' / 'notListening'),
+/// tagged the same way, so a late status from an old
+/// session cannot end (or be mistaken for) a newer one.
+class AsrStatusEvent {
+  const AsrStatusEvent(this.sessionId, this.status);
+  final int sessionId;
+  final String status;
+}
+
 abstract class VoiceInput {
   bool get isAvailable;
   String get status;
-  Stream<String> get transcripts;
+  Stream<AsrResultEvent> get transcripts;
 }
 
 class UnavailableVoiceOutput implements VoiceOutput {
@@ -47,8 +69,7 @@ class UnavailableVoiceOutput implements VoiceOutput {
   bool get isAvailable => false;
 
   @override
-  String get status =>
-      'NOT_CONFIGURED（未接入系统语音合成，当前演示只显示文字提示）';
+  String get status => 'NOT_CONFIGURED（未接入系统语音合成，当前演示只显示文字提示）';
 
   @override
   Future<void> speak(String text) async {
@@ -62,9 +83,8 @@ class UnavailableVoiceInput implements VoiceInput {
   bool get isAvailable => false;
 
   @override
-  String get status =>
-      'NOT_CONFIGURED（未接入系统语音识别，当前演示用指令输入代替）';
+  String get status => 'NOT_CONFIGURED（未接入系统语音识别，当前演示用指令输入代替）';
 
   @override
-  Stream<String> get transcripts => const Stream.empty();
+  Stream<AsrResultEvent> get transcripts => const Stream.empty();
 }
