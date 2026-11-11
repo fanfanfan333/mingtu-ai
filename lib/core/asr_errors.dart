@@ -36,6 +36,17 @@ const String asrErrorUnknown = 'error_unknown';
 String asrErrorCode(String raw) =>
     knownAsrErrorCodes.contains(raw) ? raw : asrErrorUnknown;
 
+/// The dedicated spoken notice for a permission failure of
+/// the SYSTEM speech engine (real-device fix round): on the
+/// Xiaomi 15 the engine is Xiaomi's own speech service, and
+/// it is THAT app which lacks the microphone permission --
+/// the user must grant it there, in these exact steps. This
+/// is the text _handleAsrError speaks for the permission
+/// codes; [asrErrorText] keeps the short form for status and
+/// log surfaces.
+const String asrPermissionSpeechText =
+    '系统语音识别没有麦克风权限。请打开设置，进入应用管理，找到小米语音，也就是小爱语音，在权限里把麦克风设为允许。';
+
 /// Fixed Chinese text per whitelisted code.
 String asrErrorText(String code) => switch (code) {
       'error_permission' || 'error_insufficient_permissions' => '语音识别权限被拒绝。',

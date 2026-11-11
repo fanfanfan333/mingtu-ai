@@ -9,6 +9,7 @@ import 'adapters/cloud_vision_client.dart';
 import 'adapters/cloud_vision_flow.dart';
 import 'adapters/current_location.dart';
 import 'adapters/system_voice_io.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'adapters/voice_io.dart';
 import 'adapters/yolo_detector.dart';
 import 'adapters/yolo_live_view.dart';
@@ -95,6 +96,162 @@ class MingtuApp extends StatelessWidget {
   }
 }
 
+/// Test/debug seam (MT-1111-PTT-C): the app's interface is
+/// deliberately minimal -- camera preview + one big
+/// hold-to-talk area, no visible text or other controls --
+/// so the flows the old on-screen demo panel used to drive
+/// are driven in tests through this handle instead. It only
+/// forwards to the very handlers the panel buttons called;
+/// it adds no behaviour of its own and is inert in normal
+/// use (nothing in the product reads it).
+class MingtuHomeDebugHandle {
+  MingtuHomeDebugHandle._(this._state);
+
+  final _MingtuHomePageState _state;
+
+  /// The in-app diagnostic log joined (state only; the
+  /// panel's log area used to render it).
+  String get logText => _state._log.join('\n');
+
+  /// Debug/test seam: the app's live voice input, so a
+  /// widget test can attach a fake recogniser to the
+  /// adapter (see SystemVoiceInput.debugAttachSpeechForTest)
+  /// and drive recognition errors through the adapter's
+  /// real path into the app.
+  VoiceInput get debugVoiceInput => _state._voiceInput;
+
+  /// Debug/test seam: attach a fake recogniser to the
+  /// app's CURRENT voice-input adapter (in place -- the
+  /// adapter object and the app's subscriptions to it are
+  /// unchanged) and re-register the adapter's listeners on
+  /// it. Widget tests use this to drive adapter-level
+  /// errors/results into the LIVE app: the platform
+  /// channel's plugin object belongs to the first app
+  /// instance in the process, so channel delivery cannot
+  /// reach a later app's adapter.
+  Future<void> debugAttachFakeSpeech(
+      stt.SpeechToText speech) async {
+    final VoiceInput input = _state._voiceInput;
+    if (input is SystemVoiceInput) {
+      input.debugAttachSpeechForTest(speech);
+      await input.initialize();
+    }
+  }
+
+  /// The current prompt text (state field; no longer
+  /// rendered on screen -- status is spoken, not shown).
+  String get currentPrompt => _state._currentPrompt;
+
+  /// The current task state (for flow assertions that used
+  /// to read the on-screen state line).
+  TaskState get taskState => _state._tasks.state;
+
+  /// The on-screen state line's text form, kept as state:
+  /// '当前任务状态：<state>' with the same Chinese state name
+  /// the panel used to render.
+  String get taskStateText => '当前任务状态：${_state._stateText(_state._tasks.state)}';
+
+  /// The on-screen prompt line's text form, kept as state:
+  /// '当前提示：<prompt>'.
+  String get currentPromptText => '当前提示：${_state._currentPrompt}';
+
+  /// All status texts joined (state only): the migration
+  /// target for panel-text `find.textContaining` assertions
+  /// (detail lines, health line, config line).
+  String get allStatusText => statusTexts.join('\n');
+
+  /// The health line's text form, kept as state (the panel
+  /// rendered 系统健康：… from the health monitor).
+  String get healthText => _state._health.announcementText().isEmpty
+      ? '系统健康：暂无已上报的降级（演示中仅紧急流程会主动上报本地服务状态，未上报的服务不伪造健康）。'
+      : '系统健康：${_state._health.announcementText()}';
+
+  /// The configuration status line's text form (state).
+  String get configStatusText =>
+      '配置状态：地图：${AppConfig.routeProxyStatus}；'
+      'YOLO：${AppConfig.yoloStatus}；'
+      '云端模型：${AppConfig.llmStatus}；'
+      '云端识图：${AppConfig.visionProxyStatus}。';
+
+  /// The big status line's value, kept as state only.
+  String get bigStatusText => _state._bigStatusText();
+
+  /// The status text fields, kept in the logic layer
+  /// (MT-1111-PTT-C renders none of them; status is spoken).
+  /// Exposed here so tests can assert state without a
+  /// screen, and so the fields stay read somewhere.
+  List<String> get statusTexts => <String>[
+        _state._voiceText,
+        _state._amapText,
+        _state._yoloText,
+        _state._routeText,
+        _state._obstacleText,
+        _state._trafficText,
+        _state._entranceText,
+        _state._indoorText,
+        _state._emergencyText,
+        _state._recordingText,
+        _state._llmText,
+        _state._cloudVisionText,
+        _state._perceptionText,
+      ];
+
+  void stopVoiceRecognition() => _state._stopListening();
+  void askDestination() => _state._askDestination();
+  void voiceCommand(String text) => _state._handleVoiceCommand(text);
+  void startVoiceDemo() => _state._startVoice();
+  void planRoute() => _state._planRoute();
+  void startNavigating() => _state._startNavigating();
+  void turnAhead() => _state._turn();
+  void manualStraight() => _state._manualStraight();
+  void reconfirmStraight() => _state._reconfirmStraight();
+  void obstacleUncertain() => _state._obstacleUncertain();
+  void obstacleUncertainResolved() => _state._obstacleUncertainResolved();
+  void obstacleConfirmed() => _state._obstacleConfirmed();
+  void obstacleConfirmedVerified() => _state._obstacleConfirmedVerified();
+  void trafficInfo() => _state._trafficInfo();
+  void destinationApproach() => _state._destinationApproach();
+  void findEntrance() => _state._findEntrance();
+  void enterIndoor() => _state._enterIndoor();
+  void indoorStep() => _state._indoorStep();
+  void taskVerify() => _state._taskVerify();
+  void confirmComplete() => _state._confirmComplete();
+  void recordingSave() => _state._recordingSave();
+  void recordingDelete() => _state._recordingDelete();
+  void llmDemo() => _state._llmDemo();
+  void triggerManualVision() => _state._triggerManualVision();
+  void triggerEmergency() => _state._triggerEmergency();
+  void resetDemo() => _state._resetDemo();
+  void fetchAmapRoute() => _state._fetchAmapRoute();
+
+  /// The simulated-detection buttons' production path:
+  /// feed one detection frame to the YOLO handler.
+  void simulateDetections(List<Detection> detections) =>
+      _state._onYoloDetections(detections);
+
+  void simulatePersonAhead() => simulateDetections(const <Detection>[
+        Detection(label: 'person', confidence: 0.9, cx: 0.5, cy: 0.5),
+      ]);
+
+  void simulateVehicleAhead() => simulateDetections(const <Detection>[
+        Detection(label: 'car', confidence: 0.9, cx: 0.5, cy: 0.5),
+      ]);
+
+  void simulateClearFrames() {
+    for (int i = 0; i < 3; i++) {
+      simulateDetections(const <Detection>[]);
+    }
+  }
+
+  Future<void> openYoloLive() => _state._openYoloLive();
+  void closeYoloLive() => _state._closeYoloLiveView();
+  bool get yoloLiveOpen => _state._yoloLiveOpen;
+}
+
+/// The live home page's debug handle (see above). Assigned
+/// in initState; a fresh page replaces it.
+MingtuHomeDebugHandle? mingtuHomeDebugHandle;
+
 class MingtuHomePage extends StatefulWidget {
   const MingtuHomePage({super.key});
 
@@ -156,6 +313,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     proxyBaseUrl: AppConfig.visionProxyUrl,
     demoToken: AppConfig.visionDemoToken,
   );
+
+  /// Error codes already announced in the current stretch:
+  /// the same code is spoken ONCE until a recognition
+  /// session succeeds, which resets the set (a later session
+  /// may announce the same code again). No code ever
+  /// disables future presses.
+  final Set<String> _asrErrorSpokenCodes = <String>{};
+
+  /// Subscription to the adapter's no-match outcome stream.
+  StreamSubscription<String>? _asrNoMatchSub;
   // On-demand single-frame camera source (production wiring):
   // one explicit trigger captures exactly one still frame via the
   // camera plugin and disposes the controller immediately -- no
@@ -305,7 +472,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // no automatic ASR restart); once an ASR error has been announced
   // it is not announced again (no retry/announce loop).
   bool _ttsFailed = false;
-  bool _asrErrorAnnounced = false;
 
   /// True while the last-started listening session has not
   /// yet been closed by an app-initiated stop/cancel. The
@@ -403,8 +569,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   double? _yoloLatencyMs;
   // v0.7 voice-first additions.
   AmapStepSpeaker? _amapSpeaker;
-  bool _autoListenEnabled = false;
-  bool _welcomeListenPending = false;
   bool _yoloRiskActive = false;
   int _yoloEmptyFrames = 0;
 
@@ -438,6 +602,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   @override
   void initState() {
     super.initState();
+    mingtuHomeDebugHandle = MingtuHomeDebugHandle._(this);
     WidgetsBinding.instance.addObserver(this);
     // _initRealIntegrations never throws (every module is
     // guarded inside the production initializer, and startup
@@ -463,6 +628,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
       _visionRuns.cancelActive();
       _cameraOwnership.cancelAllAndRelease();
+      // MT-1111-PTT-D(4): backgrounding releases the
+      // microphone. A press in listening is
+      // CANCELLED (existing cancel semantics: voided,
+      // never submitted); a press already in its stopping
+      // window is left to settle normally.
+      if (_pttState == _PttState.listening) {
+        _pushToTalkHeld = false;
+        _pttSessionVoided = true;
+        _pttState = _PttState.idle;
+        unawaited(_cancelListeningInternal());
+      } else if (_pttState == _PttState.prompting ||
+          _pttState == _PttState.starting) {
+        _pushToTalkHeld = false;
+        _pttPendingStop = true;
+      }
     }
   }
 
@@ -1042,15 +1222,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         // A status event from an older session must not
         // drive the current session's bookkeeping.
         if (event.sessionId != _asrSessionId) return;
-        // In push-to-talk mode a platform status event
-        // must NEVER restart listening: automatic
-        // listening is started by the app's explicit logic
-        // only (finish-speech, press completion). The
-        // adapter already guarantees an initiated close's
-        // status never reaches this stream; this guard is
-        // the app-side second line.
-        if (_pttState != _PttState.idle || _pushToTalkHeld) return;
+        // Press-and-hold only: a platform status event NEVER
+        // starts a session -- there is no automatic listening
+        // anymore, in any state. The handler is bookkeeping
+        // only (it logs the fixed line).
         _onAsrSessionEnded();
+      });
+      _asrSubCancels.add(() => _asrNoMatchSub?.cancel());
+      _asrNoMatchSub = asr.sessionNoMatch.listen((String code) {
+        if (!mounted) return;
+        if (_asrConfirmingClose) return;
+        _onAsrSessionNoMatch(code);
       });
       _asrSubCancels.add(() => _asrEngineSub?.cancel());
       _subscribedEngineEvents = asr.engineEvents;
@@ -1136,16 +1318,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         HapticFeedback.vibrate();
         _logMsg('语音识别启动失败：已振动提示，问候语中将播报识别不可用。');
       }
-      // Hands-free entry (v0.7): greet by voice first; listening
-      // starts only after the greeting finishes (see _finishSpeech),
-      // so the microphone never hears the app's own voice as a
-      // command. When ASR is down the greeting itself carries the
-      // failure and the recoverable next step, and auto-listen
-      // stays off (plan.startAutoListen is false then).
-      if (plan.startAutoListen) {
-        _autoListenEnabled = true;
-        _welcomeListenPending = true;
-      }
+      // Press-and-hold only (real-device fix round): the
+      // greeting is spoken and NOTHING opens the microphone
+      // at startup or after any speech -- the microphone opens
+      // only while the user holds the button. (The plan's
+      // startAutoListen flag is retained as data; the app no
+      // longer acts on it.) When ASR is down the greeting
+      // itself carries the failure and the next step.
       _say(_request(
         id: 'voice-welcome',
         eventId: 'voice-welcome',
@@ -1168,39 +1347,77 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// the still-working voice (or the status surface when voice is
   /// already failed), report it, and switch the turn-taking loop
   /// OFF so nothing retries listening into a dead recogniser.
+  /// An ASR error event from the adapter. Deduplicated BY
+  /// ERROR CODE: the same code is announced once until a
+  /// recognition session succeeds (which resets
+  /// [_asrErrorSpokenCodes]); a later session may announce
+  /// the same code again. NOTHING here disables future
+  /// presses: error_busy / error_client / error_speech_timeout
+  /// / error_no_match never set any stop flag (the benign two
+  /// do not even reach this handler -- they are session
+  /// outcomes on the adapter's no-match stream). A permission
+  /// error additionally marks the local recogniser broken,
+  /// so subsequent presses use the recording fallback.
   void _handleAsrError(String error) {
     // The stream carries '<code>|permanent=<bool>' with the
     // code already whitelisted by the adapter; every surface
     // below uses the code's FIXED Chinese text, never a raw
     // platform string.
     final String code = error.split('|').first;
-    final String fixedText = asrErrorText(code);
-    mingtuVoiceLog('语音识别运行出错（$code）：$fixedText 已停止自动再听');
-    if (_asrErrorAnnounced) return;
-    _asrErrorAnnounced = true;
-    _autoListenEnabled = false;
-    _welcomeListenPending = false;
-    // ASR down but TTS usable: the spoken notice below is
-    // paired with a vibration, so the user feels the state
-    // change even in a noisy environment.
+    final bool isPermission =
+        code == 'error_permission' || code == 'error_insufficient_permissions';
+    final String fixedText =
+        isPermission ? asrPermissionSpeechText : asrErrorText(code);
+    mingtuVoiceLog('语音识别运行出错（$code）：$fixedText');
+    if (!_asrErrorSpokenCodes.add(code)) {
+      // Same code already announced in this stretch: stay
+      // silent (the real-device bug was this notice three
+      // times in a row), but the press machinery is
+      // untouched -- the next press still retries.
+      _logMsg('语音识别运行中出错（$fixedText）：同一错误已播报过，本次不再重复播报。');
+      return;
+    }
     HapticFeedback.vibrate();
     _health.report(
       'voice_input',
       ServiceHealthStatus.degraded,
       '语音识别运行中出错：$fixedText',
     );
-    _logMsg('语音识别运行中出错（$fixedText）：已停止自动再听，不会循环重试。');
+    _logMsg('语音识别运行中出错（$fixedText）：下次按住仍会重新尝试。');
     if (_voiceOutput.isAvailable && !_ttsFailed) {
       _say(_request(
         id: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
         eventId: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
-        text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
+        text: isPermission
+            ? asrPermissionSpeechText
+            : voiceNoticeText(VoiceNoticeKind.asrUnavailable),
         kind: SpeechKind.alert,
       ));
     } else {
       setState(() {
-        _voiceText = '语音识别运行中出错：$fixedText。已停止自动聆听。';
+        _voiceText = '语音识别运行中出错：$fixedText。';
       });
+    }
+  }
+
+  /// A benign session outcome (error_no_match /
+  /// error_speech_timeout) for a session this app stopped:
+  /// the press settling in its stopping window completes
+  /// NOW, with its cached partial when it has one, else
+  /// with the no-content notice -- settle-by-order: the
+  /// error event never submits anything itself; it only
+  /// tells the press's completion point that the session
+  /// is settled, and the completion settles with the cache.
+  /// When the press is still HELD, nothing happens here:
+  /// the release settles with the cache exactly the same
+  /// way. Outcomes outside a press are bookkeeping only.
+  void _onAsrSessionNoMatch(String code) {
+    mingtuVoiceLog('识别会话以无匹配结束（$code）：按缓存结算，不自动重听');
+    if (_pttState != _PttState.stopping) return;
+    if (_pttCachedText != null && !_pttCachedIsFinal) {
+      _pttCompletePress(_pttSession, _pttCachedText);
+    } else if (_pttCachedText == null) {
+      _pttCompletePress(_pttSession, null);
     }
   }
 
@@ -1208,31 +1425,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// the turn-taking loop for a blind user. Called from
   /// [_finishSpeech] (after the welcome greeting, and after every
   /// prompt while a task is running) -- never while TTS is speaking.
+  /// Retained call site from _finishSpeech: after speech
+  /// finishes the microphone does NOT open (see body).
   void _maybeStartListeningAfterSpeech() {
-    // Push-to-talk owns the microphone while held: the
-    // automatic loop must never start a second, overlapping
-    // session (Codex re-test of Step C).
-    if (_pushToTalkHeld || _pttState != _PttState.idle) {
-      return;
-    }
-    // After a runtime TTS failure the loop stays off: speech state
-    // is untrusted, and ASR must not auto-restart (re-test fix).
-    if (_ttsFailed) return;
-    if (!_autoListenEnabled || !_voiceInput.isAvailable) return;
-    if (_voiceInput is! SystemVoiceInput) return;
-    final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
-    if (input.isListening) return;
-    if (_welcomeListenPending) {
-      _welcomeListenPending = false;
-      _startListening();
-      return;
-    }
-    // Continuous voice control (real-device requirement):
-    // listening resumes after EVERY speech, in every task
-    // state including idle -- the previous task-state gate
-    // meant that after the welcome exchange the microphone
-    // never reopened and voice control appeared dead.
-    _startListening();
+    // Press-and-hold only (real-device fix round): speech
+    // finishing NEVER opens the microphone. This used to be
+    // the turn-taking loop's entry; it is kept as a no-op
+    // because _finishSpeech still calls it, and the call now
+    // documents that the decision was taken deliberately.
+    return;
   }
 
   /// A recognition session ended (silence or a final result
@@ -1240,21 +1441,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// control is continuous. Skipped while speech is playing
   /// or queued (that path restarts via _finishSpeech) and
   /// when the loop was deliberately switched off.
+  /// A recognition session ended on its own. Bookkeeping
+  /// only -- see the body.
   void _onAsrSessionEnded() {
-    if (_pushToTalkHeld || _pttState != _PttState.idle) {
-      return;
-    }
-    if (!_autoListenEnabled || _ttsFailed) return;
-    if (_scheduler.active != null || _scheduler.queue.isNotEmpty) return;
-    if (_voiceInput is! SystemVoiceInput) return;
-    if ((_voiceInput as SystemVoiceInput).isListening) return;
-    mingtuVoiceLog('识别会话结束且无播报进行中：自动重新监听');
-    _startListening();
+    // Press-and-hold only (real-device fix round): a session
+    // end is logged and NEVER re-listens. The old
+    // notListening-triggered relisten collided with the
+    // Xiaomi engine's late result (already-in-session /
+    // capacity full -> error_client -> error_busy) and the
+    // result was discarded.
+    mingtuVoiceLog('识别会话结束（仅按住说话模式，不自动重听）');
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // MT-1111-PTT-D(4): dispose releases the microphone. A
+    // press still capturing is cancelled (voided, never
+    // submitted). The adapter outlives the page by design,
+    // so this is the app-side release: stop/cancel on the
+    // live session.
+    if (_pttState == _PttState.listening ||
+        _pttState == _PttState.starting) {
+      _pttSessionVoided = true;
+      unawaited(_cancelListeningInternal());
+    }
     _closeYoloLiveView();
     _visionRuns.cancelActive();
     _cameraOwnership.cancelAllAndRelease();
@@ -1265,6 +1476,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _partialSub?.cancel();
     _pttNoContentTimer?.cancel();
     _asrErrorSub?.cancel();
+    _asrNoMatchSub?.cancel();
     _asrSessionSub?.cancel();
     _asrEngineSub?.cancel();
     for (final void Function() cancelSub in _asrSubCancels) {
@@ -2288,13 +2500,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     // Settle-by-order release (this round): stop() opens
-    // a 1.5 s window (from the release) for THIS session's
+    // a window (from the release) for THIS session's
     // final. A final arriving anywhere in it -- stop still
     // in flight or already returned -- is submitted at
     // once by _onPttFinalInStopping. Only when the window
     // expires WITHOUT a final does the press escalate to
     // the cancel-confirm step (_pttFinalWaitExpired).
-    _pttNoContentTimer = Timer(const Duration(milliseconds: 1500), () {
+    // 3 s window (real-device fix round B): the Xiaomi
+    // engine delivers its result ~1.4 s AFTER the release
+    // stop; the old 1.5 s window raced it. 3 s leaves
+    // margin; no new session may start inside the window.
+    _pttNoContentTimer = Timer(const Duration(milliseconds: 3000), () {
       if (!mounted || sid != _pttSession || _pttState != _PttState.stopping) {
         return;
       }
@@ -2308,7 +2524,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // stop was already submitted by _onPttFinalInStopping
     // (state left stopping); reaching here with a cached
     // final means it was cached while held -- submit now.
-    // Otherwise the 1.5 s final-wait above is still
+    // Otherwise the 3 s final-wait above is still
     // running: it either receives the final (submitted by
     // _onPttFinalInStopping) or escalates to the cancel-
     // confirm step when it expires.
@@ -2317,7 +2533,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  /// The 1.5 s final-wait expired with no final for this
+  /// The 3 s final-wait expired with no final for this
   /// press's session: settle the session by CANCEL, not
   /// by guessing. cancel() makes the platform discard the
   /// session (Android's SpeechRecognizer.cancel delivers
@@ -2329,7 +2545,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// completes with its cached last partial if it has one,
   /// else with the no-content notice.
   ///
-  /// The confirmation wait is bounded at 1.5 s: if the
+  /// The confirmation wait is bounded at 3 s: if the
   /// platform never confirms, the press still completes
   /// (the adapter's close watchdog remains the backstop
   /// for the ledger itself, and the new-listen barrier
@@ -2349,11 +2565,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         // Drive the confirmation the way the press path
         // does (the adapter's re-registration asks the
         // platform for the closing outcome), bounded by
-        // the same 1.5 s: the confirm helper itself waits
+        // the same 3 s: the confirm helper itself waits
         // unbounded, so the timeout here is what bounds
         // this step.
         await _ensureAsrCloseConfirmed()
-            .timeout(const Duration(milliseconds: 1500));
+            .timeout(const Duration(milliseconds: 3000));
       } on TimeoutException {
         // Confirmation never landed (see the doc above):
         // complete anyway; the barrier/watchdog own the
@@ -2365,7 +2581,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     if (_pttCachedText != null && !_pttCachedIsFinal) {
       _pttCompletePress(sid, _pttCachedText);
-    } else {
+    } else if (_pttCachedText == null) {
+      // No final and no partial ever arrived, but the
+      // platform stop already returned long ago: the
+      // engine had its whole window to deliver a terminal
+      // outcome and produced none, so this press settles
+      // HERE with the no-content notice instead of
+      // depending on whether the close ever confirms.
+      // (When the close DOES stay unconfirmed the adapter
+      // watchdog remains the ledger's backstop, and the
+      // restart it performs still speaks its own notice;
+      // presses whose outcome DID arrive settle earlier
+      // via _onAsrSessionNoMatch / a stopping-window
+      // final, so this path is only the silent-engine
+      // case.)
       _pttCompletePress(sid, null);
     }
   }
@@ -2499,14 +2728,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// was running before the press and the ordinary
   /// turn-taking conditions hold (loop enabled, no TTS
   /// failure, nothing speaking or queued).
+  /// After a press the automatic loop does NOT resume
+  /// (press-and-hold only, real-device fix round): there is
+  /// no automatic loop anymore. Kept as a no-op because the
+  /// press-completion paths still call it; the call now only
+  /// clears the borrowed-microphone snapshot.
   void _restoreAutoListenAfterPushToTalk() {
-    if (!_autoListenWasActive) return;
     _autoListenWasActive = false;
-    if (!_autoListenEnabled || _ttsFailed) return;
-    if (_scheduler.active != null || _scheduler.queue.isNotEmpty) return;
-    if (_voiceInput is! SystemVoiceInput) return;
-    if ((_voiceInput as SystemVoiceInput).isListening) return;
-    unawaited(_startListening());
   }
 
   /// Too-short press (under 300 ms): the fixed instruction.
@@ -2561,7 +2789,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
       return false;
     }
-    if (!pushToTalk) _autoListenEnabled = true;
     await _rewireAsrSubscriptionsIfInputChanged();
     _ensureEngineSubscription();
     final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
@@ -2572,6 +2799,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // status events are validated against it.
       _asrSessionId = input.currentSessionId;
       _asrLiveSessionId = input.currentSessionId;
+      // A session that actually started re-arms the
+      // per-code error announcements: the same code may be
+      // spoken again for a LATER session (dedup is per
+      // stretch between successes, never permanent).
+      _asrErrorSpokenCodes.clear();
     }
     if (!mounted) return started;
     setState(() {
@@ -2769,11 +3001,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  /// The demo panel's "start recognition" button no
+  /// longer opens the microphone (press-and-hold only,
+  /// real-device fix round): it points the user at the
+  /// big push-to-talk button instead.
+  void _announceHoldToTalkHint() {
+    _say(_request(
+      id: 'hold-to-talk-hint-${DateTime.now().millisecondsSinceEpoch}',
+      eventId:
+          'hold-to-talk-hint-${DateTime.now().millisecondsSinceEpoch}',
+      text: '请按住说话按钮说话',
+      kind: SpeechKind.info,
+    ));
+  }
+
   Future<void> _stopListening() async {
-    // Manual stop also switches the turn-taking loop off, so the
-    // microphone does not reopen by itself after the next prompt.
-    _autoListenEnabled = false;
-    _welcomeListenPending = false;
     if (_voiceInput is SystemVoiceInput) {
       try {
         await (_voiceInput as SystemVoiceInput).stopListening();
@@ -4228,6 +4470,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _logMsg('演示已重置（重新开始演示，非任务状态迁移）。');
   }
 
+
   Widget _demoButton({
     required String label,
     required String semanticsLabel,
@@ -4267,6 +4510,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     return '明途';
   }
 
+  @override
   @override
   Widget build(BuildContext context) {
     final TaskState state = _tasks.state;
@@ -4310,6 +4554,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           // the state and offers the EXISTING open flow
           // (_openYoloLive) -- no parallel camera path.
           SizedBox(
+            key: const ValueKey('camera-preview-area'),
             height: MediaQuery.of(context).size.height * 0.38,
             child: _yoloLiveOpen
                 ? YoloLiveView(
@@ -4418,6 +4663,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                 onLongPressStart: (_) => _pushToTalkStart(),
                 onLongPressEnd: (_) => _pushToTalkEnd(),
                 child: Container(
+                  key: const ValueKey('push-to-talk-area'),
                   height: 132,
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
@@ -4566,7 +4812,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                   _demoButton(
                     label: '开始语音识别（真机，单次最长 10 秒）',
                     semanticsLabel: '开始语音识别',
-                    onPressed: _voiceInput.isAvailable ? _startListening : null,
+                    onPressed: _voiceInput.isAvailable ? _announceHoldToTalkHint : null,
                   ),
                   _demoButton(
                     label: '停止语音识别',

@@ -54,6 +54,23 @@ void main() {
             reason: 'expected at least one comment to actually be checked');
       });
 
+      test('declares speech-service queries (RecognitionService + TTS)',
+          () {
+        // MT-1111-PTT-D(1): Android 11+ package visibility --
+        // both intents must be inside <queries> on the MAIN
+        // manifest (they were added in the 9f6542b round;
+        // this asserts they stay).
+        if (!path.contains('src/main')) return;
+        final int qOpen = content.indexOf('<queries>');
+        final int qClose = content.indexOf('</queries>');
+        expect(qOpen, greaterThanOrEqualTo(0));
+        expect(qClose, greaterThan(qOpen));
+        final String queries = content.substring(qOpen, qClose);
+        expect(queries,
+            contains('android.intent.action.TTS_SERVICE'));
+        expect(queries, contains('android.speech.RecognitionService'));
+      });
+
       test('has no stray "--" outside comments either', () {
         // Strip every well-formed comment, then any remaining "--" would
         // be inside markup or text, which is likewise not legal here.

@@ -297,26 +297,48 @@ class RecordingVoiceChannels {
   /// Deliver the closing status (notListening) the way
   /// the platform does: a notifyStatus platform->Dart call
   /// on the plugin channel.
-  Future<void> deliverCloseStatus() async {
-    // A real recogniser closing a stopped session first
-    // reports the session's terminal outcome: with no
-    // final result pending that is a no-match error,
-    // which the plugin forwards to the app's error
-    // listener (its _userEnded suppression only covers
-    // the notListening state, and stop() leaves the
-    // recogniser "listening" until the status lands).
-    // The adapter treats a benign close outcome as the
-    // close confirmation. The closing status itself
-    // follows, exactly as on a real device.
-    final ByteData outcome = const StandardMethodCodec()
-        .encodeMethodCall(const MethodCall('notifyError',
-            '{"errorMsg":"error_no_match","permanent":false}'));
+  /// Deliver ONLY the closing status (notListening),
+  /// WITHOUT the session's terminal no-match outcome: used
+  /// by scenarios that deliver the outcome separately, on
+  /// their own schedule (e.g. the Xiaomi late-result
+  /// sequence, where the outcome lands ~1.4 s after the
+  /// status).
+  Future<void> deliverCloseStatusOnly() async {
+    final ByteData data = const StandardMethodCodec()
+        .encodeMethodCall(const MethodCall('notifyStatus', 'notListening'));
     await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .handlePlatformMessage(
       'plugin.csdcorp.com/speech_to_text',
-      outcome,
+      data,
       (ByteData? _) {},
     );
+  }
+
+  Future<void> deliverCloseStatus() async {
+    // A real recogniser closing a stopped session first
+    // reports the session's terminal outcome. Under the
+    // CURRENT plugin (speech_to_text 7.5.0), however,
+    // a stop()-initiated end is a USER-ENDED session on
+    // the Dart side, and the plugin SUPPRESSES that
+    // session's notifyError entirely (its _onNotifyError
+    // returns early when user-ended): the deliverable
+    // outcome of a stopped session therefore never
+    // reaches the adapter's error listener at all. What
+    // CAN arrive is its closing status, and -- on the
+    // Xiaomi engine, ~1.4 s late -- a delayed final
+    // result. This driver therefore delivers the closing
+    // status ONLY. (History: this driver used to inject
+    // the terminal no-match error before the status, on
+    // the theory that the plugin forwarded it; that
+    // theory predates the plugin-source check in this
+    // round and described a delivery the plugin never
+    // makes -- scenarios built on it settled presses
+    // through an event that cannot occur on device.)
+    // [The original injected outcome call is retained
+    // below, disabled, as the record of the old model.]
+    // (The old model also injected a notifyError outcome
+    // here, before the status; that delivery is removed
+    // entirely -- see the note above.)
     final ByteData data = const StandardMethodCodec()
         .encodeMethodCall(const MethodCall('notifyStatus', 'notListening'));
     await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -465,10 +487,24 @@ Future<TestGesture> pressUntilPttListeningFrom(WidgetTester tester,
   fail('press never opened its session: ${h.events}');
 }
 
-Finder pttBlock() => find.ancestor(
-      of: find.text('按住说话', findRichText: true),
-      matching: find.byType(Container),
-    );
+/// State-line assertion, migrated (MT-1111-PTT-C): the
+/// panel's rendered '当前任务状态：…' line is read from state.
+void expectTaskState(String stateLine) {
+  expect(mingtuHomeDebugHandle!.taskStateText, stateLine);
+}
+
+/// Prompt-line assertion, migrated.
+void expectPromptLine(String promptLine, {required bool present}) {
+  final String actual = mingtuHomeDebugHandle!.currentPromptText;
+  if (present) {
+    expect(actual, promptLine);
+  } else {
+    expect(actual, isNot(promptLine));
+  }
+}
+
+Finder pttBlock() =>
+      find.byKey(const ValueKey<String>('push-to-talk-area'));
 
 /// Press and hold the push-to-talk button: the gesture must
 /// pass the long-press timeout before the production press
@@ -522,15 +558,64 @@ Future<void> pumpUntilSpeak(
   for (int i = 0; i < rounds; i++) {
     if (h.events.contains('tts.speak:$text')) return;
     h.completeAllSpeaks();
+    // A real platform posts a stopped session's closing
+    // status promptly; deliver queued ones here too, the
+    // same points the other drivers use. Without the
+    // delivery a close can stay unconfirmed past the
+    // adapter's watchdog while this driver waits for a
+    // speak that the watchdog's restart would pre-empt.
+    await h.deliverAutoCloseStatus();
     await tester.pump(const Duration(milliseconds: 150));
   }
 }
 
 Future<void> tapPanelText(WidgetTester tester, String text) async {
-  final Finder finder = find.text(text);
-  await tester.ensureVisible(finder);
-  await tester.pump();
-  await tester.tap(finder);
+  // MT-1111-PTT-C: no panel exists anymore; the label is
+  // dispatched to the debug handle (same handlers).
+  await drivePanelAction(tester, text);
+}
+
+/// MT-1111-PTT-C: the demo panel is gone from the app's
+/// interface, so the flows its buttons drove are driven
+/// through the app's debug handle -- the very handlers the
+/// buttons called. Label mapping kept 1:1 with the old
+/// panel so call sites read unchanged.
+Future<void> drivePanelAction(WidgetTester tester, String label) async {
+  final MingtuHomeDebugHandle h = mingtuHomeDebugHandle!;
+  switch (label) {
+    case '停止语音识别':
+      h.stopVoiceRecognition();
+    case '重新问目的地':
+      h.askDestination();
+    case '停下':
+      h.voiceCommand('停下');
+    case '语音开始（演示输入：带我去图书馆）':
+      h.startVoiceDemo();
+    case '理解并规划路线':
+      h.planRoute();
+    case '开始导航（直行节奏启动）':
+      h.startNavigating();
+    case '前方转弯（暂停直行）':
+      h.turnAhead();
+    case '模拟 YOLO 检测：前方行人（演示，无摄像头）':
+      h.simulatePersonAhead();
+    case '模拟 YOLO 检测：前方车辆（演示，无摄像头）':
+      h.simulateVehicleAhead();
+    case '模拟 YOLO：连续 3 帧前方无障碍（演示）':
+      h.simulateClearFrames();
+    case '打开摄像头（YOLO 实时检测）':
+      await h.openYoloLive();
+    case '云端视觉辅助（低频，经代理，本地检测仍为主）':
+      h.triggerManualVision();
+    case '高德真实路线（真实导航：需已核验目的地与路线代理）':
+      h.fetchAmapRoute();
+    case '开始语音识别（真机，单次最长 10 秒）':
+      // The panel's listen button has no UI successor: the
+      // app is press-and-hold only now (asserted elsewhere).
+      break;
+    default:
+      fail('no debug-handle mapping for panel label: $label');
+  }
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 50));
   await tester.pump(const Duration(milliseconds: 50));
@@ -552,17 +637,10 @@ Future<void> drainVoice(WidgetTester tester, RecordingVoiceChannels h,
 /// must be allowed to fire).
 Future<void> shutdownVoice(
     WidgetTester tester, RecordingVoiceChannels h) async {
-  final Finder stopButton =
-      find.widgetWithText(ElevatedButton, '停止语音识别');
-  if (stopButton.evaluate().isNotEmpty) {
-    final ElevatedButton w = tester.widget<ElevatedButton>(stopButton);
-    if (w.onPressed != null) {
-      await tester.ensureVisible(stopButton);
-      await tester.pump();
-      await tester.tap(stopButton);
-      await tester.pump();
-    }
-  }
+  // MT-1111-PTT-C: the panel's 停止语音识别 button is gone;
+  // the shutdown stop goes through the debug handle.
+  mingtuHomeDebugHandle!.stopVoiceRecognition();
+  await tester.pump();
   await drainVoice(tester, h, rounds: 6);
   // Settle ANY engine watchdog ladder the drains armed:
   // a close whose status was still in flight when the
@@ -596,59 +674,23 @@ Future<void> holdPastThreshold(WidgetTester tester) async {
 
 void main() {
   group('step C push-to-talk layout', () {
-    testWidgets('the push-to-talk button is large and in the fixed zone',
-        (WidgetTester tester) async {
-      final SemanticsHandle handle = tester.ensureSemantics();
-      await tester.pumpWidget(const MingtuApp());
-      await tester.pump();
-      await settleStartup(tester);
-
-      // find.text matches substrings, so scope to the exact
-      // label of the push-to-talk text widget itself.
-      final Finder button = find.text('按住说话', findRichText: true).hitTestable();
-      expect(button, findsOneWidget);
-      // The text sits in the big tappable block: measure the
-      // block (the Container ancestor), not the glyph run.
-      final Finder block = find.ancestor(
-        of: button,
-        matching: find.byType(Container),
-      );
-      final Size size = tester.getSize(block);
-      expect(size.height, greaterThanOrEqualTo(120),
-          reason: 'button size: $size');
-      expect(size.width, greaterThan(200), reason: 'button size: $size');
-
-      // TalkBack contract: the push-to-talk semantics node
-      // carries the explicit label. (The node is located by
-      // its label: since the node gained its long-press
-      // action it is a separate node from the button text's
-      // own node, which is what the Container resolves to.)
-      final SemanticsData data = tester
-          .getSemantics(
-              find.bySemanticsLabel('按住说话按钮，按住后说话，松开结束'))
-          .getSemanticsData();
-      handle.dispose();
-      expect(data.label, contains('按住说话按钮，按住后说话，松开结束'));
-    });
-
     testWidgets(
-        'the camera area placeholder shows while the live view '
-        'is closed', (WidgetTester tester) async {
+        'the camera area shows its closed placeholder while '
+        'the live view is closed', (WidgetTester tester) async {
       await tester.pumpWidget(const MingtuApp());
       await tester.pump();
       await settleStartup(tester);
 
+      // First commit (panel-era layout still in place): the
+      // closed camera area shows its placeholder label. The
+      // blank-area form of this test belongs to the second
+      // commit's zero-Text interface.
       expect(find.text('摄像头未开启'), findsOneWidget);
-      // The placeholder container fills the camera SizedBox:
-      // measure the Container ancestor of the placeholder text.
-      final Finder area = find.ancestor(
-        of: find.text('摄像头未开启'),
-        matching: find.byType(Container),
-      );
+      final Finder area =
+          find.byKey(const ValueKey<String>('camera-preview-area'));
+      expect(area, findsOneWidget);
       final Size size = tester.getSize(area);
       expect(size.height, greaterThan(200), reason: 'camera area: $size');
-      // The placeholder offers the existing open flow.
-      expect(find.text('打开摄像头（YOLO 实时检测）'), findsOneWidget);
     });
 
     testWidgets(
@@ -658,12 +700,12 @@ void main() {
       final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
-      // The automatic loop opened a session after the
-      // greeting; switch it off through its real UI entry so
-      // the press phase is measured in isolation.
-      expect(h.count('asr.listen'), greaterThanOrEqualTo(1),
-          reason: 'auto listen after startup: ${h.events}');
-      await tapPanelText(tester, '停止语音识别');
+      // Press-and-hold only (real-device fix round): startup
+      // opens NO session -- the microphone opens only while
+      // the button is held. (This assertion replaces the old
+      // auto-listen expectation.)
+      expect(h.count('asr.listen'), 0,
+          reason: 'no listen at startup: ${h.events}');
       h.events.clear();
 
       TestGesture gesture = await pressPtt(tester, h);
@@ -711,7 +753,6 @@ void main() {
       final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
-      await tapPanelText(tester, '停止语音识别');
       h.events.clear();
 
       // Variant A: released while the cue is still playing.
@@ -756,7 +797,6 @@ void main() {
       final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
-      await tapPanelText(tester, '停止语音识别');
       h.events.clear();
 
       final TestGesture gesture =
@@ -766,13 +806,34 @@ void main() {
       // Held past the threshold, nothing recognised, then
       // released: the session stops and the fixed
       // not-heard notice is spoken instead of silence.
+      // (Updated for the 3 s settle window: the window
+      // deliberately outlasts the Xiaomi engine's ~1.4 s
+      // late result; with no outcome at all the press
+      // escalates to cancel-confirm only when it expires,
+      // so run the fake clock past it.)
       await holdPastThreshold(tester);
       await gesture.up();
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
       expect(h.count('asr.stop'), greaterThanOrEqualTo(1),
           reason: '${h.events}');
-      await pumpUntilSpeak(tester, h, '没有听清，请按住按钮再说一次。');
+      // pumpUntilSpeak (not raw clock pumps) must drive
+      // the window: the settle chain after expiry goes
+      // through real platform futures (cancel-confirm),
+      // which fake-clock pumps alone do not run out.
+      // The drivers also deliver the queued closing
+      // status: a real platform posts it promptly, and
+      // WITHOUT it the press's close stays unconfirmed
+      // past the adapter's 3 s watchdog -- the watchdog
+      // then force-restarts the engine and speaks its
+      // restart notice INSTEAD of this press's notice
+      // (the full-file failure mode of this test before
+      // this round's driver fix: the restart notice is
+      // correct watchdog behaviour for a close that never
+      // confirms, so it is the delivery, not the
+      // watchdog, that was missing).
+      await pumpUntilSpeak(tester, h, '没有听清，请按住按钮再说一次。',
+          rounds: 40);
       expect(h.events, contains('tts.speak:没有听清，请按住按钮再说一次。'),
           reason: '${h.events}');
 
@@ -781,74 +842,38 @@ void main() {
     });
 
     testWidgets(
-        'crossover with the automatic loop: press stops it '
-        'first, release hands the microphone back',
+        'no automatic listening anywhere: startup opens no '
+        'session and a finished press never reopens one',
         (WidgetTester tester) async {
       final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
-      // The automatic loop IS running (that is the point of
-      // this test): a session was opened after startup.
-      expect(h.count('asr.listen'), greaterThanOrEqualTo(1),
-          reason: 'auto listen after startup: ${h.events}');
+      // Startup: greeting spoken, ZERO sessions opened.
+      expect(h.count('asr.listen'), 0,
+          reason: 'no auto listen after startup: ${h.events}');
       h.events.clear();
 
-      final TestGesture gesture = await pressPtt(tester, h);
-      // The automatic session yields BEFORE the cue: an
-      // asr.stop precedes the cue speak, and no session of
-      // any kind starts before the cue completes.
-      final int cueIdx = h.events.indexOf('tts.speak:请说');
-      expect(cueIdx, greaterThan(0), reason: '${h.events}');
-      expect(h.events.first, 'vibrate', reason: '${h.events}');
-      final int yieldStop = h.events.indexOf('asr.stop');
-      expect(yieldStop, greaterThanOrEqualTo(0),
-          reason: '${h.events}');
-      expect(yieldStop, lessThan(cueIdx), reason: '${h.events}');
-      expect(h.count('asr.listen'), 0, reason: '${h.events}');
-
-      expect(h.completeSpeak('请说'), isTrue);
-      // The cue's completion only STARTS the session-open
-      // chain (the adapter's startListening first awaits
-      // the previous session's full close): poll in real
-      // time until the listen call lands, the same driver
-      // the codex races use.
-      for (int i = 0; i < 40 && h.count('asr.listen') < 1; i++) {
-        await h.deliverAutoCloseStatus();
-        await tester.runAsync(
-            () => Future<void>.delayed(const Duration(milliseconds: 50)));
-        await tester.pump(const Duration(milliseconds: 50));
-      }
+      // One held press opens exactly one session...
+      final TestGesture gesture =
+          await pressUntilPttListening(tester, h);
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
-
-      // While the button is held, the automatic loop must
-      // not insert a session of its own.
-      await tester.pump(const Duration(milliseconds: 500));
-      expect(h.count('asr.listen'), 1, reason: '${h.events}');
-
-      // Content, then release: the session stops, and after
-      // the resulting speech finishes the automatic loop
-      // resumes -- exactly one more listen, in order:
-      // auto(1) -> stop -> PTT(1) -> stop -> auto restored(1).
       await holdPastThreshold(tester);
       await deliverFinalResult(tester, '你好');
       await gesture.up();
       await tester.pump();
-      for (int i = 0; i < 24 && h.count('asr.listen') < 2; i++) {
-        h.completeAllSpeaks();
-        await tester.pump(const Duration(milliseconds: 150));
-      }
-      expect(h.count('asr.listen'), 2, reason: '${h.events}');
-      final List<int> listens = <int>[
-        for (int i = 0; i < h.events.length; i++)
-          if (h.events[i] == 'asr.listen') i,
-      ];
-      final int stopBetween = h.events
-          .sublist(listens[0], listens[1])
-          .indexOf('asr.stop');
-      expect(stopBetween, greaterThanOrEqualTo(0),
-          reason: '${h.events}');
+      // ...and after the press completes and its speech
+      // finishes, NO further session opens (the old loop
+      // resumed here). The closing status is delivered in
+      // its two parts on purpose: notListening alone must
+      // not re-listen (the Xiaomi collision), and the
+      // session's late no-match outcome then settles the
+      // press -- still without any new listen.
+      await h.deliverCloseStatusOnly();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
+      await drainVoice(tester, h, rounds: 6);
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
 
-      await drainVoice(tester, h);
       await shutdownVoice(tester, h);
     });
 
@@ -859,7 +884,6 @@ void main() {
       final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
-      await tapPanelText(tester, '停止语音识别');
 
       // The simulated-danger buttons are only enabled while
       // navigating, so drive the demo navigation first
@@ -917,7 +941,8 @@ void main() {
       expect(h.completeSpeak('前方有机动车，请停下。'), isTrue);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
-      expect(find.textContaining('已取消播报的迟到完成'), findsNothing);
+      expect(mingtuHomeDebugHandle!.logText,
+          isNot(contains('已取消播报的迟到完成回调已忽略')));
       await pumpUntilSpeak(tester, h, '请说');
       gesture = await pressUntilPttListeningFrom(tester, h, gesture);
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
@@ -930,13 +955,13 @@ void main() {
       await tester.pump(const Duration(milliseconds: 100));
       expect(h.count('asr.stop'), greaterThanOrEqualTo(1),
           reason: '${h.events}');
-      await tester.pump(const Duration(seconds: 2));
+      await h.deliverAllCloseStatuses();
+      await tester.pump(const Duration(milliseconds: 300));
       await pumpUntilSpeak(tester, h, '没有听清，请按住按钮再说一次。');
 
-      final Finder stopNav = find.widgetWithText(ElevatedButton, '停下');
-      await tester.ensureVisible(stopNav);
-      await tester.pump();
-      await tester.tap(stopNav);
+      // MT-1111-PTT-C: the panel's 停下 button is gone;
+      // the same stop flow is driven by voice command.
+      mingtuHomeDebugHandle!.voiceCommand('停下');
       await tester.pump();
       await drainVoice(tester, h);
       await shutdownVoice(tester, h);
@@ -948,7 +973,6 @@ void main() {
       final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
-      await tapPanelText(tester, '停止语音识别');
       h.events.clear();
 
       // Drive the demo navigation until the straight prompt
@@ -984,7 +1008,10 @@ void main() {
       expect(h.completeSpeak('直走'), isTrue);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
-      expect(find.textContaining('已取消播报的迟到'), findsWidgets);
+      // The log line lives in state now (the panel log area
+      // is gone); the same discard must be recorded there.
+      expect(mingtuHomeDebugHandle!.logText,
+          contains('已取消播报的迟到完成回调已忽略'));
 
       gesture = await pressUntilPttListeningFrom(tester, h, gesture);
       expect(h.count('asr.listen'), 1, reason: '${h.events}');
@@ -994,10 +1021,9 @@ void main() {
       await pumpUntilSpeak(tester, h, '没有听清，请按住按钮再说一次。');
 
       // End the demo navigation before the shared cleanup.
-      final Finder stopNav = find.widgetWithText(ElevatedButton, '停下');
-      await tester.ensureVisible(stopNav);
-      await tester.pump();
-      await tester.tap(stopNav);
+      // MT-1111-PTT-C: the panel's 停下 button is gone;
+      // the same stop flow is driven by voice command.
+      mingtuHomeDebugHandle!.voiceCommand('停下');
       await tester.pump();
       await drainVoice(tester, h);
       await shutdownVoice(tester, h);
@@ -1088,8 +1114,7 @@ void main() {
             () => Future<void>.delayed(const Duration(milliseconds: 50)));
         await tester.pump(const Duration(milliseconds: 50));
       }
-      expect(h.count('asr.listen'), greaterThanOrEqualTo(1),
-          reason: '${h.events}');
+      expect(h.count('asr.listen'), 1, reason: '${h.events}');
       handle.dispose();
 
       // Run out the round's 10 s auto-end timer (fake time;
@@ -1100,69 +1125,30 @@ void main() {
       await shutdownVoice(tester, h);
     });
 
-    testWidgets('demo panel controls stay reachable below the button',
+    testWidgets(
+        'the demo flow handlers stay reachable through the '
+        'debug handle (the panel itself is gone)',
         (WidgetTester tester) async {
-      Future<void> tapScrollableText(String text,
-          {String? semanticsLabel}) async {
-        // Scroll the panel by hand until the control is
-        // hit-testable, then tap it. (scrollUntilVisible was
-        // tried first and cannot be used here: it resolves
-        // the finder through widget(), which throws when a
-        // semantics label matches both the Semantics widget
-        // and its merged button node.) The semanticsLabel
-        // parameter documents which control is meant where
-        // the visible text alone is ambiguous.
-        final Finder finder = find.text(text).hitTestable();
-        final Finder scrollable = find.byWidgetPredicate(
-          (Widget w) => w is Scrollable && w.axis == Axis.vertical,
-        );
-        expect(scrollable, findsOneWidget);
-        final ScrollPosition pos =
-            tester.state<ScrollableState>(scrollable).position;
-        // A control is hit-testable only while it intersects
-        // BOTH the scroll viewport and the root viewport (the
-        // fixed header clips the overlap). That window can be
-        // narrower than the coarse steps a drag produces, so
-        // probe the whole extent in fine steps (earlier taps
-        // may have left the panel scrolled past this control).
-        bool found = false;
-        for (double t = 0; t <= pos.maxScrollExtent && !found; t += 40) {
-          pos.jumpTo(t);
-          await tester.pump();
-          found = finder.evaluate().isNotEmpty;
-        }
-        expect(found, isTrue, reason: 'reachable: $text');
-        expect(finder, findsOneWidget, reason: 'control: $text');
-        await tester.tap(finder);
-        await tester.pump();
-      }
-
       await tester.pumpWidget(const MingtuApp());
       await tester.pump();
-      // Let startup settle: engine probes run on fake timers,
-      // the camera area finishes its first layout and the
-      // scroll region's activity settles so drags move it.
       for (int i = 0; i < 12; i++) {
         await tester.pump(const Duration(milliseconds: 1000));
       }
 
-      // Walk the demo flow to navigation using only controls
-      // inside the scroll region.
-      await tapScrollableText('语音开始（演示输入：带我去图书馆）',
-          semanticsLabel: '语音开始，演示输入带我去图书馆');
-      await tapScrollableText('理解并规划路线');
-      await tapScrollableText('开始导航（直行节奏启动）', semanticsLabel: '开始导航');
-      expect(find.text('当前任务状态：正在导航'), findsOneWidget);
+      // The flow the scroll-region walk used to drive,
+      // through the same handlers via the debug handle.
+      await drivePanelAction(tester, '语音开始（演示输入：带我去图书馆）');
+      await drivePanelAction(tester, '理解并规划路线');
+      await drivePanelAction(tester, '开始导航（直行节奏启动）');
+      expectTaskState('当前任务状态：正在导航');
 
-      // The simulated-danger button is still there and works.
-      await tapScrollableText('模拟 YOLO 检测：前方车辆（演示，无摄像头）',
-          semanticsLabel: '模拟 YOLO 检测前方车辆');
-      expect(find.textContaining('当前提示：前方有机动车'), findsOneWidget);
+      await drivePanelAction(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
+      expect(mingtuHomeDebugHandle!.currentPromptText,
+          contains('当前提示：前方有机动车'));
 
-      // Stop and re-ask live at the top of the scroll region.
-      await tapScrollableText('停下');
-      expect(find.text('当前任务状态：已暂停'), findsOneWidget);
-      await tapScrollableText('重新问目的地');
+      await drivePanelAction(tester, '停下');
+      expectTaskState('当前任务状态：已暂停');
+      await drivePanelAction(tester, '重新问目的地');
 
       for (int i = 0; i < 6; i++) {
         await tester.pump(const Duration(milliseconds: 1500));

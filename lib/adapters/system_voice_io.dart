@@ -228,6 +228,8 @@ class SystemVoiceInput implements VoiceInput {
       StreamController<AsrResultEvent>.broadcast();
   final StreamController<String> _errorController =
       StreamController<String>.broadcast();
+  final StreamController<String> _noMatchController =
+      StreamController<String>.broadcast();
   final StreamController<AsrStatusEvent> _sessionEndController =
       StreamController<AsrStatusEvent>.broadcast();
   final StreamController<String> _engineController =
@@ -235,6 +237,7 @@ class SystemVoiceInput implements VoiceInput {
   bool _available = false;
   String _detail = '未初始化';
   bool _listening = false;
+
 
   SystemVoiceInput([stt.SpeechToText? speech]) : _speech = speech;
 
@@ -260,11 +263,23 @@ class SystemVoiceInput implements VoiceInput {
   /// announcing it once and stopping the retry loop.
   Stream<String> get errors => _errorController.stream;
 
+  /// Session-outcome notices for the benign close codes
+  /// (error_no_match / error_speech_timeout). These are NOT
+  /// errors and never travel on [errors]; but the
+  /// press-and-hold completion needs to KNOW a stopped
+  /// session settled with no match -- on the Xiaomi engine
+  /// that outcome arrives ~1.4 s AFTER the release stop --
+  /// so the app can settle the press with its cached partial
+  /// (or the no-content notice) at the right moment instead
+  /// of waiting out the full window. Events carry the code
+  /// only; no permanent flag, no retry semantics.
+  Stream<String> get sessionNoMatch => _noMatchController.stream;
+
   /// Fires when a listening session that was actually running
-  /// ends (silence timeout, final result, platform stop). The
-  /// app's continuous-listen loop restarts from here; without
-  /// it, a session that ended in silence left the microphone
-  /// closed forever and voice control appeared dead.
+  /// ends on its own (silence timeout, final result). Status
+  /// events NEVER start a new session: recognition opens only
+  /// from an explicit press (press-and-hold only since the
+  /// real-device fix round removed every automatic listen).
   Stream<AsrStatusEvent> get sessionEnded => _sessionEndController.stream;
 
   /// Set by the owner when this input is being torn
@@ -283,6 +298,21 @@ class SystemVoiceInput implements VoiceInput {
   /// Exposed so tests can tell an in-place re-initialize
   /// of an injected recogniser apart from a fresh engine.
   Object? get engineInstanceForTest => _engineSpeech;
+
+  /// Test-only seam (app-level widget tests): replace the
+  /// recogniser object this adapter drives, so a fake can
+  /// deliver errors/results through the adapter's REAL
+  /// onError/onStatus path into the app. Widget tests need
+  /// this because the platform channel's plugin object
+  /// belongs to the first app instance in the process --
+  /// its captured listeners point at a stale adapter, so
+  /// channel delivery cannot reach the live app's adapter.
+  /// Production code never calls this.
+  void debugAttachSpeechForTest(stt.SpeechToText speech) {
+    _speech = speech;
+    _engineSpeech = speech;
+    _engineIsPluginInstance = false;
+  }
 
   /// The current listen generation: minted once per
   /// startListening() call. Consumers read the generation
@@ -730,7 +760,15 @@ class SystemVoiceInput implements VoiceInput {
           _closeErrorConsumed++;
           if (_benignCloseErrorCodes.contains(code) &&
               !error.permanent) {
-            // Consumed as the close; see the note above.
+            // Consumed as the close -- and reported as this
+            // session's no-match OUTCOME on its own stream,
+            // so a press settling in its stopping window
+            // learns the session ended without a final
+            // (the Xiaomi engine delivers exactly this,
+            // late). It is still not an error.
+            if (!_noMatchController.isClosed) {
+              _noMatchController.add(code);
+            }
             return;
           }
         }
@@ -738,9 +776,13 @@ class SystemVoiceInput implements VoiceInput {
             !error.permanent) {
           // A routine outcome, not a failure (see
           // _benignCloseErrorCodes): the session simply
-          // ended without speech. Its sessionEnded flow
-          // (the status that follows) drives the app's
-          // relisten; nothing is reported as an error.
+          // ended without speech. Reported as an outcome on
+          // [sessionNoMatch] (a held press settles with its
+          // cached partial at release); never an error, and
+          // no status event may start a new session.
+          if (!_noMatchController.isClosed) {
+            _noMatchController.add(code);
+          }
           return;
         }
         if (!_errorController.isClosed) {
@@ -950,7 +992,15 @@ class SystemVoiceInput implements VoiceInput {
     // platform call below.
     final stt.SpeechListenOptions listenOptions =
         stt.SpeechListenOptions(
-      listenFor: const Duration(seconds: 10),
+      // Hold-to-talk tuning (MT-1111-PTT-D): listenFor is
+      // 30 s -- comfortably above the hold cap (the TalkBack
+      // long-press auto-end is 10 s and a physical hold is
+      // in that order), so the plugin never cuts a held
+      // press off, yet never unbounded. pauseFor stays
+      // 3 s: the plugin auto-stops after that much silence,
+      // which in the hold flow is only a backstop -- the
+      // user's release stop() is the primary end.
+      listenFor: const Duration(seconds: 30),
       pauseFor: const Duration(seconds: 3),
       localeId: 'zh_CN',
       partialResults: true,
@@ -1108,6 +1158,7 @@ class SystemVoiceInput implements VoiceInput {
     _controller.close();
     _partialController.close();
     _errorController.close();
+    _noMatchController.close();
     _engineController.close();
     _sessionEndController.close();
   }
