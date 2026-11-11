@@ -110,12 +110,18 @@ void main() {
     // The measured table (both backends x both egos x
     // four T values). Every landing cell: vibration frame
     // 2, speech strictly after, speech true TTC > 0.
-    // Vibration totals are the NH-M1-13 ladder's: known
+    // Vibration totals are the NH-M1-13 ladder's DISPATCH
+    // totals (the merged per-frame dispatch list): known
     // ego = 1 (the pre-urgent step spends the approach);
-    // unknown ego = 2 (the pre-urgent entry + the
-    // episode-opening WARNING the scale path grades at
-    // frame 2 -- two distinct ladder steps on distinct
-    // levels; the frame-2 urgent adds none).
+    // unknown ego = 1 as well since the M2 first commit
+    // (NH-M1-13 residual): the pre-fix total of 2 was
+    // composed of the frame-2 merged dispatch PLUS the
+    // frame-3 re-arm re-firing -- the residual bug itself
+    // (the scale path's frame-2 alert is the
+    // episode-opening URGENT, whose step the pre-urgent
+    // registration suppresses; there is no separate
+    // warning step on this path). The regression case
+    // lives in navhaz_m2_first_commit_test.
     final Map<String, Map<double, (int, int)>> expected =
         <String, Map<double, (int, int)>>{
       'known': <double, (int, int)>{
@@ -158,10 +164,13 @@ void main() {
             expect(c.speechTrueTtc, greaterThan(0),
                 reason: 'the speech lands while true TTC '
                     'remains: ${c.speechTrueTtc}');
-            expect(c.vibTotal, known ? 1 : 2,
-                reason: 'NH-M1-13 ladder total for this '
-                    'path (known: pre step only; unknown: '
-                    'pre step + first-warning step)');
+            expect(c.vibTotal, 1,
+                reason: 'NH-M1-13 ladder DISPATCH total for '
+                    'this path: the pre-urgent step spends '
+                    'the approach on both ego paths (the '
+                    'unknown path\'s old total of 2 included '
+                    'the frame-3 residual-bug dispatch -- '
+                    'see the group comment)');
           });
         }
       }
@@ -179,16 +188,20 @@ void main() {
       expect(c.preAt, 2);
       expect(c.urgAt, 7);
       expect(c.speechTrueTtc, closeTo(0.1, 1e-9));
-      expect(c.vibTotal, 2,
-          reason: 'measured ladder total 2 (the pre step '
-              '+ one alert step): on this backend the dive '
-              'also crosses the warning band before the '
-              'urgent, so one of the alert steps fires in '
-              'addition to the pre-urgent -- recorded '
-              'verbatim from the dispatch list; the '
-              'per-path step frames are pinned exactly by '
-              'the dedicated ladder tests in '
-              'navhaz_cdx5_test');
+      expect(c.vibTotal, 1,
+          reason: 'ladder dispatch total 1, re-measured '
+              'in the M2 first-commit round: the dive '
+              'dispatches ONLY the frame-2 pre-urgent step '
+              '-- it never produces a warning alert at all '
+              '(the per-frame dump shows no W on any frame), '
+              'and the frame-7 urgent\'s own step is '
+              'suppressed by the step-1 registration '
+              '(alertVibrationAllowed == false). The '
+              'pre-round expectation of 2 and its "warning '
+              'band" rationale did not match the measured '
+              'dispatch list; the dedicated ladder tests in '
+              'navhaz_cdx5_test pin the genuine three-step '
+              'path (W + pre + upgrade = 3) verbatim');
     });
 
     test('bytetrack x known ego x T=0.8: PHYSICALLY '

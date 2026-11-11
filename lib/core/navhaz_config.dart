@@ -394,6 +394,70 @@ static const double replayMinDistanceM = 3.0;
 /// sequenced speak path in main.dart.
 static const Duration dangerStopWaitCap = Duration(milliseconds: 150);
 
+/// NH-M1-17 (M2 first commit): per-character SPOKEN
+/// duration used to estimate how long an announcement
+/// takes to say -- a CONSERVATIVE UPPER bound per
+/// Chinese character at the app's TTS rate. The voice
+/// output runs at speech rate 0.85 (system_voice_io);
+/// ordinary Mandarin TTS at that rate speaks roughly
+/// 200-240 characters per minute, i.e. about 0.25-0.30 s
+/// per character. 0.30 s/char is the pessimistic end of
+/// that range, chosen so the estimate errs towards
+/// "will not finish in time" (the safe direction for the
+/// short-form decision below). NO real-device
+/// measurement backs this figure yet: it is a
+/// calibration placeholder, to be replaced by measured
+/// per-character timings on a real device (see the
+/// README known-issues note).
+static const double ttsSecondsPerCharUpperBound = 0.30;
+
+/// NH-M1-19 (narrowing NH-M1-17): the per-character
+/// coefficient of the SHORT-FORM decision's condition 2
+/// -- the issuance frame's remaining TTC must be
+/// strictly below the normal phrase's character count
+/// (runes, punctuation excluded) times THIS value for
+/// the short form to be eligible at all. 0.25 s/char is
+/// the FAST end of the same 200-240 chars/min Mandarin
+/// range the 0.30 upper bound comes from: condition 2
+/// asks "even at the fastest plausible reading speed,
+/// could the full sentence still not finish?" -- if a
+/// fast reading COULD finish it, the full sentence is
+/// kept. The two constants divide the labour:
+/// [ttsSecondsPerCharUpperBound] (0.30) remains the
+/// conservative planning bound (spoken-duration
+/// estimates), [shortPhraseSecondsPerChar] (0.25) is
+/// the short-form gate only. Like the 0.30 figure this
+/// is a calibration placeholder with NO real-device
+/// measurement behind it yet.
+static const double shortPhraseSecondsPerChar = 0.25;
+
+/// NH-M1-17, narrowed by NH-M1-19: NH-M1-17 introduced
+/// the short form (an URGENT whose normal sentence
+/// cannot finish before the physical moment speaks a
+/// minimal stop form instead); Codex's re-test of the
+/// M2 first commit measured that rule firing far too
+/// early -- the spec 2.7 approaching car's first urgent
+/// already spoke the short form at tau_now ~= 2.70-2.78
+/// s, throwing away the item and bearing information a
+/// normal urgent (true TTC ~= 2.6-3.0 s) must carry.
+/// NH-M1-19 therefore gates the short form on BOTH
+/// conditions at once; either failing keeps the FULL
+/// sentence:
+///   condition 1: the issuance frame's remaining TTC
+///     (the published tau_now, falling back to the fused
+///     TTC exactly as the cooldown's like-for-like
+///     comparison does -- never the raw surface) is
+///     strictly below [preVibrationTtcS] (1.5 s): the
+///     alert is already inside the vibrate-first zone
+///     where the short form is only a fallback;
+///   condition 2: that same TTC is strictly below the
+///     normal phrase's character count times
+///     [shortPhraseSecondsPerChar].
+/// The short form is a pure text variant of the SAME
+/// alert (same request kind, same priority, chosen once
+/// at issuance); warnings never take it. See
+/// hazard_phrases.shortUrgentPhrase.
+
 // ---- Vibration patterns ---------------------------------------------------
 // VibrationEffect waveform semantics: timings alternate
 // wait/vibrate starting with a wait; amplitudes are

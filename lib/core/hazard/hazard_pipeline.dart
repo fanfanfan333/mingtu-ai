@@ -55,6 +55,12 @@ class HazardPipelineResult {
   /// the urgent speech is delivered (a vibration without
   /// a following confirmation is an accepted false-alarm
   /// cost -- vibration is cheap, a late warning is not).
+  /// NH-M1-13 residual: this set carries only firings
+  /// that are actually DISPATCHED -- a one-shot re-arm
+  /// re-firing inside the same approach (its step 1
+  /// already spent) is gated out (see the pipeline's
+  /// approach account), so a track appears here at most
+  /// once per approach.
   final Set<int> preUrgentTrackIds;
 
   /// NH-M1-11: the subset of [preUrgentTrackIds] whose
@@ -132,8 +138,64 @@ class HazardPipeline {
 
   /// Tracks that already spent their one pre-urgent
   /// vibration in the current unbroken run of the
-  /// condition.
+  /// condition (the INSTANT eligibility one-shot: it
+  /// re-arms when the instantaneous condition clears, and
+  /// it is consumed when the urgent speech lands).
   final Set<int> _preVibrated = <int>{};
+
+  /// NH-M1-13 residual (M2 first commit; Codex replay on
+  /// 5280e00): the APPROACH-scoped step-1 account, with
+  /// TWO jobs, both keyed to the approach and NOT to the
+  /// eligibility one-shot above:
+  ///   (a) DISPATCH GATE -- the one-shot re-arms when the
+  ///       urgent speech consumes it (and when the
+  ///       instantaneous condition drops for a frame); a
+  ///       re-armed re-firing inside the same approach
+  ///       must not dispatch again. In the 5280e00 replay
+  ///       (unknown ego, T = 0.9 s) the frame-2 urgent
+  ///       consumed the one-shot and frame 3's
+  ///       still-eligible estimate re-fired it: that
+  ///       re-firing WAS the second dispatch (frames
+  ///       [2, 3]). The account records "step 1 already
+  ///       DISPATCHED in this approach" and gates the
+  ///       re-firing out of the dispatch surfaces.
+  ///   (b) LADDER REGISTRATION SOURCE -- the policy's
+  ///       registration ([HazardPolicy.notePreVibrated])
+  ///       is re-asserted from this account, not from the
+  ///       one-shot, and the policy no longer revokes it
+  ///       when an alert episode ends: a mid-approach
+  ///       urgent that opens a NEW alert episode must
+  ///       still find step 1 spent.
+  /// The account is written ONLY by an actual dispatch
+  /// and cleared ONLY when the approach truly ends (the
+  /// sustained-absence rule below). Eligibility jitter,
+  /// one-shot re-arms and the urgent speech landing move
+  /// it NOT AT ALL.
+  final Set<int> _step1SpentInApproach = <int>{};
+
+  /// NH-M1-13 residual: the approach-liveness clear
+  /// threshold, counted in CONSECUTIVE frames on which a
+  /// step-1-spent track produced NO estimate. The
+  /// pipeline cannot observe tracker retirements
+  /// directly (a lost track simply stops appearing in
+  /// [processFrame]'s estimates, and lost-coast frames
+  /// produce none either), so the approach end is read
+  /// off the estimate stream: a single absent frame must
+  /// NOT end the approach (that was the bug -- an absent
+  /// frame is the lost-coast / unestimated case, not a
+  /// retirement), while a SUSTAINED absence means the
+  /// track is gone or its risk long cleared. The bound
+  /// sits well inside the tracker's own retirement
+  /// horizon ([NavHazConfig.lostRetentionFrames] lost
+  /// frames at the nominal frame rate): an id recycled
+  /// by the tracker after retirement is preceded by at
+  /// least that many absent frames, so a recycled id
+  /// never inherits a spent step 1.
+  static const int _step1ApproachAbsentFrames = 5;
+
+  /// Consecutive absent-frame counters backing
+  /// [_step1ApproachAbsentFrames].
+  final Map<int, int> _step1AbsentRun = <int, int>{};
 
   HazardPipeline({Tracker? tracker}) : tracker = tracker ?? createTracker();
 
@@ -177,6 +239,39 @@ class HazardPipeline {
       policy.notePreVibrated(id);
     }
 
+    // NH-M1-13 residual: maintain the APPROACH account's
+    // lifecycle from the estimate stream BEFORE the
+    // policy is touched: a step-1-spent track that is
+    // estimated this frame has its absence counter reset
+    // (the approach is alive); one that is absent
+    // accumulates consecutive absent frames, and only a
+    // SUSTAINED absence ([_step1ApproachAbsentFrames])
+    // ends the approach. The ids whose approach ends on
+    // THIS frame are collected for the policy-side close
+    // below -- a one-frame absence (lost coast, a frame
+    // the tracker kept but the estimator skipped) ends
+    // NOTHING any more.
+    final Set<int> presentIds = <int>{
+      for (final TrackEstimate e in estimates) e.track.id,
+    };
+    final Set<int> approachEnded = <int>{};
+    for (final int id in _step1SpentInApproach) {
+      if (presentIds.contains(id)) {
+        _step1AbsentRun.remove(id);
+      } else {
+        final int run = (_step1AbsentRun[id] ?? 0) + 1;
+        if (run >= _step1ApproachAbsentFrames) {
+          approachEnded.add(id);
+        } else {
+          _step1AbsentRun[id] = run;
+        }
+      }
+    }
+    _step1SpentInApproach.removeAll(approachEnded);
+    for (final int id in approachEnded) {
+      _step1AbsentRun.remove(id);
+    }
+
     final HazardPolicyResult result =
         policy.evaluate(estimates, t, commit: commit);
     // NH-M1-13: close the policy's per-track ALERT
@@ -188,19 +283,26 @@ class HazardPipeline {
     // briefly unestimated between two alert frames keeps
     // neither episode's continuity unless it was actually
     // estimated (and thus alertable) on the frames between.
-    policy.noteAbsentTracks(<int>{
-      for (final TrackEstimate e in estimates) e.track.id,
-    });
-    // NH-M1-13 step 1 registration (the sustained form):
-    // tracks whose pre-urgent ALREADY fired on an earlier
-    // frame of this approach (the one-shot set still
-    // holds them) are registered with the ladder too --
-    // the fresh firings above were registered before the
-    // evaluation; this loop covers the ongoing approach
-    // so the registration survives the alert episode's
-    // own lifecycle.
+    // NH-M1-13 residual: the STEP-1 REGISTRATION is no
+    // longer closed by this call -- it belongs to the
+    // approach account above, not to the alert episode;
+    // [HazardPolicy.noteAbsentTracks] now leaves it alone
+    // and the approach-ended ids close it explicitly.
+    policy.noteAbsentTracks(presentIds);
+    for (final int id in approachEnded) {
+      policy.trackRetired(id);
+    }
+    // NH-M1-13 step 1 registration (the sustained form,
+    // re-based on the APPROACH account by the residual
+    // fix): every track whose step 1 fired during the
+    // current approach and which is estimated this frame
+    // has its registration re-asserted -- from
+    // [_step1SpentInApproach], NOT from the eligibility
+    // one-shot, so an ineligible frame (the urgent
+    // already deliverable, a momentary out-of-band raw
+    // tau) can no longer drop the registration mid-approach.
     for (final TrackEstimate e in estimates) {
-      if (_preVibrated.contains(e.track.id)) {
+      if (_step1SpentInApproach.contains(e.track.id)) {
         policy.notePreVibrated(e.track.id);
       }
     }
@@ -212,6 +314,31 @@ class HazardPipeline {
     // for the audit set below).
     final Set<int> eligibleExempted = eligibleExemptedPre;
     final Set<int> fired = firedPre;
+    // NH-M1-13 residual (the dispatch gate): [fired] is
+    // the one-shot's raw firing set, and the one-shot
+    // RE-ARMS -- by design -- when the urgent speech
+    // consumes it or the instantaneous condition drops
+    // for a frame. A re-armed one-shot must NOT dispatch
+    // a second vibration inside the same approach: the
+    // approach account ([_step1SpentInApproach]) gates
+    // the DISPATCH. The account joins a track when its
+    // step 1 is actually DISPATCHED (below), so the gate
+    // reads the account as it stood BEFORE this frame:
+    // a first-in-approach firing passes and joins; a
+    // re-armed re-firing is already in the account and
+    // is gated out of [HazardPipelineResult
+    // .preUrgentTrackIds] and the merged vibration list.
+    // The one-shot set itself, the estimator latch report
+    // below and the exemption's qualification all keep
+    // reading [fired] exactly as before -- the gate is on
+    // the physical dispatch only. (The 5280e00 replay:
+    // the frame-2 urgent consumed the one-shot, frame
+    // 3's still-eligible estimate re-fired it, and the
+    // re-firing WAS the second dispatch -- frames [2, 3]
+    // in the replay's numbering.)
+    final Set<int> firedDispatch =
+        fired.difference(_step1SpentInApproach);
+    _step1SpentInApproach.addAll(firedDispatch);
     bool urgentConsumed = false;
     if (result.alert != null && result.alert!.urgent) {
       // The urgent speech resets the one-shot, per the
@@ -243,7 +370,8 @@ class HazardPipeline {
     }
 
     final void Function(String, int)? stamp = onLatency;
-    if (stamp != null && (result.alert != null || fired.isNotEmpty)) {
+    if (stamp != null &&
+        (result.alert != null || firedDispatch.isNotEmpty)) {
       // Synthetic stamps (tests / replay) fall outside
       // the plausibility window; only plausible
       // production figures stamp.
@@ -269,12 +397,12 @@ class HazardPipeline {
     // dispatch, not any change here to the firing itself.
     final List<({int trackId, bool urgent})> vibrations =
         <({int trackId, bool urgent})>[];
-    for (final int id in fired) {
+    for (final int id in firedDispatch) {
       vibrations.add((trackId: id, urgent: true));
     }
     if (result.alert != null &&
         result.vibrationAllowed &&
-        !fired.contains(result.alert!.trackId)) {
+        !firedDispatch.contains(result.alert!.trackId)) {
       vibrations.add((
         trackId: result.alert!.trackId,
         urgent: result.alert!.urgent,
@@ -286,8 +414,9 @@ class HazardPipeline {
       riskPresent: result.riskPresent,
       estimates: estimates,
       frameCapturedAt: t,
-      preUrgentTrackIds: fired,
-      preUrgentExemptedTrackIds: fired.intersection(eligibleExempted),
+      preUrgentTrackIds: firedDispatch,
+      preUrgentExemptedTrackIds:
+          firedDispatch.intersection(eligibleExempted),
       vibrations: vibrations,
       alertVibrationAllowed: result.vibrationAllowed,
     );
@@ -381,5 +510,7 @@ class HazardPipeline {
     _estimator.reset();
     policy.reset();
     _preVibrated.clear();
+    _step1SpentInApproach.clear();
+    _step1AbsentRun.clear();
   }
 }

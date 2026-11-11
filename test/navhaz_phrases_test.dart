@@ -170,21 +170,49 @@ void main() {
       }
       // The UNIQUE phrase set is pinned verbatim so a
       // silently shrinking (or growing) entry point fails
-      // loudly: 1,044 distinct phrases. The RAW yield
-      // count is deliberately NOT pinned any more
-      // (NH-M1-14): the distance axes are now DERIVED
-      // from the shared hazardBands table (denser
+      // loudly. Composition, stated against the CODE (the
+      // previous round's comment had the genuinely-new
+      // form wrong -- it named the pole form; the rebuild
+      // below is the corrected account, re-verified this
+      // round by set difference):
+      // - NH-M1-14 baseline: 1,044 (templates only).
+      // - NH-M1-17's kind-only short forms added exactly
+      //   ONE new phrase: '停，前方有人' -- the person
+      //   near template always carries a distance readout
+      //   or the 有+name shape at its zone, so a bare
+      //   centre person short form existed nowhere in the
+      //   templates. The other three coincided with
+      //   template phrases: '停，前方来车' IS the
+      //   template's own vehicle minimum, '停，前方有杆子'
+      //   and '停，前方有杂物' are the pole / clutter near
+      //   forms verbatim. => 1,045.
+      // - NH-M1-19 reshaped the short forms (per kind x
+      //   label name x three bearings, 18 distinct texts
+      //   replacing the 4 kind-only ones): the 3 forms
+      //   that already existed stay ('停，前方来车',
+      //   '停，前方有人', '停，前方有杂物'), the one
+      //   NH-M1-17 form that existed only as a short form
+      //   is REPLACED ('停，前方有杆子' -> the pole short
+      //   '停，前方有杆', which still exists as a template
+      //   phrase, so nothing is lost), and 15 forms are
+      //   genuinely new (every side-bearing form plus the
+      //   two kind-name centre forms). => 1,045 + 15 =
+      //   1,060, verified by set difference against the
+      //   rebuilt pre-NH-M1-19 set this round (gained 15,
+      //   lost 0).
+      // The RAW yield count is deliberately NOT pinned
+      // any more (NH-M1-14): the distance axes are now
+      // DERIVED from the shared hazardBands table (denser
       // interior samples than the old hand-listed ones),
       // so the raw combination count follows the table's
       // sampling density (3,960 at the current table)
       // while the producible phrase SET -- the quantity
       // the 2,460-combination baseline actually pinned
-      // semantically -- is unchanged, verified byte-for-
-      // byte against the pre-refactor enumeration during
-      // the NH-M1-14 round.
-      expect(all.toSet().length, 1044,
-          reason: 'the producible phrase set is unchanged '
-              'by the shared-table refactor (NH-M1-14)');
+      // semantically -- is what the pin above tracks.
+      expect(all.toSet().length, 1060,
+          reason: 'the producible phrase set: NH-M1-14 '
+              'baseline 1,044 + 1 NH-M1-17 short form '
+              '(person) + 15 NH-M1-19 bearing forms');
       expect(all.length, greaterThan(2460),
           reason: 'the table-derived axes sample at least '
               'the old hand-listed coverage');
