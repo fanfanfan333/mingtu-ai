@@ -54,7 +54,16 @@
 /// evaluation from that frame's ego state: 4 s when the
 /// ego speed is known, 6 s when it is unknown (the
 /// ego-unknown path talks less often); the two re-alert
-/// exceptions apply unchanged in both windows. Different
+/// exceptions apply in both windows, with one NH-M2-07
+/// refinement (lead's final ruling, 2026-11-11): the
+/// TTC-drop exception additionally requires at least
+/// [NavHazConfig.realertDropMinInterval] (1.0 s) since
+/// that track's last spoken alert -- a drop re-alert at
+/// a 0.5 s gap would talk over the previous sentence,
+/// which has not finished playing. The upgrade
+/// exception is exempt from the interval, and a
+/// re-alert after the window has elapsed is unchanged.
+/// Different
 /// tracks with the same category and zone inside 500 ms
 /// merge into one announcement. A frame yields at most
 /// ONE alert: urgent before warning, then smaller TTC,
@@ -531,8 +540,22 @@ class HazardPolicy {
     if (level == HazardLevel.urgent && last.level == HazardLevel.warning) {
       return true; // upgrade W -> U is never held back
     }
+    // NH-M2-07 (lead's final ruling, 2026-11-11): the
+    // TTC-drop exception additionally requires
+    // [NavHazConfig.realertDropMinInterval] since the
+    // last SPOKEN alert -- at a shorter gap the previous
+    // sentence has not finished playing and the repeat
+    // would only talk over it. The upgrade branch above
+    // is deliberately NOT gated by the interval, and
+    // the window-elapsed return above is unchanged.
+    // A blocked attempt records nothing (_lastByTrack
+    // is written at issuance only), so both the
+    // interval and the drop baseline keep measuring
+    // from the last spoken alert and a later frame
+    // whose drop still holds can still re-alert.
     if (ttc != null && last.ttcS != null &&
-        ttc <= last.ttcS! * (1 - NavHazConfig.ttcDropReAlertRatio)) {
+        ttc <= last.ttcS! * (1 - NavHazConfig.ttcDropReAlertRatio) &&
+        now.difference(last.at) >= NavHazConfig.realertDropMinInterval) {
       return true; // closing much faster than last time
     }
     return false;

@@ -346,7 +346,9 @@ static const double hazardAboutSplit = 7.5;
 /// 4 s chosen). Inside the cooldown only two re-alerts are
 /// allowed: a level upgrade (W -> U), or a TTC that has
 /// fallen by at least [ttcDropReAlertRatio] since the last
-/// spoken alert for that track.
+/// spoken alert for that track (the drop path additionally
+/// requires [realertDropMinInterval] since that alert,
+/// NH-M2-07).
 static const int cooldownSeconds = 4;
 
 /// Per-track alert cooldown, seconds, when the frame's
@@ -359,6 +361,23 @@ static const int cooldownSeconds = 4;
 /// unchanged inside this longer window.
 static const int cooldownSecondsEgoUnknown = 6;
 static const double ttcDropReAlertRatio = 0.4;
+
+/// NH-M2-07 (M3 first commit, lead's FINAL ruling
+/// 2026-11-11): the TTC-drop re-alert exception above
+/// additionally requires at least this much time since
+/// that track's last SPOKEN alert (frame timestamps).
+/// Rationale: at a 0.5 s gap the previous sentence has
+/// not finished playing, so a repeat would only talk
+/// over it (overlap) -- the drop alone no longer
+/// suffices inside the window. The W -> U upgrade
+/// exception is NOT subject to this interval (speech
+/// arbitration interrupts for an upgrade, as before),
+/// and a same-level re-alert after the cooldown window
+/// has elapsed keeps the plain M1 behaviour above.
+/// Calibration placeholder: NO real-device measurement
+/// backs the 1.0 s value yet.
+static const Duration realertDropMinInterval =
+    Duration(seconds: 1);
 
 /// Two DIFFERENT tracks of the same category and direction
 /// zone alerting within this window are merged into one

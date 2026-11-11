@@ -36,7 +36,11 @@
 /// all four (a) cells feed their named ego path for
 /// real. M2B-FIX1A adds the whole-run short-form pin
 /// in group (c) (every urgent of the unknown x T = 1.2
-/// dive, not only the first).
+/// dive, not only the first). NH-M2-07 (M3) then made
+/// that dive's frame-7 re-alert a suppressed non-event
+/// under the drop re-alert minimum interval; the pin's
+/// issuance-set premise is updated there, its text
+/// assertions unchanged.
 library;
 
 import 'dart:math' as math;
@@ -667,11 +671,28 @@ void main() {
           'whole-run pin)', () {
         final List<_DiveU> urgents =
             _runDiveUrgents(backend, false, 1.2);
+        // NH-M2-07 (M3 first commit, lead's final
+        // ruling) changed this run's issuance SET, not
+        // any text: before the refinement, the run
+        // issued at frames [2, 7] -- frame 7's re-alert
+        // rode the cooldown's TTC-drop exception
+        // (tauNow 0.6365/0.6737 <= 1.29 x 0.6). The
+        // ruling adds a 1.0 s minimum interval to that
+        // exception (a repeat 0.5 s after the previous
+        // sentence starts would only talk over it), and
+        // frame 7 sits 0.5 s after frame 2, so it is
+        // held back; the dive feeds detections only
+        // through frame 11 (a 0.9 s gap), so no later
+        // frame reaches the interval either, and the
+        // run's only urgent is frame 2. The
+        // per-issuance TEXT assertions below are
+        // unchanged from M2B-FIX1A.
         expect(urgents.map((_DiveU u) => u.frame).toList(),
-            <int>[2, 7],
-            reason: 'measured issuance frames of this '
-                'cell: the first urgent and its one '
-                're-alert inside the run');
+            <int>[2],
+            reason: 'NH-M2-07: the frame-7 drop re-alert '
+                'falls inside the 1.0 s minimum interval '
+                'and is held back; the first urgent at '
+                'frame 2 stands');
         for (final _DiveU u in urgents) {
           expect(u.phrase, '停，前方来车',
               reason: 'frame ${u.frame}: the pipeline '
