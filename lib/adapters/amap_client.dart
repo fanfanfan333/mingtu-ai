@@ -195,7 +195,14 @@ String amapStepSpeechText({
   final String head = direction.isEmpty ? act : '$direction$act';
   // Step distance wording: the FIX3B navigation bands
   // (announcement-ready form from navigationDistanceText).
-  return '$head，${navigationDistanceText(distanceM)}';
+  // CDX5 S2-1: an abnormal distance (non-finite /
+  // negative, e.g. a malformed upstream payload) yields
+  // the EMPTY readout; the step text then stands alone
+  // as a complete sentence instead of ending in a
+  // dangling separator with no distance after it.
+  final String distanceText = navigationDistanceText(distanceM);
+  if (distanceText.isEmpty) return head;
+  return '$head，$distanceText';
 }
 
 class AmapWalkingResult {

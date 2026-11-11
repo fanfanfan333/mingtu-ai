@@ -1217,51 +1217,82 @@ void main() {
         });
       }
 
-      test('$backend fast approach (start TTC 1.0 s, ego '
-          'KNOWN): vibration strictly precedes speech by '
-          'frames (FIX4-FINAL dual surfaces)', () {
-        // Ranged geometry (carAt: scale and ground plane
-        // agree), walking user. The known-ego urgent
-        // branches read ONLY the guard-published tau:
-        // raw tau_now is in-band from frame 2 but the
-        // guard publishes at the 3rd consecutive in-band
-        // estimate, so speech lands at frame 4 while the
-        // vibration -- reading the raw surface -- fired
-        // at frame 2. The two frame numbers ARE the dual
-        // reading surfaces made visible.
-        final HazardPipeline pipeline =
-            HazardPipeline(tracker: trackerForBackend(backend));
-        final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
-        int preAt = -1;
-        int urgAt = -1;
-        for (int i = 0; i <= 8; i++) {
-          final double t = i * 0.1;
-          final double z = 6.0 * (1.0 - t);
-          final HazardPipelineResult r = pipeline.processFrame(
-            z > 0.6 ? <Detection>[carAt(z)] : const <Detection>[],
-            epoch.add(Duration(milliseconds: i * 100)),
-            pitchDeg: 10,
-            ego: EgoMotion.judge(gpsSpeedMps: 1.2),
-          );
-          if (r.preUrgentTrackIds.isNotEmpty && preAt < 0) {
-            preAt = i;
+      for (final double bigT in <double>[1.0, 0.9]) {
+        test('$backend fast approach (start TTC $bigT s, ego '
+            'KNOWN): vibration first, speech inside the '
+            'physical window (FIX4-FINAL dual surfaces; '
+            'NH-M1-11 for 0.9)', () {
+          // Ranged geometry (carAt: scale and ground plane
+          // agree by construction), walking user, closing
+          // 6 m/s from Z0 = 6*bigT: true TTC at frame i is
+          // bigT - 0.1*i and the target is gone at frame
+          // bigT*10, so the urgent speech must land on a
+          // frame whose true TTC is still positive.
+          //
+          // T = 1.0 (the FIX4-FINAL case): the agile legs
+          // agree at the decisive frame; raw tau_now is
+          // in-band from frame 2, the guard publishes at
+          // the 3rd consecutive in-band estimate, speech
+          // at frame 4 -- the two frame numbers ARE the
+          // dual reading surfaces made visible.
+          //
+          // T = 0.9 (the NH-M1-11 case): at frames 4-6 the
+          // agile legs transiently DISAGREE (relative
+          // difference > 50%) exactly while the guard run
+          // sits at 2. Before the exemption the fused tau
+          // nulled and the run reset to 0; the geometry
+          // died at frame 8 with the run back at only 2
+          // and the voice never landed. With the exemption
+          // (the track vibrated at frame 2 and willHit
+          // holds throughout) the disagreeing frames fuse
+          // the smaller positive agile leg and FREEZE the
+          // run at 2; frame 7's ordinary in-band estimate
+          // resumes it to 3 and the speech lands there --
+          // true TTC 0.2 s, inside the window. The normal
+          // tier is NOT exempted: both T values carry a
+          // normal-tier disagreement on the speech frame
+          // or its neighbours while the urgent speaks via
+          // tau_now.
+          final HazardPipeline pipeline =
+              HazardPipeline(tracker: trackerForBackend(backend));
+          final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+          int preAt = -1;
+          int urgAt = -1;
+          for (int i = 0; i <= 10; i++) {
+            final double t = i * 0.1;
+            final double z = 6.0 * (bigT - t) / bigT;
+            final HazardPipelineResult r = pipeline.processFrame(
+              (bigT - t) > 0.05
+                  ? <Detection>[carAt(z)]
+                  : const <Detection>[],
+              epoch.add(Duration(milliseconds: i * 100)),
+              pitchDeg: 10,
+              ego: EgoMotion.judge(gpsSpeedMps: 1.2),
+            );
+            if (r.preUrgentTrackIds.isNotEmpty && preAt < 0) {
+              preAt = i;
+            }
+            if (r.alert != null && r.alert!.urgent && urgAt < 0) {
+              urgAt = i;
+            }
           }
-          if (r.alert != null && r.alert!.urgent && urgAt < 0) {
-            urgAt = i;
-          }
-        }
-        expect(preAt, 2,
-            reason: 'raw tau_now < 1.5 s at frame 2: the '
-                'vibration fires on the current-frame '
-                'estimate');
-        expect(urgAt, 4,
-            reason: 'the speech waits for the '
-                'guard-published tau (3rd consecutive '
-                'in-band estimate) -- it does NOT follow '
-                'the raw surface down');
-        expect(preAt, lessThan(urgAt),
-            reason: 'vibration strictly before speech');
-      });
+          expect(preAt, 2,
+              reason: 'raw tau_now < 1.5 s at frame 2: the '
+                  'vibration fires on the current-frame '
+                  'estimate (both T values, both backends)');
+          expect(urgAt, bigT >= 1.0 ? 4 : 7,
+              reason: 'T=$bigT urgent speech frame '
+                  '(measured: 1.0 -> 4 via the ordinary '
+                  'guard publication; 0.9 -> 7 via the '
+                  'NH-M1-11 frozen run resuming)');
+          expect(preAt, lessThan(urgAt),
+              reason: 'vibration strictly before speech');
+          expect(bigT - 0.1 * urgAt, greaterThan(0),
+              reason: 'the speech lands while the target '
+                  'still has true TTC left (inside the '
+                  'physical window)');
+        });
+      }
 
       test('$backend cooldown survives a 2-frame gap '
           'after the urgent (CDX4 S1-a regression)', () {

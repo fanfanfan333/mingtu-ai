@@ -192,8 +192,16 @@ class NavigationTracker {
     if (d < NavHazConfig.replayMinDistanceM) return null;
     // Distance wording: the FIX3B navigation bands (the
     // function returns the announcement-ready form,
-    // leading "about" included).
-    return '前方${navigationDistanceText(d)}${stepTexts[stepIndex]}';
+    // leading "about" included). CDX5 S2-1: an abnormal
+    // distance (non-finite / negative -- a haversine over
+    // real fixes cannot produce one, but the wording
+    // layer must not trust that) yields the EMPTY
+    // readout; the prompt then drops the distance prefix
+    // entirely and keeps the bare turn text, a complete
+    // sentence, instead of splicing a hole into it.
+    final String distanceText = navigationDistanceText(d);
+    if (distanceText.isEmpty) return stepTexts[stepIndex];
+    return '前方$distanceText${stepTexts[stepIndex]}';
   }
 
   /// Nearest route point to [p]: (index, distance in metres).

@@ -38,6 +38,28 @@
 /// effective TTC is the box-scale leg alone (the policy's
 /// ego-unknown path grades on it) and disagreement never
 /// applies -- see [TtcEstimator.estimate].
+///
+/// NH-M1-11 exemption (lead's ruling, 2026-11-11): the
+/// distrust rule above protects a track that has given no
+/// other evidence. A track that has ALREADY fired its
+/// pre-urgent vibration (its tau_now genuinely fell below
+/// [NavHazConfig.preVibrationTtcS] on the raw reading
+/// surface) and STILL extrapolates into the forward
+/// channel ([TrackEstimate.willHit]) has committed that
+/// evidence; a TRANSIENT disagreement of the agile legs
+/// must not then erase the urgent tau and reset the
+/// persistence guard, or a genuinely close target loses
+/// its warning inside the physical window (the measured
+/// failure: known ego, true TTC 0.9 s -- vibration at
+/// frame 2, agile legs diverge at frames 4-6, raw tau
+/// nulled, guard counter reset, voice never lands). For
+/// such a track -- and ONLY such a track -- a disagreeing
+/// frame fuses the agile prediction CONSERVATIVELY
+/// (the smaller positive leg) and FREEZES the persistence
+/// guard's run (neither advanced nor reset). Every other
+/// track keeps the distrust rule verbatim; the normal
+/// tier's fusion is never exempted; the unknown-ego path
+/// has no fusion and so nothing to exempt.
 library;
 
 import 'dart:math' as math;
@@ -233,6 +255,22 @@ class TrackEstimate {
   /// (no growth) for hand-built estimates.
   final double scaleRate;
 
+  /// NH-M1-11: true when this frame's URGENT (agile-tier)
+  /// prediction ran under the disagreement exemption --
+  /// the two agile legs disagreed, but the track had
+  /// already fired its pre-urgent vibration in the current
+  /// episode and still extrapolates into the channel, so
+  /// the raw urgent tau was fused conservatively (the
+  /// smaller positive leg) instead of distrusted to null,
+  /// and the persistence guard's run froze on this frame.
+  /// Always false when the ego speed is unknown (no
+  /// fusion happens there) and on every track that has
+  /// not vibrated. The NORMAL tier is never exempted:
+  /// [ttcS] and [ttcDisagreement] keep their verbatim
+  /// meaning even on an exempt frame. Defaults to false
+  /// for hand-built estimates.
+  final bool urgentDisagreementExempted;
+
   /// The URGENT judgement's TTC (FIX3B): the agile tier's
   /// one-step PREDICTED TTC (fused like [ttcS] when the
   /// ego speed is known, scale-only when it is not) minus
@@ -274,7 +312,23 @@ class TrackEstimate {
     this.ttcDisagreement = false,
     this.egoSpeedKnown = true,
     this.scaleRate = 0,
+    this.urgentDisagreementExempted = false,
+    this.debugAgileScaleTtcS,
+    this.debugAgileRangeTtcS,
   });
+
+  /// TEST SEAM (NH-M1-11 literal-regression): this frame's
+  /// AGILE predicted legs BEFORE any fusion -- the two
+  /// readings whose transient disagreement the exemption
+  /// forgives. Carried on the estimate (production
+  /// consumers ignore them) so the literal per-frame
+  /// regression test can assert the exact leg values and
+  /// disagreement frame positions Codex reported, instead
+  /// of inferring the disagreement from downstream
+  /// effects. Null when the corresponding leg is unusable
+  /// this frame.
+  final double? debugAgileScaleTtcS;
+  final double? debugAgileRangeTtcS;
 }
 
 class _FilterPair {
@@ -303,8 +357,36 @@ class TtcEstimator {
   /// Per-track run length of consecutive estimates whose
   /// RAW tau_now (before the persistence guard below) sat
   /// at or under the urgent band -- the jitter guard's
-  /// counter.
+  /// counter. NH-M1-11: a frame that runs under the
+  /// disagreement exemption FREEZES its track's entry here
+  /// (the run is neither advanced nor reset); every other
+  /// frame updates it exactly as before.
   final Map<int, int> _tauNowInBandRun = <int, int>{};
+
+  /// NH-M1-11 exemption qualification latch: the track ids
+  /// whose CURRENT pre-urgent episode has already fired
+  /// the vibration. Qualification is the EPISODE's
+  /// property, not the one-shot's bookkeeping state: an
+  /// episode runs from the vibration until the episode
+  /// ENDS -- the urgent speech is delivered (the episode
+  /// is spent), the track is lost / retired, or the
+  /// estimator resets. Whether the track is pre-urgent
+  /// ELIGIBLE on any given frame in between is irrelevant
+  /// here: the FIX4-FINAL dual-surface reading makes the
+  /// raw tau of an already-confirmed track ineligible on
+  /// exactly the frames where the exemption matters (the
+  /// published tau exists), so keying qualification to
+  /// eligibility would switch the exemption off on the
+  /// first frame after the vibration. The pipeline --
+  /// which owns the pre-urgent one-shot and its resets --
+  /// reports the episode boundaries through
+  /// [notePreUrgent]; the estimator only READS the latch,
+  /// it never sets it, so the exemption's episode
+  /// semantics are the pre-urgent semantics by
+  /// construction (no second lifecycle). A retired track
+  /// id leaves the latch through [forget]; a NEW track
+  /// under a recycled id never inherits an old episode.
+  final Set<int> _preVibratedEpisode = <int>{};
 
   /// Focal length in normalised units, from the configured
   /// vertical FOV: f_y = 0.5 / tan(VFOV/2).
@@ -398,12 +480,44 @@ class TtcEstimator {
   void forget(int trackId) {
     _filters.remove(trackId);
     _tauNowInBandRun.remove(trackId);
+    _preVibratedEpisode.remove(trackId);
   }
 
   void reset() {
     _filters.clear();
     _tauNowInBandRun.clear();
+    _preVibratedEpisode.clear();
   }
+
+  /// Report a pre-urgent EPISODE boundary (NH-M1-11): the
+  /// pipeline calls this with [vibrated] = true when a
+  /// track's pre-urgent vibration fires (its episode
+  /// begins; the latch is set) and with [vibrated] = false
+  /// when the episode ENDS (the urgent speech was
+  /// delivered, consuming it -- the latch is cleared).
+  /// Mid-episode eligibility changes are NOT reported:
+  /// they do not move the latch (see
+  /// [_preVibratedEpisode]). The exemption reads the latch
+  /// in [estimate].
+  void notePreUrgent(int trackId, {required bool vibrated}) {
+    if (vibrated) {
+      _preVibratedEpisode.add(trackId);
+    } else {
+      _preVibratedEpisode.remove(trackId);
+    }
+  }
+
+  /// TEST SEAM (NH-M1-11): the persistence guard's current
+  /// run length for [trackId] -- the frozen-run assertion
+  /// of the exemption tests reads the counter directly
+  /// instead of inferring it from publication timing.
+  int debugTauNowInBandRun(int trackId) => _tauNowInBandRun[trackId] ?? 0;
+
+  /// TEST SEAM (NH-M1-11): whether [trackId]'s current
+  /// pre-urgent episode latch is set (exemption
+  /// qualification condition 1).
+  bool debugPreVibratedEpisode(int trackId) =>
+      _preVibratedEpisode.contains(trackId);
 
   /// Whether two valid TTC legs contradict each other:
   /// relative difference |a-b| / max(a,b) strictly above
@@ -419,6 +533,24 @@ class TtcEstimator {
   static double? fuseLegs(double? scale, double? range) {
     if (scale != null && range != null) {
       return legsDisagree(scale, range) ? null : math.min(scale, range);
+    }
+    return scale ?? range;
+  }
+
+  /// Conservative fusion for the NH-M1-11 exemption ONLY:
+  /// both legs valid and POSITIVE but disagreeing -> the
+  /// SMALLER leg (the more dangerous reading -- the
+  /// earlier warning), never an average. Exactly one
+  /// valid -> that one, exactly as [fuseLegs]. A
+  /// non-positive leg is not a usable reading and never
+  /// wins the min (the caller only reaches this helper
+  /// when the ordinary fusion distrusted the pair, i.e.
+  /// both legs exist; the positivity guard keeps a
+  /// degenerate leg from manufacturing a zero tau).
+  static double? fuseLegsConservative(double? scale, double? range) {
+    if (scale != null && range != null) {
+      if (scale <= 0 || range <= 0) return null;
+      return math.min(scale, range);
     }
     return scale ?? range;
   }
@@ -553,9 +685,44 @@ class TtcEstimator {
     // SCALE leg alone when it is not (the unknown path
     // never fuses). Read ONLY by the policy's urgent
     // branches.
-    final double? ttcPred = ego.speedKnown
+    double? ttcPred = ego.speedKnown
         ? TtcEstimator.fuseLegs(ttcScalePred, ttcRangePred)
         : ttcScalePred;
+    // NH-M1-11 exemption: the ordinary fusion just
+    // distrusted the agile pair (both legs valid, relative
+    // difference beyond the tolerance). The track is
+    // exempt from that distrust FOR THIS FRAME when BOTH
+    // qualification conditions hold:
+    //   (1) its current pre-urgent episode has already
+    //       fired the vibration (the [_preVibratedEpisode]
+    //       latch -- the pipeline's one-shot semantics,
+    //       reported through [notePreUrgent]);
+    //   (2) the CURRENT frame still extrapolates into the
+    //       forward channel ([willHit], computed above on
+    //       the normal tier -- its definition is untouched
+    //       by this exemption).
+    // Either missing -> the distrust stands verbatim.
+    // Exempt: fuse conservatively (the smaller positive
+    // agile leg) and mark the frame; the persistence guard
+    // below then FREEZES this track's run instead of
+    // resetting it. The normal tier above is never
+    // exempted: [ttcS] stays null and [disagreement] stays
+    // true on an exempt frame.
+    bool urgentExempted = false;
+    if (ego.speedKnown &&
+        ttcPred == null &&
+        ttcScalePred != null &&
+        ttcRangePred != null &&
+        TtcEstimator.legsDisagree(ttcScalePred, ttcRangePred) &&
+        _preVibratedEpisode.contains(track.id) &&
+        willHit) {
+      final double? conservative =
+          TtcEstimator.fuseLegsConservative(ttcScalePred, ttcRangePred);
+      if (conservative != null) {
+        ttcPred = conservative;
+        urgentExempted = true;
+      }
+    }
     final double? tauNowRaw = ttcPred == null
         ? null
         : math.max(0, ttcPred - NavHazConfig.pipelineLatencyS);
@@ -572,12 +739,23 @@ class TtcEstimator {
     // track confirmation. A genuine crossing pays two
     // frames (0.2 s), which the latency calibration
     // absorbs; a glitch whip never reaches the policy.
-    final int inBandRun = (tauNowRaw != null &&
-            tauNowRaw <= NavHazConfig.urgentTtcS)
-        ? (_tauNowInBandRun[track.id] ?? 0) + 1
-        : 0;
+    // NH-M1-11: an exemption frame FREEZES the run -- it
+    // neither advances it (the frame's evidence is
+    // contested) nor resets it (the track's committed
+    // evidence stands) -- and tau_now is not issued from a
+    // frozen frame; the run resumes accumulating from the
+    // frozen value on the next ordinary in-band frame.
+    final int inBandRun;
+    if (urgentExempted) {
+      inBandRun = _tauNowInBandRun[track.id] ?? 0;
+    } else if (tauNowRaw != null && tauNowRaw <= NavHazConfig.urgentTtcS) {
+      inBandRun = (_tauNowInBandRun[track.id] ?? 0) + 1;
+    } else {
+      inBandRun = 0;
+    }
     _tauNowInBandRun[track.id] = inBandRun;
-    final double? ttcUrgent = inBandRun >= 3 ? tauNowRaw : null;
+    final double? ttcUrgent =
+        (!urgentExempted && inBandRun >= 3) ? tauNowRaw : null;
 
     return TrackEstimate(
       track: track,
@@ -594,6 +772,9 @@ class TtcEstimator {
       ttcDisagreement: disagreement,
       egoSpeedKnown: ego.speedKnown,
       scaleRate: scaleV,
+      urgentDisagreementExempted: urgentExempted,
+      debugAgileScaleTtcS: ttcScalePred,
+      debugAgileRangeTtcS: ttcRangePred,
     );
   }
 

@@ -339,6 +339,26 @@ class MingtuHomeDebugHandle {
   Map<String, int> get recoverableErrorCounts =>
       Map<String, int>.unmodifiable(_state._asrStreakSnapshot);
 
+  /// NH-M1-10 segment-2 test seams: install the fake
+  /// segment clock + the stamp collection, and read the
+  /// stamps back. Production never calls these; the
+  /// segment's arithmetic is otherwise wall-clock (see
+  /// _latencyNow in the state).
+  void debugInstallLatencyClock(
+          DateTime Function() clock, List<(String, int)> sink) =>
+      _state._debugInstallLatencyClock(clock, sink);
+  List<(String, int)> get debugLatencySegments =>
+      List<(String, int)>.unmodifiable(
+          _state._latencySegmentsForTest ?? const <(String, int)>[]);
+
+  /// NH-M1-10: feed one detection frame WITH an injected
+  /// frame timestamp (the adapter's delivery stamp in
+  /// production), so a test can drive the pipeline path
+  /// with a known frame time.
+  void simulateDetectionsAt(
+          List<Detection> detections, DateTime frameCapturedAt) =>
+      _state._onYoloDetections(detections, frameCapturedAt);
+
   /// CDX2 streak view: the one code currently streaking
   /// and its length (0 / null when no streak is open).
   String? get asrStreakCode => _state._asrStreakCode;
@@ -468,6 +488,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// time bases for the same judgement invited exactly
   /// the confusion the CDX3 round removed.)
   DateTime Function() _speechNow = DateTime.now;
+
+  /// NH-M1-10: install the fake segment clock + stamp
+  /// collection for the segment-2 test (debug handle
+  /// entry). Production never calls this.
+  void _debugInstallLatencyClock(
+      DateTime Function() clock, List<(String, int)> sink) {
+    _latencyNow = clock;
+    _latencySegmentsForTest = sink;
+  }
 
   /// Test-only override of the camera pitch reading (see
   /// debugSetPitchDeg); null in production, where the
@@ -962,6 +991,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   final Map<String, DateTime> _hazardSpeakSegmentStarts =
       <String, DateTime>{};
   DateTime? _speakStartSegmentFrom;
+
+  /// NH-M1-10 segment-test clock + collection seam: the
+  /// wall clock segment 2's arithmetic runs on, and the
+  /// list of (stage, milliseconds) the segment has
+  /// stamped. Production never installs either: the clock
+  /// defaults to [DateTime.now] and the collection stays
+  /// null (the log line is then the only output, exactly
+  /// as before). Tests install both through the debug
+  /// handle to assert the segment's VALUE -- the mock
+  /// TTS reports its speak-start at the speak() call, so
+  /// a test can only pin the segment's arithmetic against
+  /// injected stamps, never the engine's real latency
+  /// (that calibration stays on the real-device checklist
+  /// in the README).
+  DateTime Function() _latencyNow = DateTime.now;
+  List<(String, int)>? _latencySegmentsForTest;
 
   // Blind-first voice control: the command text is a simulation of a
   // real recogniser transcript until system ASR is integrated (see
@@ -2415,9 +2460,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final DateTime? from = _speakStartSegmentFrom;
     _speakStartSegmentFrom = null;
     if (from == null) return;
-    final int? ms = latencySegmentMs(from, DateTime.now());
+    final int? ms = latencySegmentMs(from, _latencyNow());
     if (ms != null) {
       _logMsg('NAVHAZ延迟 pipeline-to-speak ${ms}ms');
+      _latencySegmentsForTest?.add(('pipeline-to-speak', ms));
     }
   }
 
@@ -4387,13 +4433,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       commit: navigating,
     );
     // S3 segment 2 START: the pipeline has returned.
-    final DateTime pipelineReturnedAt = DateTime.now();
+    // (Stamped on the segment clock -- the wall clock in
+    // production; a test may install a fake through the
+    // debug handle to pin the segment's arithmetic.)
+    final DateTime pipelineReturnedAt = _latencyNow();
     // S3 segment 1: frame timestamp -> detection-callback
     // arrival (`now`, stamped at _onYoloDetections entry).
-    // Only frames the adapter actually stamped carry a
-    // segment (simulated frames pass null), and only
-    // alert / pre-urgent frames stamp it, like the
-    // pipeline's own segment.
+    // Scope (NH-M1-10): the frame timestamp is the
+    // adapter's delivery-moment stamp, so this segment
+    // measures ONLY result-delivery -> detection callback;
+    // it does NOT include camera frame capture or model
+    // inference time. Only frames the adapter actually
+    // stamped carry a segment (simulated frames pass
+    // null), and only alert / pre-urgent frames stamp it,
+    // like the pipeline's own segment.
     if (frameCapturedAt != null &&
         (result.alert != null || result.preUrgentTrackIds.isNotEmpty)) {
       final int? segment1 = latencySegmentMs(frameCapturedAt, now);
@@ -4401,14 +4454,23 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _logMsg('NAVHAZ延迟 frame-to-callback ${segment1}ms');
       }
     }
-    // Pre-emptive urgent vibration (FIX3B): the urgent
-    // vibration fires the moment tau_now crosses the
-    // pre-vibration threshold, BEFORE urgent confirmation;
-    // no speech accompanies it -- the urgent speech still
-    // comes only through the confirmed alert path below.
+    // Vibrations (NH-M1-13 ladder): the pipeline has
+    // already merged this frame's pre-urgent one-shot and
+    // the alert's ladder-step vibration into ONE dispatch
+    // list (result.vibrations) -- the two same-frame
+    // duplicate sources (a pre-urgent firing on the alert
+    // frame, an alert vibration on top of an already-spent
+    // pre-urgent) are resolved there, so this loop is the
+    // ONLY vibration dispatch on the pipeline path and
+    // fires exactly the counted entries: urgent pattern
+    // for pre-urgent / urgent entries, warning pattern
+    // for a warning alert's step. No speech accompanies a
+    // pre-urgent entry -- the urgent speech still comes
+    // only through the confirmed alert path below.
     if (navigating) {
-      for (final int _ in result.preUrgentTrackIds) {
-        unawaited(_haptics.vibrateUrgent());
+      for (final ({int trackId, bool urgent}) v in result.vibrations) {
+        unawaited(
+            v.urgent ? _haptics.vibrateUrgent() : _haptics.vibrateWarning());
       }
     }
     if (result.riskPresent) {
@@ -4424,13 +4486,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     final HazardAlert? alert = result.alert;
     if (alert == null) return;
-    // Vibration FIRST: it starts in parallel with the
-    // physical TTS stop the hazard speak path performs --
-    // it is never awaited before speech (spec section 2.5:
-    // the voice follows the vibration start closely; the
-    // sequenced speak path owns that timing).
-    unawaited(
-        alert.urgent ? _haptics.vibrateUrgent() : _haptics.vibrateWarning());
+    // NH-M1-13: NO vibration dispatch here any more --
+    // the alert's vibration (when its ladder step allows
+    // one) was already dispatched in parallel with the
+    // speech preparation by the result.vibrations loop
+    // above (vibration first, never awaited before
+    // speech; spec section 2.5 timing is unchanged).
+    // Dispatching again here was duplicate source (ii):
+    // the same urgent frame vibrated twice.
     String text = alert.phrase;
     if (alert.urgent) {
       // A sideways step may ONLY come from the avoidance

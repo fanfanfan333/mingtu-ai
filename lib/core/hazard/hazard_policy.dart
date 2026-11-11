@@ -124,7 +124,71 @@ class HazardPolicyResult {
   /// without it.
   final bool riskPresent;
 
-  const HazardPolicyResult({required this.alert, required this.riskPresent});
+  /// Whether THIS alert may fire its level's vibration
+  /// (NH-M1-13, vibration counted per APPROACH -- the
+  /// ladder documented at [HazardAlertSteps]): the
+  /// episode's first WARNING vibrates (step 2); a WARNING
+  /// re-alert inside the same episode does not; an URGENT
+  /// that upgrades a previously WARNED episode vibrates
+  /// once more (step 3); an URGENT that opens the episode
+  /// vibrates ONLY if this approach has not already spent
+  /// its vibration on the pre-urgent step (step 1, which
+  /// the pipeline registers via [HazardPolicy.notePreVibrated]
+  /// before evaluating) -- a pure pre-urgent -> U approach
+  /// therefore vibrates exactly once in total. False
+  /// whenever [alert] is null. The SPEECH is never gated
+  /// by this flag -- only the vibration is counted.
+  final bool vibrationAllowed;
+
+  const HazardPolicyResult({
+    required this.alert,
+    required this.riskPresent,
+    this.vibrationAllowed = false,
+  });
+}
+
+/// The per-approach vibration ladder (NH-M1-13), the
+/// single statement of how many vibrations one approach
+/// of one track may produce. The steps are LEVEL STEPS,
+/// and each step fires at most once per approach:
+///
+///   step 1  pre-urgent vibration -- at most ONE per
+///           pre-urgent episode (the pipeline's one-shot;
+///           TTC < 1.5 s before confirmation);
+///   step 2  the approach's first WARNING alert -- ONE
+///           warning vibration;
+///   step 3  the WARNING -> URGENT upgrade inside the
+///           same approach -- ONE more (urgent) vibration:
+///           the level changed, a new step.
+///
+/// The per-path totals follow from which steps the path
+/// actually walks:
+///   pre-urgent -> URGENT (never warned): ONE (step 1
+///     spends the approach's vibration; the urgent frame
+///     adds nothing -- whether the pre-urgent fired on an
+///     earlier frame or the same frame);
+///   WARNING -> URGENT (never pre-vibrated): TWO (steps
+///     2 + 3);
+///   pre-urgent + WARNING + URGENT (all three steps
+///     walked): THREE -- each step fired once.
+/// Inside one approach nothing else vibrates: no re-alert
+/// repeats its step, no second upgrade exists.
+///
+/// Two clocks, deliberately separate: an "alert episode"
+/// (the policy's -- from the track's first alert until
+/// its alert stream ends: the track leaves the estimates,
+/// or [HazardPolicy.trackRetired] reports its retirement)
+/// scopes steps 2/3; the pre-urgent episode (the
+/// pipeline's latch -- NH-M1-11's exemption reads it)
+/// scopes step 1. The ladder JOINS them only through the
+/// registration [HazardPolicy.notePreVibrated]: when an
+/// urgent OPENS an alert episode, step 1's having fired
+/// earlier in the approach (registration present) is what
+/// suppresses the urgent's own dispatch. NH-M1-11
+/// exemption frames fire NO vibration and are untouched
+/// by this ladder.
+class HazardAlertSteps {
+  HazardAlertSteps._();
 }
 
 class _LastAlert {
@@ -146,9 +210,60 @@ class HazardPolicy {
   final Map<int, _LastAlert> _lastByTrack = <int, _LastAlert>{};
   _Emitted? _lastEmitted;
 
+  /// NH-M1-13 vibration-episode bookkeeping (steps 2/3 of
+  /// the ladder at [HazardAlertSteps]): the level of the
+  /// last alert per track IN THE CURRENT alert episode.
+  /// An entry exists exactly while the track's alert
+  /// episode is open: it is created by the episode's
+  /// first alert, consulted to decide whether the next
+  /// alert is the first warning / the W -> U upgrade /
+  /// neither, and cleared when the episode ends -- the
+  /// caller reports the end explicitly (the track absent
+  /// from a frame's estimates, or its retirement, via
+  /// [trackRetired] / [noteAbsentTracks]); the speech
+  /// cooldown map above is a different clock and is NOT
+  /// reused for this.
+  final Map<int, HazardLevel> _episodeAlertLevel = <int, HazardLevel>{};
+
   void reset() {
     _lastByTrack.clear();
     _lastEmitted = null;
+    _episodeAlertLevel.clear();
+    _preVibratedInApproach.clear();
+  }
+
+  /// NH-M1-13: report that [trackId]'s alert episode has
+  /// ended (the track retired, or it was absent from a
+  /// frame's estimates so its alert stream broke). The
+  /// next alert of a (possibly new) track with this id
+  /// opens a fresh episode with a fresh vibration budget.
+  void trackRetired(int trackId) {
+    _episodeAlertLevel.remove(trackId);
+    _preVibratedInApproach.remove(trackId);
+  }
+
+  /// NH-M1-13: close the alert episodes of every track
+  /// NOT in [presentIds] (a frame's estimated tracks).
+  /// The step-1 registration clears on the same boundary:
+  /// an approach that has left the estimates is over.
+  void noteAbsentTracks(Set<int> presentIds) {
+    _episodeAlertLevel.removeWhere((int id, HazardLevel _) =>
+        !presentIds.contains(id));
+    _preVibratedInApproach.removeWhere(
+        (int id) => !presentIds.contains(id));
+  }
+
+  /// NH-M1-13 step 1 registration: the pipeline reports
+  /// that [trackId]'s pre-urgent vibration has fired in
+  /// the current approach (called BEFORE [evaluate] on
+  /// the firing frame, and re-asserted while the
+  /// pipeline's one-shot holds the track). Consulted for
+  /// exactly one decision: an episode-opening URGENT adds
+  /// no vibration when the approach already spent step 1.
+  final Set<int> _preVibratedInApproach = <int>{};
+
+  void notePreVibrated(int trackId) {
+    _preVibratedInApproach.add(trackId);
   }
 
   /// The level one estimate qualifies for, or null. Pure
@@ -491,6 +606,25 @@ class HazardPolicy {
             ? (chosen.ttcUrgentS ?? chosen.ttcS)
             : chosen.ttcS);
     _lastEmitted = _Emitted(now, kind, zone, level);
-    return HazardPolicyResult(alert: alert, riskPresent: true);
+    // NH-M1-13 ladder (see [HazardAlertSteps]): the
+    // episode's first WARNING vibrates (step 2); a
+    // WARNING -> URGENT upgrade vibrates once more
+    // (step 3); an episode-opening URGENT vibrates ONLY
+    // when the approach has not already spent step 1 (no
+    // pre-urgent registration) -- otherwise the pure
+    // pre-urgent -> U path would vibrate twice for one
+    // approach; every other alert of the episode
+    // (warning re-alert, urgent re-alert) does not.
+    final HazardLevel? episodeLevel = _episodeAlertLevel[track.id];
+    final bool vibrationAllowed = switch ((episodeLevel, level)) {
+      (null, HazardLevel.warning) => true,
+      (null, HazardLevel.urgent) =>
+        !_preVibratedInApproach.contains(track.id),
+      (HazardLevel.warning, HazardLevel.urgent) => true,
+      _ => false,
+    };
+    _episodeAlertLevel[track.id] = level;
+    return HazardPolicyResult(
+        alert: alert, riskPresent: true, vibrationAllowed: vibrationAllowed);
   }
 }

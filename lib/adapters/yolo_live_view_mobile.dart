@@ -103,7 +103,11 @@ class _YoloLiveViewHostState extends State<_YoloLiveViewHost> {
         // results -- the plugin exposes no camera capture
         // timestamp, so this delivery stamp is the frame's
         // app-side timestamp and the start point of the
-        // frame-to-callback latency segment.
+        // frame-to-callback latency segment. Scope of that
+        // segment (NH-M1-10): it measures ONLY result-
+        // delivery -> detection callback; it does NOT
+        // include camera frame capture or model inference
+        // time (both happen before this stamp exists).
         final DateTime frameCapturedAt = DateTime.now();
         widget.onDetections(
             results.map((YOLOResult r) => yoloResultToDetection(

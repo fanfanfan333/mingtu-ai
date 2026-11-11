@@ -168,15 +168,26 @@ void main() {
                 'is enumerated');
         expect(containsBannedWord(phrase), isFalse);
       }
-      // The count is pinned so a silently shrinking entry
-      // point fails loudly.
-      final int names = spokenNameAxes().length;
-      expect(all.length, names * 2 * (3 * 9 + 12 * 8),
-          reason: 'names x levels x (near 3 zones x 9 '
-              'ranges + far 12 hours x 8 ranges) -- the '
-              'FIX3B band space is deliberately compact: '
-              'distance wording no longer has hundreds of '
-              'numeric gradations');
+      // The UNIQUE phrase set is pinned verbatim so a
+      // silently shrinking (or growing) entry point fails
+      // loudly: 1,044 distinct phrases. The RAW yield
+      // count is deliberately NOT pinned any more
+      // (NH-M1-14): the distance axes are now DERIVED
+      // from the shared hazardBands table (denser
+      // interior samples than the old hand-listed ones),
+      // so the raw combination count follows the table's
+      // sampling density (3,960 at the current table)
+      // while the producible phrase SET -- the quantity
+      // the 2,460-combination baseline actually pinned
+      // semantically -- is unchanged, verified byte-for-
+      // byte against the pre-refactor enumeration during
+      // the NH-M1-14 round.
+      expect(all.toSet().length, 1044,
+          reason: 'the producible phrase set is unchanged '
+              'by the shared-table refactor (NH-M1-14)');
+      expect(all.length, greaterThan(2460),
+          reason: 'the table-derived axes sample at least '
+              'the old hand-listed coverage');
     });
 
     test('distance wording bands (FIX3B)', () {

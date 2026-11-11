@@ -199,6 +199,29 @@ void main() {
     // THIS -- never a shortened window.
     DateTime fakeNow = DateTime.fromMillisecondsSinceEpoch(0);
 
+    // NH-M1-10: mock speak.onStart dispatches owed to the
+    // plugin (one per speak call), delivered by
+    // flushSpeakStarts() -- the harness's analogue of the
+    // engine latency between a speak() call and phonation.
+    int pendingStartDispatches = 0;
+
+    /// Deliver every owed mock speak.onStart event
+    /// through the real plugin path (platform -> Dart
+    /// 'speak.onStart' on the flutter_tts channel).
+    void flushSpeakStarts() {
+      final TestDefaultBinaryMessenger messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      while (pendingStartDispatches > 0) {
+        pendingStartDispatches -= 1;
+        messenger.handlePlatformMessage(
+          'flutter_tts',
+          const StandardMethodCodec()
+              .encodeMethodCall(const MethodCall('speak.onStart')),
+          (ByteData? _) {},
+        );
+      }
+    }
+
     List<String> timeline() =>
         events.map(((int, String) e) => e.$2).toList();
     int idxOf(String event) => timeline().indexOf(event);
@@ -219,6 +242,32 @@ void main() {
               return 1;
             case 'speak':
               events.add((clockMs, 'speak:${call.arguments}'));
+              // NH-M1-10: the mock engine reports the
+              // utterance START through the plugin's real
+              // inbound event: flutter_tts dispatches
+              // platform->Dart calls named 'speak.onStart'
+              // on this same channel, and the plugin routes
+              // them to the handler the adapter registered
+              // via setStartHandler. Firing it at the
+              // speak() call point is the mock's
+              // approximation of phonation -- on a device
+              // the engine sends it when the sound ACTUALLY
+              // starts; the magnitude difference between
+              // the two is exactly what segment 2 measures
+              // and stays on the real-device checklist.
+              // The start event is OWED, not delivered
+              // inline: flushSpeakStarts() delivers it
+              // when the test drains/completes speaks (or
+              // flushes explicitly) -- modelling the
+              // engine latency between the speak() call
+              // and phonation inside the harness's own
+              // completion discipline. On a device the
+              // engine sends speak.onStart when the sound
+              // ACTUALLY starts; the mock cannot know that
+              // moment, and the magnitude difference is
+              // what segment 2 measures on the device
+              // (real-device checklist).
+              pendingStartDispatches += 1;
               final Completer<dynamic> c = Completer<dynamic>();
               pendingSpeaks.add(c);
               return c.future;
@@ -278,6 +327,10 @@ void main() {
 
     Future<void> drainSpeaks(WidgetTester tester) async {
       for (int i = 0; i < 40; i++) {
+        // NH-M1-10: owed speak.onStart events are flushed
+        // as part of draining (an utterance that is being
+        // completed has, physically, started).
+        flushSpeakStarts();
         final List<Completer<dynamic>> pending = pendingSpeaks
             .where((Completer<dynamic> c) => !c.isCompleted)
             .toList();
@@ -301,6 +354,7 @@ void main() {
       expect(idx, greaterThanOrEqualTo(0), reason: 'no such speak: $marker');
       final int speakOrdinal =
           timeline().sublist(0, idx + 1).where((String e) => e.startsWith('speak:')).length - 1;
+      flushSpeakStarts();
       pendingSpeaks[speakOrdinal].complete(1);
       await pumpFrames(tester);
     }
@@ -385,6 +439,7 @@ void main() {
       clockMs = 0;
       stopLatencyMs = 80;
       stopNeverCompletes = false;
+      pendingStartDispatches = 0;
       fakeNow = DateTime.now();
       installMocks();
     });
@@ -751,6 +806,60 @@ void main() {
       );
       // ignore: avoid_print
       print('expired=${h.debugExpired}; replay count=0');
+      await drainSpeaks(tester);
+      expectTimelineClean();
+    });
+
+    testWidgets(
+        '(f) segment 2 (pipeline-to-speak) stamps the INJECTED '
+        'difference through the mock speak-start (NH-M1-10)',
+        (tester) async {
+      final MingtuHomeDebugHandle h = await startApp(tester);
+      installTracker(h);
+      h.debugSetPitchDeg(10);
+      // The segment clock: T0 until the test flips it.
+      // The pipeline-return stamp is taken while the
+      // clock reads T0; the speak-start stamp is taken
+      // after the flip, so the stamped segment must equal
+      // the injected delta EXACTLY -- the arithmetic runs
+      // on the injected stamps, not on wall time.
+      final DateTime t0 =
+          DateTime.fromMillisecondsSinceEpoch(1700000000000);
+      DateTime segNow = t0;
+      final List<(String, int)> sink = <(String, int)>[];
+      h.debugInstallLatencyClock(() => segNow, sink);
+      // Feed the approaching-car geometry until the hazard
+      // alert lands (its request carries the pipeline-
+      // return stamp taken at T0).
+      feedApproachingCar(h);
+      await pumpFrames(tester);
+      // Sanity: an alert speak must be in flight before
+      // the flip, or there is nothing to close.
+      expect(
+          timeline().any((String e) =>
+              e.startsWith('speak:') && e.contains('停')),
+          isTrue,
+          reason: 'the hazard alert speak started; '
+              'timeline: ${timeline()}');
+      // Flip the segment clock by the injected delta and
+      // deliver the owed mock speak.onStart (the harness
+      // delivers start events when the test flushes them,
+      // modelling the engine latency between the speak
+      // call and phonation): the segment must now close
+      // against the flipped clock.
+      segNow = t0.add(const Duration(milliseconds: 180));
+      flushSpeakStarts();
+      await pumpFrames(tester, 6);
+      expect(sink, contains(('pipeline-to-speak', 180)),
+          reason: 'the stamped segment equals the '
+              'injected pipeline-return -> speak-start '
+              'difference (180 ms), collected through the '
+              'debug seam; the log line carries the same '
+              'value');
+      expect(h.logText.contains('NAVHAZ延迟 pipeline-to-speak 180ms'),
+          isTrue,
+          reason: 'the production log line stamped the '
+              'same 180 ms');
       await drainSpeaks(tester);
       expectTimelineClean();
     });

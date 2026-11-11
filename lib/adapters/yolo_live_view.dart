@@ -25,8 +25,10 @@ import 'yolo_live_view_stub.dart'
 /// by the adapter the moment the plugin delivers the frame's
 /// results -- the plugin exposes no capture timestamp; the stamp
 /// is the start point of the frame-to-callback latency segment,
-/// FIX4-FINAL S3); [onLatencyMs] reports the frame processing
-/// time in milliseconds when the plugin provides it.
+/// FIX4-FINAL S3 -- that segment measures ONLY result-delivery
+/// -> detection callback, NOT camera frame capture or model
+/// inference time, NH-M1-10); [onLatencyMs] reports the frame
+/// processing time in milliseconds when the plugin provides it.
 class YoloLiveView extends StatelessWidget {
   final String modelPath;
   final void Function(List<Detection> detections, DateTime frameCapturedAt)
