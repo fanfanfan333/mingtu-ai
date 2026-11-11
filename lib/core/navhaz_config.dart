@@ -705,4 +705,42 @@ static const Duration cloudAutoWindow = Duration(minutes: 10);
 
 /// See [cloudAutoWindow].
 static const int cloudAutoMaxPerWindow = 5;
+
+// ---- Pothole second detector (M3) -----------------------------------
+//
+// The pothole detector is a SECOND, independent detector
+// (its own model, tahaUgan/pothole-yolo11n, CC BY 4.0 --
+// see tool/fetch_pothole_model.sh and the README model
+// section) behind the build-time switch
+// --dart-define=MINGTU_POTHOLE=1 (AppConfig.potholeEnabled,
+// default OFF). The constants below govern only its scan
+// cadence and its grading threshold; the grading itself is
+// the dedicated pit branch in hazard_policy.dart.
+
+/// Pit URGENT range (M3 ruling): a pothole whose measured
+/// ground range Z is at or below this many metres grades
+/// URGENT. A pit is a static ground feature, so the grade
+/// is a pure range rule -- the TTC machinery (approach
+/// tests, scale/range closing legs) never applies to it.
+/// (Provisional value from the ruling; real-device
+/// calibration pending, like every value in this file.)
+static const double pitUrgentRangeM = 1.5;
+
+/// Scan cadence cap for the pothole scanner: at most one
+/// scan per this interval (200 ms = 5 FPS), and scans run
+/// ONLY while the user is walking (the pipeline's own ego
+/// judgement). A pothole scan is a single frame through
+/// the shared routed frame source plus one predict() on
+/// the second model -- never a second camera session.
+static const Duration potholeScanMinInterval =
+    Duration(milliseconds: 200);
+
+/// How long a completed scan's detections stay mergeable
+/// into live frames at the shared intake. Scans refresh
+/// at the cadence above while walking, so this age only
+/// bounds the tail after walking stops or a scan stalls:
+/// past it, the stored detections are dropped and the pit
+/// track coasts out through the tracker's normal lost
+/// window instead of being re-fed forever.
+static const Duration potholeResultMaxAge = Duration(seconds: 1);
 }

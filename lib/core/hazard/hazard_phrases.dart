@@ -70,6 +70,8 @@ String hazardSpokenName(String label, HazardKind kind) {
       return '行人';
     case 'pole':
       return '杆子';
+    case 'pothole':
+      return '坑洞';
     default:
       return hazardKindName(kind);
   }
@@ -518,7 +520,7 @@ List<(String, bool)> spokenNameAxes() {
   }
   for (final String label in <String>[
     'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'person',
-    'pole', 'mystery-box',
+    'pole', 'pothole', 'mystery-box',
   ]) {
     final HazardKind kind = hazardKindForLabel(label) ?? HazardKind.clutter;
     names[hazardSpokenName(label, kind)] =

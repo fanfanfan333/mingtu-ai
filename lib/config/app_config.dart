@@ -103,6 +103,28 @@ class AppConfig {
   static String get asrProxyUrl =>
       _asrProxyUrlDefine.isNotEmpty ? _asrProxyUrlDefine : visionProxyUrl;
 
+  /// NAVHAZ M3 pothole second detector switch: ON only
+  /// when built with --dart-define=MINGTU_POTHOLE=1.
+  /// Default OFF (an absent or different value is off):
+  /// while off, the app never constructs the pothole
+  /// scanner, never loads the pothole model and never
+  /// captures a frame for it -- pipeline behaviour is
+  /// exactly the pre-M3 behaviour. This getter is the
+  /// SINGLE access point for the switch; the wiring layer
+  /// injects its value into the scanner so tests can flip
+  /// it without a build flag.
+  static const bool potholeEnabled =
+      String.fromEnvironment('MINGTU_POTHOLE') == '1';
+
+  /// Bundled pothole model asset (fetched and
+  /// SHA256-verified by tool/fetch_pothole_model.sh; the
+  /// weights are never committed). Only ever loaded when
+  /// [potholeEnabled] is on.
+  static const String potholeModelPath = String.fromEnvironment(
+    'MINGTU_POTHOLE_MODEL_PATH',
+    defaultValue: 'assets/models/pothole2v.tflite',
+  );
+
   static bool get hasRouteProxy => routeProxyUrl.isNotEmpty;
   static bool get hasAmapDemoKey => amapDemoKey.isNotEmpty;
   static bool get hasYoloModelPath => yoloModelPath.isNotEmpty;

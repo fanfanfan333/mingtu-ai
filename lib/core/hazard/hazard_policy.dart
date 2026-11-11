@@ -69,6 +69,15 @@
 /// ONE alert: urgent before warning, then smaller TTC,
 /// then the hazard-kind order.
 ///
+/// M3 adds ONE dedicated branch to the table: a pothole
+/// ([HazardKind.pit], from the second detector) is graded
+/// by [_levelForPit] before every path above -- measured
+/// ground range at or below 1.5 m is urgent, the static
+/// range / near-corridor rules give warnings, and no TTC
+/// input is ever consulted for it (a pit does not close
+/// in; the user walks toward it). The NH-M1-19 short-form
+/// gate likewise never applies to a pit.
+///
 /// This policy never produces a step direction: wording is
 /// [hazard_phrases] only, and a sideways step may be added
 /// by the caller solely from the avoidance advisor's
@@ -307,6 +316,16 @@ class HazardPolicy {
     final bool confirmedW = track.confirmed;
     final bool confirmedU = track.urgentConfirmed;
     if (!confirmedW && !confirmedU) return null;
+    // M3: a pothole is graded by its dedicated branch
+    // BEFORE every other path (including the ego-unknown
+    // scale path). A pit is a static ground feature: the
+    // TTC machinery -- approaching tests, closing legs,
+    // scale-TTC bands -- never applies to it, in either
+    // ego state. See [_levelForPit].
+    if ((hazardKindForLabel(track.label) ?? HazardKind.clutter) ==
+        HazardKind.pit) {
+      return _levelForPit(e, urgentOk: confirmedU, warningOk: confirmedW);
+    }
     // Ego speed unknown: the dedicated scale path judges
     // the estimate on its own rules (no willHit corridor,
     // no approaching test) -- see the library doc. When
@@ -515,6 +534,43 @@ class HazardPolicy {
     return null;
   }
 
+  /// The pit branch (M3 ruling): the level for one
+  /// pothole estimate. A pit is a static ground feature,
+  /// so the grade is a pure ground-range / nearness rule
+  /// in the style of the existing static-obstacle rules --
+  /// no TTC input of any kind is consulted:
+  ///   URGENT  -- the measured ground range Z is at or
+  ///              below [NavHazConfig.pitUrgentRangeM]
+  ///              (1.5 m), on URGENT-tier confirmation;
+  ///   WARNING -- the static-obstacle range rule (Z at or
+  ///              below [NavHazConfig.warningStaticRangeM]),
+  ///              or the inherited near-corridor rule (box
+  ///              bottom low in the frame) when no range
+  ///              could be measured -- the same courtesy
+  ///              the TTC == null rules extend to every
+  ///              non-vehicle kind, and never more than a
+  ///              warning on position alone.
+  /// The forward-channel test ([TrackEstimate.willHit])
+  /// gates the branch like every other grading path: a
+  /// pothole beside the user's path grades nothing.
+  HazardLevel? _levelForPit(TrackEstimate e,
+      {required bool urgentOk, required bool warningOk}) {
+    if (!e.willHit) return null;
+    final double? rangeM = e.rangeM;
+    if (urgentOk && rangeM != null && rangeM <= NavHazConfig.pitUrgentRangeM) {
+      return HazardLevel.urgent;
+    }
+    if (!warningOk) return null;
+    if (rangeM != null && rangeM <= NavHazConfig.warningStaticRangeM) {
+      return HazardLevel.warning;
+    }
+    final TrackSample? s = e.track.latest;
+    if (s != null && s.bottom > NavHazConfig.nearBottom) {
+      return HazardLevel.warning;
+    }
+    return null;
+  }
+
   bool _cooldownAllows(TrackEstimate e, HazardLevel level, DateTime now) {
     final _LastAlert? last = _lastByTrack[e.track.id];
     if (last == null) return true;
@@ -648,7 +704,14 @@ class HazardPolicy {
     // the distance the user needs).
     final double? remainingTtc =
         level == HazardLevel.urgent ? (chosen.ttcUrgentS ?? chosen.ttcS) : null;
-    final String phrase = (remainingTtc != null &&
+    // M3: the short-form gate never applies to a pit --
+    // it is a TTC gate and a pit has no TTC (its grade is
+    // the range rule in [_levelForPit]); a pit urgent
+    // always speaks its full sentence. The exclusion also
+    // keeps pit out of [shortUrgentPhrase], whose table
+    // deliberately carries no pit entry.
+    final String phrase = (kind != HazardKind.pit &&
+            remainingTtc != null &&
             shortFormApplies(remainingTtc, normalPhrase))
         ? shortUrgentPhrase(kind, spokenName, s.cx)
         : normalPhrase;

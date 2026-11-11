@@ -226,6 +226,17 @@ void main() {
       //   centre vehicle form via the short table too).
       //   => 1,060 - 30 = 1,030, verified by set
       //   difference this round (gained 0, lost 30).
+      // - M3 (pothole second detector): ONE new spoken
+      //   name axis joins the space -- 坑洞 (the pit
+      //   kind's name, also the 'pothole' label's spoken
+      //   name; the two deduplicate to a single axis).
+      //   Its producible forms are the axis' near zone
+      //   forms, no-range clock forms and far clock
+      //   forms: 102 distinct strings, every one
+      //   carrying the new item name.
+      //   => 1,030 + 102 = 1,132, verified by set
+      //   difference this round (gained 102, lost 0;
+      //   measured in navhaz_pothole_test.dart).
       // The RAW yield count is deliberately NOT pinned
       // any more (NH-M1-14): the distance axes are now
       // DERIVED from the shared hazardBands table (denser
@@ -235,11 +246,12 @@ void main() {
       // while the producible phrase SET -- the quantity
       // the 2,460-combination baseline actually pinned
       // semantically -- is what the pin above tracks.
-      expect(all.toSet().length, 1030,
+      expect(all.toSet().length, 1132,
           reason: 'the producible phrase set: NH-M1-14 '
               'baseline 1,044 + 1 NH-M1-17 short form '
               '(person) + 15 NH-M1-19 bearing forms '
-              '- 30 M2-B no-range warning forms (see the '
+              '- 30 M2-B no-range warning forms '
+              '+ 102 M3 pothole-axis forms (see the '
               'composition account above)');
       expect(all.length, greaterThan(2460),
           reason: 'the table-derived axes sample at least '

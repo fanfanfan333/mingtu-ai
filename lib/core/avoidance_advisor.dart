@@ -33,13 +33,14 @@ import '../modules/visual_perception.dart';
 
 /// The hazard categories the user asked to be named in
 /// announcements, in danger order (vehicles first).
-enum HazardKind { motorVehicle, nonMotorVehicle, person, pole, clutter }
+enum HazardKind { motorVehicle, nonMotorVehicle, person, pole, pit, clutter }
 
 String hazardKindName(HazardKind kind) => switch (kind) {
       HazardKind.motorVehicle => '机动车',
       HazardKind.nonMotorVehicle => '非机动车',
       HazardKind.person => '行人',
       HazardKind.pole => '杆子',
+      HazardKind.pit => '坑洞',
       HazardKind.clutter => '杂物',
     };
 
@@ -48,8 +49,18 @@ int hazardKindPriority(HazardKind kind) => switch (kind) {
       HazardKind.nonMotorVehicle => 1,
       HazardKind.person => 2,
       HazardKind.pole => 3,
-      HazardKind.clutter => 4,
+      HazardKind.pit => 4,
+      HazardKind.clutter => 5,
     };
+
+/// The pipeline label of a pothole detection. The pothole
+/// model (M3) has two classes -- 'Pothole' (index 0) and
+/// 'Sewage-Manhole' (index 1) per its model card; the
+/// adapter normalises class 0 to this label, and class 1
+/// stays UNMAPPED (a manhole cover is not the hazard this
+/// round was ruled for, so it never enters the hazard
+/// system).
+const String potholeLabel = 'pothole';
 
 /// Map a detector label to a hazard category. The bundled
 /// COCO model has no pole class, so [HazardKind.pole] is
@@ -61,6 +72,7 @@ HazardKind? hazardKindForLabel(String label) => switch (label) {
       'bicycle' => HazardKind.nonMotorVehicle,
       'person' => HazardKind.person,
       'pole' => HazardKind.pole,
+      potholeLabel => HazardKind.pit,
       _ => null,
     };
 

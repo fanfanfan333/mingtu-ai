@@ -35,3 +35,13 @@ flutter:
     # The file is fetched and SHA256-verified by
     # tool/fetch_model.sh -- run it before building.
     - assets/models/yolo11n.tflite
+    # Pothole second-detector model (NAVHAZ M3, CC BY 4.0;
+    # see README "YOLO 模型" and tool/fetch_pothole_model.sh).
+    # Fetched and SHA256-verified by
+    # tool/fetch_pothole_model.sh -- run it before building.
+    # The detector itself is behind
+    # --dart-define=MINGTU_POTHOLE=1 and OFF by default;
+    # the asset is declared unconditionally (same
+    # discipline as the main model) so an enabled build
+    # always finds it bundled.
+    - assets/models/pothole2v.tflite

@@ -457,6 +457,13 @@ class HazardPipeline {
   /// eligible again on the first ordinary frame whose raw
   /// tau is back under the threshold.
   bool _preUrgentEligible(TrackEstimate e) {
+    // M3: a pothole never pre-vibrates on a TTC reading --
+    // the TTC machinery does not apply to a static ground
+    // feature (its grade is the range rule in
+    // HazardPolicy._levelForPit); a pit urgent vibrates
+    // through the alert ladder's own episode-opening step,
+    // like every other episode-opening urgent.
+    if (e.track.label == potholeLabel) return false;
     final double? tauNow = e.ttcUrgentRawS ?? e.ttcUrgentS;
     if (tauNow == null || tauNow >= NavHazConfig.preVibrationTtcS) {
       return false;

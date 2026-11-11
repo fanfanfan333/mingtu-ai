@@ -13,6 +13,7 @@ import 'adapters/current_location.dart';
 import 'adapters/system_voice_io.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'adapters/voice_io.dart';
+import 'adapters/pothole_detector.dart';
 import 'adapters/yolo_detector.dart';
 import 'adapters/yolo_live_view.dart';
 import 'config/app_config.dart';
@@ -30,6 +31,7 @@ import 'core/danger_alerts.dart';
 import 'core/avoidance_advisor.dart';
 import 'core/cloud_vision_hazard.dart';
 import 'core/cloud_trigger_policy.dart';
+import 'core/pothole_scan.dart';
 import 'core/orientation.dart';
 import 'adapters/orientation_monitor.dart';
 import 'adapters/haptics.dart';
@@ -323,6 +325,19 @@ class MingtuHomeDebugHandle {
   DetourInfo? get debugLastDetourInfo => _state._lastDetourInfo;
   DateTime? get debugLastDetourAt => _state._lastDetourAt;
   bool get debugCloudAutoInFlight => _state._cloudAutoBudget.inFlight;
+
+  /// M3 seam: install a pothole scanner directly (widget
+  /// tests inject one built on fakes; production installs
+  /// it in _initStartupModules only when
+  /// AppConfig.potholeEnabled). Passing null removes it.
+  void debugSetPotholeScanner(PotholeScanner? scanner) =>
+      _state._potholeScanner = scanner;
+
+  /// M3 seam: whether a pothole scanner is installed, and
+  /// the detections currently stored for merging.
+  bool get debugPotholeScannerInstalled => _state._potholeScanner != null;
+  List<Detection> get debugLatestPotholeDetections =>
+      List<Detection>.unmodifiable(_state._latestPotholeDetections);
 
   /// NAVHAZ M1 seam: feed one live-navigation fix through
   /// the production fix handler.
@@ -801,6 +816,23 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // per pipeline frame, never accumulated across breaks.
   final CloudTriggerPolicy _cloudTriggerPolicy = const CloudTriggerPolicy();
   final CloudAutoTriggerBudget _cloudAutoBudget = CloudAutoTriggerBudget();
+
+  // ---- M3: pothole second detector ----
+  // The scanner exists ONLY when the build-time switch
+  // is on (AppConfig.potholeEnabled, default off): it is
+  // constructed in _initStartupModules, after the routed
+  // frame source exists. While this field is null the
+  // pothole path is entirely absent -- no model load, no
+  // captures, no merges -- and behaviour is pre-M3.
+  PotholeScanner? _potholeScanner;
+
+  /// The latest completed scan's pothole detections and
+  /// when its frame was taken. A completed scan REPLACES
+  /// the list (an empty scan clears it); the merge at the
+  /// shared intake only reads it while it is fresh (see
+  /// NavHazConfig.potholeResultMaxAge).
+  List<Detection> _latestPotholeDetections = const <Detection>[];
+  DateTime? _latestPotholeAt;
 
   /// When the current unbroken stillness began (ego
   /// judge not walking); null while walking.
@@ -1732,6 +1764,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       log: startupFailures,
     );
     _frameSource = init.frameSource;
+    // M3: construct the pothole scanner ONLY when its
+    // build-time switch is on (default off). The detector
+    // loads its model lazily on the first scan, so
+    // construction itself costs nothing; while the switch
+    // is off nothing here exists at all.
+    if (AppConfig.potholeEnabled) {
+      _potholeScanner = PotholeScanner(
+        enabled: AppConfig.potholeEnabled,
+        detector: createPotholeDetector(AppConfig.potholeModelPath),
+        frameSource: _frameSource,
+        onDetections: _onPotholeScanResult,
+      );
+    }
     _amapClient = init.amapClient;
     _locationProvider = init.locationProvider;
     _yoloDetector = init.yolo;
@@ -4388,6 +4433,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // at delivery (null for simulated / scripted frames,
     // which then stamp no frame-to-callback segment).
     final DateTime now = DateTime.now();
+    // M3: merge the pothole scanner's latest results
+    // into THIS frame at the shared intake, BEFORE every
+    // downstream gate (the thermal class restriction
+    // below included -- a pit is not in its pass set, so
+    // a restricted frame drops pit input exactly like
+    // any other non-vehicle/pedestrian input). The merge
+    // is the ONLY entry pit detections have: they never
+    // call this handler on their own, so the avoidance
+    // bookkeeping and perception below always see whole
+    // frames, never pit-only partial frames. While the
+    // switch is off the stored list is always empty and
+    // this is a no-op.
+    final List<Detection> freshPotholes = _freshPotholeDetections(now);
+    if (freshPotholes.isNotEmpty) {
+      detections = <Detection>[...detections, ...freshPotholes];
+    }
     // M2 section 3.3 evidence: whether THIS frame shows
     // a traffic light (COCO label). Read off the raw
     // frame, before any downstream gating.
@@ -4452,6 +4513,33 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           events.map((PerceptionEvent e) => e.label).join('、');
       _logMsg('YOLO 新跟踪：$labels（仅报告检测，不给行走方向）。');
     }
+  }
+
+  /// M3: a completed pothole scan replaces the stored
+  /// result wholesale (an empty scan clears it -- the
+  /// previous scan's detections are not re-fed once the
+  /// scanner itself has looked again and seen none).
+  void _onPotholeScanResult(List<Detection> detections, DateTime at) {
+    _latestPotholeDetections = detections;
+    _latestPotholeAt = at;
+  }
+
+  /// M3: the stored pothole detections while they are
+  /// fresh enough to merge into a live frame (see
+  /// NavHazConfig.potholeResultMaxAge); empty when there
+  /// is nothing stored or the result has aged out (after
+  /// walking stops, the scanner stops refreshing and the
+  /// pit track coasts out through the tracker's normal
+  /// lost window instead of being re-fed forever).
+  List<Detection> _freshPotholeDetections(DateTime now) {
+    final DateTime? at = _latestPotholeAt;
+    if (at == null || _latestPotholeDetections.isEmpty) {
+      return const <Detection>[];
+    }
+    if (now.difference(at) > NavHazConfig.potholeResultMaxAge) {
+      return const <Detection>[];
+    }
+    return _latestPotholeDetections;
   }
 
   /// Shared risk-state entry for both hazard chains
@@ -4654,6 +4742,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // pipeline's own frame (danger and live tracks come
     // from its estimates). No-op while the flag is off.
     _applyFrameRatePolicy(result, egoNow, now);
+    // M3: offer this frame's moment to the pothole
+    // scanner. The walking gate is THIS frame's ego
+    // verdict (the same egoNow the pipeline and the
+    // frame-rate policy consumed -- never a second
+    // judgement); the scanner applies its own cadence
+    // and in-flight gates, and its results come back
+    // through _onPotholeScanResult for merging at the
+    // shared intake. Entirely absent while the switch
+    // is off (the scanner is never constructed then).
+    final PotholeScanner? potholeScanner = _potholeScanner;
+    if (potholeScanner != null) {
+      unawaited(potholeScanner.maybeScan(
+        walking: egoNow.state == EgoState.walking,
+        now: now,
+      ));
+    }
     // M2 section 3.3: the automatic cloud event triggers
     // are evaluated on the pipeline's own frame too --
     // stillness and the corridor-obstacle hold are
