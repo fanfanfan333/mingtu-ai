@@ -863,9 +863,16 @@ def _parse_asr_wav(decoded_audio):
     a WAV. Strictness rules, all mandatory:
 
     * The RIFF declared size (bytes 4-7, little-endian)
-      must equal len(body) - 8, allowing at most ONE pad
-      byte of slack: len(body) - 8 must be riff_size or
-      riff_size + 1.
+      must equal len(body) - 8 EXACTLY (CDX3 /
+      MT-1111-PTT-4: the earlier {0, 1} slack is gone --
+      Codex showed riff_size - 1 sailing through and
+      spending quota). There is NO size tolerance: a pad
+      byte exists in a RIFF file only as part of an
+      odd-sized chunk's word alignment INSIDE the chunk
+      walk, and it is counted in riff_size like every
+      other byte after the 8-byte header; the walk below
+      (size + pad stepping, pad presence bounds-checked)
+      is the one and only place padding is handled.
     * EVERY chunk is walked from offset 12 to the end of
       the file: a chunk header (8 bytes) plus its declared
       size must never run past the end of the file, and
@@ -897,8 +904,11 @@ def _parse_asr_wav(decoded_audio):
         return None
     riff_size = int.from_bytes(decoded_audio[4:8], "little")
     # RIFF size counts everything after its own 8-byte
-    # header; at most one trailing pad byte is tolerated.
-    if (total - 8) - riff_size not in (0, 1):
+    # header and must match it EXACTLY (CDX3): riff_size
+    # - 1 and riff_size + 1 are both malformed. No pad
+    # allowance lives here: chunk pad bytes are inside
+    # the declared size and are handled by the walk.
+    if riff_size != total - 8:
         return None
     fmt = None
     fmt_count = 0
@@ -908,8 +918,9 @@ def _parse_asr_wav(decoded_audio):
     while offset < total:
         if offset + 8 > total:
             # A remainder that cannot hold a chunk header
-            # (beyond the single RIFF pad byte, which the
-            # chunk walk itself never produces) is malformed.
+            # is malformed: the walk must consume the file
+            # exactly, chunk by chunk, with nothing left
+            # over (a lone trailing byte included).
             return None
         chunk_id = decoded_audio[offset:offset + 4]
         if any(b < 0x20 or b > 0x7E for b in chunk_id):

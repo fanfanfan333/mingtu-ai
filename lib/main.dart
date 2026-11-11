@@ -289,6 +289,69 @@ class MingtuHomeDebugHandle {
   /// 'restart_failed') this page has handled, in order.
   List<String> get debugEngineEvents =>
       List<String>.unmodifiable(_state._debugEngineEvents);
+
+  /// Test-only: whether the app is currently inside a
+  /// close-confirmation wait (its finally has not run).
+  bool get debugConfirmingClose => _state._asrConfirmingClose;
+
+  /// Test-only: the live adapter's unconfirmed-close
+  /// count (-1 when the input is not the system adapter).
+  int get debugPendingCloses {
+    final VoiceInput input = _state._voiceInput;
+    return input is SystemVoiceInput ? input.pendingCloses : -1;
+  }
+
+  /// Test-only: run the same engine-epoch accounting a
+  /// listen attempt performs (the missed-watchdog-restart
+  /// replay path), without starting a listen.
+  void debugEnsureEngineSubscription() =>
+      _state._ensureEngineSubscription();
+
+  /// Test-only: identity of the engineEvents stream this
+  /// page believes it is subscribed to (-1 when none).
+  int get debugSubscribedEngineStreamIdentity => _state
+              ._subscribedEngineEvents ==
+          null
+      ? -1
+      : identityHashCode(_state._subscribedEngineEvents);
+
+  /// Test-only: identity of the LIVE adapter's
+  /// engineEvents stream object.
+  int get debugLiveEngineStreamIdentity {
+    final VoiceInput input = _state._voiceInput;
+    return input is SystemVoiceInput
+        ? identityHashCode(input.debugEngineEventsStreamIdentity)
+        : -2;
+  }
+
+  /// Test-only: run the SAME unbounded close-confirmation
+  /// wait a stuck press's final-wait expiry runs
+  /// (_pttFinalWaitExpired's helper): the adapter
+  /// watchdog's restart is what resolves it. Used by the
+  /// missed-restart replay scenario to stay inside the
+  /// restart window with a live waiter when the restart
+  /// lands.
+  void debugConfirmClose() =>
+      unawaited(_state._ensureAsrCloseConfirmed());
+
+  /// Test-only: drop this page's live engine-events
+  /// subscription (and keep it dropped) -- the
+  /// subscription-gap half of the missed-restart replay
+  /// scenario.
+  void debugDropEngineSubscription() =>
+      _state._debugDropEngineSubscription();
+
+  /// Test-only: how many engine events the LIVE adapter
+  /// has EMITTED in total (its broadcast stream drops an
+  /// event with no live listener; this log does not), so
+  /// a test can prove a watchdog restart really happened
+  /// on THIS app's adapter while the app handled none.
+  int get debugAdapterEngineEventsEmittedCount {
+    final VoiceInput input = _state._voiceInput;
+    return input is SystemVoiceInput
+        ? input.debugEngineEventsEmitted.length
+        : -1;
+  }
   void debugTalkBackLongPress() => _state._talkBackLongPress();
   void debugFireCapTimerFor(int sid) =>
       unawaited(_state._onPttCapTimerFired(sid));
@@ -403,10 +466,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// streak (null = no streak) and [_asrStreakCount] its
   /// length. A different code RESTARTS the streak at 1 --
   /// busy, client, busy never accumulates to an
-  /// escalation. The streak is cleared by a delivered
-  /// recognition result and by a newly STARTED listen
-  /// (see _startListening for the exact reading). Fatal
-  /// codes never land here (they route directly).
+  /// escalation. The streak lives ACROSS presses (CDX3 /
+  /// MT-1111-PTT-4, tightened by MT-1111-PTT-4B): it is
+  /// cleared ONLY at the moment a recognition result is
+  /// actually SUBMITTED (see [_noteAsrSessionDelivered],
+  /// called from the press completion point), or
+  /// displaced by a different error code restarting it.
+  /// A partial that merely ARRIVES clears nothing -- it
+  /// is a cache entry until a release submits it. A
+  /// listen that merely STARTS clears nothing either:
+  /// two presses that each error busy once, with a
+  /// successful listen start and no submitted result
+  /// between them, are a streak of 2 and the NEXT press
+  /// escalates to the cloud route. Fatal codes never
+  /// land here (they route directly).
   String? _asrStreakCode;
   int _asrStreakCount = 0;
 
@@ -436,8 +509,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  /// Close the streak (a delivered result, or a newly
-  /// started listen -- see _startListening).
+  /// Close the streak. Called ONLY from the submission
+  /// clearing point ([_noteAsrSessionDelivered]); never
+  /// from a listen start or a result's mere arrival
+  /// (CDX3 / MT-1111-PTT-4B).
   void _resetAsrErrorStreak() {
     _asrStreakCode = null;
     _asrStreakCount = 0;
@@ -572,6 +647,41 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// cannot be distinguished from the initial state, and
   /// announcing it at startup would be wrong).
   int? _engineEpochSeen;
+
+  /// Test-only one-shot: skip the epoch accounting of
+  /// the NEXT [_ensureEngineSubscription] pass entirely
+  /// (set by the missed-restart replay test through a
+  /// MethodChannel marker; production code never sets
+  /// it). Simulates the subscription-rebuild gap in
+  /// which a watchdog restart's notification is lost.
+  bool _suppressNextEngineEpochCheck = false;
+
+  /// Account for ONE adapter epoch bump observed by
+  /// [_ensureEngineSubscription]. Epochs minted by the
+  /// RECOVERY re-initialize are consumed silently (the
+  /// adapter attributes them; the press flow already
+  /// handled that restart and spoke its own outcome).
+  /// Every other bump is a WATCHDOG restart whose live
+  /// notification was missed, so its outcome is replayed
+  /// exactly once -- success handling when the restart's
+  /// re-initialize succeeded, the failure handling when
+  /// it failed (via [SystemVoiceInput.lastRestartSucceeded]).
+  /// CDX3: an earlier form synced _engineEpochSeen to the
+  /// current epoch UNCONDITIONALLY at the top of
+  /// _ensureEngineSubscription, which rewrote the very
+  /// epoch difference this replay compares -- a missed
+  /// watchdog restart could never replay again. Bump
+  /// attribution, not blanket syncing, is what separates
+  /// the two restart kinds.
+  void _noteEngineEpochBump(SystemVoiceInput input, int epoch) {
+    if (input.consumeRecoveryEpoch(epoch)) return;
+    if (!mounted) return;
+    if (input.lastRestartSucceeded) {
+      _onEngineRestarted();
+    } else {
+      _onEngineRestartFailed();
+    }
+  }
 
   /// Set by [_ensureAsrCloseConfirmed] while it confirms
   /// the automatic session's close: during that window a
@@ -1279,7 +1389,49 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  /// Test-marker channel (harness -> app -> adapter):
+  /// widget tests send 'noteTestMarker' here to drive
+  /// the missed-restart replay scenario; production
+  /// platform code never uses this channel. Forwarded to
+  /// the adapter's test inbox; the epoch check in
+  /// [_ensureEngineSubscription] drains it.
+  static const MethodChannel _testMarkerChannel =
+      MethodChannel('dev.mingtu.test/markers');
+  bool _testMarkerHandlerArmed = false;
+
+  /// Test-only: drop the live engine-events subscription
+  /// (the missed-watchdog-restart replay scenario). The
+  /// flag it sets also tells the wiring pass below not to
+  /// re-create it: the scenario's whole point is a window
+  /// in which NO engine listener is live on this page.
+  bool _debugEngineSubDropped = false;
+
+  void _armTestMarkerChannel() {
+    if (_testMarkerHandlerArmed) return;
+    _testMarkerHandlerArmed = true;
+    _testMarkerChannel.setMethodCallHandler((MethodCall call) async {
+      if (call.method == 'noteTestMarker' && call.arguments is String) {
+        final VoiceInput input = _voiceInput;
+        if (input is SystemVoiceInput) {
+          input.debugNoteTestMarker(call.arguments as String);
+        }
+      }
+      return null;
+    });
+  }
+
+  /// Test-only counterpart of the marker channel: drop
+  /// the engine-events subscription for the replay
+  /// scenario (see [_debugEngineSubDropped]).
+  void _debugDropEngineSubscription() {
+    _debugEngineSubDropped = true;
+    _asrEngineSub?.cancel();
+    _asrEngineSub = null;
+    _subscribedEngineEvents = null;
+  }
+
   Future<bool> _initStartupModules() async {
+    _armTestMarkerChannel();
     // Every module is initialised behind its own guard by the
     // production initializer (adapters/startup_initializer.dart):
     // camera, configuration, Amap, location/permission, TTS,
@@ -1334,7 +1486,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           return;
         }
         final String text = event.text;
-        _noteAsrSessionDelivered();
+        // MT-1111-PTT-4B: a result ARRIVING here is only
+        // cached / routed below; it does NOT clear the
+        // error streak. Clearing happens when a result is
+        // SUBMITTED at the press completion point.
         if (_pttState == _PttState.listening) {
           // Cache only: while the button is held nothing is
           // executed. The release path submits the cached
@@ -1377,6 +1532,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (_asrConfirmingClose) return;
         if (event.sessionId != _asrSessionId) return;
         if (_pttSessionVoided) return;
+        // Partials only refresh the fallback cache below:
+        // a partial is never submitted by itself, so it
+        // never clears the error streak (MT-1111-PTT-4B).
         // Partials are only ever the push-to-talk fallback
         // cache; automatic sessions never act on them.
         if (_pttState == _PttState.listening) {
@@ -1417,18 +1575,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       });
       _asrSubCancels.add(() => _asrEngineSub?.cancel());
       _subscribedEngineEvents = asr.engineEvents;
-      _asrEngineSub = asr.engineEvents.listen((String event) {
-        if (!mounted) return;
-        if (event == 'restarted') {
-          // The recognition engine was force-restarted by
-          // the adapter watchdog: handled by the shared
-          // restart path (also used when a restart is
-          // detected via its epoch bump after the fact).
-          _onEngineRestarted();
-        } else if (event == 'restart_failed') {
-          _onEngineRestartFailed();
-        }
-      });
+      _asrEngineSub = _debugEngineSubDropped
+          ? null
+          : asr.engineEvents.listen((String event) {
+              if (!mounted) return;
+              if (event == 'restarted') {
+                // The recognition engine was force-restarted by
+                // the adapter watchdog: handled by the shared
+                // restart path (also used when a restart is
+                // detected via its epoch bump after the fact).
+                _onEngineRestarted();
+              } else if (event == 'restart_failed') {
+                _onEngineRestartFailed();
+              }
+            });
       _asrSubCancels.add(() => _asrErrorSub?.cancel());
       _asrErrorSub = asr.errors.listen((String error) {
         if (!mounted) return;
@@ -3167,12 +3327,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttCompletePress(_pttSession, text);
   }
 
-  /// A recognition session DELIVERED a result: one of the
-  /// two events that clear the recoverable-error streak
-  /// (CDX2) -- escalation measures a truly consecutive
-  /// stretch of failures, and one delivered result breaks
-  /// it. (The other clearing event is a newly started
-  /// listen; see _startListening.)
+  /// A recognition result was SUBMITTED: this is THE
+  /// event that clears the recoverable-error streak
+  /// (CDX3 / MT-1111-PTT-4, tightened by
+  /// MT-1111-PTT-4B). Escalation measures a truly
+  /// consecutive stretch of failures, and one submitted
+  /// result breaks it. The ONLY call site is the press
+  /// completion point submitting a result (text != null):
+  /// a result that merely ARRIVED -- a cached partial, an
+  /// unsubmitted final, a voided too-short press's
+  /// result -- clears nothing, and neither does a listen
+  /// start or a clean non-error session end; a different
+  /// error code displaces the streak instead of clearing
+  /// it (see _noteRecoverableAsrError).
   void _noteAsrSessionDelivered() {
     _resetAsrErrorStreak();
   }
@@ -3190,6 +3357,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttCachedText = null;
     _pttCachedIsFinal = false;
     if (text != null) {
+      // MT-1111-PTT-4B: THE streak clearing point -- a
+      // recognition result is submitted and executed
+      // right here, so the consecutive-failure streak
+      // ends. (A no-content or too-short completion
+      // submits nothing and clears nothing.)
+      _noteAsrSessionDelivered();
       _processPushToTalkFinal(text);
       _restoreAutoListenAfterPushToTalk();
     } else if (tooShort) {
@@ -3402,21 +3575,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // spoken again for a LATER session (dedup is per
       // stretch between successes, never permanent).
       _asrErrorSpokenCodes.clear();
-      // CDX2 streak clearing (supersedes the PTT-2
+      // CDX3 / MT-1111-PTT-4B streak rule (supersedes
+      // the CDX2 listen-start clearing AND the PTT-2
       // do-not-clear note): a listen that successfully
-      // STARTS clears the streak -- but only the streak of
-      // the session stretch that ENDED BEFORE this listen.
-      // Errors of THIS session are counted fresh from
-      // zero: busy, a recovery press whose listen starts
-      // fine and whose session then ends busy again, is
-      // streak 1, NOT an escalation. Escalation requires
-      // two same-code errors with NO successful listen and
-      // NO delivered result between them (e.g. the second
-      // error lands before its listen ever confirmed a
-      // start, or twice inside one session). The other
-      // clearing event is a delivered result
-      // (_noteAsrSessionDelivered).
-      _resetAsrErrorStreak();
+      // STARTS clears NOTHING. The streak lives across
+      // presses and is cleared only when a result is
+      // actually SUBMITTED at the press completion point
+      // (see _noteAsrSessionDelivered), or displaced by
+      // a different error code. So two presses that each
+      // error busy once -- the second press's recovery
+      // listen starting fine but submitting no result --
+      // form a streak of 2, and the NEXT press escalates
+      // to the cloud recording route.
       _asrRecoveryPending = false;
     }
     if (!mounted) return started;
@@ -3474,15 +3644,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
     if (input.pendingCloses == 0) return;
     _asrConfirmingClose = true;
+    // Register the epoch-accounting continuation on the
+    // confirmation's resolution (test seam): the watchdog
+    // restart that resolves this wait bumps the epoch,
+    // and its accounting must run HERE -- at the
+    // resolution -- not at some later listen attempt.
+    input.debugCloseConfirmedObserver = _ensureEngineSubscription;
     try {
       await input.confirmSessionClose();
     } finally {
+      input.debugCloseConfirmedObserver = null;
       _asrConfirmingClose = false;
     }
   }
 
   Future<void> _rewireAsrSubscriptionsIfInputChanged() async {
-    if (identical(_voiceInput, _subscribedVoiceInput)) return;
+    if (identical(_voiceInput, _subscribedVoiceInput)) {
+      // No swap: still run the epoch accounting -- the
+      // close-confirmation path reaches this method after
+      // the adapter may have restarted underneath an
+      // UNCHANGED input object, and a missed watchdog
+      // restart must be accounted there, not only at the
+      // next listen attempt.
+      _ensureEngineSubscription();
+      return;
+    }
     if (_voiceInput is! SystemVoiceInput) return;
     for (final void Function() cancelSub in _asrSubCancels) {
       cancelSub();
@@ -3509,21 +3695,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _ensureEngineSubscription() {
     if (_voiceInput is! SystemVoiceInput) return;
     final SystemVoiceInput input = _voiceInput as SystemVoiceInput;
-    // A recovery re-initialize (restartForRecovery, driven
-    // synchronously by the press flow and deliberately NOT
-    // published on the engine stream) also bumps the
-    // adapter epoch. Mark it as seen HERE, before the
-    // missed-restart replay check below: that replay
-    // exists for WATCHDOG restarts whose notification was
-    // lost, and a handled recovery bump must never be
-    // replayed as one -- the replay would wind up the
-    // very press the recovery just served (it was observed
-    // doing exactly that: restart handled ~0.5 ms after
-    // the recovery listen started, press wound up, the
-    // user told to press again).
-    _engineEpochSeen = input.engineEpoch;
+    // Test-marker scan (empty in production): a harness
+    // can ask this app to arm the adapter's restart-init
+    // marker, and the adapter records a marked watchdog
+    // restart's platform initialize -- together they
+    // model the subscription-rebuild gap in which a
+    // restart's notification (and with it, its epoch
+    // accounting) is genuinely missed.
+    final List<String> markers =
+        input.debugDrainTestMarkers();
+    if (markers.contains('restartInit')) {
+      mingtuVoiceLog('测试缝：模拟丢失一次引擎重启的纪元核算');
+      _suppressNextEngineEpochCheck = true;
+    }
+    final bool suppressEpochCheck = _suppressNextEngineEpochCheck;
+    _suppressNextEngineEpochCheck = false;
     final Stream<String> current = input.engineEvents;
-    if (!identical(current, _subscribedEngineEvents)) {
+    if (!_debugEngineSubDropped &&
+        !identical(current, _subscribedEngineEvents)) {
       _asrEngineSub?.cancel();
       _subscribedEngineEvents = current;
       _asrEngineSub = current.listen((String event) {
@@ -3536,22 +3725,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       });
       _asrSubCancels.add(() => _asrEngineSub?.cancel());
     }
+    // Missed-restart accounting, epoch by epoch. The
+    // FIRST observation only establishes the baseline (a
+    // bump that predates any subscription cannot be told
+    // apart from the initial state; undrained recovery
+    // attributions are drained silently so a later real
+    // bump is judged on its own). Every LATER bump is
+    // accounted exactly once by _noteEngineEpochBump:
+    // recovery bumps are swallowed (that restart was
+    // already handled by the press flow), watchdog bumps
+    // replay their missed notification -- this check runs
+    // on every listen attempt, so a watchdog restart that
+    // fired while the subscription was down is delivered
+    // here at the latest.
+    if (suppressEpochCheck) return;
+    final int currentEpoch = input.engineEpoch;
     final int? seenEpoch = _engineEpochSeen;
     if (seenEpoch == null) {
-      _engineEpochSeen = input.engineEpoch;
-    } else if (input.engineEpoch > seenEpoch) {
-      _engineEpochSeen = input.engineEpoch;
-      if (mounted) {
-        // The restart fired while this page had no live
-        // listener on the (then-new) stream: deliver its
-        // notification now, once -- the FAILURE handling
-        // when the missed restart's re-initialize failed,
-        // never the success notice.
-        if (input.lastRestartSucceeded) {
-          _onEngineRestarted();
-        } else {
-          _onEngineRestartFailed();
-        }
+      for (int e = 0; e <= currentEpoch; e++) {
+        input.consumeRecoveryEpoch(e);
+      }
+      _engineEpochSeen = currentEpoch;
+    } else if (currentEpoch > seenEpoch) {
+      _engineEpochSeen = currentEpoch;
+      for (int e = seenEpoch + 1; e <= currentEpoch; e++) {
+        _noteEngineEpochBump(input, e);
       }
     }
   }
@@ -5208,3 +5406,4 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 }
+

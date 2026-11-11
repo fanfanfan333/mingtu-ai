@@ -329,6 +329,56 @@ class SystemVoiceInput implements VoiceInput {
     _engineIsPluginInstance = false;
   }
 
+  /// Test-only inbox of app test markers, fed from the
+  /// app side's own marker MethodChannel
+  /// ('dev.mingtu.test/markers' -- messages the test
+  /// harness sends and production platform code never
+  /// does): 'armRestartInitMarker' asks the adapter to
+  /// trace the next watchdog restart's platform
+  /// initialize (see debugMarkNextRestartInit), and the
+  /// restart's initialize itself lands here as
+  /// 'restartInit' on its way back. [debugDrainTestMarkers]
+  /// hands the accumulated markers to the app, which is
+  /// their only consumer.
+  static const MethodChannel _testMarkerChannel =
+      MethodChannel('dev.mingtu.test/markers');
+  final List<String> _testMarkers = <String>[];
+  bool _testMarkerHandlerArmed = false;
+
+  /// Receive one test marker (the app's marker-channel
+  /// handler forwards here; see the missed-restart
+  /// replay scenario in test/cdx3_ptt_test.dart).
+  void debugNoteTestMarker(String marker) {
+    _testMarkers.add(marker);
+    if (marker == 'armRestartInitMarker') {
+      debugMarkNextRestartInit();
+    }
+  }
+
+  /// Drain the accumulated test markers for the app.
+  List<String> debugDrainTestMarkers() {
+    final List<String> drained = List<String>.of(_testMarkers);
+    _testMarkers.clear();
+    return drained;
+  }
+
+  /// Arm the incoming side of the test-marker channel
+  /// (idempotent): harness -> app -> adapter forwarding
+  /// lives in the app's marker handler; the adapter's
+  /// own outgoing restart trace is issued on the plugin
+  /// channel in _doInitialize (see there).
+  void debugArmTestMarkerChannel() {
+    if (_testMarkerHandlerArmed) return;
+    _testMarkerHandlerArmed = true;
+    _testMarkerChannel.setMethodCallHandler((MethodCall call) async {
+      if (call.method == 'noteTestMarker' &&
+          call.arguments is String) {
+        debugNoteTestMarker(call.arguments as String);
+      }
+      return null;
+    });
+  }
+
   /// The current listen generation: minted once per
   /// startListening() call. Consumers read the generation
   /// of the session they just started here and validate
@@ -403,7 +453,22 @@ class SystemVoiceInput implements VoiceInput {
   /// ledgers were still cleared (nothing stays wedged),
   /// but recognition is unavailable until a later start
   /// attempt succeeds again.
-  Stream<String> get engineEvents => _engineController.stream;
+  /// The engineEvents stream object, cached: a
+  /// StreamController's .stream getter mints a NEW stream
+  /// object on every access, so identity comparisons
+  /// (the app's re-subscription check) only mean anything
+  /// against a stable instance. (Before this cache, every
+  /// access differed, the app re-subscribed on every
+  /// listen attempt, and each re-subscription silently
+  /// re-based its missed-restart epoch accounting.)
+  late final Stream<String> _engineEventsStream =
+      _engineController.stream;
+
+  Stream<String> get engineEvents => _engineEventsStream;
+
+  /// Test-only: the identity of the engineEvents stream
+  /// object this adapter hands out.
+  Object get debugEngineEventsStreamIdentity => _engineEventsStream;
 
   /// Test-only log of every engine event this adapter has
   /// emitted, in order (the broadcast stream drops events
@@ -419,6 +484,41 @@ class SystemVoiceInput implements VoiceInput {
   /// failure handling, never the success notice.
   bool get lastRestartSucceeded => _lastRestartSucceeded;
   bool _lastRestartSucceeded = true;
+
+  /// The engine epochs that were minted by RECOVERY
+  /// re-initializes ([restartForRecovery]) and have not
+  /// yet been consumed by the app. restartForRecovery
+  /// publishes NO engine event by design (the press flow
+  /// drives it synchronously and speaks its own outcome),
+  /// so when the app later notices one of these epochs it
+  /// must NOT mistake it for a watchdog restart whose
+  /// notification was lost. The app consumes (removes)
+  /// each value exactly once via [consumeRecoveryEpoch].
+  /// A watchdog restart's epoch is never recorded here.
+  final Set<int> _recoveryEpochs = <int>{};
+
+  /// Whether [epoch] was minted by a recovery
+  /// re-initialize; consumes the record when it was, so
+  /// each recovery epoch is attributed exactly once.
+  bool consumeRecoveryEpoch(int epoch) =>
+      _recoveryEpochs.remove(epoch);
+
+  /// Test-only hook for the missed-restart replay
+  /// scenario: armed by the app when a test asks it to
+  /// (over the app's own test-marker channel -- the
+  /// adapter owns no incoming channel of its own), it
+  /// makes the NEXT forced platform initialize (the one
+  /// a watchdog restart issues directly on the plugin
+  /// channel inside _doInitialize) leave a one-shot
+  /// trace the app can observe on that same channel, so
+  /// the app can account the restart as MISSED instead
+  /// of current. Production code never arms it.
+  bool _markNextRestartInit = false;
+
+  /// Arm the one-shot restart-init marker (test only).
+  void debugMarkNextRestartInit() {
+    _markNextRestartInit = true;
+  }
 
   /// The plugin's platform channel, invoked DIRECTLY by
   /// a watchdog restart: the plugin's Dart-side
@@ -606,7 +706,22 @@ class SystemVoiceInput implements VoiceInput {
       }
     }
     await awaitSessionClosed();
+    // The wait resolved -- by the closing status itself
+    // or by the watchdog restart that cleared the
+    // ledgers. Either way the engine state this close
+    // waited on has changed underneath the app: notify
+    // the app's close-confirmation observer, if one is
+    // registered, so it can run its epoch accounting on
+    // exactly this resolution (a restart resolved here
+    // is otherwise invisible to the app until its next
+    // listen attempt).
+    final void Function()? observer = debugCloseConfirmedObserver;
+    if (observer != null) observer();
   }
+
+  /// Test-only observer invoked when a close-confirmation
+  /// wait resolves (see [confirmSessionClose]).
+  void Function()? debugCloseConfirmedObserver;
 
   /// The close watchdog (escalation ladder): while any
   /// close is unconfirmed, at 3 s the engine is prodded
@@ -856,7 +971,7 @@ class SystemVoiceInput implements VoiceInput {
             }
             return;
           }
-          if (_pendingCloses > 0) {
+    if (_pendingCloses > 0) {
             // A close the app initiated is still
             // unconfirmed: this status CONFIRMS it. It is
             // consumed by the closing session ONLY -- it
@@ -922,6 +1037,15 @@ class SystemVoiceInput implements VoiceInput {
       // THIS epoch's closures. The channel result is the
       // restart's real outcome: a platform that does not
       // answer true has NOT been re-initialized.
+      if (_markNextRestartInit) {
+        // Test-only trace (see debugMarkNextRestartInit):
+        // record this restart's platform initialize in
+        // the test-marker inbox BEFORE issuing it, so the
+        // app side accounts the restart as MISSED when it
+        // next runs its epoch check.
+        _markNextRestartInit = false;
+        _testMarkers.add('restartInit');
+      }
       try {
         final bool? platformOk =
             await _pluginChannel.invokeMethod<bool>(
@@ -1249,6 +1373,11 @@ class SystemVoiceInput implements VoiceInput {
       ok = false;
     }
     _lastRestartSucceeded = ok;
+    // Attribute this epoch to the RECOVERY flow before
+    // any app-side epoch check can observe it: the epoch
+    // bump of a recovery re-initialize is not a missed
+    // watchdog restart and must never be replayed as one.
+    _recoveryEpochs.add(epoch);
     _available = ok;
     _listening = false;
     _genOpen = 0;
@@ -1311,3 +1440,4 @@ Future<void> speakAfterClosingMic({
   }
   await speak();
 }
+

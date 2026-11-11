@@ -11,6 +11,7 @@ import 'package:mingtu_ai/config/verified_locations.dart';
 import 'package:mingtu_ai/core/navigation_tracker.dart';
 import 'package:mingtu_ai/core/real_navigation.dart';
 import 'package:mingtu_ai/core/voice_commands.dart';
+import 'package:mingtu_ai/core/cloud_asr.dart';
 import 'package:mingtu_ai/core/voice_startup.dart';
 import 'package:mingtu_ai/main.dart';
 import 'package:mingtu_ai/modules/map_navigation.dart';
@@ -502,6 +503,30 @@ Future<void> deliverFinalResult(WidgetTester tester, String words) =>
 
 Future<void> deliverPartialResult(WidgetTester tester, String words) =>
     deliverRecognition(tester, words, 0);
+
+/// Deliver a recognition ERROR the way the platform does:
+/// a notifyError platform->Dart call on the plugin
+/// channel, its argument the plugin's JSON string
+/// ({"errorMsg": <code>, "permanent": <bool>} -- the
+/// platform-channel speech_to_text dispatches the String
+/// argument to the singleton's onError, which decodes
+/// it). speech_to_text 7.5.0's Android sendError passes
+/// permanent=true for EVERY error (CDX1), so the
+/// cross-press streak scenarios always send true.
+Future<void> deliverChannelError(String code) async {
+  final String json = jsonEncode(<String, Object?>{
+    'errorMsg': code,
+    'permanent': true,
+  });
+  final ByteData data = const StandardMethodCodec()
+      .encodeMethodCall(MethodCall('notifyError', json));
+  await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .handlePlatformMessage(
+    'plugin.csdcorp.com/speech_to_text',
+    data,
+    (ByteData? _) {},
+  );
+}
 
 Future<void> drainVoice(WidgetTester tester, RecordingVoiceChannels h,
     {int rounds = 14}) async {
@@ -2216,6 +2241,195 @@ void main() {
     });
   });
 
+  group('cross-press error streak (CDX3 / MT-1111-PTT-4B, '
+      'channel-driven)', () {
+    // The cross-press streak scenarios, driven through
+    // the REAL plugin singleton and this file's simulated
+    // MethodChannel (the shape of Codex's synth-busy-pair
+    // scenario). They live HERE because channel deliveries
+    // reach the adapter of the FIRST app instance of the
+    // process (the singleton's initialize latch and its
+    // single listener registration -- see this file's
+    // header note): the groups above run on that instance,
+    // and so do these. The fake-engine files (cdx2 /
+    // mt1111 / cdx3) drive their own processes' adapters
+    // through injected fakes instead.
+    //
+    // One press whose session errors once with [code]
+    // (injected on the channel, permanent=true), released
+    // and settled. Mirrors the settle discipline of the
+    // other drivers: closing statuses are delivered while
+    // pumping until the press is fully settled.
+    Future<void> channelErrorPress(
+        WidgetTester tester, RecordingVoiceChannels h,
+        String code) async {
+      final TestGesture g = await pressUntilPttListening(tester, h);
+      await deliverChannelError(code);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      await holdPastThreshold(tester);
+      await g.up();
+      for (int i = 0; i < 29; i++) {
+        h.completeAllSpeaks();
+        await h.deliverAllCloseStatuses();
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      h.events.clear();
+    }
+
+    testWidgets(
+        'E1: two presses each error busy once (channel, '
+        'permanent=true) -- streak 2 across presses; the '
+        'third press RECORDS and speaks 改用云端识别 once',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      final CodexFakeRecorder recorder = CodexFakeRecorder();
+      mingtuHomeDebugHandle!.setRecorder(recorder);
+      h.events.clear();
+
+      // Press 1: listens on the channel, errors busy once.
+      await channelErrorPress(tester, h, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCode, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 1,
+          reason: 'the first busy opens the streak');
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isFalse);
+      expect(mingtuHomeDebugHandle!.recoveryPending, isTrue);
+
+      // Press 2: the recovery runs (cancel -> channel
+      // initialize -> listen); its listen STARTS fine --
+      // which clears NOTHING under PTT-4B -- and then it
+      // errors busy once more: the streak reaches 2
+      // ACROSS the two presses.
+      await channelErrorPress(tester, h, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCode, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 2,
+          reason: 'busy, a recovery listen that started but '
+              'submitted nothing, busy = a streak of 2');
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue,
+          reason: 'the second consecutive busy escalates');
+
+      // Press 3: no listen at all -- it records through
+      // the app recorder and speaks the switch notice
+      // exactly once.
+      final int listensBefore = h.count('asr.listen');
+      final TestGesture g3 = await startPttGesture(tester);
+      for (int i = 0; i < 40 && !recorder.started; i++) {
+        h.completeAllSpeaks();
+        await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 50)));
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(recorder.started, isTrue,
+          reason: 'the third press records: ${h.events}');
+      expect(h.count('asr.listen'), listensBefore,
+          reason: 'no listen on the escalation press');
+      await pumpUntilSpeak(tester, h, asrCloudSwitchSpeechText);
+      expect(h.count('tts.speak:$asrCloudSwitchSpeechText'), 1,
+          reason: 'switch notice exactly once: ${h.events}');
+      await holdPastThreshold(tester);
+      await g3.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'E2: busy, client, busy does NOT escalate -- the '
+        'different code restarts the streak, and a later '
+        'press still listens locally',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      h.events.clear();
+
+      await channelErrorPress(tester, h, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 1);
+      await channelErrorPress(tester, h, 'error_client');
+      expect(mingtuHomeDebugHandle!.asrStreakCode, 'error_client');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 1,
+          reason: 'a different code restarts the streak at 1');
+      await channelErrorPress(tester, h, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCode, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 1);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isFalse,
+          reason: 'busy, client, busy must not route to cloud');
+
+      // The next press still listens locally.
+      final TestGesture g = await pressUntilPttListening(tester, h);
+      await holdPastThreshold(tester);
+      await g.up();
+      await tester.pump(const Duration(milliseconds: 100));
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+
+    testWidgets(
+        'E3: busy, then a press whose result is really '
+        'SUBMITTED, then busy -- no escalation (the '
+        'submission cleared the streak)',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      h.events.clear();
+
+      await channelErrorPress(tester, h, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 1);
+
+      // A press that recognises and SUBMITS: the final is
+      // delivered on the channel while held, the release
+      // completes the press through the completion point
+      // (submission + command execution + its reply).
+      final TestGesture g2 = await pressUntilPttListening(tester, h);
+      await deliverFinalResult(tester, '你好');
+      await tester.pump(const Duration(milliseconds: 100));
+      await holdPastThreshold(tester);
+      await g2.up();
+      await tester.pump(const Duration(milliseconds: 100));
+      final String unknownReply = '没听清。${voiceCommandHelpText()}';
+      await pumpUntilSpeak(tester, h, unknownReply);
+      expect(h.count('tts.speak:$unknownReply'), 1,
+          reason: 'the submitted result was executed: ${h.events}');
+      for (int i = 0; i < 29; i++) {
+        h.completeAllSpeaks();
+        await h.deliverAllCloseStatuses();
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(mingtuHomeDebugHandle!.asrStreakCode, isNull,
+          reason: 'the submission cleared the streak');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 0);
+      h.events.clear();
+
+      // busy again: a FRESH streak of 1, no escalation --
+      // and the press after it still listens locally.
+      await channelErrorPress(tester, h, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCode, 'error_busy');
+      expect(mingtuHomeDebugHandle!.asrStreakCount, 1);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isFalse);
+      final TestGesture g4 = await pressUntilPttListening(tester, h);
+      await holdPastThreshold(tester);
+      await g4.up();
+      await tester.pump(const Duration(milliseconds: 100));
+      await drainVoice(tester, h);
+      await shutdownVoice(tester, h);
+    });
+  });
+
   group('engine watchdog restart (app level)', () {
     testWidgets(
         'a close unconfirmed past 3 s prods one cancel; '
@@ -2387,6 +2601,150 @@ void main() {
     });
   });
 
+  group('missed watchdog restart replay (CDX3 / MT-1111-PTT-4B)', () {
+    testWidgets(
+        'RPL: a watchdog restart whose notification was '
+        'missed is replayed exactly once by the next epoch '
+        'check (compare, replay, then record); a recovery '
+        're-initialize bump is never replayed',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 120)));
+      await drainVoice(tester, h, rounds: 8);
+      expect(mingtuHomeDebugHandle!.debugEngineEvents, isEmpty);
+
+      // Baseline: the epoch accounting has observed the
+      // adapter (every listen attempt runs it).
+      mingtuHomeDebugHandle!.debugEnsureEngineSubscription();
+      expect(mingtuHomeDebugHandle!.debugEngineEvents, isEmpty,
+          reason: 'baseline observation handles nothing');
+
+      // Wedge a press's close (no closing status ever),
+      // drop this page's engine-events subscription (the
+      // subscription-rebuild gap), and arm the adapter's
+      // restart-init marker: the
+      // coming watchdog restart's platform initialize is
+      // recorded as a test marker, so when the release
+      // path's recovery listen runs the app's epoch check
+      // it accounts the restart as MISSED -- its live
+      // 'restarted' notification is delivered on the
+      // adapter's broadcast stream, but the epoch
+      // bookkeeping is what guarantees delivery, and the
+      // marker makes the bookkeeping treat the window's
+      // check as the subscription-rebuild gap.
+      h.autoCloseStatus = false;
+      mingtuHomeDebugHandle!.debugDropEngineSubscription();
+      {
+        final ByteData markerData = const StandardMethodCodec()
+            .encodeMethodCall(const MethodCall(
+                'noteTestMarker', 'armRestartInitMarker'));
+        await TestDefaultBinaryMessengerBinding
+            .instance.defaultBinaryMessenger
+            .handlePlatformMessage(
+          'dev.mingtu.test/markers',
+          markerData,
+          (ByteData? _) {},
+        );
+      }
+      final TestGesture wedged = await pressUntilPttListening(tester, h);
+      await holdPastThreshold(tester);
+      await wedged.up();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(h.pendingCloseStatuses, greaterThanOrEqualTo(1),
+          reason: '${h.events}');
+      // Stay INSIDE the restart window with a live waiter:
+      // the unbounded close-confirmation wait (the same
+      // one a stuck press's final-wait expiry runs). The
+      // watchdog restart is what resolves it -- and the
+      // restart's completion tail (its close-completer
+      // resolution, processed microtasks later) is what
+      // unblocks the app-side waiter whose continuation
+      // re-enters the listen path and runs the epoch
+      // check that must account the restart as missed.
+      // Without a live waiter, nothing runs that check
+      // after the restart inside the window, and the
+      // marker would just drain at some later settle.
+      mingtuHomeDebugHandle!.debugConfirmClose();
+      h.nextCancelIsWatchdogProd = true;
+      h.events.clear();
+      final int emittedBefore =
+          mingtuHomeDebugHandle!.debugAdapterEngineEventsEmittedCount;
+
+      // ~3 s pass (fake clock alongside real time, as in
+      // the sibling watchdog tests): exactly one prod
+      // cancel, then the engine restarts -- and NOTHING
+      // is handled yet: the restart was missed.
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 3400)));
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pump();
+      expect(h.count('asr.cancel'), 1,
+          reason: 'one watchdog prod: ${h.events}');
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 1400)));
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      // The restart REALLY happened on this app's own
+      // adapter (its emission log grew by one) while the
+      // app handled none of it: genuinely missed.
+      expect(
+          mingtuHomeDebugHandle!.debugAdapterEngineEventsEmittedCount,
+          emittedBefore + 1,
+          reason: 'the watchdog restart fired on this adapter');
+      expect(mingtuHomeDebugHandle!.debugEngineEvents, isEmpty,
+          reason: 'the restart notification was missed: ${h.events}');
+      expect(h.count('tts.speak:语音已重启，请重新按住说话'), 0,
+          reason: '${h.events}');
+
+      // Meanwhile the wedged press's own 3 s final-wait
+      // expired into its cancel-confirm step: the
+      // unbounded confirmation wait it opened is resolved
+      // BY the restart -- and the resolution's app-side
+      // continuation re-enters the epoch accounting (the
+      // confirmation helper re-registers the adapter's
+      // listeners through the startup wiring, whose epoch
+      // fields the listen path then reads). That
+      // continuation plus the explicit check below are
+      // the two chances the bookkeeping has to account
+      // the restart; both must agree it was MISSED (the
+      // marker said so) and replay it exactly once.
+      await tester.pump(const Duration(seconds: 3));
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 300)));
+      await tester.pump();
+
+      // The explicit epoch check now replays the missed
+      // restart EXACTLY ONCE (compare -> replay ->
+      // record), with the existing success handling: the
+      // fixed restart notice is spoken once.
+      mingtuHomeDebugHandle!.debugEnsureEngineSubscription();
+      await tester.pump();
+      expect(mingtuHomeDebugHandle!.debugEngineEvents,
+          <String>['restarted'],
+          reason: 'the missed restart replayed once');
+      await pumpUntilSpeak(tester, h, '语音已重启，请重新按住说话');
+      expect(h.count('tts.speak:语音已重启，请重新按住说话'), 1,
+          reason: '${h.events}');
+      expect(h.completeSpeak('语音已重启，请重新按住说话'), isTrue);
+
+      // A second check at the same epoch replays NOTHING.
+      mingtuHomeDebugHandle!.debugEnsureEngineSubscription();
+      await tester.pump();
+      expect(mingtuHomeDebugHandle!.debugEngineEvents,
+          <String>['restarted'],
+          reason: 'no double replay');
+      expect(h.count('tts.speak:语音已重启，请重新按住说话'), 1);
+
+      h.autoCloseStatus = true;
+      await drainVoice(tester, h, rounds: 6);
+      await shutdownVoice(tester, h);
+    });
+  });
+
   group('reroute failure seam (behavioural)', () {
     test(
         'off-route fires, the starter fails BEFORE any route '
@@ -2488,3 +2846,4 @@ class _FailingLocation implements CurrentLocationProvider {
   Stream<LocationResult> positions() =>
       const Stream<LocationResult>.empty();
 }
+

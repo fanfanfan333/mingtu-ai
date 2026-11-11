@@ -356,6 +356,67 @@ class AsrWavValidationTest(unittest.TestCase):
         clip[4:8] = struct.pack("<I", declared - 100)
         self._assert_rejected_no_upstream_no_quota(bytes(clip))
 
+    def test_malformed_riff_size_minus_one_rejected(self):
+        # CDX3 / MT-1111-PTT-4: riff_size EXACTLY one less
+        # than the true value. The old {0, 1} slack let
+        # this through to the upstream and spent quota;
+        # the strict rule rejects it: 400, poster 0, the
+        # limiter's single slot still free.
+        clip = bytearray(make_wav(seconds=2.0))
+        declared = struct.unpack("<I", clip[4:8])[0]
+        clip[4:8] = struct.pack("<I", declared - 1)
+        self._assert_rejected_no_upstream_no_quota(bytes(clip))
+
+    def test_malformed_riff_size_plus_one_rejected(self):
+        # riff_size EXACTLY one MORE than the true value:
+        # equally malformed under the strict equality.
+        clip = bytearray(make_wav(seconds=2.0))
+        declared = struct.unpack("<I", clip[4:8])[0]
+        clip[4:8] = struct.pack("<I", declared + 1)
+        self._assert_rejected_no_upstream_no_quota(bytes(clip))
+
+    def test_odd_sized_chunk_with_pad_accepted(self):
+        # A legal pad case (MT-1111-PTT-4): an ODD-sized
+        # unknown chunk (LIST, 3 bytes + 1 pad byte) sits
+        # between fmt and data; the data chunk itself is a
+        # normal even-sized 2 s PCM payload. riff_size is
+        # exactly len - 8 (the pad counted in it) and the
+        # chunk walk steps over size + pad, so the clip is
+        # accepted and reaches the upstream exactly once.
+        fmt = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+        junk = b"abc"
+        data = b"\x00" * 64000
+        riff_size = (4 + (8 + len(fmt)) + (8 + len(junk) + 1)
+                     + (8 + len(data)))
+        clip = (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+                + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+                + b"LIST" + struct.pack("<I", len(junk)) + junk
+                + b"\x00"
+                + b"data" + struct.pack("<I", len(data)) + data)
+        self.assertEqual(riff_size, len(clip) - 8)
+        poster = CapturingPoster()
+        resp = _handle(_event(_asr_body(clip)), poster=poster)
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertEqual(len(poster.calls), 1)
+
+    def test_odd_data_with_pad_rejected_frame_alignment(self):
+        # data with an ODD byte count (3) AND its pad byte,
+        # riff_size exact. Rejected anyway: 3 is not a
+        # multiple of blockAlign (2), i.e. not a whole
+        # number of 16-bit PCM frames. (Same shape as the
+        # ALIGN-B block-align case, kept here to pin the
+        # CDX3 pad reading: padding never rescues a clip
+        # that is not frame-aligned PCM.)
+        fmt = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+        data = b"\x00" * 3
+        riff_size = 4 + (8 + len(fmt)) + (8 + len(data) + 1)
+        clip = (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+                + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+                + b"data" + struct.pack("<I", len(data)) + data
+                + b"\x00")
+        self.assertEqual(riff_size, len(clip) - 8)
+        self._assert_rejected_no_upstream_no_quota(clip)
+
     def test_malformed_data_truncated_rejected(self):
         # data-truncated: the data chunk DECLARES more
         # bytes than are actually present in the file.
