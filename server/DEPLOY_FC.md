@@ -114,6 +114,7 @@ flutter build apk --debug \
 - 部署动作：本路由随函数代码一起发布——**需要重新打包 `server/fc/build_zip.sh` 并重新上传 zip**（或在控制台更新代码），旧版本函数没有 `/asr`。
 - App 构建参数：可选 `--dart-define=MINGTU_ASR_PROXY_URL=<FC地址>`；不填时 App 自动回落使用 `MINGTU_VISION_PROXY_URL` 的地址（同一函数部署、同一令牌）。
 - 诚实状态：**FC 未重新部署前，兜底不可用**（App 会播报“云端识别未配置/暂时不可用”）；本路由只经过 fixture/mock 测试，**未经真机验证，也未做过真实百炼调用**。
+- WAV 头校验（MT-1111-PTT-2，2026-11-11）：服务端手工解析 RIFF 头，只接受 PCM、16 bit、单声道、采样率 8000–48000 的 WAV，时长（按 data 块字节数计算）不得超过 10.5 秒；不合规返回 400（`audio format not allowed` / `audio too long`）。**校验在限流扣减之前**：校验失败不调用上游、也不消耗 `/asr` 限流额度；令牌校验仍在最前且不消耗额度。
 
 
 - 地址必须是第 5 节的 https 地址；填 http 会被客户端拒绝并播报“识图未配置”。

@@ -8,6 +8,7 @@ the poster is a fake and no real API is ever called.
 """
 import base64
 import json
+import struct
 import unittest
 
 import amap_proxy
@@ -16,7 +17,28 @@ TOKEN = "test-token-not-real"
 KEY = "fixture-dashscope-key"
 AMAP_KEY = "fixture-amap-key"
 
-WAV_BYTES = b"RIFF" + b"\x00" * 96  # 100-byte fake clip
+def make_wav(rate=16000, channels=1, bits=16, seconds=2.0,
+             audio_format=1):
+    """Build a real RIFF/WAVE byte string by hand (fixture
+    builder for the PTT-2 header validation tests)."""
+    bytes_per_sample = bits // 8
+    frames = int(rate * seconds)
+    data = b"\x00" * (frames * channels * bytes_per_sample)
+    byte_rate = rate * channels * bytes_per_sample
+    block_align = channels * bytes_per_sample
+    fmt = struct.pack(
+        "<HHIIHH", audio_format, channels, rate, byte_rate,
+        block_align, bits)
+    riff_size = 4 + (8 + len(fmt)) + (8 + len(data))
+    return (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+            + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+            + b"data" + struct.pack("<I", len(data)) + data)
+
+
+# The default clip for the pre-existing guard tests: a REAL
+# WAV now (16 kHz mono 16-bit PCM, 2 s) -- the PTT-2 header
+# validation rejects the old 100-byte fake header.
+WAV_BYTES = make_wav()
 
 
 def _upstream_ok(text="去图书馆"):
@@ -227,6 +249,98 @@ class AsrGuardTest(unittest.TestCase):
         # request (model gate), never an ASR success.
         resp = _handle(_event(_asr_body(), path="/vision"))
         self.assertEqual(resp["statusCode"], 400)
+
+
+class AsrWavValidationTest(unittest.TestCase):
+    """MT-1111-PTT-2: hand-parsed RIFF validation, the
+    10.5 s duration cap, and the no-quota-on-failure rule."""
+
+    def test_valid_16k_mono_2s_200(self):
+        poster = CapturingPoster()
+        resp = _handle(_event(_asr_body(make_wav(seconds=2.0))),
+                       poster=poster)
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertEqual(len(poster.calls), 1)
+
+    def test_8khz_5s_within_duration_200(self):
+        # 8000 Hz is a LEGAL sample rate now (not 16k-only).
+        resp = _handle(_event(_asr_body(
+            make_wav(rate=8000, seconds=5.0))))
+        self.assertEqual(resp["statusCode"], 200)
+
+    def test_8khz_20s_is_320044_bytes_and_too_long_no_quota(self):
+        clip = make_wav(rate=8000, seconds=20.0)
+        self.assertEqual(len(clip), 320044)  # 44 header + 320000
+        poster = CapturingPoster()
+        limiter = amap_proxy.VisionRateLimiter(1, 100)
+        resp = _handle(_event(_asr_body(clip)), poster=poster,
+                       asr_limiter=limiter)
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertEqual(json.loads(resp["body"]),
+                         {"error": "audio too long"})
+        self.assertEqual(poster.calls, [])
+        # No quota consumed: the single slot is still free.
+        self.assertTrue(limiter.allow())
+
+    def test_duration_boundary_10_5_ok_10_6_too_long(self):
+        ok = _handle(_event(_asr_body(make_wav(seconds=10.5))))
+        self.assertEqual(ok["statusCode"], 200)
+        over = _handle(_event(_asr_body(make_wav(seconds=10.6))))
+        self.assertEqual(over["statusCode"], 400)
+        self.assertEqual(json.loads(over["body"]),
+                         {"error": "audio too long"})
+
+    def test_12s_16k_too_long(self):
+        resp = _handle(_event(_asr_body(make_wav(seconds=12.0))))
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertEqual(json.loads(resp["body"]),
+                         {"error": "audio too long"})
+
+    def test_stereo_rejected(self):
+        resp = _handle(_event(_asr_body(make_wav(channels=2))))
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertEqual(json.loads(resp["body"]),
+                         {"error": "audio format not allowed"})
+
+    def test_8bit_rejected(self):
+        resp = _handle(_event(_asr_body(make_wav(bits=8))))
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertEqual(json.loads(resp["body"]),
+                         {"error": "audio format not allowed"})
+
+    def test_non_pcm_rejected(self):
+        resp = _handle(_event(_asr_body(make_wav(audio_format=3))))
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertEqual(json.loads(resp["body"]),
+                         {"error": "audio format not allowed"})
+
+    def test_sample_rate_too_low_rejected(self):
+        resp = _handle(_event(_asr_body(
+            make_wav(rate=4000, seconds=1.0))))
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertEqual(json.loads(resp["body"]),
+                         {"error": "audio format not allowed"})
+
+    def test_non_wav_bytes_rejected(self):
+        resp = _handle(_event(_asr_body(b"NOTAWAV" + b"\x00" * 60)))
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertEqual(json.loads(resp["body"]),
+                         {"error": "audio format not allowed"})
+
+    def test_truncated_wav_rejected(self):
+        resp = _handle(_event(_asr_body(make_wav()[:30])))
+        self.assertEqual(resp["statusCode"], 400)
+
+    def test_validation_failure_consumes_no_quota(self):
+        # A stereo clip is rejected BEFORE the limiter: with
+        # a 1-per-minute limiter the follow-up VALID clip
+        # must still pass (the failure spent nothing).
+        limiter = amap_proxy.VisionRateLimiter(1, 100)
+        bad = _handle(_event(_asr_body(make_wav(channels=2))),
+                      asr_limiter=limiter)
+        self.assertEqual(bad["statusCode"], 400)
+        good = _handle(_event(_asr_body()), asr_limiter=limiter)
+        self.assertEqual(good["statusCode"], 200)
 
 
 if __name__ == "__main__":

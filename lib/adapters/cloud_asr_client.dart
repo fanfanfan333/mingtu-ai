@@ -26,6 +26,13 @@ const Set<String> asrUnavailableErrorCodes = <String>{
   'vision_not_configured',
   'asr_not_configured',
   'body too large',
+  // MT-1111-PTT-2 server WAV validation codes: the clip
+  // itself was rejected before any upstream call; the user
+  // hears the same fixed unavailable text as any other
+  // cloud failure.
+  'audio format not allowed',
+  'audio too long',
+  'audio invalid',
 };
 
 /// Outcome of one transcription attempt: exactly one of

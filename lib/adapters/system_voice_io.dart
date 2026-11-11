@@ -261,6 +261,13 @@ class SystemVoiceInput implements VoiceInput {
   /// into the failure. Listeners get one event per platform error
   /// ('<code>|permanent=<bool>') and are responsible for
   /// announcing it once and stopping the retry loop.
+  ///
+  /// CDX1: the payload's permanent field is the PLUGIN's raw
+  /// flag, carried for diagnostics only -- speech_to_text
+  /// 7.5.0's Android side reports permanent=true for every
+  /// error. NO availability or retry decision (here or in
+  /// the app) may use it; classification is by error code
+  /// (see isFatalAsrError / isRecoverableAsrError).
   Stream<String> get errors => _errorController.stream;
 
   /// Session-outcome notices for the benign close codes
@@ -738,9 +745,18 @@ class SystemVoiceInput implements VoiceInput {
         // only the code and its fixed Chinese text travel on.
         final String code = asrErrorCode(error.errorMsg);
         _detail = 'NOT_CONFIGURED（${asrErrorText(code)}）';
-        if (error.permanent) {
-          // A permanent error blocks recognition until resolved;
-          // claiming availability afterwards would be a lie.
+        // Availability is decided BY ERROR CODE, never by
+        // error.permanent (CDX1): speech_to_text 7.5.0's
+        // Android sendError passes permanent=true for EVERY
+        // error, so trusting the flag permanently disabled
+        // recognition after a routine busy / client /
+        // speech-timeout / no-match -- the Xiaomi failure.
+        // Only FATAL codes (the engine itself cannot serve:
+        // its own permission missing, no recogniser service,
+        // no Chinese support) mark the input unavailable;
+        // recoverable codes and unknown end this session
+        // only, and the next press listens again.
+        if (isFatalAsrError(code)) {
           _available = false;
           _listening = false;
         }
@@ -758,8 +774,7 @@ class SystemVoiceInput implements VoiceInput {
           // whatever session is live by then.
           _consumePendingClose();
           _closeErrorConsumed++;
-          if (_benignCloseErrorCodes.contains(code) &&
-              !error.permanent) {
+          if (_benignCloseErrorCodes.contains(code)) {
             // Consumed as the close -- and reported as this
             // session's no-match OUTCOME on its own stream,
             // so a press settling in its stopping window
@@ -772,8 +787,7 @@ class SystemVoiceInput implements VoiceInput {
             return;
           }
         }
-        if (_benignCloseErrorCodes.contains(code) &&
-            !error.permanent) {
+        if (_benignCloseErrorCodes.contains(code)) {
           // A routine outcome, not a failure (see
           // _benignCloseErrorCodes): the session simply
           // ended without speech. Reported as an outcome on
@@ -1141,6 +1155,100 @@ class SystemVoiceInput implements VoiceInput {
     } finally {
       _listening = false;
     }
+  }
+
+  /// Issue a platform cancel UNCONDITIONALLY
+  /// (MT-1111-PTT-2 recovery step 1 of 3). Unlike
+  /// [cancelListening] -- which is a no-op without a live
+  /// session and books a pending close for one -- this
+  /// cancel exists to drop whatever residue the PREVIOUS
+  /// session left inside the platform recogniser before a
+  /// recovery re-initialize, so it reaches the platform
+  /// even when the adapter believes nothing is listening
+  /// (the errored session was already stopped locally).
+  /// It books NO pending close: the recovery's own
+  /// re-initialize clears every ledger immediately after,
+  /// and the session it cancels was already closed on the
+  /// adapter's books. Errors propagate to the caller.
+  Future<void> cancelForRecovery() async {
+    _resultArrivedSinceStopBegan = false;
+    if (_listening) _genOpen = 0;
+    await _speech?.cancel();
+    _listening = false;
+  }
+
+  /// Recover the engine for the NEXT press after a
+  /// recoverable error (MT-1111-PTT-2 recovery step 2 of
+  /// 3: cancel -> re-initialize -> listen; the app issues
+  /// the cancel itself as step 1). The re-initialize is
+  /// REAL: it runs the same forced re-initialize as the
+  /// watchdog restart -- registrations are re-made under
+  /// a bumped epoch with fresh onStatus/onError closures
+  /// (the epoch guard voids the old registration) and, for
+  /// a plugin engine, the platform initialize is issued
+  /// directly on the plugin channel because the plugin's
+  /// Dart-side initialize() latches after its first
+  /// success. Unlike the watchdog restart this emits NO
+  /// engine event (the app drives it synchronously inside
+  /// a press and speaks its own outcome), and it restores
+  /// availability from the re-initialize's own result even
+  /// when a FATAL error had marked the input unavailable:
+  /// availability after recovery is whatever the fresh
+  /// initialize says. The ledgers are cleared either way,
+  /// so a failed recovery can never wedge a later press.
+  /// Returns whether the engine is ready to listen.
+  Future<bool> restartForRecovery() async {
+    if (_engineRestarting) return _lastRestartSucceeded;
+    _engineRestarting = true;
+    if (_engineController.isClosed || engineDisposed) {
+      _engineRestarting = false;
+      return false;
+    }
+    final Completer<void>? early = _startBarrier;
+    _startBarrier = null;
+    if (early != null && !early.isCompleted) early.complete();
+    _engineWatchdog?.cancel();
+    _engineWatchdog = null;
+    _engineRetryTimer?.cancel();
+    _engineRetryTimer = null;
+    final int epoch = ++_engineEpoch;
+    // Yield once: an in-flight start attempt released
+    // above settles its bookkeeping (which belongs to the
+    // OLD epoch) before this recovery's state writes.
+    await Future<void>.delayed(Duration.zero);
+    final bool pluginEngine = _engineIsPluginInstance;
+    final stt.SpeechToText fresh =
+        identical(_speech, _engineSpeech) && _engineIsPluginInstance
+            ? stt.SpeechToText()
+            : _speech!;
+    _speech = fresh;
+    _engineSpeech = fresh;
+    _engineIsPluginInstance = true;
+    bool ok = false;
+    try {
+      ok = await _doInitialize(fresh, epoch, pluginEngine)
+          .timeout(const Duration(seconds: 3));
+    } catch (_) {
+      ok = false;
+    }
+    _lastRestartSucceeded = ok;
+    _available = ok;
+    _listening = false;
+    _genOpen = 0;
+    _pendingCloses = 0;
+    _closeErrorConsumed = 0;
+    _statusesOwed = 0;
+    _resultArrivedSinceStopBegan = false;
+    _sessionOpening = false;
+    _engineRestarting = false;
+    _detail = ok
+        ? '系统语音识别已接入（引擎已恢复，zh-CN）'
+        : 'NOT_CONFIGURED（语音引擎恢复后仍不可用）';
+    mingtuVoiceLog('语音引擎已为下一次按压恢复（epoch=$epoch）：旧会话全部作废');
+    final Completer<void>? c = _closeCompleter;
+    _closeCompleter = null;
+    if (c != null && !c.isCompleted) c.complete();
+    return ok;
   }
 
   void dispose() {

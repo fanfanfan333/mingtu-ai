@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/adapters/cloud_asr_client.dart';
+import 'package:mingtu_ai/core/cloud_asr.dart';
 import 'package:mingtu_ai/adapters/system_voice_io.dart';
 import 'package:mingtu_ai/adapters/voice_recorder.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
@@ -458,6 +459,17 @@ class FakeStt implements stt.SpeechToText {
   /// Listen calls seen (adapter-level count for this file).
   int listenCalls = 0;
 
+  /// initialize / cancel calls seen, and the ordered op
+  /// log -- the MT-1111-PTT-2 recovery tests assert the
+  /// cancel -> initialize -> listen ORDER on these.
+  int initializeCalls = 0;
+  int cancelCalls = 0;
+  final List<String> ops = <String>[];
+
+  /// When false, initialize() reports failure (the PTT-2
+  /// recovery init-failure test arms this).
+  bool initializeResult = true;
+
   @override
   Future<bool> initialize({
     stt.SpeechErrorListener? onError,
@@ -466,13 +478,18 @@ class FakeStt implements stt.SpeechToText {
     Duration finalTimeout = const Duration(seconds: 2),
     List<stt.SpeechConfigOption>? options,
   }) async {
+    initializeCalls++;
+    ops.add('initialize');
     errorListener = onError;
     statusListener = onStatus;
-    return true;
+    return initializeResult;
   }
 
   @override
-  Future<void> cancel() async {}
+  Future<void> cancel() async {
+    cancelCalls++;
+    ops.add('cancel');
+  }
 
   @override
   Future<void> stop() async {}
@@ -483,6 +500,7 @@ class FakeStt implements stt.SpeechToText {
       resultListener = invocation.namedArguments[#onResult]
           as stt.SpeechResultListener?;
       listenCalls++;
+      ops.add('listen');
       return Future<void>.value();
     }
     if (invocation.memberName == #hasPermission) {
@@ -520,6 +538,10 @@ Future<void> installFakeBackedInput(WidgetTester tester) async {
   // per-attachment: each test asserts the listen count of
   // ITS OWN presses only.
   processFakeStt!.listenCalls = 0;
+  processFakeStt!.initializeCalls = 0;
+  processFakeStt!.cancelCalls = 0;
+  processFakeStt!.ops.clear();
+  processFakeStt!.initializeResult = true;
   fakeBackedInput =
       mingtuHomeDebugHandle!.debugVoiceInput as SystemVoiceInput;
   await mingtuHomeDebugHandle!.debugAttachFakeSpeech(processFakeStt!);
@@ -934,6 +956,247 @@ void main() {
     });
   });
 
+  group('MT-1111-PTT-2 recovery (f)', () {
+    // One recoverable error, delivered with permanent=true
+    // (the plugin's universal shape): press 1 listens and
+    // errors; the press settles; press 2 must run the fixed
+    // recovery -- cancel, then a REAL initialize (counted
+    // on the fake), then listen -- in that order.
+    Future<void> recoverableCase(
+        WidgetTester tester, String code) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await installFakeBackedInput(tester);
+      h.events.clear();
+
+      final TestGesture g1 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g1,
+          expectRecorder: false, useFakeListen: true);
+      expect(processFakeStt!.listenCalls, 1);
+      final int initBefore = processFakeStt!.initializeCalls;
+      await deliverError(tester, code, true);
+      // The benign two never reach the error handler (they
+      // settle the session through the no-match stream),
+      // but their streak/recovery bookkeeping is maintained
+      // on THAT stream with the same rules; the others are
+      // counted by the error handler directly.
+      expect(
+          mingtuHomeDebugHandle!.recoverableErrorCounts[code], 1,
+          reason: 'first $code occurrence counts once');
+      expect(mingtuHomeDebugHandle!.recoveryPending, isTrue);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isFalse,
+          reason: 'a first recoverable error never routes '
+              'to the cloud');
+      await holdPastThreshold(tester);
+      await g1.up();
+      await tester.pump(const Duration(milliseconds: 200));
+      await deliverFakeStatus(tester, 'notListening');
+      await settleReleasedPress(tester, h);
+      h.events.clear();
+      processFakeStt!.ops.clear();
+
+      final TestGesture g2 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g2,
+          expectRecorder: false, useFakeListen: true);
+      // RED LINE: a real path started -- a NEW listen.
+      expect(processFakeStt!.listenCalls, 2,
+          reason: 'press 2 must listen again after $code');
+      // Recovery order: cancel -> initialize -> listen.
+      final List<String> ops = processFakeStt!.ops;
+      final int cancelIdx = ops.indexOf('cancel');
+      final int initIdx = ops.indexOf('initialize');
+      final int listenIdx = ops.lastIndexOf('listen');
+      expect(cancelIdx, greaterThanOrEqualTo(0),
+          reason: 'recovery ops: $ops');
+      expect(initIdx, greaterThan(cancelIdx),
+          reason: 'recovery ops: $ops');
+      expect(listenIdx, greaterThan(initIdx),
+          reason: 'recovery ops: $ops');
+      expect(processFakeStt!.initializeCalls, greaterThan(initBefore),
+          reason: 'a REAL platform initialize happened');
+      await holdPastThreshold(tester);
+      await g2.up();
+      await tester.pump(const Duration(milliseconds: 200));
+      await deliverFakeStatus(tester, 'notListening');
+      await settleReleasedPress(tester, h);
+      await drainVoice(tester, h);
+    }
+
+    for (final String code in <String>[
+      'error_busy',
+      'error_client',
+      'error_speech_timeout',
+      'error_no_match',
+    ]) {
+      testWidgets(
+          'PTT-2: $code (permanent=true) -- next press recovers '
+          '(cancel -> initialize -> listen) and listens again',
+          (WidgetTester tester) async {
+        await recoverableCase(tester, code);
+      });
+    }
+
+    testWidgets(
+        'PTT-2: the same recoverable code twice in a row -- the '
+        'next press RECORDS and speaks 改用云端识别 exactly once',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await installFakeBackedInput(tester);
+      final FakeRecorder recorder = FakeRecorder();
+      mingtuHomeDebugHandle!.setRecorder(recorder);
+      h.events.clear();
+
+      Future<void> errorPress() async {
+        final TestGesture g = await startPttGesture(tester);
+        await pressUntilCapture(tester, h, g,
+            expectRecorder: false, useFakeListen: true);
+        await deliverError(tester, 'error_busy', true);
+        await holdPastThreshold(tester);
+        await g.up();
+        await tester.pump(const Duration(milliseconds: 200));
+        await deliverFakeStatus(tester, 'notListening');
+        await settleReleasedPress(tester, h);
+        h.events.clear();
+      }
+
+      await errorPress(); // busy x1: count 1, recovery armed
+      expect(
+          mingtuHomeDebugHandle!.recoverableErrorCounts[
+              'error_busy'],
+          1);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isFalse);
+      await errorPress(); // busy x2 (via recovery): escalate
+      expect(
+          mingtuHomeDebugHandle!.recoverableErrorCounts[
+              'error_busy'],
+          2);
+      expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue);
+      final int listensBefore = processFakeStt!.listenCalls;
+
+      // The switching press: recorder, no listen, and the
+      // switch notice exactly once.
+      final TestGesture g3 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g3,
+          expectRecorder: true, recorder: recorder);
+      expect(recorder.started, isTrue);
+      expect(processFakeStt!.listenCalls, listensBefore,
+          reason: 'no listen on the switching press');
+      await pumpUntilSpeak(tester, h, asrCloudSwitchSpeechText);
+      expect(h.count('tts.speak:$asrCloudSwitchSpeechText'), 1,
+          reason: '${h.events}');
+      await holdPastThreshold(tester);
+      await g3.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await settleReleasedPress(tester, h);
+      h.events.clear();
+
+      // A later press is ALREADY on the fallback: it records
+      // and does NOT repeat the switch notice.
+      final TestGesture g4 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g4,
+          expectRecorder: true, recorder: recorder);
+      expect(recorder.started, isTrue);
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(h.count('tts.speak:$asrCloudSwitchSpeechText'), 0,
+          reason: 'no repeat switch notice: ${h.events}');
+      await holdPastThreshold(tester);
+      await g4.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await drainVoice(tester, h);
+    });
+
+    testWidgets(
+        'PTT-2: a failed re-initialize during recovery -- that '
+        'press RECORDS and speaks 改用云端识别 once',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      await installFakeBackedInput(tester);
+      final FakeRecorder recorder = FakeRecorder();
+      mingtuHomeDebugHandle!.setRecorder(recorder);
+      h.events.clear();
+
+      final TestGesture g1 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g1,
+          expectRecorder: false, useFakeListen: true);
+      await deliverError(tester, 'error_client', true);
+      expect(mingtuHomeDebugHandle!.recoveryPending, isTrue);
+      await holdPastThreshold(tester);
+      await g1.up();
+      await tester.pump(const Duration(milliseconds: 200));
+      await deliverFakeStatus(tester, 'notListening');
+      await settleReleasedPress(tester, h);
+      h.events.clear();
+
+      // The recovery's re-initialize will fail.
+      processFakeStt!.initializeResult = false;
+      final int listensBefore = processFakeStt!.listenCalls;
+      final TestGesture g2 = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g2,
+          expectRecorder: true, recorder: recorder);
+      expect(recorder.started, isTrue,
+          reason: 'the press must still start a real path');
+      expect(processFakeStt!.listenCalls, listensBefore,
+          reason: 'no listen after a failed re-initialize');
+      await pumpUntilSpeak(tester, h, asrCloudSwitchSpeechText);
+      expect(h.count('tts.speak:$asrCloudSwitchSpeechText'), 1);
+      await holdPastThreshold(tester);
+      await g2.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      await drainVoice(tester, h);
+    });
+
+    testWidgets(
+        'PTT-2: recording cap -- holding past the cap auto-stops '
+        'and transcribes once; an early release never double-sends',
+        (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await settleRecordedApp(tester, h);
+      h.events.clear();
+
+      final FakeRecorder recorder = FakeRecorder();
+      await armFallbackRecorderOnly(tester, h, recorder,
+          asrText: '去图书馆');
+      mingtuHomeDebugHandle!.setRecordCapMs(300);
+
+      final TestGesture g = await startPttGesture(tester);
+      await pressUntilCapture(tester, h, g,
+          expectRecorder: true, recorder: recorder);
+      expect(recorder.started, isTrue);
+      // Hold WITHOUT releasing. The cap timer is a
+      // wall-clock Timer the widget tester's fake clock
+      // cannot fire, so the completion is driven through
+      // the debug seam -- the SAME _onPttRecordCapReached
+      // the production Timer calls. (That the Timer itself
+      // is armed at asrMaxRecordMs on this path is covered
+      // by the arming in _pttStartRecording; the seam
+      // verifies the completion semantics.)
+      mingtuHomeDebugHandle!.debugFireRecordCap();
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(recorder.started, isFalse,
+          reason: 'the cap auto-stopped the recorder');
+      expect(fallbackSenderCalls!(), 1,
+          reason: 'the capped clip was transcribed once');
+      await pumpUntilSpeak(tester, h, asrRecordCapSpeechText);
+      // Releasing after the cap must not send again.
+      await g.up();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(fallbackSenderCalls!(), 1,
+          reason: 'no double transcription after the cap');
+      await drainVoice(tester, h);
+    });
+  });
+
   group('no automatic listen (e) + PTT-D checks', () {
     testWidgets(
         '(e) during and after a press there is exactly one '
@@ -1047,6 +1310,38 @@ void main() {
     });
 
   });
+}
+
+/// Arm the recording fallback for a test that does not
+/// live inside the (b, c, d) group: inject the recorder
+/// and a counting fake ASR client, then force the broken
+/// flag with a permission error on a system-ASR press
+/// (the same arming the group's helper performs).
+Future<void> armFallbackRecorderOnly(WidgetTester tester,
+    RecordingVoiceChannels h, FakeRecorder recorder,
+    {String? asrText}) async {
+  int senderCalls = 0;
+  mingtuHomeDebugHandle!.setRecorder(recorder);
+  mingtuHomeDebugHandle!.setCloudAsrClient(CloudAsrClient(
+    proxyBaseUrl: 'https://fc.example',
+    sender: (Uri url, String body, Map<String, String> headers) async {
+      senderCalls++;
+      return jsonEncode(<String, Object?>{'text': asrText});
+    },
+  ));
+  await installFakeBackedInput(tester);
+  final TestGesture g0 = await startPttGesture(tester);
+  await pressUntilCapture(tester, h, g0,
+      expectRecorder: false, useFakeListen: true);
+  await deliverError(tester, 'error_permission', true);
+  expect(mingtuHomeDebugHandle!.localAsrBroken, isTrue);
+  await holdPastThreshold(tester);
+  await g0.up();
+  await tester.pump(const Duration(milliseconds: 200));
+  await deliverFakeStatus(tester, 'notListening');
+  await settleReleasedPress(tester, h);
+  h.events.clear();
+  fallbackSenderCalls = () => senderCalls;
 }
 
 /// Set by the fallback-arming helper: reads the fake ASR

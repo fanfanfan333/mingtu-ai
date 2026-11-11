@@ -144,6 +144,11 @@ void main() {
         'asr_not_configured',
         'vision_not_configured',
         'unauthorized',
+        // MT-1111-PTT-2 server WAV-validation codes map to
+        // the same fixed unavailable failure.
+        'audio format not allowed',
+        'audio too long',
+        'audio invalid',
       ]) {
         final CloudAsrClient client = CloudAsrClient(
           proxyBaseUrl: 'https://fc.example',

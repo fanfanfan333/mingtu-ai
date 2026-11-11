@@ -257,6 +257,20 @@ class MingtuHomeDebugHandle {
   void setCloudAsrClient(CloudAsrClient client) =>
       _state._cloudAsrClient = client;
   bool get localAsrBroken => _state._localAsrBroken;
+
+  /// MT-1111-PTT-2 seams: inject a shorter recording cap
+  /// (tests) and read the recoverable-error bookkeeping.
+  void setRecordCapMs(int ms) => _state._recordCapMsOverride = ms;
+
+  /// Test seam: drive the recording-cap completion
+  /// directly (a widget test's fake clock cannot fire the
+  /// app's private wall-clock cap timer). Production never
+  /// calls this -- the cap Timer does.
+  void debugFireRecordCap() =>
+      unawaited(_state._onPttRecordCapReached(_state._pttSession));
+  Map<String, int> get recoverableErrorCounts =>
+      Map<String, int>.unmodifiable(_state._asrRecoverableErrorCounts);
+  bool get recoveryPending => _state._asrRecoveryPending;
 }
 
 /// The live home page's debug handle (see above). Assigned
@@ -354,6 +368,40 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// may announce the same code again). No code ever
   /// disables future presses.
   final Set<String> _asrErrorSpokenCodes = <String>{};
+
+  /// Consecutive counts of RECOVERABLE recognition errors,
+  /// per error code (MT-1111-PTT-2): the same recoverable
+  /// code twice in a row escalates the next affected press
+  /// to the cloud recording fallback. A successful
+  /// recognition session clears ALL counts. Fatal codes
+  /// never land here (they route directly).
+  final Map<String, int> _asrRecoverableErrorCounts =
+      <String, int>{};
+
+  /// A recoverable error was seen since the last session:
+  /// the NEXT press must first run the fixed recovery
+  /// (cancel -> re-initialize -> listen) before it may
+  /// listen. Cleared when a session starts successfully.
+  bool _asrRecoveryPending = false;
+
+  /// The recoverable-error streak (code -> count snapshot)
+  /// whose escalation currently owns the recording route,
+  /// or null when it does not. The switch notice is spoken
+  /// on the ONE press where a NEW streak takes the route;
+  /// later presses on the same streak stay silent, and a
+  /// streak that re-forms after a delivered result (which
+  /// cleared the counts) announces again.
+  Map<String, int>? _asrEscalationAnnouncedFor;
+
+  /// Test-only override of the recording cap (production
+  /// always uses asrMaxRecordMs); set via the debug handle.
+  int? _recordCapMsOverride;
+
+  /// The recording cap timer for the current press: armed
+  /// when a recording starts, fires the cap completion
+  /// (auto-stop + transcribe) if the press is still held,
+  /// and is cancelled on release / cancel / background.
+  Timer? _pttRecordCapTimer;
 
   /// Subscription to the adapter's no-match outcome stream.
   StreamSubscription<String>? _asrNoMatchSub;
@@ -671,6 +719,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (_pttState == _PttState.listening) {
         _pushToTalkHeld = false;
         if (_pttRecording) {
+          _pttRecordCapTimer?.cancel();
+          _pttRecordCapTimer = null;
           _pttRecording = false;
           _pttState = _PttState.idle;
           unawaited(() async {
@@ -1206,6 +1256,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           return;
         }
         final String text = event.text;
+        _noteAsrSessionDelivered();
         if (_pttState == _PttState.listening) {
           // Cache only: while the button is held nothing is
           // executed. The release path submits the cached
@@ -1420,7 +1471,25 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         code == 'error_permission' || code == 'error_insufficient_permissions';
     final bool isEngineUnavailable =
         code == 'not_available' || code == 'error_server';
-    if (isPermission || isEngineUnavailable) {
+    // MT-1111-PTT-2 routing: ONLY no-engine / permission /
+    // language (the fatal set) and error_server go straight
+    // to the cloud fallback. A RECOVERABLE code never marks
+    // the recogniser broken on its first occurrence: it
+    // arms the recovery for the next press (cancel ->
+    // re-initialize -> listen) and counts CONSECUTIVE
+    // occurrences of the same code; the second consecutive
+    // occurrence escalates to the fallback.
+    final bool recoverable = isRecoverableAsrError(code);
+    if (recoverable) {
+      final int n = (_asrRecoverableErrorCounts[code] ?? 0) + 1;
+      _asrRecoverableErrorCounts[code] = n;
+      if (n >= 2) {
+        _localAsrBroken = true;
+      } else {
+        _asrRecoveryPending = true;
+      }
+    }
+    if (isPermission || isEngineUnavailable || isFatalAsrError(code)) {
       // The engine cannot record (its own permission is
       // missing, or the service is absent): later presses
       // record with the app's own permission instead. This
@@ -1475,6 +1544,23 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// way. Outcomes outside a press are bookkeeping only.
   void _onAsrSessionNoMatch(String code) {
     mingtuVoiceLog('识别会话以无匹配结束（$code）：按缓存结算，不自动重听');
+    // MT-1111-PTT-2: the benign codes (no_match /
+    // speech_timeout) are RECOVERABLE codes too -- they
+    // never reach _handleAsrError (they settle the session
+    // on this stream instead), so their recovery arming and
+    // consecutive streak are maintained HERE, with exactly
+    // the same rules: first occurrence arms the next-press
+    // recovery; the second consecutive occurrence switches
+    // the route to the cloud recording.
+    if (isRecoverableAsrError(code)) {
+      final int n = (_asrRecoverableErrorCounts[code] ?? 0) + 1;
+      _asrRecoverableErrorCounts[code] = n;
+      if (n >= 2) {
+        _localAsrBroken = true;
+      } else {
+        _asrRecoveryPending = true;
+      }
+    }
     if (_pttState != _PttState.stopping) return;
     if (_pttCachedText != null && !_pttCachedIsFinal) {
       _pttCompletePress(_pttSession, _pttCachedText);
@@ -1527,6 +1613,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _pttState == _PttState.starting) {
       _pttSessionVoided = true;
       if (_pttRecording) {
+        _pttRecordCapTimer?.cancel();
+        _pttRecordCapTimer = null;
         _pttRecording = false;
         unawaited(() async {
           try {
@@ -2464,6 +2552,51 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _pttFinishTooShort(sid);
       return;
     }
+    if (!_localAsrBroken && _asrRecoveryPending) {
+      // MT-1111-PTT-2 recovery, run on THIS press before
+      // it may listen: cancel (drop the previous session's
+      // residue) -> re-initialize (a REAL platform
+      // initialize via the adapter) -> listen (below). A
+      // failed re-initialize switches THIS press to the
+      // cloud recording instead -- with the switch notice.
+      _asrRecoveryPending = false;
+      bool recovered = false;
+      if (_voiceInput is SystemVoiceInput) {
+        // Step 1: cancel -- unconditional at the platform
+        // (cancelForRecovery), because the errored session
+        // is already closed on the adapter's books and a
+        // session-guarded cancel would never reach the
+        // recogniser's residue.
+        try {
+          await (_voiceInput as SystemVoiceInput)
+              .cancelForRecovery();
+        } catch (e) {
+          _logMsg('恢复前取消语音识别失败，继续重新初始化：$e');
+        }
+        if (!mounted || sid != _pttSession) return;
+        if (_pttPendingStop) {
+          _pttFinishTooShort(sid);
+          return;
+        }
+        try {
+          recovered = await (_voiceInput as SystemVoiceInput)
+              .restartForRecovery();
+        } catch (_) {
+          recovered = false;
+        }
+      }
+      if (!mounted || sid != _pttSession) return;
+      if (_pttPendingStop) {
+        _pttFinishTooShort(sid);
+        return;
+      }
+      if (!recovered) {
+        _localAsrBroken = true;
+        await _pttStartRecording(sid, switchedToCloud: true);
+        return;
+      }
+      // Recovered: fall through to the normal listen below.
+    }
     if (_localAsrBroken) {
       // Cloud ASR fallback: the system recogniser cannot
       // serve this device (its engine lacks the microphone
@@ -2478,7 +2611,26 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // stop the local-ASR path gets. (TalkBack speech is
       // system-level and the app cannot stop it; that
       // boundary is documented in the README.)
-      await _pttStartRecording(sid);
+      // MT-1111-PTT-2: when THIS press is the one where the
+      // escalation switched the route (the same recoverable
+      // code twice in a row), the switch is announced once:
+      // the announcing streak is remembered, so later
+      // presses on the SAME streak announce nothing, while
+      // presses that merely START on the fallback (startup
+      // unavailability, a fatal code) carry no streak at
+      // all and announce nothing either.
+      bool switchedNow = false;
+      if (_asrRecoverableErrorCounts.values.any((int n) => n >= 2)) {
+        final Map<String, int> streak =
+            Map<String, int>.of(_asrRecoverableErrorCounts);
+        if (!_sameIntMap(streak, _asrEscalationAnnouncedFor)) {
+          switchedNow = true;
+          _asrEscalationAnnouncedFor = streak;
+        }
+      } else {
+        _asrEscalationAnnouncedFor = null;
+      }
+      await _pttStartRecording(sid, switchedToCloud: switchedNow);
       return;
     }
     _pttState = _PttState.starting;
@@ -2576,7 +2728,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// timer that ends the press exactly like a release (the
   /// TalkBack long-press action's own 10 s auto-end lands
   /// on the same path).
-  Future<void> _pttStartRecording(int sid) async {
+  Future<void> _pttStartRecording(int sid,
+      {bool switchedToCloud = false}) async {
     _pttState = _PttState.starting;
     bool permitted = false;
     try {
@@ -2623,6 +2776,25 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!mounted || sid != _pttSession) return;
     _pttRecording = true;
     _pttState = _PttState.listening;
+    // MT-1111-PTT-2 cap: EVERY recording path is capped by
+    // the same timer (normal hold and TalkBack alike --
+    // TalkBack's own delayed auto-end lands on the same
+    // completion point, and the state guard settles the
+    // press exactly once whichever fires first).
+    _armPttRecordCapTimer(sid);
+    if (switchedToCloud && _voiceOutput.isAvailable && !_ttsFailed) {
+      // The switch notice: spoken once, on the switching
+      // press only (see the prompt step). The recording is
+      // already running; the notice is scheduler speech and
+      // does not gate the capture.
+      _say(_request(
+        id: 'ptt-cloud-switch-${DateTime.now().millisecondsSinceEpoch}',
+        eventId:
+            'ptt-cloud-switch-${DateTime.now().millisecondsSinceEpoch}',
+        text: asrCloudSwitchSpeechText,
+        kind: SpeechKind.alert,
+      ));
+    }
     if (_pttPendingStop) {
       // Released while the recorder was starting: the
       // release was necessarily too short; the recording
@@ -2632,6 +2804,48 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  /// Arm the recording cap for press [sid]: when
+  /// asrMaxRecordMs elapses with the press STILL recording,
+  /// the press auto-completes exactly like a release
+  /// (stop -> transcribe -> submit) via
+  /// [_onPttRecordCapReached]. Cancelled by every other
+  /// completion path (release, cancel, background, dispose).
+  void _armPttRecordCapTimer(int sid) {
+    _pttRecordCapTimer?.cancel();
+    _pttRecordCapTimer = Timer(
+      Duration(milliseconds: _recordCapMsOverride ?? asrMaxRecordMs),
+      () {
+        if (!mounted || sid != _pttSession) return;
+        unawaited(_onPttRecordCapReached(sid));
+      },
+    );
+  }
+
+  /// The recording cap fired: short vibration + the fixed
+  /// cap notice, then the press settles through the SAME
+  /// release path a physical release uses. Guarded by the
+  /// state machine (still listening, still recording, same
+  /// session): a late fire after a release/cancel is a
+  /// no-op, so the press can never complete twice.
+  Future<void> _onPttRecordCapReached(int sid) async {
+    if (sid != _pttSession ||
+        _pttState != _PttState.listening ||
+        !_pttRecording) {
+      return;
+    }
+    _pushToTalkHeld = false;
+    HapticFeedback.vibrate();
+    if (_voiceOutput.isAvailable && !_ttsFailed) {
+      _say(_request(
+        id: 'ptt-rec-cap-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'ptt-rec-cap-${DateTime.now().millisecondsSinceEpoch}',
+        text: asrRecordCapSpeechText,
+        kind: SpeechKind.alert,
+      ));
+    }
+    await _pttReleaseFromRecording();
+  }
+
   /// Release of a recording press. Settles through the
   /// SAME single completion discipline as a system-ASR
   /// press (state stopping -> idle, exactly once), but
@@ -2639,6 +2853,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// to the cloud ASR route and its transcript enters the
   /// ordinary command pipeline via _processPushToTalkFinal.
   Future<void> _pttReleaseFromRecording() async {
+    _pttRecordCapTimer?.cancel();
+    _pttRecordCapTimer = null;
     final int sid = _pttSession;
     final DateTime? pressedAt = _pushToTalkPressedAt;
     _pushToTalkPressedAt = null;
@@ -2846,6 +3062,25 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pttCompletePress(_pttSession, text);
   }
 
+  static bool _sameIntMap(Map<String, int> a, Map<String, int>? b) {
+    if (b == null || a.length != b.length) return false;
+    for (final MapEntry<String, int> e in a.entries) {
+      if (b[e.key] != e.value) return false;
+    }
+    return true;
+  }
+
+  /// A recognition session DELIVERED a result: the
+  /// MT-1111-PTT-2 'successful session' that resets the
+  /// consecutive recoverable-error streak (all codes) --
+  /// escalation measures a consecutive stretch of failures,
+  /// and one delivered result breaks it.
+  void _noteAsrSessionDelivered() {
+    if (_asrRecoverableErrorCounts.isNotEmpty) {
+      _asrRecoverableErrorCounts.clear();
+    }
+  }
+
   /// The single completion point of a released press.
   /// Guarded by the state machine: only a press still in
   /// stopping can complete, and completing leaves stopping,
@@ -3043,6 +3278,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // spoken again for a LATER session (dedup is per
       // stretch between successes, never permanent).
       _asrErrorSpokenCodes.clear();
+      // MT-1111-PTT-2 note: the recoverable-error streak
+      // is NOT cleared here. 'Successful session' in the
+      // final spec means a session that actually DELIVERS
+      // a result: clearing at listen-START would erase the
+      // streak on the very press the recovery opened, and
+      // a second consecutive error could never escalate.
+      // The streak clears in _noteAsrSessionDelivered,
+      // called when a transcript of the live session lands.
+      _asrRecoveryPending = false;
     }
     if (!mounted) return started;
     setState(() {

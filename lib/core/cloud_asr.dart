@@ -33,6 +33,21 @@ const String asrModelId = 'qwen3-asr-flash';
 /// commands; 10 s matches the system recogniser's own limit.
 const int asrMaxRecordMs = 10000;
 
+/// Spoken when a press switches from the local recogniser
+/// to the cloud ASR recording fallback (MT-1111-PTT-2):
+/// fixed text, spoken exactly once per switch -- on the
+/// press where the switch happens, never on later presses
+/// that are already on the fallback.
+const String asrCloudSwitchSpeechText = '改用云端识别';
+
+/// Spoken when a recording reaches the [asrMaxRecordMs]
+/// cap and is auto-stopped for transcription
+/// (MT-1111-PTT-2), preceded by a short vibration. The
+/// wording names the 10 s constant; a test injecting a
+/// smaller cap still hears this exact text (the cap the
+/// USER experiences is 10 s).
+const String asrRecordCapSpeechText = '已录10秒，正在识别';
+
 /// 10 s of 16 kHz mono 16-bit WAV is ~320 KB (plus the header).
 const int asrMaxAudioBytes = 400000;
 

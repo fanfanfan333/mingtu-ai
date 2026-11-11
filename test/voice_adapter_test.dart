@@ -321,7 +321,9 @@ void main() {
       expect(input.isAvailable, isTrue);
     });
 
-    test('a permanent error marks the input unavailable', () async {
+    test(
+        'a FATAL code (permission) marks the input unavailable '
+        '-- by code, not by the permanent flag', () async {
       final fake = FakeStt();
       final input = SystemVoiceInput(fake);
       await input.initialize();
@@ -331,6 +333,46 @@ void main() {
       );
       expect(await firstError, contains('permanent=true'));
       expect(input.isAvailable, isFalse);
+    });
+
+    test(
+        'MT-1111-PTT-2/CDX1: a RECOVERABLE code with '
+        'permanent=true (the plugin sends permanent=true for '
+        'EVERY error) does NOT mark the input unavailable',
+        () async {
+      for (final String code in <String>[
+        'error_busy',
+        'error_client',
+        'error_network',
+        'error_audio',
+      ]) {
+        final fake = FakeStt();
+        final input = SystemVoiceInput(fake);
+        await input.initialize();
+        final Future<String> firstError = input.errors.first;
+        fake.capturedOnError!(SpeechRecognitionError(code, true));
+        // The payload still carries the flag for
+        // diagnostics; the DECISION must ignore it.
+        expect(await firstError, '$code|permanent=true');
+        expect(input.isAvailable, isTrue,
+            reason: '$code is recoverable: availability must '
+                'survive a permanent=true delivery');
+      }
+    });
+
+    test(
+        'MT-1111-PTT-2: error_unknown with permanent=true is '
+        'recoverable too (retry, never permanent silence)',
+        () async {
+      final fake = FakeStt();
+      final input = SystemVoiceInput(fake);
+      await input.initialize();
+      final Future<String> firstError = input.errors.first;
+      fake.capturedOnError!(
+        SpeechRecognitionError('error_unknown', true),
+      );
+      expect(await firstError, 'error_unknown|permanent=true');
+      expect(input.isAvailable, isTrue);
     });
 
     test(
@@ -1049,7 +1091,13 @@ void main() {
       expect(entries.single, isNot(contains('http')));
       expect(entries.single, isNot(contains('example.invalid')));
       expect(asrErrorText('error_unknown'), isNot(contains('http')));
-      expect(input.isAvailable, isFalse);
+      // OLD assertion (pre-PTT-2): isAvailable was false,
+      // because the adapter trusted the error's permanent
+      // flag (this delivery carried permanent=true). NEW
+      // classification: the code collapsed to error_unknown,
+      // which is RECOVERABLE by code -- availability must
+      // SURVIVE even a permanent=true delivery.
+      expect(input.isAvailable, isTrue);
     });
   });
 }

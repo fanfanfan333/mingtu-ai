@@ -36,6 +36,54 @@ const String asrErrorUnknown = 'error_unknown';
 String asrErrorCode(String raw) =>
     knownAsrErrorCodes.contains(raw) ? raw : asrErrorUnknown;
 
+/// Error classification BY CODE -- never by the platform's
+/// `permanent` flag (CDX1): speech_to_text 7.5.0's Android
+/// sendError passes permanent=true for EVERY error, so a
+/// permanent-based availability decision permanently kills
+/// recognition after a routine busy/timeout/no-match -- the
+/// exact Xiaomi real-device failure. The normalised code is
+/// the only trustworthy signal.
+///
+/// Recoverable codes: the failure ends THIS session only.
+/// The recogniser stays available and the next press MUST
+/// listen again. (error_server / error_cancelled are
+/// deliberately in NEITHER set: server keeps its historic
+/// fallback routing in the app, cancelled stays a
+/// plain error -- both documented, neither is decided by
+/// the permanent flag either.)
+const Set<String> recoverableAsrErrorCodes = <String>{
+  'error_busy',
+  'error_client',
+  'error_speech_timeout',
+  'error_no_match',
+  'error_network',
+  'error_network_timeout',
+  'error_audio',
+  'error_audio_error',
+  asrErrorUnknown,
+};
+
+/// Fatal codes: the engine itself cannot serve (its own
+/// permission missing, no recogniser service, no Chinese
+/// support). Only these may mark the input unavailable and
+/// route presses to the recording + cloud ASR fallback.
+const Set<String> fatalAsrErrorCodes = <String>{
+  'error_permission',
+  'error_insufficient_permissions',
+  'not_available',
+  'error_language_not_supported',
+  'error_language_unavailable',
+};
+
+/// True when [code] (already normalised by [asrErrorCode])
+/// is recoverable: session-scoped, never disabling.
+bool isRecoverableAsrError(String code) =>
+    recoverableAsrErrorCodes.contains(code);
+
+/// True when [code] is fatal (see [fatalAsrErrorCodes]).
+bool isFatalAsrError(String code) =>
+    fatalAsrErrorCodes.contains(code);
+
 /// The dedicated spoken notice for a permission failure of
 /// the SYSTEM speech engine (real-device fix round): on the
 /// Xiaomi 15 the engine is Xiaomi's own speech service, and

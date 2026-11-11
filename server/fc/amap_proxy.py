@@ -615,6 +615,23 @@ def vision_reject_reason(token, expected_token, limiter):
     return None
 
 
+def token_reject_reason(token, expected_token):
+    """Token half of the guard chain ONLY (steps 1-2a):
+    returns (status, error_code) to reject, or None when
+    the token authorises the call. Consumes NO rate quota:
+    the /asr dispatchers run it first, validate the clip,
+    and only then spend a slot via the limiter -- so a
+    validation failure costs no quota (MT-1111-PTT-2).
+    (vision_reject_reason above already had this property
+    for the token itself: a failed token never reaches its
+    limiter either.)"""
+    if not expected_token:
+        return 503, "vision_not_configured"
+    if not token or not hmac.compare_digest(token, expected_token):
+        return 401, "unauthorized"
+    return None
+
+
 # ------------------------------------------------------------------
 # Hazard mode (task == "hazard_scan" on /vision): the strict
 # JSON schema the walking scan uses for stairs / curbs / pits /
@@ -827,6 +844,99 @@ ASR_PER_MINUTE_DEFAULT = 10
 ASR_PER_DAY_DEFAULT = 60
 _ASR_DATA_URI_PREFIX = "data:audio/wav;base64,"
 
+# Duration cap for /asr clips (MT-1111-PTT-2): the client
+# caps recordings at 10 s; the server allows a half-second
+# of slack for header/rounding and rejects anything longer.
+ASR_MAX_DURATION_S = 10.5
+
+
+def _parse_asr_wav(decoded_audio):
+    """Hand-parse a RIFF/WAVE header (PTT-2: byte-level,
+    not the wave module, so acceptance does not depend on
+    that module's strictness quirks). Returns
+    (sample_rate, data_bytes) for an acceptable clip --
+    PCM (audioFormat 1), 16-bit, mono, sample rate in
+    [8000, 48000] -- or None when the bytes are not such a
+    WAV."""
+    if len(decoded_audio) < 12:
+        return None
+    if decoded_audio[0:4] != b"RIFF" or decoded_audio[8:12] != b"WAVE":
+        return None
+    fmt = None
+    data_size = None
+    offset = 12
+    while offset + 8 <= len(decoded_audio):
+        chunk_id = decoded_audio[offset:offset + 4]
+        chunk_size = int.from_bytes(
+            decoded_audio[offset + 4:offset + 8], "little")
+        body_start = offset + 8
+        if chunk_id == b"fmt ":
+            if chunk_size < 16 or body_start + 16 > len(decoded_audio):
+                return None
+            fmt = decoded_audio[body_start:body_start + chunk_size]
+        elif chunk_id == b"data":
+            data_size = chunk_size
+            break
+        # Chunks are word-aligned: an odd-sized chunk is
+        # followed by one pad byte.
+        offset = body_start + chunk_size + (chunk_size & 1)
+    if fmt is None or data_size is None:
+        return None
+    audio_format = int.from_bytes(fmt[0:2], "little")
+    channels = int.from_bytes(fmt[2:4], "little")
+    sample_rate = int.from_bytes(fmt[4:8], "little")
+    bits_per_sample = int.from_bytes(fmt[14:16], "little")
+    if audio_format != 1 or channels != 1 or bits_per_sample != 16:
+        return None
+    if sample_rate < 8000 or sample_rate > 48000:
+        return None
+    return sample_rate, data_size
+
+
+def validate_asr_body(raw, *, dashscope_key=None):
+    """Validation half of the /asr pipeline (MT-1111-PTT-2
+    split): parses the request and validates the clip
+    WITHOUT calling upstream and WITHOUT consuming any
+    rate-limit quota. Returns (status, error_body_bytes)
+    to reject, or (None, decoded_audio) to proceed. The
+    dispatch layers run the token check first, then this,
+    then SPEND the rate slot, then forward_asr_body -- so
+    a validation failure costs no quota and never reaches
+    the upstream poster."""
+    if not dashscope_key:
+        return 503, json.dumps(
+            {"error": "asr_not_configured"}).encode()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return 400, json.dumps(
+            {"error": "request must be JSON"}).encode()
+    if not isinstance(payload, dict):
+        return 400, json.dumps(
+            {"error": "request must be JSON"}).encode()
+    audio_uri = payload.get("audio")
+    if not isinstance(audio_uri, str) or \
+            not audio_uri.startswith(_ASR_DATA_URI_PREFIX):
+        return 400, json.dumps(
+            {"error": "audio must be a wav data URI"}).encode()
+    try:
+        decoded_audio = base64.b64decode(
+            audio_uri[len(_ASR_DATA_URI_PREFIX):], validate=True)
+    except Exception:
+        return 400, json.dumps(
+            {"error": "audio decode failed"}).encode()
+    if len(decoded_audio) > ASR_MAX_AUDIO_BYTES:
+        return 400, json.dumps({"error": "audio too large"}).encode()
+    parsed = _parse_asr_wav(decoded_audio)
+    if parsed is None:
+        return 400, json.dumps(
+            {"error": "audio format not allowed"}).encode()
+    sample_rate, data_bytes = parsed
+    duration_s = data_bytes / float(sample_rate * 2)  # mono 16-bit
+    if duration_s > ASR_MAX_DURATION_S:
+        return 400, json.dumps({"error": "audio too long"}).encode()
+    return None, decoded_audio
+
 
 def _whitelist_asr_text(raw_body, secrets):
     """Rebuild an ASR upstream answer as {"text": ...} only.
@@ -862,9 +972,28 @@ def _whitelist_asr_text(raw_body, secrets):
 
 def handle_asr_body(raw, *, dashscope_key, asr_upstream, poster,
                     amap_key=""):
-    """Parse, pin, forward and whitelist one /asr request
-    body. Returns (status, body_bytes). Shared by the FC
-    handler and the standalone server, like handle_vision_body."""
+    """Validate, forward and whitelist one /asr request
+    body (the composition of validate_asr_body +
+    forward_asr_body; the dispatch layers call the two
+    halves separately so the rate slot is spent only after
+    validation passes -- see validate_asr_body). Returns
+    (status, body_bytes). Shared by the FC handler and the
+    standalone server, like handle_vision_body."""
+    status, result = validate_asr_body(raw, dashscope_key=dashscope_key)
+    if status is not None:
+        return status, result
+    return forward_asr_body(
+        raw, result, dashscope_key=dashscope_key,
+        asr_upstream=asr_upstream, poster=poster, amap_key=amap_key)
+
+
+def forward_asr_body(raw, decoded_audio, *, dashscope_key, asr_upstream,
+                     poster, amap_key=""):
+    """Forwarding half of the /asr pipeline: the clip in
+    [decoded_audio] has already passed validate_asr_body.
+    Pins the upstream, rebuilds the request with the
+    server-side model and forwards it. Returns
+    (status, body_bytes)."""
     if asr_upstream != ASR_UPSTREAM_DEFAULT:
         # The key may ONLY ever go to the pinned endpoint.
         return 502, json.dumps({"error": "upstream not allowed"}).encode()
@@ -883,13 +1012,6 @@ def handle_asr_body(raw, *, dashscope_key, asr_upstream, poster,
     audio = payload.get("audio")
     if not isinstance(audio, str) or not audio.startswith(_ASR_DATA_URI_PREFIX):
         return 400, json.dumps({"error": "audio required"}).encode()
-    encoded = audio[len(_ASR_DATA_URI_PREFIX):]
-    try:
-        decoded_audio = base64.b64decode(encoded, validate=True)
-    except Exception:
-        return 400, json.dumps({"error": "audio invalid"}).encode()
-    if len(decoded_audio) > ASR_MAX_AUDIO_BYTES:
-        return 400, json.dumps({"error": "audio too large"}).encode()
     if "format" in payload and payload.get("format") != "wav":
         return 400, json.dumps({"error": "format not allowed"}).encode()
     if not dashscope_key:
@@ -1012,18 +1134,32 @@ def fc_handle_event(event, *, dashscope_key=None, expected_token=None,
         body_bytes = (raw_body.encode("utf-8")
                       if isinstance(raw_body, str) else bytes(raw_body))
     if "asr" in path and "vision" not in path:
-        # /asr: same token guard, ASR's OWN limiter. (Path
-        # check order matters: a /vision path never enters
-        # this branch.)
-        reject = vision_reject_reason(
-            lowered.get(VISION_TOKEN_HEADER), expected_token, asr_limiter)
+        # /asr: same token guard, ASR's OWN limiter -- but
+        # spent only AFTER the clip validates (MT-1111-PTT-2:
+        # a validation failure consumes no quota and never
+        # reaches upstream). (Path check order matters: a
+        # /vision path never enters this branch.)
+        reject = token_reject_reason(
+            lowered.get(VISION_TOKEN_HEADER), expected_token)
         if reject is not None:
             status, code = reject
             return _fc_response(status, {"error": code})
         if len(body_bytes) > ASR_MAX_BODY_BYTES:
             return _fc_response(413, {"error": "body too large"})
-        status, body = handle_asr_body(
+        vstatus, vresult = validate_asr_body(
+            body_bytes, dashscope_key=dashscope_key)
+        if vstatus is not None:
+            return {
+                "statusCode": vstatus,
+                "headers": {"Content-Type": "application/json; charset=utf-8"},
+                "isBase64Encoded": False,
+                "body": vresult.decode("utf-8"),
+            }
+        if asr_limiter is not None and not asr_limiter.allow():
+            return _fc_response(429, {"error": "rate_limited"})
+        status, body = forward_asr_body(
             body_bytes,
+            vresult,
             dashscope_key=dashscope_key,
             asr_upstream=asr_upstream,
             poster=poster,
@@ -1177,12 +1313,14 @@ class WalkingHandler(BaseHTTPRequestHandler):
         self._send_json(status, body)
 
     def _do_asr_post(self):
-        # Same guard chain as /vision but the ASR limiter and
-        # the 1 MB cap: rejected calls never forward a body.
-        reject = vision_reject_reason(
+        # Same token guard as /vision and the 1 MB cap, but
+        # the ASR limiter is spent only AFTER the clip
+        # validates (MT-1111-PTT-2: a validation failure
+        # consumes no quota and never reaches upstream);
+        # rejected calls never forward a body.
+        reject = token_reject_reason(
             self.headers.get("X-Mingtu-Vision-Token"),
             self.vision_token,
-            self.asr_limiter,
         )
         if reject is not None:
             status, code = reject
@@ -1199,8 +1337,18 @@ class WalkingHandler(BaseHTTPRequestHandler):
             self._send_json(413, json.dumps({"error": "body too large"}).encode())
             return
         raw = self.rfile.read(length) if length > 0 else b""
-        status, body = handle_asr_body(
+        vstatus, vresult = validate_asr_body(
+            raw, dashscope_key=self.dashscope_key)
+        if vstatus is not None:
+            self._send_json(vstatus, vresult)
+            return
+        if self.asr_limiter is not None and not self.asr_limiter.allow():
+            self._send_json(
+                429, json.dumps({"error": "rate_limited"}).encode())
+            return
+        status, body = forward_asr_body(
             raw,
+            vresult,
             dashscope_key=self.dashscope_key,
             asr_upstream=self.asr_upstream,
             poster=self.poster,
