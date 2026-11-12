@@ -346,7 +346,9 @@ static const double hazardAboutSplit = 7.5;
 /// 4 s chosen). Inside the cooldown only two re-alerts are
 /// allowed: a level upgrade (W -> U), or a TTC that has
 /// fallen by at least [ttcDropReAlertRatio] since the last
-/// spoken alert for that track.
+/// spoken alert for that track (the drop path additionally
+/// requires [realertDropMinInterval] since that alert,
+/// NH-M2-07).
 static const int cooldownSeconds = 4;
 
 /// Per-track alert cooldown, seconds, when the frame's
@@ -359,6 +361,23 @@ static const int cooldownSeconds = 4;
 /// unchanged inside this longer window.
 static const int cooldownSecondsEgoUnknown = 6;
 static const double ttcDropReAlertRatio = 0.4;
+
+/// NH-M2-07 (M3 first commit, lead's FINAL ruling
+/// 2026-11-11): the TTC-drop re-alert exception above
+/// additionally requires at least this much time since
+/// that track's last SPOKEN alert (frame timestamps).
+/// Rationale: at a 0.5 s gap the previous sentence has
+/// not finished playing, so a repeat would only talk
+/// over it (overlap) -- the drop alone no longer
+/// suffices inside the window. The W -> U upgrade
+/// exception is NOT subject to this interval (speech
+/// arbitration interrupts for an upgrade, as before),
+/// and a same-level re-alert after the cooldown window
+/// has elapsed keeps the plain M1 behaviour above.
+/// Calibration placeholder: NO real-device measurement
+/// backs the 1.0 s value yet.
+static const Duration realertDropMinInterval =
+    Duration(seconds: 1);
 
 /// Two DIFFERENT tracks of the same category and direction
 /// zone alerting within this window are merged into one
@@ -686,4 +705,52 @@ static const Duration cloudAutoWindow = Duration(minutes: 10);
 
 /// See [cloudAutoWindow].
 static const int cloudAutoMaxPerWindow = 5;
+
+// ---- Pothole second detector (M3) -----------------------------------
+//
+// The pothole detector is a SECOND, independent detector
+// (its own model, tahaUgan/pothole-yolo11n, CC BY 4.0 --
+// see tool/fetch_pothole_model.sh and the README model
+// section) behind the build-time switch
+// --dart-define=MINGTU_POTHOLE=1 (AppConfig.potholeEnabled,
+// default OFF). The constants below govern only its scan
+// cadence and its grading threshold; the grading itself is
+// the dedicated pit branch in hazard_policy.dart.
+
+/// Pit URGENT range (M3 ruling): a pothole whose measured
+/// ground range Z is at or below this many metres grades
+/// URGENT. A pit is a static ground feature, so the grade
+/// is a pure range rule -- the TTC machinery (approach
+/// tests, scale/range closing legs) never applies to it.
+/// (Provisional value from the ruling; real-device
+/// calibration pending, like every value in this file.)
+static const double pitUrgentRangeM = 1.5;
+
+/// Scan cadence cap for the pothole scanner: at most one
+/// scan per this interval (200 ms = 5 FPS), and scans run
+/// ONLY while the user is walking (the pipeline's own ego
+/// judgement). A pothole scan is a single frame through
+/// the shared routed frame source plus one predict() on
+/// the second model -- never a second camera session.
+static const Duration potholeScanMinInterval =
+    Duration(milliseconds: 200);
+
+/// How long a completed scan's detections stay mergeable
+/// into live frames at the shared intake. Scans refresh
+/// at the cadence above while walking, so this age only
+/// bounds the tail after walking stops or a scan stalls:
+/// past it, the stored detections are dropped and the pit
+/// track coasts out through the tracker's normal lost
+/// window instead of being re-fed forever.
+static const Duration potholeResultMaxAge = Duration(seconds: 1);
+
+/// The ONE spoken notice for "the switch is on but the
+/// weight asset is not bundled" (M3 COMMIT23 zero-burden
+/// rule): spoken exactly once per process, at alert level
+/// like the other degradation notices (startup failures,
+/// the cloud-vision downgrade sentence). While the switch
+/// is OFF nothing is checked or spoken at all. Short and
+/// factual on purpose -- it names the feature and its
+/// state, nothing else.
+static const String potholeUnavailableAnnouncementText = '坑洞识别不可用';
 }

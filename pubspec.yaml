@@ -35,3 +35,20 @@ flutter:
     # The file is fetched and SHA256-verified by
     # tool/fetch_model.sh -- run it before building.
     - assets/models/yolo11n.tflite
+    # Pothole second-detector model (NAVHAZ M3, CC BY 4.0;
+    # see README "YOLO 模型" and tool/fetch_pothole_model.sh).
+    # DIRECTORY declaration on purpose (M3 COMMIT23
+    # zero-burden rule): the build must succeed whether or
+    # not the weight has been fetched -- a clean checkout
+    # builds with just the .gitkeep in this directory, and
+    # the default demo package ships WITHOUT the ~10 MB
+    # weight. When tool/fetch_pothole_model.sh has placed
+    # the SHA256-verified weight here, it is bundled under
+    # assets/models/pothole/pothole2v.tflite. Presence is
+    # a runtime question (asset system), never a build
+    # prerequisite; the detector is behind
+    # --dart-define=MINGTU_POTHOLE=1 and OFF by default.
+    # (The main model above deliberately keeps its
+    # single-file declaration and fetch-before-build
+    # discipline -- unchanged.)
+    - assets/models/pothole/

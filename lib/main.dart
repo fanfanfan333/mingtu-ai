@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
+import 'adapters/amap_navi_source.dart';
 import 'adapters/camera_frame_source.dart';
 import 'adapters/cloud_asr_client.dart';
 import 'adapters/cloud_vision_client.dart';
@@ -13,6 +14,7 @@ import 'adapters/current_location.dart';
 import 'adapters/system_voice_io.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'adapters/voice_io.dart';
+import 'adapters/pothole_detector.dart';
 import 'adapters/yolo_detector.dart';
 import 'adapters/yolo_live_view.dart';
 import 'config/app_config.dart';
@@ -30,6 +32,7 @@ import 'core/danger_alerts.dart';
 import 'core/avoidance_advisor.dart';
 import 'core/cloud_vision_hazard.dart';
 import 'core/cloud_trigger_policy.dart';
+import 'core/pothole_scan.dart';
 import 'core/orientation.dart';
 import 'adapters/orientation_monitor.dart';
 import 'adapters/haptics.dart';
@@ -323,6 +326,19 @@ class MingtuHomeDebugHandle {
   DetourInfo? get debugLastDetourInfo => _state._lastDetourInfo;
   DateTime? get debugLastDetourAt => _state._lastDetourAt;
   bool get debugCloudAutoInFlight => _state._cloudAutoBudget.inFlight;
+
+  /// M3 seam: install a pothole scanner directly (widget
+  /// tests inject one built on fakes; production installs
+  /// it in _initStartupModules only when
+  /// AppConfig.potholeEnabled). Passing null removes it.
+  void debugSetPotholeScanner(PotholeScanner? scanner) =>
+      _state._potholeScanner = scanner;
+
+  /// M3 seam: whether a pothole scanner is installed, and
+  /// the detections currently stored for merging.
+  bool get debugPotholeScannerInstalled => _state._potholeScanner != null;
+  List<Detection> get debugLatestPotholeDetections =>
+      List<Detection>.unmodifiable(_state._latestPotholeDetections);
 
   /// NAVHAZ M1 seam: feed one live-navigation fix through
   /// the production fix handler.
@@ -802,6 +818,54 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   final CloudTriggerPolicy _cloudTriggerPolicy = const CloudTriggerPolicy();
   final CloudAutoTriggerBudget _cloudAutoBudget = CloudAutoTriggerBudget();
 
+  // ---- M3: pothole second detector ----
+  // The scanner exists ONLY when the build-time switch
+  // is on (AppConfig.potholeEnabled, default off): it is
+  // constructed in _initStartupModules, after the routed
+  // frame source exists. While this field is null the
+  // pothole path is entirely absent -- no model load, no
+  // captures, no merges -- and behaviour is pre-M3.
+  PotholeScanner? _potholeScanner;
+
+  // ---- M3: Amap TBT navigation source (spike) ----
+  // Non-null ONLY while a live trip runs with the
+  // build-time switch on (AppConfig.amapNaviEnabled,
+  // default off) AND the source started successfully
+  // for that trip. While _amapNaviActive is set, the
+  // TBT source owns turn-ahead prompts (its navi text
+  // IS the turn prompt) and the tracker's own turn-
+  // ahead events are suppressed in _onLiveNavFix --
+  // every other tracker event (arrival hand-over,
+  // off-route + re-plan, weak signal) and ALL trip
+  // state stay tracker-owned. A failed start leaves
+  // both fields null/false: the trip runs purely on the
+  // Web source, exactly as before, with one log line
+  // and no new announcement. In this build a start
+  // ALWAYS fails: the spike's final ruling adopted no
+  // navi binding (docs/amap_navi_spike_report.md), so
+  // the stub binding's initialize throws by design.
+  AmapNaviSource? _amapNaviSource;
+  StreamSubscription<NavEvent>? _amapNaviSub;
+  bool _amapNaviActive = false;
+
+  /// The latest completed scan's pothole detections and
+  /// when its frame was taken. A completed scan REPLACES
+  /// the list (an empty scan clears it); the merge at the
+  /// shared intake only reads it while it is fresh (see
+  /// NavHazConfig.potholeResultMaxAge).
+  List<Detection> _latestPotholeDetections = const <Detection>[];
+  DateTime? _latestPotholeAt;
+
+  /// M3 COMMIT23 zero-burden rule: the switch was on at
+  /// startup but the weight asset is not bundled in this
+  /// build. The feature then behaves as off (no scanner
+  /// is constructed); the absence is logged once and --
+  /// because the user explicitly enabled the feature --
+  /// spoken once through [_potholeUnavailableNotice].
+  bool _potholeModelMissing = false;
+  final PotholeUnavailableNoticeLatch _potholeUnavailableNotice =
+      PotholeUnavailableNoticeLatch();
+
   /// When the current unbroken stillness began (ego
   /// judge not walking); null while walking.
   DateTime? _stillSince;
@@ -1221,6 +1285,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _logMsg('振动未执行：设备报告振动失败（累计 ${HapticsFailureLog.count} 次）。');
     };
     _announceStartupFailures(speechUsable: speechUsable);
+    _announcePotholeModelMissing(speechUsable: speechUsable);
     unawaited(_kickoffVoiceNavFlow(speechUsable));
   }
 
@@ -1345,6 +1410,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _onLiveNavFix,
           onError: (Object e) => mingtuVoiceLog('定位流出错，实时导航提示暂停'),
         );
+    // M3 TBT spike: with the switch on, also start the
+    // Amap navi source for this trip (fire-and-forget:
+    // its start outcome never blocks or breaks the Web
+    // source trip that is already running above).
+    if (AppConfig.amapNaviEnabled) {
+      unawaited(_startAmapNaviSource(destinationName));
+    }
     // Live straight prompts: the shared 3 s tick reads its
     // confirmation from the tracker while live nav runs.
     if (_pacing.isPaused) {
@@ -1365,6 +1437,43 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _startStraightTimer();
     }
     _logMsg('实时导航已开始：GPS 跟踪中（转向/偏航/到达自动播报）。');
+  }
+
+  /// M3 TBT spike: start the Amap navi source for the
+  /// trip whose tracker was just installed. Any failure
+  /// (in this build: the stub binding always fails --
+  /// no binding is adopted; also trip already over)
+  /// falls back to the Web source: one fixed log line,
+  /// no new
+  /// announcement, no crash, and the tracker trip above
+  /// is untouched. The trip-generation guard (the
+  /// tracker instance captured before the await) keeps
+  /// a late completion from attaching itself to a
+  /// DIFFERENT trip that started in the meantime.
+  Future<void> _startAmapNaviSource(String destinationName) async {
+    if (_amapNaviActive) return;
+    final NavigationTracker? tripTracker = _liveNav;
+    if (tripTracker == null) return;
+    final AmapNaviSource source =
+        AmapNaviSource(binding: createAmapNaviBinding());
+    final StreamSubscription<NavEvent> sub =
+        source.events.listen(_handleNavEvent);
+    final bool started = await source.start(
+      destination: tripTracker.destination,
+      destinationName: destinationName,
+    );
+    if (!started || !mounted || !identical(_liveNav, tripTracker)) {
+      await sub.cancel();
+      await source.dispose();
+      if (!started) {
+        mingtuVoiceLog('高德 TBT 导航源启动失败，已回退 Web 源导航');
+      }
+      return;
+    }
+    _amapNaviSource = source;
+    _amapNaviSub = sub;
+    _amapNaviActive = true;
+    mingtuVoiceLog('高德 TBT 导航源已启动（试验）');
   }
 
   void _onLiveNavFix(LocationResult r) {
@@ -1407,6 +1516,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _liveNavRemainingM = _liveNav!.remainingM;
     });
     for (final NavEvent e in events) {
+      // M3 TBT spike: while the Amap navi source is
+      // live it owns turn-ahead prompts; the tracker's
+      // own turn-ahead for the same intersections would
+      // double-speak. Every other tracker event still
+      // flows unchanged.
+      if (_amapNaviActive && e.kind == NavEventKind.turnAhead) continue;
       _handleNavEvent(e);
     }
     if (_pacing.isPaused && !_rerouting) {
@@ -1643,6 +1758,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _endLiveNavigation() {
     _gpsSub?.cancel();
     _gpsSub = null;
+    // M3 TBT spike: the TBT source dies with the trip.
+    _amapNaviSub?.cancel();
+    _amapNaviSub = null;
+    final AmapNaviSource? naviSource = _amapNaviSource;
+    _amapNaviSource = null;
+    _amapNaviActive = false;
+    if (naviSource != null) unawaited(naviSource.stop());
     _liveNav = null;
     _liveNavRemainingM = null;
     _entrance = null;
@@ -1672,6 +1794,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         kind: SpeechKind.alert,
       ));
     }
+  }
+
+  /// M3 COMMIT23: the missing-pothole-weight notice. The
+  /// switch was explicitly enabled for this build but the
+  /// weight asset is not in the bundle: the feature is
+  /// off (no scanner exists), one fixed line goes to the
+  /// app log, and -- because the enablement was explicit
+  /// -- the fixed sentence is spoken ONCE per process at
+  /// alert level, like the other degradation notices
+  /// (startup failures, the cloud-vision downgrade). The
+  /// latch keeps any startup re-run from repeating it.
+  /// When speech itself is unusable nothing is claimed to
+  /// be spoken; the log line still lands.
+  void _announcePotholeModelMissing({required bool speechUsable}) {
+    if (!_potholeModelMissing) return;
+    _logMsg('坑洞识别：开关已开启但模型权重未随包提供，功能已停用'
+        '（补入权重并重新打包后生效）。');
+    if (!speechUsable) return;
+    if (!_potholeUnavailableNotice.claimOnce()) return;
+    _say(_request(
+      id: 'pothole-unavailable',
+      eventId: 'pothole-unavailable',
+      text: NavHazConfig.potholeUnavailableAnnouncementText,
+      kind: SpeechKind.alert,
+    ));
   }
 
   /// Test-marker channel (harness -> app -> adapter):
@@ -1732,6 +1879,46 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       log: startupFailures,
     );
     _frameSource = init.frameSource;
+    // M3: construct the pothole scanner ONLY when its
+    // build-time switch is on (default off). The detector
+    // loads its model lazily on the first scan, so
+    // construction itself costs nothing; while the switch
+    // is off nothing here exists at all -- not even the
+    // bundled check below (COMMIT23: switch off means no
+    // check, no log, no speech).
+    if (AppConfig.potholeEnabled) {
+      // Zero-burden rule (COMMIT23): the build succeeds
+      // with or without the weight, so presence is a
+      // RUNTIME question, answered through the asset
+      // system (rootBundle), never the file system. A
+      // missing weight degrades the feature to off (the
+      // absence is logged and spoken once, after startup
+      // -- see _announcePotholeModelMissing); it never
+      // crashes startup.
+      final PotholeStartupState potholeState = potholeStartupState(
+        enabled: AppConfig.potholeEnabled,
+        modelBundled: await _potholeModelBundled(),
+      );
+      if (potholeState == PotholeStartupState.ready) {
+        _potholeScanner = PotholeScanner(
+          enabled: AppConfig.potholeEnabled,
+          detector: createPotholeDetector(AppConfig.potholeModelPath),
+          frameSource: _frameSource,
+          onDetections: _onPotholeScanResult,
+        );
+        // Feed the CURRENT applied thermal cap before the
+        // first scan can run: a device that is already hot
+        // at boot must not load the second model at all
+        // (COMMIT23 thermal gate; later changes arrive
+        // through _onThermalStatus).
+        _potholeScanner!.setThermalRestricted(
+          _thermalCap.restrictClasses,
+          now: DateTime.now(),
+        );
+      } else {
+        _potholeModelMissing = true;
+      }
+    }
     _amapClient = init.amapClient;
     _locationProvider = init.locationProvider;
     _yoloDetector = init.yolo;
@@ -4388,6 +4575,26 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // at delivery (null for simulated / scripted frames,
     // which then stamp no frame-to-callback segment).
     final DateTime now = DateTime.now();
+    // M3: merge the pothole scanner's latest results
+    // into THIS frame at the shared intake, BEFORE every
+    // downstream gate (the thermal class restriction
+    // below included -- a pit is not in its pass set, so
+    // a restricted frame drops pit input exactly like
+    // any other non-vehicle/pedestrian input; since the
+    // COMMIT23 thermal gate the scanner is stopped and
+    // its stored result cleared while the cap restricts,
+    // so this restriction is only the backstop for a
+    // result already in flight when the heat spiked). The merge
+    // is the ONLY entry pit detections have: they never
+    // call this handler on their own, so the avoidance
+    // bookkeeping and perception below always see whole
+    // frames, never pit-only partial frames. While the
+    // switch is off the stored list is always empty and
+    // this is a no-op.
+    final List<Detection> freshPotholes = _freshPotholeDetections(now);
+    if (freshPotholes.isNotEmpty) {
+      detections = <Detection>[...detections, ...freshPotholes];
+    }
     // M2 section 3.3 evidence: whether THIS frame shows
     // a traffic light (COCO label). Read off the raw
     // frame, before any downstream gating.
@@ -4452,6 +4659,49 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           events.map((PerceptionEvent e) => e.label).join('、');
       _logMsg('YOLO 新跟踪：$labels（仅报告检测，不给行走方向）。');
     }
+  }
+
+  /// M3 COMMIT23: is the pothole weight actually in this
+  /// build's asset bundle? Asked through the asset system
+  /// (rootBundle) -- the ONLY sanctioned presence check:
+  /// the pubspec declares the model's DIRECTORY, so the
+  /// build succeeds either way and this load is what
+  /// tells the two shapes apart. Any load failure (asset
+  /// absent, bundle unreadable) reads as "not bundled".
+  Future<bool> _potholeModelBundled() async {
+    try {
+      await rootBundle.load(AppConfig.potholeModelPath);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// M3: a completed pothole scan replaces the stored
+  /// result wholesale (an empty scan clears it -- the
+  /// previous scan's detections are not re-fed once the
+  /// scanner itself has looked again and seen none).
+  void _onPotholeScanResult(List<Detection> detections, DateTime at) {
+    _latestPotholeDetections = detections;
+    _latestPotholeAt = at;
+  }
+
+  /// M3: the stored pothole detections while they are
+  /// fresh enough to merge into a live frame (see
+  /// NavHazConfig.potholeResultMaxAge); empty when there
+  /// is nothing stored or the result has aged out (after
+  /// walking stops, the scanner stops refreshing and the
+  /// pit track coasts out through the tracker's normal
+  /// lost window instead of being re-fed forever).
+  List<Detection> _freshPotholeDetections(DateTime now) {
+    final DateTime? at = _latestPotholeAt;
+    if (at == null || _latestPotholeDetections.isEmpty) {
+      return const <Detection>[];
+    }
+    if (now.difference(at) > NavHazConfig.potholeResultMaxAge) {
+      return const <Detection>[];
+    }
+    return _latestPotholeDetections;
   }
 
   /// Shared risk-state entry for both hazard chains
@@ -4538,6 +4788,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final DateTime now = DateTime.now();
     final ThermalCap cap = _thermalPolicy.evaluate(status: status, now: now);
     _thermalCap = cap;
+    // M3 COMMIT23 thermal gate: the pothole scanner runs
+    // only while the APPLIED cap does not restrict
+    // classes. It is fed here, from the same evaluation
+    // that drives the intake restriction and the scope
+    // announcement, so the three can never disagree: at
+    // SEVERE / CRITICAL the second model stops entirely
+    // (no load, no captures -- it is itself a heat
+    // source); when the ladder settles back to a
+    // non-restricting rung it resumes on its own. (No
+    // scanner exists while the pothole switch is off.)
+    _potholeScanner?.setThermalRestricted(cap.restrictClasses, now: now);
     // Episode-latch announcement mapping (thermal_policy
     // raises at most one event per evaluation): the FPS
     // drop and the scope restriction are degradations the
@@ -4654,6 +4915,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // pipeline's own frame (danger and live tracks come
     // from its estimates). No-op while the flag is off.
     _applyFrameRatePolicy(result, egoNow, now);
+    // M3: offer this frame's moment to the pothole
+    // scanner. The walking gate is THIS frame's ego
+    // verdict (the same egoNow the pipeline and the
+    // frame-rate policy consumed -- never a second
+    // judgement); the scanner applies its own cadence
+    // and in-flight gates, and its results come back
+    // through _onPotholeScanResult for merging at the
+    // shared intake. Entirely absent while the switch
+    // is off (the scanner is never constructed then).
+    final PotholeScanner? potholeScanner = _potholeScanner;
+    if (potholeScanner != null) {
+      unawaited(potholeScanner.maybeScan(
+        walking: egoNow.state == EgoState.walking,
+        now: now,
+      ));
+    }
     // M2 section 3.3: the automatic cloud event triggers
     // are evaluated on the pipeline's own frame too --
     // stillness and the corridor-obstacle hold are

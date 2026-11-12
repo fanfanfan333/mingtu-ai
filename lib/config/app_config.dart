@@ -103,6 +103,54 @@ class AppConfig {
   static String get asrProxyUrl =>
       _asrProxyUrlDefine.isNotEmpty ? _asrProxyUrlDefine : visionProxyUrl;
 
+  /// NAVHAZ M3 pothole second detector switch: ON only
+  /// when built with --dart-define=MINGTU_POTHOLE=1.
+  /// Default OFF (an absent or different value is off):
+  /// while off, the app never constructs the pothole
+  /// scanner, never loads the pothole model and never
+  /// captures a frame for it -- pipeline behaviour is
+  /// exactly the pre-M3 behaviour. This getter is the
+  /// SINGLE access point for the switch; the wiring layer
+  /// injects its value into the scanner so tests can flip
+  /// it without a build flag.
+  static const bool potholeEnabled =
+      String.fromEnvironment('MINGTU_POTHOLE') == '1';
+
+  /// Bundled pothole model asset (fetched and
+  /// SHA256-verified by tool/fetch_pothole_model.sh; the
+  /// weights are never committed). Only ever loaded when
+  /// [potholeEnabled] is on. The asset lives in its own
+  /// pubspec DIRECTORY declaration (M3 COMMIT23
+  /// zero-burden rule): the build succeeds whether or not
+  /// the weight file is present, and presence is checked
+  /// at runtime through the asset system -- a missing
+  /// weight with the switch on degrades to "feature off
+  /// plus one spoken notice", never a build failure.
+  static const String potholeModelPath = String.fromEnvironment(
+    'MINGTU_POTHOLE_MODEL_PATH',
+    defaultValue: 'assets/models/pothole/pothole2v.tflite',
+  );
+
+  /// NAVHAZ M3 Amap TBT spike switch: ON only when built
+  /// with --dart-define=MINGTU_AMAP_NAVI=1. Default OFF:
+  /// while off, the TBT navigation source is never
+  /// constructed, the flutter_amap_navi plugin is never
+  /// called, and live navigation runs on the existing
+  /// Web-route + GPS tracker source exactly as before.
+  /// This getter is the SINGLE access point for the
+  /// switch.
+  ///
+  /// ON does not guarantee the source starts: the Amap
+  /// navigation SDK additionally needs deployer-side
+  /// console configuration (package name / signing SHA1 /
+  /// key), which is deliberately NOT part of this
+  /// codebase -- no key is read, stored or passed anywhere
+  /// in this repository. The wiring treats a failed TBT
+  /// start as "fall back to the Web source": one fixed
+  /// log line, no new announcement, no crash.
+  static const bool amapNaviEnabled =
+      String.fromEnvironment('MINGTU_AMAP_NAVI') == '1';
+
   static bool get hasRouteProxy => routeProxyUrl.isNotEmpty;
   static bool get hasAmapDemoKey => amapDemoKey.isNotEmpty;
   static bool get hasYoloModelPath => yoloModelPath.isNotEmpty;

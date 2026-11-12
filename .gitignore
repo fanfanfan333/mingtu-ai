@@ -12,3 +12,16 @@ build/
 .DS_Store
 .idea/
 .vscode/
+# Model weights - never committed. Both models are
+# fetched and hash-verified by tool/fetch_model.sh and
+# tool/fetch_pothole_model.sh; ignoring them changes
+# nothing for the build (the asset system reads the
+# files from disk, ignored or not) and nothing for the
+# main model's fail-fast (its per-file pubspec entry
+# still fails the build when the fetched file is
+# absent). The .gitkeep placeholders stay tracked so
+# the asset directories exist in a clean checkout.
+*.tflite
+assets/models/**
+!assets/models/**/
+!assets/models/**/.gitkeep
