@@ -16,6 +16,11 @@ dependencies:
   ultralytics_yolo: ^0.7.1
   sensors_plus: ^7.1.1
   record: ^7.1.2
+  # UI-A11Y S1 (UI-06): runtime permission requests + the
+  # system-settings jump for the all-voice permission flow.
+  # Exact pin, MIT licence (verified against the pub.dev
+  # archive, Copyright (c) 2018 Baseflow).
+  permission_handler: 13.0.2
   byte_track_dart: 0.4.0
   path_provider: ^2.1.6
 

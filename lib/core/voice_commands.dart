@@ -108,3 +108,11 @@ VoiceCommand parseVoiceCommand(String raw) {
 
 String voiceCommandHelpText() => '你可以说：带我去图书馆、停下、暂停、继续、取消、再说一遍、'
     '现在到哪了、前面有什么、看看前面、确认、保存录像、删除录像、我需要帮助。';
+
+/// UI-A11Y S1 (UI-01): semantics labels of the big button
+/// in TalkBack TOGGLE mode (MediaQuery.accessibleNavigation
+/// on). Idle invites a double-tap to start; while a press
+/// session is live the label says how to end it. The
+/// hold-mode label stays in main.dart, unchanged.
+const String talkBackToggleIdleLabel = '按住说话，双击开始';
+const String talkBackToggleListeningLabel = '正在听，双击结束';

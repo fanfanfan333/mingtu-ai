@@ -60,6 +60,10 @@ import 'core/voice_log.dart';
 import 'adapters/startup_initializer.dart';
 import 'core/voice_commands.dart';
 import 'core/voice_startup.dart';
+import 'core/permission_flow.dart';
+import 'core/recording_silence.dart';
+import 'adapters/permission_gateway.dart';
+import 'adapters/guide_store.dart';
 import 'core/risk_engine.dart';
 import 'core/speech_scheduler.dart';
 import 'core/task_manager.dart';
@@ -116,6 +120,18 @@ class MingtuApp extends StatelessWidget {
     );
   }
 }
+
+/// Test/debug seams for the UI-A11Y S1 additions, assigned
+/// BEFORE the app is pumped (mirroring
+/// mingtuPttPressDebugHook). Production leaves both null:
+/// the real gateway / store factories are used then.
+/// UI-06: swap the permission gateway (the plugin-backed
+/// one) for a fake in widget tests.
+PermissionGateway? mingtuPermissionGatewayOverride;
+
+/// UI-06: swap the first-launch marker store for a fake in
+/// widget tests.
+GuideStore? mingtuGuideStoreOverride;
 
 /// Test/debug seam (MT-1111-PTT-C): the app's interface is
 /// deliberately minimal -- camera preview + one big
@@ -353,6 +369,43 @@ class MingtuHomeDebugHandle {
   /// ASR client a press uses (widget tests inject fakes;
   /// production never calls these).
   void setRecorder(VoiceRecorder recorder) => _state._recorder = recorder;
+
+  /// UI-06 debug/test seams: swap the permission gateway /
+  /// first-launch store in place after pumping.
+  void setPermissionGateway(PermissionGateway gateway) =>
+      _state._permissionGateway = gateway;
+
+  void setGuideStore(GuideStore store) => _state._guideStore = store;
+
+  /// UI-06: start the first-launch guide + permission flow
+  /// on demand (tests drive it deterministically; in
+  /// production startup chains into it automatically).
+  Future<void> startPermissionFlowForTest() =>
+      _state._runFirstLaunchGuideAndPermissions();
+
+  /// UI-06: whether the permission flow is live right now.
+  bool get permissionFlowRunning => _state._permissionFlowRunning;
+
+  /// UI-01 debug/test seam: force (or, with null, unforce)
+  /// the TalkBack toggle-mode decision, bypassing the
+  /// MediaQuery. Widget tests primarily drive the real
+  /// MediaQuery; this stays as a fallback seam.
+  void debugSetTalkBackToggleMode(bool? enabled) {
+    _state._talkBackToggleOverride = enabled;
+    // ignore: invalid_use_of_protected_member
+    _state.setState(() {});
+  }
+
+  /// UI-01: the toggle tap the Semantics onTap dispatches
+  /// to, callable directly in unit-style widget tests.
+  void debugPttToggleTap() => _state._pttToggleTap();
+
+  /// UI-01: the clock the recording-silence tracker reads,
+  /// so a test can advance scripted silence deterministically
+  /// while the real amplitude stream stays real-time.
+  void debugSetSilenceClock(DateTime Function()? clock) {
+    _state._silenceClock = clock ?? DateTime.now;
+  }
   void setCloudAsrClient(CloudAsrClient client) =>
       _state._cloudAsrClient = client;
   bool get localAsrBroken => _state._localAsrBroken;
@@ -699,6 +752,58 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// armed only when that session's listening/recording
   /// has ACTUALLY started (ALIGN-B), never at press time.
   int? _talkBackCapSessionId;
+
+  /// UI-A11Y UI-01: TalkBack TOGGLE mode. The mode is
+  /// decided per build from MediaQuery.accessibleNavigation
+  /// (TalkBack on) and cached here for non-build readers;
+  /// [_talkBackToggleOverride] is a test-only seam that
+  /// wins over the MediaQuery when set.
+  bool _toggleModeNow = false;
+  bool? _talkBackToggleOverride;
+
+  /// Session id of the press started by a toggle tap, or
+  /// -1. Same stale-id discipline as [_talkBackCapSessionId]:
+  /// compared against the live [_pttSession] before acting,
+  /// so a leftover marker can never end a later hold press.
+  /// A toggle press is NOT marked in [_talkBackCapSessionId]:
+  /// on the local path it ends by the recogniser's own
+  /// pauseFor / the second tap (and is bounded by the
+  /// adapter's listenFor), NOT by the 10 s recording cap.
+  int _pttToggleSessionId = -1;
+
+  /// UI-01 cloud-path silence auto-end: amplitude
+  /// subscription for the CURRENT toggle recording only
+  /// (hold-mode recordings keep their exact old behaviour).
+  /// The tracker itself lives in the subscription closure.
+  StreamSubscription<double>? _silenceSub;
+
+  /// Clock for the silence tracker; a debug seam replaces
+  /// it in tests so scripted silence is deterministic.
+  DateTime Function() _silenceClock = DateTime.now;
+
+  /// UI-A11Y UI-06: the permission flow's seams + state.
+  /// [_permissionGateway] / [_guideStore] are resolved in
+  /// initState (debug overrides first, factories after).
+  late PermissionGateway _permissionGateway;
+  late GuideStore _guideStore;
+  final PermissionFlow _permissionFlow = PermissionFlow();
+  bool _permissionFlowRunning = false;
+
+  /// UI-06 first-launch marker cache: null while the
+  /// priming read is in flight, then the read's answer.
+  bool? _guideSeenCache;
+
+  /// UI-06: true once the startup gate has decided (so a
+  /// late marker read knows the kickoff already went).
+  bool _guideGateDecided = false;
+
+  /// UI-06: whether speech worked at startup, remembered
+  /// for a late first-launch guide run.
+  bool _speechUsableAtStartup = false;
+
+  /// Monotonic counter making each flow announcement's
+  /// request id unique (ids carry the speech-settle wait).
+  int _permissionSpeechSeq = 0;
 
   /// Test-only log of handled engine events (see the
   /// debug handle).
@@ -1065,7 +1170,28 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// only records [_pttPendingStop]; the sequence itself
   /// performs the stop when its current await returns, so
   /// no release window can leak an open microphone.
-  _PttState _pttState = _PttState.idle;
+  ///
+  /// UI-A11Y UI-01: the TalkBack toggle-mode semantics
+  /// label must flip between idle and listening, so writes
+  /// go through a setter that refreshes the widget tree --
+  /// but ONLY when the idle/non-idle boundary is crossed,
+  /// so the machine's internal transitions
+  /// (prompting -> starting -> listening -> stopping)
+  /// never trigger a rebuild. Hold mode ignores the extra
+  /// refresh (it rebuilds an identical tree).
+  _PttState _pttStateValue = _PttState.idle;
+
+  _PttState get _pttState => _pttStateValue;
+
+  set _pttState(_PttState value) {
+    final bool wasIdle = _pttStateValue == _PttState.idle;
+    _pttStateValue = value;
+    final bool isIdle = value == _PttState.idle;
+    if (wasIdle != isIdle && _toggleModeNow && mounted) {
+      setState(() {});
+    }
+  }
+
   int _pttSession = 0;
   bool _pttPendingStop = false;
 
@@ -1194,6 +1320,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     super.initState();
     mingtuHomeDebugHandle = MingtuHomeDebugHandle._(this);
     _recorder = createVoiceRecorder();
+    // UI-06 seams: pre-pump debug overrides win; production
+    // uses the factories (plugin-backed on a phone,
+    // unavailable off-device).
+    _permissionGateway =
+        mingtuPermissionGatewayOverride ?? createPermissionGateway();
+    _guideStore = mingtuGuideStoreOverride ?? createGuideStore();
+    // UI-06: start the first-launch marker read now; it
+    // is never awaited on the startup path (see
+    // _primeGuideSeenCache).
+    unawaited(_primeGuideSeenCache());
     WidgetsBinding.instance.addObserver(this);
     // _initRealIntegrations never throws (every module is
     // guarded inside the production initializer, and startup
@@ -1208,6 +1344,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// same via [dispose].
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // UI-06: returning to the foreground while the
+    // permission flow waits on the system settings page
+    // re-checks exactly that permission and announces the
+    // result, then the flow continues. Nothing else runs
+    // on resume (no background behaviour of any kind).
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_onPermissionSettingsReturn());
+    }
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached) {
@@ -1227,6 +1371,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (_pttState == _PttState.listening) {
         _pushToTalkHeld = false;
         if (_pttRecording) {
+          _stopSilenceWatch();
           _pttRecordCapTimer?.cancel();
           _pttRecordCapTimer = null;
           _pttRecording = false;
@@ -1286,7 +1431,180 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     };
     _announceStartupFailures(speechUsable: speechUsable);
     _announcePotholeModelMissing(speechUsable: speechUsable);
-    unawaited(_kickoffVoiceNavFlow(speechUsable));
+    // UI-06: on a first launch the spoken guide and the
+    // permission flow run BEFORE the destination kickoff
+    // (chained, not parallel: the kickoff asks for the
+    // destination, which presumes the user already knows
+    // how to talk). Off a first launch -- and off-device,
+    // where the store answers "seen" -- this completes
+    // immediately and startup is exactly as before.
+    _speechUsableAtStartup = speechUsable;
+    unawaited(() async {
+      await _maybeRunFirstLaunchGuide(speechUsable);
+      if (!mounted) return;
+      unawaited(_kickoffVoiceNavFlow(speechUsable));
+    }());
+  }
+
+  /// UI-06: the first-launch marker read. Any failure --
+  /// or a platform with no permission system -- answers
+  /// "seen": without storage there is no honest way to
+  /// know this is a first launch, and guessing "first"
+  /// would re-run onboarding on every start.
+  Future<bool> _readGuideSeen() async {
+    if (!_permissionGateway.isAvailable) return true;
+    try {
+      return await _guideStore.hasSeenGuide();
+    } catch (_) {
+      return true;
+    }
+  }
+
+  /// UI-06: prime the marker cache from initState. The
+  /// read is a platform round-trip; it must never be
+  /// awaited on the startup path (an unanswered platform
+  /// would stall the kickoff behind it). On a real phone
+  /// it lands during module initialisation, well before
+  /// the gate below reads the cache. If it lands only
+  /// AFTER the gate already let the kickoff go and it
+  /// reports a first launch, the guide runs late instead
+  /// (see [_maybeRunFirstLaunchGuide]).
+  Future<void> _primeGuideSeenCache() async {
+    final bool seen = await _readGuideSeen();
+    _guideSeenCache = seen;
+    if (!seen &&
+        _guideGateDecided &&
+        mounted &&
+        _speechUsableAtStartup) {
+      unawaited(_runFirstLaunchGuideAndPermissions());
+    }
+  }
+
+  /// UI-06 first-launch gate: the guide + permission flow
+  /// runs only when speech works, a real permission system
+  /// exists on this platform, and the guide marker says
+  /// this is a first launch. Every other combination
+  /// returns immediately (existing startup untouched).
+  Future<void> _maybeRunFirstLaunchGuide(bool speechUsable) async {
+    _guideGateDecided = true;
+    if (!speechUsable) return;
+    if (!_permissionGateway.isAvailable) return;
+    // Only a COMPLETED marker read may hold back the
+    // kickoff. An in-flight read proceeds as "seen" here;
+    // if it later reports a first launch, its completion
+    // handler (_primeGuideSeenCache) runs the guide then.
+    if (_guideSeenCache != false) return;
+    await _runFirstLaunchGuideAndPermissions();
+  }
+
+  /// UI-06: speak the first-launch guide, then run the
+  /// permission flow to completion (or until it pauses on
+  /// the system settings; the resumed handler finishes
+  /// it). The guide is also what the voice command for
+  /// help replays (see the help case in the dispatcher).
+  Future<void> _runFirstLaunchGuideAndPermissions() async {
+    if (_permissionFlowRunning) return;
+    _permissionFlowRunning = true;
+    await _sayPermissionFlowText(firstLaunchGuideText);
+    if (!mounted) return;
+    await _executePermissionEffects(_permissionFlow.start());
+    // NOTE: a settings pause returns from the executor
+    // with the flow still live; _permissionFlowRunning is
+    // cleared only when the done effect executes (or the
+    // state is disposed), so the resumed re-check can
+    // always find its flow.
+  }
+
+  /// UI-06: speak one flow text through the scheduler and
+  /// WAIT until it has actually been delivered (or the
+  /// wait expires), so a purpose announcement is never
+  /// still queued when its system dialog appears. [alert]
+  /// texts ride the alert level (denials must arrive);
+  /// purposes/confirmations ride info, so an emergency or
+  /// danger prompt (levels 0 and 1) always outranks
+  /// onboarding speech and is never delayed by it.
+  Future<void> _sayPermissionFlowText(String text,
+      {bool alert = false}) async {
+    final String id =
+        'permission-flow-${_permissionSpeechSeq++}';
+    _say(_request(
+      id: id,
+      eventId: id,
+      kind: alert ? SpeechKind.alert : SpeechKind.info,
+      text: text,
+    ));
+    await _waitForSpeechSettled(id);
+  }
+
+  /// Poll until request [id] is neither the scheduler's
+  /// active item nor queued. Bounded (~30 s): a wedged
+  /// speech engine must never wedge onboarding or startup.
+  Future<void> _waitForSpeechSettled(String id) async {
+    for (int i = 0; i < 600 && mounted; i++) {
+      final bool active = _scheduler.active?.id == id;
+      final bool queued =
+          _scheduler.queue.any((SpeechRequest r) => r.id == id);
+      if (!active && !queued) return;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
+
+  /// UI-06: execute a batch of machine effects in order.
+  /// A request effect feeds its outcome straight back into
+  /// the machine and CONTINUES with the returned effects;
+  /// a settings effect pauses the flow (the resumed
+  /// handler re-checks and continues it); the done effect
+  /// records the guide marker.
+  Future<void> _executePermissionEffects(List<Object> effects) async {
+    final List<Object> queue = List<Object>.of(effects);
+    while (queue.isNotEmpty) {
+      if (!mounted) return;
+      final Object effect = queue.removeAt(0);
+      if (effect is PermissionSpeakEffect) {
+        await _sayPermissionFlowText(effect.text, alert: effect.alert);
+      } else if (effect is PermissionRequestEffect) {
+        PermissionOutcome outcome;
+        try {
+          outcome = await _permissionGateway.request(effect.permission);
+        } catch (_) {
+          outcome = PermissionOutcome.denied;
+        }
+        if (!mounted) return;
+        queue.insertAll(
+            0,
+            _permissionFlow.onRequestResult(
+                effect.permission, outcome));
+      } else if (effect is PermissionOpenSettingsEffect) {
+        try {
+          await _permissionGateway.openSettings();
+        } catch (_) {}
+        return; // paused until the resumed re-check
+      } else if (effect is PermissionFlowDoneEffect) {
+        _permissionFlowRunning = false;
+        try {
+          await _guideStore.markGuideSeen();
+        } catch (_) {}
+        return;
+      }
+    }
+  }
+
+  /// UI-06: app resumed. When the flow is paused on the
+  /// settings page, re-check exactly that permission,
+  /// announce the result and continue the flow. A resume
+  /// at any other time does nothing at all.
+  Future<void> _onPermissionSettingsReturn() async {
+    final GuidePermission? step = _permissionFlow.awaitingSettingsFor;
+    if (step == null || !_permissionFlowRunning) return;
+    PermissionOutcome outcome;
+    try {
+      outcome = await _permissionGateway.status(step);
+    } catch (_) {
+      outcome = PermissionOutcome.denied;
+    }
+    if (!mounted) return;
+    await _executePermissionEffects(
+        _permissionFlow.onSettingsReturn(step, outcome));
   }
 
   /// Step 2 kickoff, after the startup announcements: request
@@ -2264,7 +2582,30 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (isRecoverableAsrError(code)) {
       _noteRecoverableAsrError(code);
     }
-    if (_pttState != _PttState.stopping) return;
+    if (_pttState != _PttState.stopping) {
+      // UI-A11Y UI-01: a TalkBack TOGGLE press has no hand
+      // to lift. When the engine ends its session by
+      // itself (its pauseFor silence detection) while the
+      // toggle press is still held, the press settles
+      // EXACTLY as if the release had already moved it to
+      // stopping and this outcome then arrived: same cache
+      // rules, same completion entry. (No final can follow
+      // a no-match outcome, so the release path's 3 s
+      // final-wait and its too-short rule -- both about a
+      // hand lifting early -- do not apply here.)
+      if (_pttToggleSessionId == _pttSession &&
+          _pttState == _PttState.listening &&
+          !_pttRecording) {
+        _pushToTalkHeld = false;
+        _pttState = _PttState.stopping;
+        if (_pttCachedText != null && !_pttCachedIsFinal) {
+          _pttCompletePress(_pttSession, _pttCachedText);
+        } else if (_pttCachedText == null) {
+          _pttCompletePress(_pttSession, null);
+        }
+      }
+      return;
+    }
     if (_pttCachedText != null && !_pttCachedIsFinal) {
       _pttCompletePress(_pttSession, _pttCachedText);
     } else if (_pttCachedText == null) {
@@ -2302,6 +2643,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // capacity full -> error_client -> error_busy) and the
     // result was discarded.
     mingtuVoiceLog('识别会话结束（仅按住说话模式，不自动重听）');
+    // UI-A11Y UI-01: TalkBack TOGGLE mode is the one
+    // exception to "a session end settles nothing". The
+    // recogniser can end a session on its own after a
+    // delivered final (its pauseFor elapsed post-result);
+    // a toggle press has no release gesture coming, so it
+    // ends here through the ordinary release path. Hold
+    // presses are untouched: their marker never matches.
+    if (_pttToggleSessionId == _pttSession &&
+        _pttState == _PttState.listening &&
+        !_pttRecording) {
+      unawaited(_pushToTalkEnd());
+    }
   }
 
   @override
@@ -2316,6 +2669,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _pttState == _PttState.starting) {
       _pttSessionVoided = true;
       if (_pttRecording) {
+        _stopSilenceWatch();
         _pttRecordCapTimer?.cancel();
         _pttRecordCapTimer = null;
         _pttRecording = false;
@@ -3693,6 +4047,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // re-arms the ONE timer, and the session/state guards
     // settle the press exactly once).
     _armPttRecordCapTimer(sid);
+    // UI-01: a TOGGLE-mode recording additionally watches
+    // for the pauseFor-equivalent silence end (the local
+    // path gets it from the recogniser; the recorder has
+    // no such signal of its own).
+    if (sid == _pttToggleSessionId) {
+      _startSilenceWatch(sid);
+    }
     if (switchedToCloud && _voiceOutput.isAvailable && !_ttsFailed) {
       // The switch notice: spoken once, on the switching
       // press only (see the prompt step). The recording is
@@ -3785,6 +4146,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// to the cloud ASR route and its transcript enters the
   /// ordinary command pipeline via _processPushToTalkFinal.
   Future<void> _pttReleaseFromRecording() async {
+    _stopSilenceWatch();
     _pttRecordCapTimer?.cancel();
     _pttRecordCapTimer = null;
     final int sid = _pttSession;
@@ -4166,6 +4528,68 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (_pttSession != before) {
       _talkBackCapSessionId = _pttSession;
     }
+  }
+
+  /// UI-A11Y UI-01: TalkBack TOGGLE start -- the semantics
+  /// onTap (and the toggle-mode long-press) begin a press
+  /// through the very same entry as a physical press, then
+  /// mark the new session as toggle-owned. The mark is
+  /// what later lets the engine's own session end (local
+  /// path) and the amplitude silence watch (cloud path)
+  /// end THIS press, and it deliberately does NOT mark
+  /// [_talkBackCapSessionId]: a local toggle press is not
+  /// bound by the 10 s recording cap.
+  void _pttToggleStart() {
+    final int before = _pttSession;
+    _pushToTalkStart();
+    if (_pttSession != before) {
+      _pttToggleSessionId = _pttSession;
+    }
+  }
+
+  /// UI-01: the toggle tap. Idle -> start a press; any live
+  /// press -> end it through the ordinary release path
+  /// (finalisation / commit / no-content rules unchanged).
+  void _pttToggleTap() {
+    if (_pttState == _PttState.idle) {
+      _pttToggleStart();
+    } else {
+      unawaited(_pushToTalkEnd());
+    }
+  }
+
+  /// UI-01: arm the amplitude silence watch for a toggle
+  /// recording. Samples feed the pure tracker
+  /// (core/recording_silence.dart); when it fires, the
+  /// recording ends through the ordinary recording
+  /// release path -- WITHOUT the cap's vibration/notice,
+  /// because this is a normal end, not a limit hit.
+  void _startSilenceWatch(int sid) {
+    _stopSilenceWatch();
+    final VoiceRecorder recorder = _recorder;
+    if (recorder is! VoiceRecorderAmplitude) return;
+    final RecordingSilenceTracker tracker = RecordingSilenceTracker();
+    _silenceSub =
+        (recorder as VoiceRecorderAmplitude).amplitudeDbfs().listen(
+      (double dbfs) {
+        if (!mounted || sid != _pttSession || !_pttRecording) return;
+        if (tracker.addSample(dbfs, _silenceClock())) {
+          _stopSilenceWatch();
+          _pushToTalkHeld = false;
+          unawaited(_pttReleaseFromRecording());
+        }
+      },
+      onError: (_) {
+        // A broken amplitude feed only loses the
+        // auto-end; release / tap / cap still apply.
+        _stopSilenceWatch();
+      },
+    );
+  }
+
+  void _stopSilenceWatch() {
+    _silenceSub?.cancel();
+    _silenceSub = null;
   }
 
   void _restoreAutoListenAfterPushToTalk() {
@@ -6343,6 +6767,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.help:
+        // UI-06: the help command replays the first-launch
+        // guide first (how to talk / stop / react to a
+        // danger prompt), then the command list as before.
+        _say(_request(
+          id: 'voice-guide-${DateTime.now().millisecondsSinceEpoch}',
+          eventId: 'voice-guide-${DateTime.now().millisecondsSinceEpoch}',
+          text: firstLaunchGuideText,
+          kind: SpeechKind.info,
+        ));
         _say(_request(
           id: 'voice-help-${DateTime.now().millisecondsSinceEpoch}',
           eventId: 'voice-help-${DateTime.now().millisecondsSinceEpoch}',
@@ -6489,6 +6922,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // is rendered. The button keeps its TalkBack Semantics
     // label and long-press action, and the physical
     // press-and-hold gestures are unchanged.
+    //
+    // UI-A11Y UI-01: with TalkBack on (accessible
+    // navigation), the button additionally becomes a
+    // TOGGLE: its semantics gain a tap action (double-tap
+    // under TalkBack) that starts a press, and tapping
+    // again ends it; the label flips between the idle and
+    // listening forms, and the status stays in the value,
+    // as in hold mode. Hold mode below is byte-identical
+    // to before.
+    final bool toggleMode =
+        _talkBackToggleOverride ?? MediaQuery.of(context).accessibleNavigation;
+    _toggleModeNow = toggleMode;
+    final bool pttActive = _pttState != _PttState.idle;
     return Scaffold(
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -6559,8 +7005,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
               child: Semantics(
                 button: true,
                 container: true,
-                label: '按住说话按钮，按住后说话，松开结束',
-                onLongPress: _talkBackLongPress,
+                label: toggleMode
+                    ? (pttActive
+                        ? talkBackToggleListeningLabel
+                        : talkBackToggleIdleLabel)
+                    : '按住说话按钮，按住后说话，松开结束',
+                value: toggleMode ? _bigStatusText() : null,
+                onTap: toggleMode ? _pttToggleTap : null,
+                onLongPress:
+                    toggleMode ? _pttToggleStart : _talkBackLongPress,
                 child: GestureDetector(
                   onLongPressStart: (_) => _pushToTalkStart(),
                   onLongPressEnd: (_) => _pushToTalkEnd(),

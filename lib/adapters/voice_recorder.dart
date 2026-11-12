@@ -35,6 +35,27 @@ abstract class VoiceRecorder {
   bool get isRecording;
 }
 
+/// Optional capability: a live amplitude feed while
+/// recording, in dBFS (the `record` package's
+/// `AudioRecorder.onAmplitudeChanged` reports
+/// `Amplitude.current`, documented as dBFS amplitude in
+/// record_platform_interface: 0 is full scale, speech peaks
+/// sit well above -30, a quiet room's floor is around
+/// -50 to -60).
+///
+/// This is a SEPARATE interface on purpose: the existing
+/// [VoiceRecorder] contract is implemented by test fakes
+/// across the suite, and growing a member onto it would
+/// break every one of them. The app checks for this
+/// capability with `is` and only then arms the
+/// silence auto-end (core/recording_silence.dart); a
+/// recorder without it simply never auto-ends on silence
+/// (release / toggle / hard cap still apply).
+abstract class VoiceRecorderAmplitude {
+  /// Amplitude samples (dBFS) while recording.
+  Stream<double> amplitudeDbfs();
+}
+
 /// Fallback used until the platform implementation is created
 /// (and the only implementation off-device): every operation
 /// reports unavailable; it never fakes audio.

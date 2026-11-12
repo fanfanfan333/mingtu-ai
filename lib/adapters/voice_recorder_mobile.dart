@@ -21,7 +21,8 @@ import 'voice_recorder.dart';
 
 VoiceRecorder createVoiceRecorder() => RecordPackageVoiceRecorder();
 
-class RecordPackageVoiceRecorder implements VoiceRecorder {
+class RecordPackageVoiceRecorder
+    implements VoiceRecorder, VoiceRecorderAmplitude {
   // Created lazily on first use: the record plugin's
   // constructor immediately opens its platform channel, and
   // constructing it eagerly (e.g. in initState) would hit
@@ -100,4 +101,17 @@ class RecordPackageVoiceRecorder implements VoiceRecorder {
 
   @override
   bool get isRecording => _recording;
+
+  /// Live amplitude in dBFS while recording (the record
+  /// package polls the platform amplitude at the given
+  /// interval; its `Amplitude.current` is documented as
+  /// dBFS). Used only by the TalkBack toggle mode's
+  /// silence auto-end; an error on this stream simply ends
+  /// the feed, never the recording.
+  @override
+  Stream<double> amplitudeDbfs() {
+    return _recorder
+        .onAmplitudeChanged(const Duration(milliseconds: 200))
+        .map((Amplitude amplitude) => amplitude.current);
+  }
 }
