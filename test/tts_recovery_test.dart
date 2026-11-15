@@ -325,6 +325,58 @@ void main() {
     });
   }
 
+  testWidgets('resume catches up bare turn near the kerb', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    handle.voiceCommand('暂停');
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(handle.taskState, TaskState.paused);
+    const a = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+    const b = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+    const c = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+    handle.debugInstallLiveTracker(
+      steps: const <AmapStep>[
+        AmapStep(action: '直行', orientation: '北', polyline: [a, b],
+            distanceM: 200, durationS: 150),
+        AmapStep(action: '右转', orientation: '东', polyline: [b, c],
+            distanceM: 100, durationS: 75),
+      ],
+      stepTexts: const ['直行', '右转进入林荫道'],
+      destination: c,
+      destinationName: '图书馆',
+    );
+    handle.debugLiveFix(GeoPoint(
+        latitude: b.latitude! - 1 / 111194.9, longitude: b.longitude), 5);
+    await tester.pump();
+    await tester.pump();
+    expect(output.spoken.any((text) => text.contains('右转')), isFalse);
+    handle.voiceCommand('继续');
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(handle.taskState, TaskState.navigating);
+    final turns = output.spoken.where((text) => text.contains('右转进入林荫道'));
+    expect(turns, isNotEmpty);
+    expect(turns.every((text) => !text.contains('前方') && !text.contains('米')), isTrue);
+    expect(output.spoken.every((text) => !text.contains('左右移步') &&
+        !text.contains('左移') && !text.contains('右移')), isTrue);
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
   for (final bool stale in <bool>[false, true]) {
     testWidgets(stale ? 'resume ignores stale off-route fix' :
         'resume ignores low-accuracy off-route fix', (tester) async {

@@ -2513,7 +2513,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     if (turnStep == null || !sameTracker) return;
-    final String? text = nav.regenerateTurnPrompt(
+    final String? text = nav.catchUpTurnPrompt(
       turnStep,
       NavFix(point: point, accuracyM: _lastFixAccuracyM, at: DateTime.now()),
     );
