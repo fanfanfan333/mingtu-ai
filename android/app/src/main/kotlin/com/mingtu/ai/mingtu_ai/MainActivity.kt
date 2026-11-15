@@ -6,11 +6,36 @@ import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.util.Log
+import android.view.KeyEvent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
+
+    private var headsetChannel: MethodChannel? = null
+    private var resumed = false
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+    }
+
+    override fun onPause() {
+        resumed = false
+        super.onPause()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (HeadsetKeyFilter.accepts(
+                resumed, event.keyCode, event.action, event.repeatCount
+            )
+        ) {
+            headsetChannel?.invokeMethod("toggle", null)
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
 
     // The mingtu/device channel instance, kept so the
     // thermal monitor (below) can PUSH status changes back
@@ -24,6 +49,7 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        headsetChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "mingtu/headset")
         // mingtu/device: the app's own device channel. It
         // carries the NAVHAZ vibration patterns (spec
         // section 2.5): the Dart side sends parallel

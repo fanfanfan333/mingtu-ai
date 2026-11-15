@@ -447,6 +447,7 @@ class MingtuHomeDebugHandle {
   /// UI-01: the toggle tap the Semantics onTap dispatches
   /// to, callable directly in unit-style widget tests.
   void debugPttToggleTap() => _state._pttToggleTap();
+  Future<void> debugHeadsetToggle() => _state._headsetToggle();
   void debugPttCloseWait() => _state._announcePttCloseWait();
   void debugAsrError(String code) => _state._handleAsrError(code);
 
@@ -1416,6 +1417,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         text: text,
         kind: SpeechKind.alert)),
   );
+  static const MethodChannel _headsetChannel = MethodChannel('mingtu/headset');
+  bool _headsetGatePending = false;
   bool _foreground = true;
   Timer? _foregroundTimer;
 
@@ -1438,6 +1441,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void initState() {
     super.initState();
     mingtuHomeDebugHandle = MingtuHomeDebugHandle._(this);
+    _headsetChannel.setMethodCallHandler((call) async {
+      if (call.method == 'toggle') await _headsetToggle();
+    });
     _tasks.onStateChanged = _updateForegroundPolicies;
     _recorder = createVoiceRecorder();
     // UI-06 seams: pre-pump debug overrides win; production
@@ -2907,6 +2913,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    _headsetChannel.setMethodCallHandler(null);
     _pocketMode.dispose();
     _foreground = false;
     _foregroundTimer?.cancel();
@@ -4850,6 +4857,40 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _pttToggleStart();
     } else {
       unawaited(_pushToTalkEnd());
+    }
+  }
+
+  Future<void> _headsetToggle() async {
+    if (!mounted || !_foreground || _headsetGatePending) return;
+    if (_pttState != _PttState.idle || !_permissionGateway.isAvailable) {
+      _pttToggleTap();
+      return;
+    }
+    _headsetGatePending = true;
+    try {
+      final outcome = await _permissionStatus(GuidePermission.microphone);
+      if (!mounted || !_foreground) return;
+      if (outcome != PermissionOutcome.granted || !_microphoneInitialized) {
+        _say(_request(
+          id: 'headset-microphone-permission-${_permissionSpeechSeq++}',
+          eventId: 'headset-microphone-permission-$_permissionSpeechSeq',
+          kind: SpeechKind.alert,
+          text: _guideResolvedSeen
+              ? permissionDeniedText(GuidePermission.microphone)
+              : permissionPurposeText(GuidePermission.microphone),
+        ));
+        if (!_guideResolvedSeen) {
+          if (_permissionFlowRunning) {
+            _retryDeferredPermissionFlow();
+          } else {
+            unawaited(_runFirstLaunchGuideAndPermissions());
+          }
+        }
+        return;
+      }
+      _pttToggleTap();
+    } finally {
+      _headsetGatePending = false;
     }
   }
 
