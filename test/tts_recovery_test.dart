@@ -123,6 +123,33 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
   });
 
+  testWidgets('recovery restores emergency and replays fallback guidance',
+      (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    handle.triggerEmergency();
+    expect(handle.taskState, TaskState.emergency);
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    expect(handle.taskState, TaskState.paused);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump();
+    expect(handle.taskState, TaskState.emergency);
+    expect(output.spoken.any((text) => text.contains('语音已恢复')), isTrue);
+    expect(output.spoken.every((text) => !text.contains('继续导航')), isTrue);
+    expect(output.spoken.any((text) => text.contains('备用办法')), isTrue);
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
   testWidgets('recovery preserves a user initiated pause', (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
     addTearDown(() => mingtuStartupTtsFactoryOverride = null);

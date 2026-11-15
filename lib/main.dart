@@ -1346,6 +1346,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (!mounted) return;
       _voiceOutput = output;
       var spokenAnnouncement = announcement;
+      var recoveredEmergency = false;
       if (_tasks.state == TaskState.paused) {
         final last = _tasks.history.isEmpty ? null : _tasks.history.last;
         if (last != null &&
@@ -1353,6 +1354,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             _tasks.canTransitionTo(last.from)) {
           _tasks.transitionTo(last.from, trigger: 'tts-recovery');
           spokenAnnouncement = '语音已恢复，继续导航。';
+          recoveredEmergency = last.from == TaskState.emergency;
           if (last.from == TaskState.navigating) {
             _straightConfirmed = true;
             _scheduler.resumeStraight(
@@ -1373,11 +1375,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       setState(() {
         _voiceText = '语音：TTS：${output.status}；ASR：${_voiceInput.status}。';
       });
-      _say(_request(
-          id: 'tts-recovered-${DateTime.now().microsecondsSinceEpoch}',
-          eventId: 'tts-recovered',
-          text: spokenAnnouncement,
-          kind: SpeechKind.info));
+      if (recoveredEmergency) {
+        final result = _emergency.trigger(
+          triggerType: 'voice-小途，我需要帮助（演示）',
+          networkAvailable: false,
+          llmAvailable: false,
+        );
+        _speakEmergencyFallback(result,
+            prefix: '语音已恢复。',
+            eventId: 'emergency-1-recovery-${DateTime.now().microsecondsSinceEpoch}');
+      } else {
+        _say(_request(
+            id: 'tts-recovered-${DateTime.now().microsecondsSinceEpoch}',
+            eventId: 'tts-recovered',
+            text: spokenAnnouncement,
+            kind: SpeechKind.info));
+      }
     },
   );
 
@@ -7674,10 +7687,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // A blind user in an emergency cannot read the screen for them,
     // and must never be left waiting for a help station that was
     // never actually contacted.
+    _speakEmergencyFallback(result);
+  }
+
+  void _speakEmergencyFallback(EmergencyResult result,
+      {String prefix = '', String eventId = 'emergency-1'}) {
     _say(_request(
-      id: 'emergency-1',
-      eventId: 'emergency-1',
-      text: '${result.statusText}备用办法：${result.fallbackOptions.join('；')}。',
+      id: eventId,
+      eventId: eventId,
+      text: '$prefix${result.statusText}备用办法：${result.fallbackOptions.join('；')}。',
       kind: SpeechKind.emergency,
     ));
   }
