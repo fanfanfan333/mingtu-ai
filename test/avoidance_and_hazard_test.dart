@@ -7,6 +7,7 @@ import 'package:mingtu_ai/adapters/cloud_vision_client.dart';
 import 'package:mingtu_ai/core/avoidance_advisor.dart';
 import 'package:mingtu_ai/core/cloud_vision.dart';
 import 'package:mingtu_ai/core/cloud_vision_hazard.dart';
+import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
 import 'package:mingtu_ai/core/orientation.dart';
 import 'package:mingtu_ai/modules/visual_perception.dart';
 
@@ -375,7 +376,10 @@ void main() {
       });
       final String? speech = hazardPavingSpeech(a);
       expect(speech, contains('识别到前方有盲道'));
-      expect(speech, contains('是否畅通无法确认'));
+      expect(speech, contains('是否被占用无法确认'));
+      expect(containsBannedWord(speech!), isFalse);
+      expect(speech, contains(cloudVisionDisclaimer));
+      expect(speech, isNot(contains('可以走')));
       expect(speech, isNot(contains('向左')));
       expect(speech, isNot(contains('向右')));
     });

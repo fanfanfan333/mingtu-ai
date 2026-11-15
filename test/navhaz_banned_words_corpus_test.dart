@@ -1,8 +1,7 @@
 /// NAVHAZ M1, spec 2.7.10 corpus (CDX2-6b / FIX2 round):
 /// the spoken texts produced by the test classes 1-8,
 /// gathered into ONE auditable set and asserted free of
-/// every banned word (the full four-word list -- 安全 /
-/// 可以通行 / 放心 / 可以过马路 -- never a reduced set).
+/// every word in the complete banned-announcement list.
 ///
 /// Sources of the corpus (each entry's origin is kept in
 /// the failure message):
@@ -61,7 +60,7 @@ Detection _carAt(double z) {
 
 void main() {
   test('corpus: every spoken text from test classes 1-8 '
-      'is free of all four banned words', () {
+      'is free of all banned words', () {
     final Map<String, String> corpus = <String, String>{};
     void add(String origin, String text) {
       corpus.putIfAbsent(text, () => origin);

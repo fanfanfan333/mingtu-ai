@@ -230,7 +230,7 @@ String? hazardGroundSpeech(HazardAssessment a) {
 /// and no direction is derived from it.
 String? hazardPavingSpeech(HazardAssessment a) {
   if (!a.parsed || a.type != HazardType.tactilePaving) return null;
-  return '识别到前方有盲道，是否畅通无法确认，请以盲杖探测为准。'
+  return '识别到前方有盲道，是否被占用无法确认，请以盲杖探测为准。'
       '提醒：$cloudVisionDisclaimer';
 }
 

@@ -25,6 +25,10 @@ const List<String> bannedAnnouncementWords = <String>[
   '可以' '通行',
   '放' '心',
   '可以过' '马路',
+  '畅' '通',
+  '没有' '障碍',
+  '放' '心走',
+  '安' '全通过',
 ];
 
 /// Fixed replacement spoken when an announcement fails the
