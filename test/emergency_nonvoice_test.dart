@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/main.dart';
+import 'package:mingtu_ai/core/pocket_mode.dart';
 import 'package:mingtu_ai/modules/emergency.dart';
 
 void main() {
@@ -14,13 +17,29 @@ void main() {
   testWidgets('three fingers held trigger once with truthful speech',
       (tester) async {
     await tester.pumpWidget(const MingtuApp());
+    final h = mingtuHomeDebugHandle!;
+    final initialState = h.taskState;
+    final initialCamera = h.yoloLiveOpen;
     final gestures = <TestGesture>[];
     for (var i = 0; i < 3; i++) {
       gestures.add(await tester.startGesture(Offset(100.0 + i * 50, 100),
           pointer: i + 1));
     }
     await tester.pump(const Duration(milliseconds: 900));
-    final h = mingtuHomeDebugHandle!;
+    expect(h.emergencyTriggerCount, 0);
+    expect(h.currentPromptText, contains('即将发起紧急求助，再次三指长按确认'));
+    expect(h.yoloLiveOpen, initialCamera);
+    expect(h.taskState, initialState);
+    for (final gesture in gestures) {
+      await gesture.up();
+    }
+    expect(h.taskState, initialState);
+    gestures.clear();
+    for (var i = 0; i < 3; i++) {
+      gestures.add(await tester.startGesture(Offset(100.0 + i * 50, 100),
+          pointer: i + 1));
+    }
+    await tester.pump(const Duration(milliseconds: 900));
     expect(h.emergencyTriggerCount, 1);
     expect(h.statusTexts.join(), contains('尚未确认联系到任何帮助站'));
     final speech = h.currentPromptText;
@@ -46,13 +65,86 @@ void main() {
     final b = await tester.startGesture(const Offset(150, 100), pointer: 2);
     await tester.pump(const Duration(seconds: 1));
     expect(mingtuHomeDebugHandle!.emergencyTriggerCount, 0);
+    expect(mingtuHomeDebugHandle!.currentPromptText,
+        isNot(contains('即将发起紧急求助，再次三指长按确认')));
     final c = await tester.startGesture(const Offset(200, 100), pointer: 3);
     await tester.pump(const Duration(milliseconds: 400));
     await c.up();
     await tester.pump(const Duration(seconds: 1));
     expect(mingtuHomeDebugHandle!.emergencyTriggerCount, 0);
+    expect(mingtuHomeDebugHandle!.currentPromptText,
+        isNot(contains('即将发起紧急求助，再次三指长按确认')));
     await a.up();
     await b.up();
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(seconds: 3));
+    }
+  });
+
+  testWidgets('confirmation expires and requires a fresh pair of holds',
+      (tester) async {
+    await tester.pumpWidget(const MingtuApp());
+    final h = mingtuHomeDebugHandle!;
+    Future<void> hold() async {
+      final gestures = <TestGesture>[];
+      for (var i = 0; i < 3; i++) {
+        gestures.add(await tester.startGesture(Offset(100.0 + i * 50, 100),
+            pointer: i + 1));
+      }
+      await tester.pump(const Duration(milliseconds: 900));
+      for (final gesture in gestures) {
+        await gesture.up();
+      }
+    }
+
+    final state = h.taskState;
+    await hold();
+    expect(h.currentPromptText, contains('即将发起紧急求助，再次三指长按确认'));
+    await tester.pump(emergencyConfirmTimeout);
+    await hold();
+    expect(h.emergencyTriggerCount, 0);
+    expect(h.taskState, state);
+    expect(h.yoloLiveOpen, isFalse);
+    await hold();
+    expect(h.emergencyTriggerCount, 1);
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(seconds: 3));
+    }
+  });
+
+  testWidgets('pocket lock ignores a three-finger hold', (tester) async {
+    final proximity = StreamController<bool>.broadcast();
+    mingtuProximityEventsOverride = () => proximity.stream;
+    mingtuPocketNowOverride = tester.binding.clock.now;
+    addTearDown(() async {
+      mingtuProximityEventsOverride = null;
+      mingtuPocketNowOverride = null;
+      await proximity.close();
+    });
+    await tester.pumpWidget(const MingtuApp());
+    final h = mingtuHomeDebugHandle!;
+    h.debugSetPocketEnabled(true);
+    proximity.add(true);
+    await tester.pump();
+    await tester.pump(pocketNearDuration);
+    expect(h.debugIgnoreTouches, isTrue);
+    final state = h.taskState;
+    final camera = h.yoloLiveOpen;
+    final gestures = <TestGesture>[];
+    for (var i = 0; i < 3; i++) {
+      gestures.add(await tester.startGesture(Offset(100.0 + i * 50, 100),
+          pointer: i + 1));
+    }
+    await tester.pump(const Duration(milliseconds: 900));
+    expect(h.currentPromptText, isNot(contains('即将发起紧急求助，再次三指长按确认')));
+    expect(h.emergencyTriggerCount, 0);
+    expect(h.taskState, state);
+    expect(h.yoloLiveOpen, camera);
+    for (final gesture in gestures) {
+      await gesture.up();
+    }
     await tester.pumpWidget(const SizedBox());
     for (var i = 0; i < 10; i++) {
       await tester.pump(const Duration(seconds: 3));

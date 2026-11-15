@@ -143,6 +143,8 @@ WakelockGateway? mingtuWakelockGatewayOverride;
 DateTime Function()? mingtuWatchdogNowOverride;
 
 @visibleForTesting
+const emergencyConfirmTimeout = Duration(seconds: 10);
+
 Stream<bool> Function()? mingtuProximityEventsOverride;
 DateTime Function()? mingtuPocketNowOverride;
 
@@ -1530,23 +1532,47 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _headsetGatePending = false;
   final Set<int> _emergencyPointers = <int>{};
   Timer? _emergencyHoldTimer;
+  Timer? _emergencyConfirmTimer;
+  int _emergencyConfirmSequence = 0;
   Timer? _headsetPressTimer;
   int _headsetPressCount = 0;
   bool _emergencyHoldTriggered = false;
 
   void _emergencyPointerDown(int pointer) {
+    if (_pocketMode.ignoreTouches) return;
     _emergencyPointers.add(pointer);
     if (_emergencyPointers.length >= 3 &&
         !_emergencyHoldTriggered &&
         _emergencyHoldTimer == null) {
       _emergencyHoldTimer = Timer(const Duration(milliseconds: 900), () {
         _emergencyHoldTimer = null;
-        if (mounted && _emergencyPointers.length >= 3) {
+        if (mounted &&
+            !_pocketMode.ignoreTouches &&
+            _emergencyPointers.length >= 3) {
           _emergencyHoldTriggered = true;
-          _triggerEmergency();
+          _requestEmergencyConfirm();
         }
       });
     }
+  }
+
+  void _requestEmergencyConfirm() {
+    if (_emergencyConfirmTimer != null) {
+      _emergencyConfirmTimer!.cancel();
+      _emergencyConfirmTimer = null;
+      _triggerEmergency();
+      return;
+    }
+    _emergencyConfirmTimer = Timer(emergencyConfirmTimeout, () {
+      _emergencyConfirmTimer = null;
+    });
+    final id = 'emergency-confirm-${_emergencyConfirmSequence++}';
+    _say(_request(
+      id: id,
+      eventId: id,
+      text: '即将发起紧急求助，再次三指长按确认',
+      kind: SpeechKind.alert,
+    ));
   }
 
   void _emergencyPointerUp(int pointer) {
@@ -3093,6 +3119,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   @override
   void dispose() {
     _emergencyHoldTimer?.cancel();
+    _emergencyConfirmTimer?.cancel();
     _headsetPressTimer?.cancel();
     if (mingtuLensSampleSink == _onLensSample) {
       mingtuLensSampleSink = null;
