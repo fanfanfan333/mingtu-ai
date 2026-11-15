@@ -413,6 +413,9 @@ class MingtuHomeDebugHandle {
   void debugLiveFix(GeoPoint point, double? accuracyM) =>
       _state._onLiveNavFix(LocationResult.fix(point, accuracyM));
 
+  /// Override the last delivery time for recovery tests.
+  void debugSetLastFixAt(DateTime at) => _state._lastFixAt = at;
+
   Future<void> openYoloLive() => _state._openYoloLive();
   void closeYoloLive() => _state._closeYoloLiveView();
   void debugYoloViewError(Object error) => _state._onYoloViewError(error);
@@ -1082,6 +1085,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   );
   GeoPoint? _lastFixPoint;
   double? _lastFixAccuracyM;
+  DateTime? _lastFixAt;
   // Latest GPS ground speed carried by a live fix, and
   // when it arrived (ego-motion judge evidence, M1 fix
   // round; freshness is judged against the frame time).
@@ -2365,8 +2369,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
       return;
     }
+    final DateTime fixAt = DateTime.now();
     _lastFixPoint = r.pointGcj02;
     _lastFixAccuracyM = r.accuracyM;
+    _lastFixAt = fixAt;
     // The fix's own ground speed feeds the ego-motion
     // judge (M1 fix round); a fix without a usable speed
     // leaves the previous reading to age out by freshness.
@@ -2383,7 +2389,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final List<NavEvent> events = _liveNav!.onFix(NavFix(
       point: r.pointGcj02!,
       accuracyM: r.accuracyM,
-      at: DateTime.now(),
+      at: fixAt,
     ));
     setState(() {
       _liveNavRemainingM = _liveNav!.remainingM;
@@ -2493,13 +2499,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (nav == null) return;
     nav.resetOffRouteStreak();
     if (point == null) return;
-    if (nav.isOffRoute(point)) {
+    final DateTime? fixAt = _lastFixAt;
+    final double? accuracyM = _lastFixAccuracyM;
+    final Duration? fixAge = fixAt == null ? null : DateTime.now().difference(fixAt);
+    if (accuracyM != null &&
+        accuracyM <= NavigationTracker.weakAccuracyM &&
+        fixAge != null &&
+        !fixAge.isNegative &&
+        fixAge <= NavHazConfig.gpsSpeedFreshness &&
+        nav.isOffRoute(point)) {
       nav.markOffRouteAnnounced();
       _handleNavEvent(const NavEvent(NavEventKind.offRoute, '你已偏离路线。'));
       return;
     }
     if (turnStep == null || !sameTracker) return;
-    final String? text = nav.regenerateTurnPrompt(
+    final String? text = nav.catchUpTurnPrompt(
       turnStep,
       NavFix(point: point, accuracyM: _lastFixAccuracyM, at: DateTime.now()),
     );

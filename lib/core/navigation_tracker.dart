@@ -190,7 +190,15 @@ class NavigationTracker {
   /// step when the turn event fires, so equality means "in
   /// the announcement zone of that very intersection", which
   /// is exactly the case a regeneration exists for.
-  String? regenerateTurnPrompt(int stepIndex, NavFix latestFix) {
+  String? regenerateTurnPrompt(int stepIndex, NavFix latestFix) =>
+      _turnReplayPrompt(stepIndex, latestFix, bareWhenNear: false);
+
+  /// Catch up a suppressed turn, including its bare text at the kerb.
+  String? catchUpTurnPrompt(int stepIndex, NavFix latestFix) =>
+      _turnReplayPrompt(stepIndex, latestFix, bareWhenNear: true);
+
+  String? _turnReplayPrompt(int stepIndex, NavFix latestFix,
+      {required bool bareWhenNear}) {
     if (arrived) return null;
     if (stepIndex < 0 || stepIndex >= _stepStartPointIndex.length) {
       return null;
@@ -202,7 +210,9 @@ class NavigationTracker {
     if (nearestIdx > startPointIdx) return null;
     final double d =
         haversineMeters(latestFix.point, _points[startPointIdx]);
-    if (d < NavHazConfig.replayMinDistanceM) return null;
+    if (d < NavHazConfig.replayMinDistanceM) {
+      return bareWhenNear ? stepTexts[stepIndex] : null;
+    }
     // Distance wording: the FIX3B navigation bands (the
     // function returns the announcement-ready form,
     // leading "about" included). CDX5 S2-1: an abnormal

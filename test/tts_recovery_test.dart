@@ -5,6 +5,7 @@ import 'package:mingtu_ai/adapters/voice_io.dart';
 import 'package:mingtu_ai/adapters/system_voice_io.dart';
 import 'package:mingtu_ai/adapters/amap_client.dart';
 import 'package:mingtu_ai/core/haptics.dart';
+import 'package:mingtu_ai/core/navigation_tracker.dart';
 import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
 import 'package:mingtu_ai/core/tts_recovery.dart';
 import 'package:mingtu_ai/core/speech_scheduler.dart';
@@ -318,6 +319,194 @@ void main() {
           offRoute ? '偏离路线' : '右转进入林荫道')), isTrue);
       expect(output.spoken.any((text) => text.contains('已恢复导航，但直行提醒还没有恢复')), isTrue);
       if (offRoute) expect(handle.debugRerouting, isTrue);
+      expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 4));
+    });
+  }
+
+  testWidgets('resume skips a passed turn and announces the next turn', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    handle.voiceCommand('暂停');
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(handle.taskState, TaskState.paused);
+    expect(output.spoken, contains('语音已恢复，导航仍在暂停。'));
+
+    const a = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+    const b = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+    const pastB = GeoPoint(latitude: 37.726206, longitude: 120.441950);
+    const beforeC = GeoPoint(latitude: 37.726206, longitude: 120.442575);
+    const c = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+    const d = GeoPoint(latitude: 37.728, longitude: 120.442859);
+    handle.debugInstallLiveTracker(
+      steps: const <AmapStep>[
+        AmapStep(action: '直行', orientation: '北', polyline: [a, b],
+            distanceM: 200, durationS: 150),
+        AmapStep(action: '右转', orientation: '东',
+            polyline: [b, pastB, beforeC, c], distanceM: 100, durationS: 75),
+        AmapStep(action: '左转', orientation: '北', polyline: [c, d],
+            distanceM: 200, durationS: 150),
+      ],
+      stepTexts: const ['直行', '右转进入林荫道', '左转进入广场'],
+      destination: d,
+      destinationName: '广场',
+    );
+    handle.debugLiveFix(GeoPoint(
+        latitude: b.latitude! - 25 / 111194.9, longitude: b.longitude), 5);
+    await tester.pump();
+    await tester.pump();
+    expect(output.spoken.any((text) => text.contains('右转')), isFalse);
+    handle.debugLiveFix(pastB, 5);
+    await tester.pump();
+    expect(handle.taskState, TaskState.paused);
+    expect(output.spoken.any((text) => text.contains('右转')), isFalse);
+
+    handle.voiceCommand('继续');
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(handle.taskState, TaskState.navigating);
+    expect(output.spoken.any((text) => text.contains('右转进入林荫道')), isFalse);
+
+    handle.debugLiveFix(beforeC, 5);
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(output.spoken.any((text) => text.contains('左转进入广场')), isTrue);
+    expect(output.spoken.every((text) => !containsBannedWord(text) &&
+        !text.contains('左右移步') && !text.contains('可以通行') &&
+        !text.contains('放心') && !text.contains('畅通') &&
+        !text.contains('没有障碍')), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('resume catches up bare turn near the kerb', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    handle.voiceCommand('暂停');
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(handle.taskState, TaskState.paused);
+    const a = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+    const b = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+    const c = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+    handle.debugInstallLiveTracker(
+      steps: const <AmapStep>[
+        AmapStep(action: '直行', orientation: '北', polyline: [a, b],
+            distanceM: 200, durationS: 150),
+        AmapStep(action: '右转', orientation: '东', polyline: [b, c],
+            distanceM: 100, durationS: 75),
+      ],
+      stepTexts: const ['直行', '右转进入林荫道'],
+      destination: c,
+      destinationName: '图书馆',
+    );
+    handle.debugLiveFix(GeoPoint(
+        latitude: b.latitude! - 1 / 111194.9, longitude: b.longitude), 5);
+    await tester.pump();
+    await tester.pump();
+    expect(output.spoken.any((text) => text.contains('右转')), isFalse);
+    handle.voiceCommand('继续');
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(handle.taskState, TaskState.navigating);
+    final turns = output.spoken.where((text) => text.contains('右转进入林荫道'));
+    expect(turns, isNotEmpty);
+    expect(turns.every((text) => !text.contains('前方') && !text.contains('米')), isTrue);
+    expect(output.spoken.every((text) => !text.contains('左右移步') &&
+        !text.contains('左移') && !text.contains('右移')), isTrue);
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  for (final bool stale in <bool>[false, true]) {
+    testWidgets(stale ? 'resume ignores stale off-route fix' :
+        'resume ignores low-accuracy off-route fix', (tester) async {
+      mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+      addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+      await tester.pumpWidget(const MingtuApp());
+      await tester.pump();
+      final handle = mingtuHomeDebugHandle!;
+      handle.startVoiceDemo();
+      handle.planRoute();
+      handle.startNavigating();
+      final output = FakeOutput();
+      handle.debugFailTts(() async => output);
+      handle.voiceCommand('暂停');
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pump();
+      expect(handle.taskState, TaskState.paused);
+      expect(output.spoken, contains('语音已恢复，导航仍在暂停。'));
+      const a = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+      const b = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+      const c = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+      handle.debugInstallLiveTracker(
+        steps: const <AmapStep>[
+          AmapStep(action: '直行', orientation: '北', polyline: [a, b],
+              distanceM: 200, durationS: 150),
+          AmapStep(action: '右转', orientation: '东', polyline: [b, c],
+              distanceM: 100, durationS: 75),
+        ],
+        stepTexts: const ['直行', '右转进入林荫道'],
+        destination: c,
+        destinationName: '图书馆',
+      );
+      const far = GeoPoint(latitude: 37.730, longitude: 120.450);
+      for (var i = 0; i < NavigationTracker.offRouteFixesNeeded; i++) {
+        handle.debugLiveFix(far, stale ? 5 : 80);
+      }
+      if (stale) {
+        handle.debugSetLastFixAt(DateTime.now().subtract(const Duration(days: 1)));
+      }
+      await tester.pump();
+      expect(output.spoken.any((text) => text.contains('偏离路线') ||
+          text.contains('重新规划')), isFalse);
+      handle.voiceCommand('继续');
+      await tester.pump();
+      await tester.pump();
+      expect(handle.taskState, TaskState.navigating);
+      expect(handle.debugRerouting, isFalse);
+      expect(output.spoken.any((text) => text.contains('偏离路线') ||
+          text.contains('重新规划')), isFalse);
+      for (var i = 0; i < NavigationTracker.offRouteFixesNeeded; i++) {
+        handle.debugLiveFix(far, 5);
+      }
+      await tester.pump();
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pump();
+      expect(output.spoken.any((text) => text.contains('偏离路线')), isTrue);
+      expect(handle.debugRerouting, isTrue);
       expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump(const Duration(seconds: 4));
