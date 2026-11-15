@@ -1,3 +1,4 @@
+import 'cloud_vision.dart';
 import 'cloud_vision_hazard.dart';
 
 const String walkingNavigationDisclaimer = '台阶和路沿不能可靠提醒，请用盲杖确认。';
@@ -5,11 +6,17 @@ const String walkingNavigationDisclaimer = '台阶和路沿不能可靠提醒，
 /// Independent walking scan cadence. The caller owns camera and transport gates.
 class WalkingHazardScan {
   WalkingHazardScan(
-      {required this.scan, required this.speak, required this.gate});
+      {required this.scan,
+      required this.speak,
+      required this.gate,
+      required this.onFailure,
+      required this.onSuccess});
 
   final Future<HazardScanOutcome?> Function(DateTime now) scan;
   final void Function(String text) speak;
   final CloudVisionDowngradeGate gate;
+  final void Function(CloudVisionFailure failure) onFailure;
+  final void Function() onSuccess;
   DateTime? _lastAttempt;
   bool _inFlight = false;
   bool get inFlight => _inFlight;
@@ -32,15 +39,16 @@ class WalkingHazardScan {
       if (outcome == null) return;
       final HazardAssessment? assessment = outcome.assessment;
       if (!outcome.ok || assessment == null || !assessment.parsed) {
-        if (gate.shouldAnnounce(now)) speak(cloudVisionDowngradeSpeech);
+        onFailure(outcome.failure ?? CloudVisionFailure.uncertain);
         return;
       }
       gate.noteSuccess();
+      onSuccess();
       final String? text =
           hazardGroundSpeech(assessment) ?? hazardPavingSpeech(assessment);
       if (text != null) speak(text);
     } catch (_) {
-      if (gate.shouldAnnounce(now)) speak(cloudVisionDowngradeSpeech);
+      onFailure(CloudVisionFailure.network);
     } finally {
       _inFlight = false;
     }

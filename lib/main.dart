@@ -1057,6 +1057,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   late final WalkingHazardScan _walkingHazardScan = WalkingHazardScan(
     gate: _visionDowngrade,
     scan: _captureWalkingHazard,
+    onFailure: _handleAutoVisionFailure,
+    onSuccess: _visionBackoff.onSuccess,
     speak: (String text) {
       if (!mounted || _liveNav == null) return;
       final String id =
@@ -6931,7 +6933,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  /// Shared failure handling for the two automatic
+  /// Shared failure handling for automatic
   /// triggers. Returns true when [failure] was non-null
   /// and has been fully handled: a 429 records a backoff
   /// strike (and speaks the once-per-episode notice when
@@ -6943,7 +6945,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (mounted) {
         _logMsg('云端识图：请求过于频繁，已按退避策略处理，其间只用本地检测。');
       }
-      if (_visionBackoff.onRateLimited(DateTime.now())) {
+      if (_visionBackoff.onRateLimited(DateTime.now()) &&
+          _visionDowngrade.shouldAnnounce(DateTime.now())) {
         _say(_request(
           id: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
           eventId: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
@@ -7022,7 +7025,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// Speak the fixed cloud-vision downgrade sentence,
   /// rate-limited by [_visionDowngrade]: repeated cloud
   /// failures (for example while the FC still runs an
-  /// older build) announce ONCE per cooldown window,
+  /// older build) announce ONCE per failure episode,
   /// never on every trigger.
   void _announceVisionDowngrade() {
     if (!mounted) return;

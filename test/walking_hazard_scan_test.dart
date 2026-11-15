@@ -20,6 +20,8 @@ void main() {
     final scan = WalkingHazardScan(
       gate: CloudVisionDowngradeGate(),
       speak: (_) {},
+      onFailure: (_) {},
+      onSuccess: () {},
       scan: (_) async {
         calls++;
         return const HazardScanOutcome.ok(HazardAssessment.unknown);
@@ -70,11 +72,16 @@ void main() {
         });
       },
     );
-    final gate =
-        CloudVisionDowngradeGate(announceCooldown: const Duration(minutes: 3));
+    final gate = CloudVisionDowngradeGate();
     final scan = WalkingHazardScan(
         gate: gate,
         speak: spoken.add,
+        onFailure: (_) {
+          if (gate.shouldAnnounce(DateTime.now())) {
+            spoken.add(cloudVisionDowngradeSpeech);
+          }
+        },
+        onSuccess: () {},
         scan: (_) => client.describeHazardReserved(
             imageBytes: Uint8List.fromList([1, 2])));
     final start = DateTime(2026);
@@ -90,8 +97,62 @@ void main() {
     await tick(120);
     expect(dimension, cloudVisionMaxDimension);
     expect(spoken.last, contains('前方有路沿，请停下。'));
-    for (final word in ['向左迈', '向右迈', '安全', '可以通行', '放心', '可以过马路']) {
+    for (final word in [
+      '向左迈',
+      '向右迈',
+      '安全',
+      '可以通行',
+      '放心',
+      '可以过马路',
+      '畅通',
+      '没有障碍',
+      '放心走',
+      '安全通过'
+    ]) {
       expect(spoken.last, isNot(contains(word)));
     }
+    fail = true;
+    await tick(180);
+    await tick(240);
+    expect(
+        spoken.where((text) => text == cloudVisionDowngradeSpeech).length, 2);
+  });
+
+  test('walking 429 records backoff and announces busy once', () async {
+    final gate = CloudVisionDowngradeGate();
+    final backoff = VisionRateBackoff();
+    final spoken = <String>[];
+    final start = DateTime(2026);
+    var now = start;
+    var calls = 0;
+    final scan = WalkingHazardScan(
+      gate: gate,
+      speak: spoken.add,
+      onFailure: (failure) {
+        expect(failure, CloudVisionFailure.rateLimited);
+        if (backoff.onRateLimited(now) && gate.shouldAnnounce(now)) {
+          spoken.add('识图暂时繁忙，稍后会自动重试，其间继续用本地检测。');
+        }
+      },
+      onSuccess: backoff.onSuccess,
+      scan: (time) async {
+        if (!backoff.allow(time)) return null;
+        calls++;
+        return const HazardScanOutcome.failed(CloudVisionFailure.rateLimited);
+      },
+    );
+    Future<void> tick(int seconds) {
+      now = start.add(Duration(seconds: seconds));
+      return scan.tick(navigating: true, walking: true, busy: false, now: now);
+    }
+
+    await tick(0);
+    expect(backoff.allow(start.add(const Duration(seconds: 29))), isFalse);
+    await tick(60);
+    await tick(120);
+    await tick(180);
+    expect(calls, 3);
+    expect(spoken, ['识图暂时繁忙，稍后会自动重试，其间继续用本地检测。']);
+    expect(spoken, isNot(contains(cloudVisionDowngradeSpeech)));
   });
 }

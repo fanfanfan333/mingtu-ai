@@ -281,38 +281,19 @@ String hazardDescriptionSpeech(HazardAssessment a) {
 /// no server string is ever copied into it.
 const String cloudVisionDowngradeSpeech = '云端识图暂不可用，请慢行。';
 
-/// Announce-once + rate limit for
-/// [cloudVisionDowngradeSpeech]. A cloud path that keeps
-/// failing (for example against an old FC deployment) must
-/// tell the user ONCE that cloud vision is unavailable and
-/// then stay quiet for [announceCooldown]; without the gate,
-/// a repeating trigger would repeat the sentence forever.
-/// A successful call resets the gate, so the next failure
-/// episode may speak once again.
+/// Announces once per failure episode. A successful call re-arms the gate.
 class CloudVisionDowngradeGate {
-  final Duration announceCooldown;
+  bool _announced = false;
 
-  DateTime? _lastAnnouncedAt;
-
-  CloudVisionDowngradeGate({
-    this.announceCooldown = const Duration(seconds: 60),
-  });
-
-  /// True when the downgrade sentence may be spoken at
-  /// [now]; records the announcement when it returns true.
+  /// Records the first announcement until [noteSuccess] resets the gate.
   bool shouldAnnounce(DateTime now) {
-    final DateTime? last = _lastAnnouncedAt;
-    if (last != null && now.difference(last) < announceCooldown) {
-      return false;
-    }
-    _lastAnnouncedAt = now;
+    if (_announced) return false;
+    _announced = true;
     return true;
   }
 
-  /// A scan succeeded: the next failure is a new episode
-  /// and may be announced once again.
   void noteSuccess() {
-    _lastAnnouncedAt = null;
+    _announced = false;
   }
 }
 

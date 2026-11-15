@@ -570,15 +570,15 @@ void main() {
   group('cloud-vision downgrade gate: announce once, rate-limited', () {
     test(
         'first failure speaks, repeats are muted for the '
-        'cooldown, a success re-arms', () {
+        'failure episode, a success re-arms', () {
       final CloudVisionDowngradeGate g = CloudVisionDowngradeGate();
       final DateTime t0 = DateTime(2026, 1, 1, 12);
       expect(cloudVisionDowngradeSpeech, '云端识图暂不可用，请慢行。');
       expect(g.shouldAnnounce(t0), isTrue);
       expect(g.shouldAnnounce(t0.add(const Duration(seconds: 10))), isFalse);
       expect(g.shouldAnnounce(t0.add(const Duration(seconds: 59))), isFalse);
-      expect(g.shouldAnnounce(t0.add(const Duration(seconds: 61))), isTrue);
-      // Muted again right after the second announcement...
+      expect(g.shouldAnnounce(t0.add(const Duration(seconds: 61))), isFalse);
+      // Still muted after the previous cooldown...
       expect(g.shouldAnnounce(t0.add(const Duration(seconds: 70))), isFalse);
       // ...until a success resets the gate.
       g.noteSuccess();
@@ -613,6 +613,8 @@ void main() {
       expect(mainDart, contains('describeCrossingReserved'));
       expect(mainDart, contains('describeDetourReserved'));
       expect(mainDart, contains('_visionBackoff.onRateLimited'));
+      expect(mainDart, contains('onFailure: _handleAutoVisionFailure'));
+      expect(mainDart, contains('onSuccess: _visionBackoff.onSuccess'));
       expect(mainDart, contains('_triggerManualVision()'));
     });
   });
