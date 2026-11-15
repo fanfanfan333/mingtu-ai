@@ -135,6 +135,8 @@ class MingtuApp extends StatelessWidget {
 /// UI-06: swap the permission gateway (the plugin-backed
 /// one) for a fake in widget tests.
 PermissionGateway? mingtuPermissionGatewayOverride;
+WakelockGateway? mingtuWakelockGatewayOverride;
+DateTime Function()? mingtuWatchdogNowOverride;
 
 @visibleForTesting
 Stream<bool> Function()? mingtuProximityEventsOverride;
@@ -382,6 +384,7 @@ class MingtuHomeDebugHandle {
 
   Future<void> openYoloLive() => _state._openYoloLive();
   void closeYoloLive() => _state._closeYoloLiveView();
+  void debugYoloViewError(Object error) => _state._onYoloViewError(error);
   bool get yoloLiveOpen => _state._yoloLiveOpen;
 
   /// Cloud-ASR fallback seams: substitute the recorder /
@@ -1419,9 +1422,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// utterance's first moments; see _trackedSpeak.
   DateTime? _pttStoppedUtteranceAt;
 
-  final WakelockControl _wakelock = WakelockControl(PluginWakelockGateway());
+  final WakelockControl _wakelock =
+      WakelockControl(mingtuWakelockGatewayOverride ?? PluginWakelockGateway());
   late final ForegroundWatchdog _watchdog = ForegroundWatchdog(
-    now: DateTime.now,
+    now: mingtuWatchdogNowOverride ?? DateTime.now,
     onFault: (text) => _say(_request(
         id: 'foreground-fault-${DateTime.now().microsecondsSinceEpoch}',
         eventId: text,
@@ -5916,6 +5920,42 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  void _onYoloViewError(Object error) {
+    // Classified, never raw: a CAMERA
+    // PERMISSION denial and a MODEL LOAD
+    // failure get DIFFERENT announcements --
+    // the remedies differ (open system
+    // settings vs fix the bundled model). One
+    // shared sentence for both was a Codex
+    // re-test finding.
+    final YoloViewErrorKind errorKind = classifyYoloViewError(error);
+    mingtuVoiceLog('YOLO 实时视图出错类别：${errorKind.name}');
+    _logMsg('YOLO 实时视图出错：${yoloViewErrorStatus(errorKind)}。');
+    setState(() {
+      _yoloText = yoloViewErrorStatus(errorKind);
+      if (errorKind == YoloViewErrorKind.modelLoadFailed) {
+        _yoloModelFailed = true;
+        _closeYoloLiveView();
+        _yoloAvailableAtStartup = false;
+        _yoloDetector = UnavailableYoloDetector();
+      }
+    });
+    if (!_yoloErrorAnnounced) {
+      _yoloErrorAnnounced = true;
+      _health.report(
+        'yolo',
+        ServiceHealthStatus.unavailable,
+        yoloViewErrorStatus(errorKind),
+      );
+      _say(_request(
+        id: 'yolo-view-error',
+        eventId: 'yolo-view-error',
+        text: yoloViewErrorSpeech(errorKind),
+        kind: SpeechKind.alert,
+      ));
+    }
+  }
+
   /// Open the YOLO live view under the shared arbiter. The
   /// acquire first waits for any pending physical release; when
   /// the camera is busy (or the wait times out) the view does NOT
@@ -7441,45 +7481,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                                   _yoloLatencyMs = ms;
                                 });
                               },
-                              onError: (Object error) {
-                                // Classified, never raw: a CAMERA
-                                // PERMISSION denial and a MODEL LOAD
-                                // failure get DIFFERENT announcements --
-                                // the remedies differ (open system
-                                // settings vs fix the bundled model). One
-                                // shared sentence for both was a Codex
-                                // re-test finding.
-                                final YoloViewErrorKind errorKind =
-                                    classifyYoloViewError(error);
-                                mingtuVoiceLog(
-                                    'YOLO 实时视图出错类别：${errorKind.name}');
-                                _logMsg(
-                                    'YOLO 实时视图出错：${yoloViewErrorStatus(errorKind)}。');
-                                setState(() {
-                                  _yoloText = yoloViewErrorStatus(errorKind);
-                                  if (errorKind ==
-                                      YoloViewErrorKind.modelLoadFailed) {
-                                    _yoloModelFailed = true;
-                                    _closeYoloLiveView();
-                                    _yoloAvailableAtStartup = false;
-                                    _yoloDetector = UnavailableYoloDetector();
-                                  }
-                                });
-                                if (!_yoloErrorAnnounced) {
-                                  _yoloErrorAnnounced = true;
-                                  _health.report(
-                                    'yolo',
-                                    ServiceHealthStatus.unavailable,
-                                    yoloViewErrorStatus(errorKind),
-                                  );
-                                  _say(_request(
-                                    id: 'yolo-view-error',
-                                    eventId: 'yolo-view-error',
-                                    text: yoloViewErrorSpeech(errorKind),
-                                    kind: SpeechKind.alert,
-                                  ));
-                                }
-                              },
+                              onError: _onYoloViewError,
                             )
                           : Container(
                               key:
