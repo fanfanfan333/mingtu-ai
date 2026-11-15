@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/widgets.dart';
 import 'package:mingtu_ai/adapters/voice_io.dart';
 import 'package:mingtu_ai/adapters/system_voice_io.dart';
+import 'package:mingtu_ai/adapters/amap_client.dart';
 import 'package:mingtu_ai/core/haptics.dart';
 import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
 import 'package:mingtu_ai/core/tts_recovery.dart';
@@ -10,6 +11,7 @@ import 'package:mingtu_ai/core/speech_scheduler.dart';
 import 'package:mingtu_ai/core/task_manager.dart';
 import 'package:mingtu_ai/main.dart';
 import 'package:mingtu_ai/modules/visual_perception.dart';
+import 'package:mingtu_ai/modules/map_navigation.dart';
 
 class FakeStartupTts extends SystemVoiceOutput {
   @override
@@ -88,6 +90,49 @@ void main() {
     expect(handle.activeSpeechKind, isNull);
     expect(handle.debugSpeechQueueLength, 0);
     expect(output.spoken, isEmpty);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('navigation recovery replays a hazard that appeared during failure',
+      (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    expect(handle.taskState, TaskState.navigating);
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    expect(handle.taskState, TaskState.paused);
+    for (final s in <double>[0.20, 0.32, 0.45, 0.60, 0.75]) {
+      handle.simulateDetections(<Detection>[
+        Detection(label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s),
+      ]);
+    }
+    expect(handle.taskState, TaskState.paused);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump();
+    await tester.pump();
+    expect(handle.taskState, TaskState.navigating);
+    expect(output.spoken.any((text) => text.contains('语音已恢复')), isTrue);
+    expect(output.spoken.every((text) => !text.contains('继续导航')), isTrue);
+    expect(output.spoken.any((text) => text.contains('车') || text.contains('障碍')), isTrue);
+    expect(output.spoken, contains('用盲杖确认。'));
+    final recoveryIndex = output.spoken.indexWhere((text) => text.contains('语音已恢复'));
+    final hazardIndex = output.spoken.indexWhere(
+        (text) => text.contains('车') || text.contains('障碍'));
+    expect(recoveryIndex, lessThan(hazardIndex));
+    expect(recoveryIndex, lessThan(output.spoken.indexOf('用盲杖确认。')));
+    expect(output.spoken.every((text) => !text.contains('直走')), isTrue);
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump();
+    expect(output.spoken.every((text) => !text.contains('直走')), isTrue);
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(seconds: 4));
   });
@@ -171,9 +216,113 @@ void main() {
     expect(output.spoken, contains('语音已恢复，导航仍在暂停。'));
     expect(output.spoken.any((text) => text.contains('直走')), isFalse);
     expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+    const a = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+    const b = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+    const c = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+    handle.debugInstallLiveTracker(
+      steps: const <AmapStep>[
+        AmapStep(action: '直行', orientation: '北', polyline: [a, b],
+            distanceM: 200, durationS: 150),
+        AmapStep(action: '右转', orientation: '东', polyline: [b, c],
+            distanceM: 100, durationS: 75),
+      ],
+      stepTexts: const ['直行', '右转进入林荫道'],
+      destination: c,
+      destinationName: '图书馆',
+    );
+    handle.debugLiveFix(GeoPoint(
+        latitude: b.latitude! - 25 / 111194.9, longitude: b.longitude), 5);
+    await tester.pump();
+    await tester.pump();
+    expect(output.spoken.any((text) =>
+        text.contains('右转') || text.contains('左转') || text.contains('转弯')), isFalse);
+    const far = GeoPoint(latitude: 37.730, longitude: 120.450);
+    handle.debugLiveFix(far, 5);
+    handle.debugLiveFix(far, 5);
+    await tester.pump();
+    await tester.pump();
+    expect(output.spoken.any((text) =>
+        text.contains('偏离路线') || text.contains('重新规划')), isFalse);
+    expect(handle.taskState, TaskState.paused);
+    final haptics = RecordingHaptics();
+    handle.debugSetHaptics(haptics);
+    for (final s in <double>[0.20, 0.32, 0.45, 0.60, 0.75]) {
+      handle.simulateDetections(<Detection>[
+        Detection(label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s),
+      ]);
+    }
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump();
+    expect(haptics.calls.any((c) => c == 'urgent' || c == 'warning'), isTrue);
+    expect(output.spoken.any((text) => text.contains('车') ||
+        text.contains('障碍') || text.contains('用盲杖确认。')), isTrue);
+    expect(handle.taskState, TaskState.paused);
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(seconds: 4));
   });
+
+  for (final bool offRoute in <bool>[false, true]) {
+    testWidgets(
+        offRoute ? 'resume catches up off-route during TTS pause' :
+            'resume catches up turn during TTS pause', (tester) async {
+      mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+      addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+      await tester.pumpWidget(const MingtuApp());
+      await tester.pump();
+      final handle = mingtuHomeDebugHandle!;
+      handle.startVoiceDemo();
+      handle.planRoute();
+      handle.startNavigating();
+      final output = FakeOutput();
+      handle.debugFailTts(() async => output);
+      handle.voiceCommand('暂停');
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pump();
+      expect(handle.taskState, TaskState.paused);
+      const a = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+      const b = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+      const c = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+      handle.debugInstallLiveTracker(
+        steps: const <AmapStep>[
+          AmapStep(action: '直行', orientation: '北', polyline: [a, b],
+              distanceM: 200, durationS: 150),
+          AmapStep(action: '右转', orientation: '东', polyline: [b, c],
+              distanceM: 100, durationS: 75),
+        ],
+        stepTexts: const ['直行', '右转进入林荫道'],
+        destination: c,
+        destinationName: '图书馆',
+      );
+      if (offRoute) {
+        const far = GeoPoint(latitude: 37.730, longitude: 120.450);
+        handle.debugLiveFix(far, 5);
+        handle.debugLiveFix(far, 5);
+      } else {
+        handle.debugLiveFix(GeoPoint(
+            latitude: b.latitude! - 25 / 111194.9, longitude: b.longitude), 5);
+      }
+      await tester.pump();
+      await tester.pump();
+      expect(output.spoken.any((text) => text.contains('右转') ||
+          text.contains('偏离路线') || text.contains('重新规划')), isFalse);
+      handle.voiceCommand('继续');
+      await tester.pump();
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pump();
+      expect(handle.taskState, TaskState.navigating);
+      expect(output.spoken.any((text) => text.contains(
+          offRoute ? '偏离路线' : '右转进入林荫道')), isTrue);
+      expect(output.spoken.any((text) => text.contains('已恢复导航，但直行提醒还没有恢复')), isTrue);
+      if (offRoute) expect(handle.debugRerouting, isTrue);
+      expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 4));
+    });
+  }
 
   testWidgets('recovery restores entrance search with matching wording', (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;

@@ -245,6 +245,12 @@ class NavigationTracker {
     _offRouteAnnounced = false;
   }
 
+  /// Whether the current position is beyond the normal off-route threshold.
+  bool isOffRoute(GeoPoint point) => _nearest(point).$2 > offRouteDistanceM;
+
+  /// Record an immediately handled off-route event to avoid duplicate fixes.
+  void markOffRouteAnnounced() => _offRouteAnnounced = true;
+
   int get rerouteCount => budget.count;
 
   /// Whether the step the user is currently on is a straight

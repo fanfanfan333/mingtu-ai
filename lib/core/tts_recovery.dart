@@ -78,6 +78,9 @@ class TtsRecoveryController {
   void danger(
       {int? trackId, String? eventId, DangerLevel level = DangerLevel.urgent}) {
     if (!_failed || _disposed) return;
+    final newEpisode = _dangerTrackId == null &&
+        _dangerEventId == null &&
+        _dangerLevel == null;
     final different = (trackId != null &&
             _dangerTrackId != null &&
             trackId != _dangerTrackId) ||
@@ -108,7 +111,8 @@ class TtsRecoveryController {
     _dangerIntervals.removeWhere((interval) =>
         !interval.$2.isAfter(start.subtract(dangerRollingWindow)));
     Duration episodeDuration = dangerDurationCap;
-    if (level != DangerLevel.urgent || !(different || escalated)) {
+    if (level != DangerLevel.urgent ||
+        !(newEpisode || different || escalated)) {
       // Usage during a continuously running episode is monotonic over this
       // window: old active time can leave no faster than new time enters.
       int usageAt(int micros) {

@@ -228,6 +228,8 @@ class MingtuHomeDebugHandle {
   /// to read the on-screen state line).
   TaskState get taskState => _state._tasks.state;
 
+  bool get debugRerouting => _state._rerouting;
+
   /// The on-screen state line's text form, kept as state:
   /// '当前任务状态：<state>' with the same Chinese state name
   /// the panel used to render.
@@ -1320,6 +1322,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _lastNavHazUrgent = false;
   bool _replayHazardAfterRecovery = false;
   bool _userPausedDuringTtsFailure = false;
+  int? _pausedTurnStepIndex;
+  NavigationTracker? _pausedTurnTracker;
   bool get _hazardWatchActive {
     if (_tasks.state == TaskState.navigating ||
         _tasks.state == TaskState.avoidingObstacle ||
@@ -1360,11 +1364,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             _tasks.canTransitionTo(last.from)) {
           final clearedObstacle = last.from == TaskState.avoidingObstacle &&
               !_riskActive && !_yoloRiskActive;
+          final navigatingWithRisk = last.from == TaskState.navigating &&
+              (_riskActive || _yoloRiskActive);
           _tasks.transitionTo(
             clearedObstacle ? TaskState.navigating : last.from,
             trigger: 'tts-recovery',
           );
-          if (last.from == TaskState.avoidingObstacle && !clearedObstacle) {
+          if ((last.from == TaskState.avoidingObstacle && !clearedObstacle) ||
+              navigatingWithRisk) {
             spokenAnnouncement = '语音已恢复。';
             _replayHazardAfterRecovery = true;
           } else if (last.from == TaskState.findingEntrance) {
@@ -1373,7 +1380,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             spokenAnnouncement = '语音已恢复，继续导航。';
           }
           recoveredEmergency = last.from == TaskState.emergency;
-          if (last.from == TaskState.navigating || clearedObstacle) {
+          if ((last.from == TaskState.navigating && !navigatingWithRisk) ||
+              clearedObstacle) {
             _straightConfirmed = true;
             _recheckStraightResume(rearmIfRunning: true);
           }
@@ -2389,7 +2397,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (_amapNaviActive && e.kind == NavEventKind.turnAhead) continue;
       _handleNavEvent(e);
     }
-    if (_pacing.isPaused && !_rerouting) {
+    if (_pacing.isPaused && !_rerouting && !_userPausedDuringTtsFailure) {
       // A re-planned route whose first segment was not
       // straight stays suspended; a later fix may reach a
       // straight segment, judged by the NEW tracker only.
@@ -2469,11 +2477,46 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _tasks.transitionTo(TaskState.completed, trigger: 'entrance-arrived');
       _tasks.reset();
       _userPausedDuringTtsFailure = false;
+      _pausedTurnStepIndex = null;
+      _pausedTurnTracker = null;
     }
     _askDestination(prompt: '还要去别的地方吗？');
   }
 
+  void _catchUpPausedNavigation() {
+    final NavigationTracker? nav = _liveNav;
+    final GeoPoint? point = _lastFixPoint;
+    final int? turnStep = _pausedTurnStepIndex;
+    final bool sameTracker = identical(nav, _pausedTurnTracker);
+    _pausedTurnStepIndex = null;
+    _pausedTurnTracker = null;
+    if (nav == null) return;
+    nav.resetOffRouteStreak();
+    if (point == null) return;
+    if (nav.isOffRoute(point)) {
+      nav.markOffRouteAnnounced();
+      _handleNavEvent(const NavEvent(NavEventKind.offRoute, '你已偏离路线。'));
+      return;
+    }
+    if (turnStep == null || !sameTracker) return;
+    final String? text = nav.regenerateTurnPrompt(
+      turnStep,
+      NavFix(point: point, accuracyM: _lastFixAccuracyM, at: DateTime.now()),
+    );
+    if (text != null) {
+      _handleNavEvent(NavEvent(NavEventKind.turnAhead, text, stepIndex: turnStep));
+    }
+  }
+
   void _handleNavEvent(NavEvent e) {
+    if (_userPausedDuringTtsFailure &&
+        (e.kind == NavEventKind.turnAhead || e.kind == NavEventKind.offRoute)) {
+      if (e.kind == NavEventKind.turnAhead) {
+        _pausedTurnStepIndex = e.stepIndex;
+        _pausedTurnTracker = _liveNav;
+      }
+      return;
+    }
     final String ts = '${DateTime.now().millisecondsSinceEpoch}';
     void speak(NavEventSpeech speech) => _say(_request(
           id: speech.id,
@@ -2606,6 +2649,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _amapNaviActive = false;
     if (naviSource != null) unawaited(naviSource.stop());
     _liveNav = null;
+    _pausedTurnStepIndex = null;
+    _pausedTurnTracker = null;
     _updateForegroundPolicies();
     _liveNavRemainingM = null;
     _entrance = null;
@@ -3453,6 +3498,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final DateTime now = _speechNow();
     const Duration expiry = NavHazConfig.replayExpiry;
     for (final SpeechRequest r in _scheduler.interruptedNavigationRequests()) {
+      if (_userPausedDuringTtsFailure &&
+          (r.eventId.startsWith('nav-turn') ||
+              r.eventId.startsWith('nav-offroute') ||
+              (r.replay == NavReplay.regenerate && r.navStepIndex != null))) {
+        _scheduler.discardInterrupted(r);
+        continue;
+      }
       final DateTime? at = _scheduler.interruptedAtOf(r);
       if (at != null && now.difference(at) >= expiry) {
         _scheduler.discardInterrupted(r);
@@ -7497,6 +7549,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.resume:
+        final bool catchUpNavigation = _userPausedDuringTtsFailure &&
+            _tasks.state == TaskState.paused;
         _userPausedDuringTtsFailure = false;
         // v0.7: while navigating with straight unconfirmed and no
         // risk, "继续" re-confirms the straight segment (e.g. after a
@@ -7520,6 +7574,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             text: '已恢复导航，但直行提醒还没有恢复，请先重新确认直行路段。',
             kind: SpeechKind.info,
           ));
+          if (catchUpNavigation) _catchUpPausedNavigation();
         } else {
           _say(_request(
             id: 'voice-resume-no-${DateTime.now().millisecondsSinceEpoch}',
@@ -7531,6 +7586,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         return;
       case VoiceCommand.cancel:
         _userPausedDuringTtsFailure = false;
+        _pausedTurnStepIndex = null;
+        _pausedTurnTracker = null;
         if (_tasks.canTransitionTo(TaskState.cancelled)) {
           _tasks.transitionTo(TaskState.cancelled, trigger: 'voice-cancel');
           _endLiveNavigation();
@@ -7686,6 +7743,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   void _triggerEmergency() {
     _userPausedDuringTtsFailure = false;
+    _pausedTurnStepIndex = null;
+    _pausedTurnTracker = null;
     _ttsRecovery.stopDanger();
     _emergencyTriggerCount++;
     final DateTime now = DateTime.now();
@@ -7747,6 +7806,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   void _resetDemo() {
     _userPausedDuringTtsFailure = false;
+    _pausedTurnStepIndex = null;
+    _pausedTurnTracker = null;
     _ttsRecovery.stopDanger();
     _stopStraightTimer();
     if (_tasks.state == TaskState.emergency || _tasks.isTerminal) {
