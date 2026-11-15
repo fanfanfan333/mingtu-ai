@@ -147,6 +147,72 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
   });
 
+  testWidgets(
+      'navigation recovery re-arms straight prompts at 3 second intervals',
+      (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    var now = DateTime(2026);
+    handle.debugSetStraightClock(() => now);
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump();
+    expect(handle.taskState, TaskState.navigating);
+    expect(output.spoken, isNot(contains('直走')));
+    expect(handle.activeSpeechText, isNot('直走'));
+    expect(handle.debugSpeechQueueLength, 0);
+    now = now.add(const Duration(seconds: 2));
+    await tester.pump(const Duration(seconds: 2));
+    expect(output.spoken, isNot(contains('直走')));
+    expect(handle.activeSpeechText, isNot('直走'));
+    expect(handle.debugSpeechQueueLength, 0);
+    now = now.add(const Duration(seconds: 1));
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    expect(output.spoken.where((text) => text == '直走').length, 1);
+    now = now.add(const Duration(seconds: 3));
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump();
+    expect(output.spoken.where((text) => text == '直走').length,
+        greaterThanOrEqualTo(2));
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('user pause remains quiet after TTS recovery', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    handle.voiceCommand('暂停');
+    await tester.pump();
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 10));
+    expect(handle.taskState, TaskState.paused);
+    expect(output.spoken, isNot(contains('直走')));
+    expect(handle.activeSpeechText, isNot('直走'));
+    expect(handle.debugSpeechQueueLength, 0);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
   test('retries after 1, 3, 10 and repeated 10 second delays', () {
     fakeAsync((clock) {
       var attempts = 0;

@@ -347,6 +347,9 @@ class MingtuHomeDebugHandle {
   void debugSetSpeechClock(DateTime Function()? clock) =>
       _state._speechNow = clock ?? DateTime.now;
 
+  void debugSetStraightClock(DateTime Function() clock) =>
+      _state._straightNow = clock;
+
   /// NAVHAZ M1 seam (EGOUNK round): inject a fixed camera
   /// pitch for tests. The widget environment has no
   /// accelerometer, so the pitch monitor reads unknown and
@@ -694,6 +697,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// time bases for the same judgement invited exactly
   /// the confusion the CDX3 round removed.)
   DateTime Function() _speechNow = DateTime.now;
+  DateTime Function() _straightNow = DateTime.now;
 
   /// NH-M1-10: install the fake segment clock + stamp
   /// collection for the segment-2 test (debug handle
@@ -1349,6 +1353,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             _tasks.canTransitionTo(last.from)) {
           _tasks.transitionTo(last.from, trigger: 'tts-recovery');
           spokenAnnouncement = '语音已恢复，继续导航。';
+          if (last.from == TaskState.navigating) {
+            _straightConfirmed = true;
+            _scheduler.resumeStraight(
+              now: _straightNow(),
+              straightSegmentConfirmed: true,
+              riskActive: false,
+              currentNavigationVersion: _navVersion,
+              straightNavigationVersion: _navVersion,
+            );
+            _startStraightTimer();
+          }
         } else {
           spokenAnnouncement = '语音已恢复，导航仍在暂停。';
         }
@@ -3821,13 +3836,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!resumed) return;
     // The machine judged the resume valid on current state;
     // re-arm the scheduler's 3 s clock from NOW (no catch-up)
-    // and restart the single timer. This is the ONLY place
-    // either happens for a resume: no flow may call the
-    // scheduler's resume or the timer directly (the demo
-    // re-confirmation used to, bypassing the persistent
-    // pacing state entirely).
+    // and restart the single timer when the pacing hold clears.
+    // TTS recovery separately re-arms an already-running session.
     _scheduler.resumeStraight(
-      now: DateTime.now(),
+      now: _straightNow(),
       straightSegmentConfirmed: true,
       riskActive: false,
       currentNavigationVersion: _navVersion,
@@ -3859,7 +3871,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _riskActive) {
       return;
     }
-    final DateTime now = DateTime.now();
+    final DateTime now = _straightNow();
     if (!_scheduler.shouldPlayStraight(
       now: now,
       straightSegmentConfirmed: true,
