@@ -69,7 +69,7 @@ HazardKind? hazardKindForLabel(String label) => switch (label) {
       _ => null,
     };
 
-enum StepAdvice { stopOnly, stepLeft, stepRight }
+enum StepAdvice { stopOnly }
 
 enum BoxDistanceLevel { near, mid, far, unknown }
 

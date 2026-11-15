@@ -40,9 +40,10 @@ void main() {
       expect(a.stepDirection, StepDirection.none);
       expect(a.action, RiskAction.stop);
     }
-    // Ordinary obstacle with the same evidence may still step.
+    // Ordinary obstacle with the same evidence also requires stopping.
     final ok = engine.assess(_event('obstacle', _confirmedSide), now);
-    expect(ok.stepDirection, StepDirection.right);
+    expect(ok.stepDirection, StepDirection.none);
+    expect(ok.action, RiskAction.stop);
   });
 
   test('traffic scene service never allows crossing', () {

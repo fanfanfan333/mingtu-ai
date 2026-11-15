@@ -6446,7 +6446,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           '步数方向：${assessment.stepDirection?.name ?? 'none'}。'
           '注意：播报完成不等于动作完成，需下一步重新感知确认。';
     });
-    _logMsg('障碍（侧方已确认）：仅在演示数据确认右侧可通行时才给出一步指令。');
+    _logMsg('障碍（侧方已确认）：请停下，用盲杖确认。');
     _say(_request(
       id: 'obstacle-confirmed-prompt',
       eventId: 'obstacle-confirmed',

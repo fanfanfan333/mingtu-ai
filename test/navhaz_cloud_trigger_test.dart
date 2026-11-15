@@ -150,9 +150,7 @@ void main() {
       );
     });
 
-    test('advisor gate: a step verdict, or no verdict yet, never fires', () {
-      expect(policy.evaluate(blocked(advice: StepAdvice.stepLeft)), isNull);
-      expect(policy.evaluate(blocked(advice: StepAdvice.stepRight)), isNull);
+    test('advisor gate: no verdict yet never fires', () {
       expect(policy.evaluate(blocked(advice: null)), isNull);
     });
 
