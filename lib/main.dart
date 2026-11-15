@@ -5126,11 +5126,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!mounted || !_foreground) return;
     if (_countHeadsetPress()) {
       if (_headsetCooldownTimer?.isActive ?? false) {
+        if (_scheduler.active?.kind == SpeechKind.emergency ||
+            _scheduler.queue
+                .any((request) => request.kind == SpeechKind.emergency)) {
+          unawaited(_haptics.vibrateWarning());
+          return;
+        }
         _say(_request(
           id: 'headset-emergency-in-progress',
           eventId: 'headset-emergency-in-progress',
           text: '紧急求助已在进行',
-          kind: SpeechKind.emergency,
+          kind: SpeechKind.info,
         ));
         return;
       }

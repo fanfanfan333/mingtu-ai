@@ -6,6 +6,7 @@ import 'package:flutter/semantics.dart' show CustomSemanticsAction;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/main.dart';
 import 'package:mingtu_ai/core/pocket_mode.dart';
+import 'package:mingtu_ai/core/haptics.dart';
 import 'package:mingtu_ai/modules/emergency.dart';
 
 void main() {
@@ -275,11 +276,19 @@ void main() {
     expect(h.emergencyTriggerCount, 0);
     h.debugHeadsetToggle();
     expect(h.emergencyTriggerCount, 1);
+    final fallback = h.debugActiveSpeech;
+    expect(fallback?.id, 'emergency-1');
+    expect(fallback?.text, contains('备用办法：'));
+    final haptics = RecordingHaptics();
+    h.debugSetHaptics(haptics);
     h.debugHeadsetToggle();
     h.debugHeadsetToggle();
     h.debugHeadsetToggle();
     expect(h.emergencyTriggerCount, 1);
-    expect(h.debugActiveSpeech?.text, '紧急求助已在进行');
+    expect(h.debugActiveSpeech, same(fallback));
+    expect(h.debugLensSpeechQueue.map((speech) => speech.text),
+        isNot(contains('紧急求助已在进行')));
+    expect(haptics.calls, ['warning']);
     await tester.pump(headsetEmergencyCooldown);
     h.debugHeadsetToggle();
     h.debugHeadsetToggle();
