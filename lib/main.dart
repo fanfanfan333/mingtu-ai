@@ -6045,6 +6045,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       text: '$text。',
       kind: alert.speechKind,
     ));
+    if (alert.urgent) {
+      _say(_request(
+        id: '$requestId-cane',
+        eventId: 'navhaz-cane-${alert.trackId}',
+        text: '用盲杖确认。',
+        kind: SpeechKind.alert,
+      ));
+    }
     _logMsg('NAVHAZ ${alert.urgent ? '紧急' : '警示'}：$text'
         '（track ${alert.trackId}）。');
   }

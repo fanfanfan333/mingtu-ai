@@ -3,12 +3,7 @@
 /// Blind-path priority is a preference, NOT a hard rule: if the blind
 /// path ahead is blocked, the system must not keep following it.
 /// "No obstacle detected" is never treated as "blind path is clear".
-enum BlindPathRecommendation {
-  continueOnBlindPath,
-  useAlternative,
-  stopAndAskHelp,
-  uncertain
-}
+enum BlindPathRecommendation { continueOnBlindPath, stopAndAskHelp, uncertain }
 
 class BlindPathAssessment {
   final BlindPathRecommendation recommendation;
@@ -38,19 +33,11 @@ class BlindPathService {
         'blind-path-not-blocked-in-this-frame-only',
       );
     }
-    // Blocked.
-    if (alternativeConfirmed && alternativeSideKnown) {
-      return const BlindPathAssessment(
-        BlindPathRecommendation.useAlternative,
-        '前方盲道被占用，已确认有替代通道，请等待具体绕行指令。',
-        'alternative-confirmed',
-      );
-    }
-    // Blocked and alternative NOT confirmed: never guess a side.
+    // A blocked path requires stopping regardless of alternative reports.
     return const BlindPathAssessment(
       BlindPathRecommendation.stopAndAskHelp,
-      '前方盲道被占用，暂时无法确认绕行方向，请先停下。',
-      'blocked-alternative-unconfirmed',
+      '前方盲道被占用，请停下，用盲杖确认。',
+      'blind-path-blocked',
     );
   }
 }
