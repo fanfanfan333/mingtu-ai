@@ -6782,27 +6782,44 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     int seq = 0;
     try {
       if (_permissionGateway.isAvailable &&
-          !_grantedPermissions.contains(GuidePermission.camera) &&
-          (!_guideResolvedSeen ||
-              await _permissionStatus(GuidePermission.camera) !=
-                  PermissionOutcome.granted)) {
-        if (!mounted) return;
-        _say(_request(
-          id: 'manual-camera-permission-${_permissionSpeechSeq++}',
-          eventId: 'manual-camera-permission-$_permissionSpeechSeq',
-          kind: SpeechKind.alert,
-          text: _guideResolvedSeen
-              ? permissionDeniedText(GuidePermission.camera)
-              : permissionPurposeText(GuidePermission.camera),
-        ));
+          !_grantedPermissions.contains(GuidePermission.camera)) {
         if (!_guideResolvedSeen) {
           if (_permissionFlowRunning) {
             _retryDeferredPermissionFlow();
           } else {
             unawaited(_runFirstLaunchGuideAndPermissions());
           }
+          return;
         }
-        return;
+        PermissionOutcome status =
+            await _permissionStatus(GuidePermission.camera);
+        if (!mounted || token.isCancelled) return;
+        if (status == PermissionOutcome.denied) {
+          final bool delivered = await _sayPermissionFlowText(
+            permissionPurposeText(GuidePermission.camera),
+            alert: true,
+            requireDelivery: true,
+          );
+          if (!delivered || !mounted || token.isCancelled) return;
+          try {
+            status = await _permissionGateway
+                .request(GuidePermission.camera)
+                .timeout(AppConfig.effectivePermissionRequestTimeout);
+          } catch (_) {
+            status = PermissionOutcome.denied;
+          }
+          if (!mounted || token.isCancelled) return;
+        }
+        if (status != PermissionOutcome.granted) {
+          _say(_request(
+            id: 'manual-camera-permission-${_permissionSpeechSeq++}',
+            eventId: 'manual-camera-permission-$_permissionSpeechSeq',
+            kind: SpeechKind.alert,
+            text: permissionDeniedText(GuidePermission.camera),
+          ));
+          return;
+        }
+        _grantedPermissions.add(GuidePermission.camera);
       }
       if (!mounted) return;
       final CloudVisionFlowOutcome outcome = await _cloudVisionFlow.run(

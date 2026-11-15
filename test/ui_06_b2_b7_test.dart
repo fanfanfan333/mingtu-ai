@@ -974,6 +974,7 @@ void main() {
   testWidgets('B8 manual vision checks camera grant before flow',
       (tester) async {
     store.seen = true;
+    gateway.requestResults[GuidePermission.camera] = PermissionOutcome.denied;
     final h = await _openApp(tester);
     await _pumpSpeaks(tester, h);
     final frames = _CountingFrameSource();
@@ -994,6 +995,84 @@ void main() {
         () => mingtuHomeDebugHandle!.statusTexts
             .any((text) => text.contains('识图未配置')),
         'granted manual vision proceeds');
+  });
+
+  testWidgets('B12 camera purpose completes before re-request', (tester) async {
+    store.seen = true;
+    gateway.requestResults[GuidePermission.camera] = PermissionOutcome.denied;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    final frames = _CountingFrameSource();
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
+    final purpose = permissionPurposeText(GuidePermission.camera);
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _driveUntil(tester, h, () => h.events.contains('tts.speak:$purpose'),
+        'camera purpose',
+        hold: {purpose});
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+    expect(frames.calls, 0);
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.camera),
+        'camera request');
+    expect(h.events.indexOf('tts.speak:$purpose'),
+        lessThan(h.events.indexOf('request:camera')));
+    await _pumpSpeaks(tester, h, rounds: 5);
+    expect(frames.calls, 0);
+    expect(containsBannedWord(purpose), isFalse);
+    expect(containsBannedWord(permissionDeniedText(GuidePermission.camera)),
+        isFalse);
+  });
+
+  testWidgets('B12 unfinished camera purpose prevents request', (tester) async {
+    store.seen = true;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    final frames = _CountingFrameSource();
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
+    final purpose = permissionPurposeText(GuidePermission.camera);
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _driveUntil(tester, h, () => h.events.contains('tts.speak:$purpose'),
+        'camera purpose',
+        hold: {purpose});
+    await _pumpSpeaks(tester, h, rounds: 10, hold: {purpose});
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+    expect(frames.calls, 0);
+    expect(containsBannedWord(purpose), isFalse);
+  });
+
+  testWidgets('B12 permanent camera denial does not request', (tester) async {
+    store.seen = true;
+    gateway.statusResults[GuidePermission.camera] =
+        PermissionOutcome.permanentlyDenied;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    final frames = _CountingFrameSource();
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
+    mingtuHomeDebugHandle!.triggerManualVision();
+    final denial = permissionDeniedText(GuidePermission.camera);
+    await _driveUntil(tester, h, () => h.events.contains('tts.speak:$denial'),
+        'camera denial');
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+    expect(frames.calls, 0);
+    expect(containsBannedWord(denial), isFalse);
+  });
+
+  testWidgets('B12 mid-guide manual vision keeps microphone first',
+      (tester) async {
+    final h = await _openApp(tester);
+    final mic = permissionPurposeText(GuidePermission.microphone);
+    final camera = permissionPurposeText(GuidePermission.camera);
+    await _driveUntil(tester, h, () => h.events.contains('tts.speak:$mic'),
+        'microphone purpose',
+        hold: {mic});
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _pumpSpeaks(tester, h, rounds: 5, hold: {mic});
+    expect(h.events, isNot(contains('tts.speak:$camera')));
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+    expect(containsBannedWord(mic), isFalse);
+    expect(containsBannedWord(camera), isFalse);
   });
 
   test('B8 production manual flow gates camera before run', () {
