@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart' show CustomSemanticsAction;
 import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
@@ -1556,7 +1557,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  void _requestEmergencyConfirm() {
+  void _requestEmergencyConfirm({
+    String confirmationText = '即将发起紧急求助，再次三指长按确认',
+  }) {
     if (_emergencyConfirmTimer != null) {
       _emergencyConfirmTimer!.cancel();
       _emergencyConfirmTimer = null;
@@ -1570,7 +1573,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _say(_request(
       id: id,
       eventId: id,
-      text: '即将发起紧急求助，再次三指长按确认',
+      text: confirmationText,
       kind: SpeechKind.alert,
     ));
   }
@@ -7723,6 +7726,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                     if (!_pocketMode.ignoreTouches) _pttToggleTap();
                   }
                 : null,
+            customSemanticsActions: <CustomSemanticsAction, VoidCallback>{
+              const CustomSemanticsAction(label: '紧急求助'): () {
+                if (!_pocketMode.ignoreTouches) {
+                  _requestEmergencyConfirm(
+                    confirmationText: '即将发起紧急求助，再次选择紧急求助确认',
+                  );
+                }
+              },
+            },
             onLongPress: () {
               if (!_pocketMode.ignoreTouches) {
                 if (toggleMode) {

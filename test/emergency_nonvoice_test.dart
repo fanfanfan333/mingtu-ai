@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:ui' show SemanticsAction;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart' show CustomSemanticsAction;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/main.dart';
 import 'package:mingtu_ai/core/pocket_mode.dart';
@@ -12,6 +14,119 @@ void main() {
     expect(result.contactClaimed, isFalse);
     expect(result.statusText, contains('尚未确认联系到任何帮助站'));
     expect(result.statusText, contains('请不要等待'));
+  });
+
+  testWidgets('custom emergency action shares confirmation and expires',
+      (tester) async {
+    final semantics = tester.ensureSemantics();
+    await tester.pumpWidget(const MingtuApp());
+    final h = mingtuHomeDebugHandle!;
+    final initialState = h.taskState;
+    final initialCamera = h.yoloLiveOpen;
+    const action = CustomSemanticsAction(label: '紧急求助');
+    void invoke() {
+      final node =
+          tester.getSemantics(find.bySemanticsLabel('按住说话按钮，按住后说话，松开结束'));
+      expect(node.getSemanticsData().customSemanticsActionIds,
+          contains(CustomSemanticsAction.getIdentifier(action)));
+      node.owner!.performAction(node.id, SemanticsAction.customAction,
+          CustomSemanticsAction.getIdentifier(action));
+    }
+
+    invoke();
+    await tester.pump();
+    expect(h.currentPromptText, contains('即将发起紧急求助，再次选择紧急求助确认'));
+    expect(h.emergencyTriggerCount, 0);
+    expect(h.taskState, initialState);
+    expect(h.yoloLiveOpen, initialCamera);
+    await tester.pump(emergencyConfirmTimeout);
+    invoke();
+    await tester.pump();
+    expect(h.emergencyTriggerCount, 0);
+    expect(h.taskState, initialState);
+    expect(h.yoloLiveOpen, initialCamera);
+    invoke();
+    await tester.pump();
+    expect(h.emergencyTriggerCount, 1);
+    expect(h.statusTexts.join(), contains('尚未确认联系到任何帮助站'));
+    expect(h.currentPromptText, contains('尚未确认联系到任何帮助站'));
+    expect(h.currentPromptText, contains('请不要等待'));
+    expect(h.currentPromptText, isNot(contains('已联系帮助站')));
+    semantics.dispose();
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(seconds: 3));
+    }
+  });
+
+  testWidgets('three-finger confirmation accepts custom emergency action',
+      (tester) async {
+    final semantics = tester.ensureSemantics();
+    await tester.pumpWidget(const MingtuApp());
+    final h = mingtuHomeDebugHandle!;
+    final gestures = <TestGesture>[];
+    for (var i = 0; i < 3; i++) {
+      gestures.add(await tester.startGesture(Offset(100.0 + i * 50, 100),
+          pointer: i + 1));
+    }
+    await tester.pump(const Duration(milliseconds: 900));
+    for (final gesture in gestures) {
+      await gesture.up();
+    }
+    expect(h.emergencyTriggerCount, 0);
+    final node =
+        tester.getSemantics(find.bySemanticsLabel('按住说话按钮，按住后说话，松开结束'));
+    node.owner!.performAction(
+        node.id,
+        SemanticsAction.customAction,
+        CustomSemanticsAction.getIdentifier(
+            const CustomSemanticsAction(label: '紧急求助')));
+    await tester.pump();
+    expect(h.emergencyTriggerCount, 1);
+    semantics.dispose();
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(seconds: 3));
+    }
+  });
+
+  testWidgets('pocket lock ignores custom emergency action', (tester) async {
+    final proximity = StreamController<bool>.broadcast();
+    mingtuProximityEventsOverride = () => proximity.stream;
+    mingtuPocketNowOverride = tester.binding.clock.now;
+    addTearDown(() async {
+      mingtuProximityEventsOverride = null;
+      mingtuPocketNowOverride = null;
+      await proximity.close();
+    });
+    final semantics = tester.ensureSemantics();
+    await tester.pumpWidget(const MingtuApp());
+    final h = mingtuHomeDebugHandle!;
+    h.debugSetPocketEnabled(true);
+    proximity.add(true);
+    await tester.pump();
+    await tester.pump(pocketNearDuration);
+    expect(h.debugIgnoreTouches, isTrue);
+    final state = h.taskState;
+    final camera = h.yoloLiveOpen;
+    final prompt = h.currentPromptText;
+    final node =
+        tester.getSemantics(find.bySemanticsLabel('按住说话按钮，按住后说话，松开结束'));
+    node.owner!.performAction(
+        node.id,
+        SemanticsAction.customAction,
+        CustomSemanticsAction.getIdentifier(
+            const CustomSemanticsAction(label: '紧急求助')));
+    await tester.pump();
+    expect(h.currentPromptText, prompt);
+    expect(h.emergencyTriggerCount, 0);
+    expect(h.taskState, state);
+    expect(h.yoloLiveOpen, camera);
+    semantics.dispose();
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(seconds: 3));
+    }
   });
 
   testWidgets('three fingers held trigger once with truthful speech',
