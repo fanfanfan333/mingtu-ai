@@ -33,6 +33,7 @@ import 'core/asr_errors.dart';
 import 'core/danger_alerts.dart';
 import 'core/avoidance_advisor.dart';
 import 'core/cloud_vision_hazard.dart';
+import 'core/walking_hazard_scan.dart';
 import 'core/cloud_trigger_policy.dart';
 import 'core/pothole_scan.dart';
 import 'core/orientation.dart';
@@ -660,7 +661,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
-
   /// The clock every speech-arbitration timestamp runs on
   /// (CDX3): request creation / expiry stamps, the
   /// scheduler's submit stamps -- which is where an
@@ -1044,6 +1044,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // automatic event triggers alike).
   final VisionRateBackoff _visionBackoff = VisionRateBackoff();
   final CloudVisionDowngradeGate _visionDowngrade = CloudVisionDowngradeGate();
+  late final WalkingHazardScan _walkingHazardScan = WalkingHazardScan(
+    gate: _visionDowngrade,
+    scan: _captureWalkingHazard,
+    speak: (String text) {
+      if (!mounted || _liveNav == null) return;
+      final String id =
+          'walking-hazard-${DateTime.now().microsecondsSinceEpoch}';
+      _say(_request(id: id, eventId: id, text: text, kind: SpeechKind.alert));
+    },
+  );
   GeoPoint? _lastFixPoint;
   double? _lastFixAccuracyM;
   // Latest GPS ground speed carried by a live fix, and
@@ -1287,7 +1297,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     rebuild: () async {
       if (_ttsRebuildOverride != null) return _ttsRebuildOverride!();
       final output = SystemVoiceOutput();
-      if (!await output.initialize() || !output.chineseVoiceVerified) return null;
+      if (!await output.initialize() || !output.chineseVoiceVerified) {
+        return null;
+      }
       output.onSpeakStart = _onTtsSpeakStart;
       return output;
     },
@@ -1299,8 +1311,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       setState(() {
         _voiceText = '语音：TTS：${output.status}；ASR：${_voiceInput.status}。';
       });
-      _say(_request(id: 'tts-recovered-${DateTime.now().microsecondsSinceEpoch}',
-          eventId: 'tts-recovered', text: announcement, kind: SpeechKind.info));
+      _say(_request(
+          id: 'tts-recovered-${DateTime.now().microsecondsSinceEpoch}',
+          eventId: 'tts-recovered',
+          text: announcement,
+          kind: SpeechKind.info));
     },
   );
 
@@ -2054,6 +2069,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// subscribe to the (once-converted) position stream.
   void _beginLiveNavigation(
       RealNavigationOutcome outcome, String destinationName) {
+    if (_liveNav == null) {
+      final String id =
+          'walking-disclaimer-${DateTime.now().microsecondsSinceEpoch}';
+      _say(_request(
+          id: id,
+          eventId: id,
+          text: walkingNavigationDisclaimer,
+          kind: SpeechKind.alert));
+    }
     // A route was just installed: any earlier reroute-failure
     // notice belongs to a finished episode.
     _rerouteFailureAnnounced = false;
@@ -5819,6 +5843,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // no live navigation is running.
     _updateCloudTriggerEvidence(result, egoNow, now);
     _evaluateCloudAutoTriggers(now);
+    unawaited(_walkingHazardScan.tick(
+      navigating: _liveNav != null && navigating,
+      walking: egoNow.isWalking,
+      busy: _cloudAutoBudget.inFlight || _cloudVisionFlow.inFlight,
+      now: now,
+    ));
     // S3 segment 2 START: the pipeline has returned.
     // (Stamped on the segment clock -- the wall clock in
     // production; a test may install a fake through the
@@ -6665,7 +6695,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _logMsg('云端视觉：429 退避中，手动识图已跳过，只用本地检测。');
       return;
     }
-    if (!_cloudAutoBudget.tryBegin(VisionTrigger.manual, now)) {
+    if (_walkingHazardScan.inFlight ||
+        !_cloudAutoBudget.tryBegin(VisionTrigger.manual, now)) {
       _logMsg('云端视觉：已有云端请求在进行中，手动识图已跳过。');
       _say(_request(
         id: 'cloud-vision-busy-${now.millisecondsSinceEpoch}',
@@ -6741,6 +6772,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// budget records a dispatch only when a request will
   /// actually go out.
   void _evaluateCloudAutoTriggers(DateTime now) {
+    if (_walkingHazardScan.inFlight) return;
     if (!NavHazConfig.cloudAutoTriggerEnabled) return;
     final NavigationTracker? nav = _liveNav;
     if (nav == null) return;
@@ -6929,6 +6961,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       text: cloudVisionDowngradeSpeech,
       kind: SpeechKind.alert,
     ));
+  }
+
+  Future<HazardScanOutcome?> _captureWalkingHazard(DateTime now) async {
+    if (!_cloudVisionClient.isConfigured) {
+      return const HazardScanOutcome.failed(CloudVisionFailure.notConfigured);
+    }
+    if (!_visionBackoff.allow(now)) return null;
+    if (!_cloudVisionClient.tryReserve(now)) return null;
+    if (_permissionGateway.isAvailable &&
+        !_grantedPermissions.contains(GuidePermission.camera) &&
+        (!_guideResolvedSeen ||
+            await _permissionStatus(GuidePermission.camera) !=
+                PermissionOutcome.granted)) {
+      return null;
+    }
+    final CameraFrameCapture capture = await _frameSource.captureSingleFrame();
+    if (!capture.ok || capture.bytes == null) {
+      return const HazardScanOutcome.failed(CloudVisionFailure.noImage);
+    }
+    return _cloudVisionClient.describeHazardReserved(
+        imageBytes: capture.bytes!);
   }
 
   Future<void> _runCloudVisionAssist() async {
