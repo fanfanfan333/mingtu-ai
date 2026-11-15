@@ -33,6 +33,33 @@ void main() {
     expect(captures, 2);
   });
 
+  test(
+      'hung capture times out and its late completion cannot release a new capture',
+      () async {
+    final first = Completer<void>();
+    final second = Completer<void>();
+    var captures = 0;
+    final firstRequest = scheduler.request(() {
+      captures++;
+      return first.future;
+    });
+    now = now.add(const Duration(seconds: 3));
+    final secondRequest = scheduler.request(() {
+      captures++;
+      return second.future;
+    });
+    expect(captures, 2);
+    first.complete();
+    await firstRequest;
+    now = now.add(const Duration(milliseconds: 600));
+    await scheduler.request(() async {
+      captures++;
+    });
+    expect(captures, 2);
+    second.complete();
+    await secondRequest;
+  });
+
   test('cool and fast permits a capture at 500 ms', () async {
     int captures = 0;
     Future<void> capture() async {
@@ -45,17 +72,14 @@ void main() {
     expect(captures, 2);
   });
 
-  test('heat requires one second between starts', () async {
+  test('low adaptive fps stays at 500 ms without heat', () async {
     int captures = 0;
     Future<void> capture() async {
       captures++;
     }
 
     await scheduler.request(capture, appliedFps: 10);
-    now = now.add(const Duration(milliseconds: 999));
-    await scheduler.request(capture, appliedFps: 10);
-    expect(captures, 1);
-    now = now.add(const Duration(milliseconds: 1));
+    now = now.add(const Duration(milliseconds: 500));
     await scheduler.request(capture, appliedFps: 10);
     expect(captures, 2);
   });

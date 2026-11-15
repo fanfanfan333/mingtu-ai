@@ -145,7 +145,9 @@ DateTime Function()? mingtuWatchdogNowOverride;
 
 @visibleForTesting
 const emergencyConfirmTimeout = Duration(seconds: 10);
+const headsetEmergencyCooldown = Duration(seconds: 10);
 
+@visibleForTesting
 Stream<bool> Function()? mingtuProximityEventsOverride;
 DateTime Function()? mingtuPocketNowOverride;
 
@@ -184,6 +186,8 @@ class MingtuHomeDebugHandle {
 
   void debugPushLuma(double mean, double variance) =>
       _state._onLensSample(LumaStats(mean, variance));
+
+  SpeechRequest? get debugActiveSpeech => _state._scheduler.active;
 
   List<SpeechRequest> get debugLensSpeechQueue =>
       List<SpeechRequest>.unmodifiable(_state._scheduler.queue);
@@ -1551,6 +1555,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   Timer? _emergencyHoldTimer;
   Timer? _emergencyConfirmTimer;
   int _emergencyConfirmSequence = 0;
+  Timer? _headsetCooldownTimer;
   Timer? _headsetPressTimer;
   int _headsetPressCount = 0;
   bool _emergencyHoldTriggered = false;
@@ -3142,6 +3147,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _emergencyHoldTimer?.cancel();
     _emergencyConfirmTimer?.cancel();
     _headsetPressTimer?.cancel();
+    _headsetCooldownTimer?.cancel();
     if (mingtuLensSampleSink == _onLensSample) {
       mingtuLensSampleSink = null;
     }
@@ -5108,6 +5114,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   Future<void> _headsetToggle() async {
     if (!mounted || !_foreground) return;
     if (_countHeadsetPress()) {
+      if (_headsetCooldownTimer?.isActive ?? false) {
+        _say(_request(
+          id: 'headset-emergency-in-progress',
+          eventId: 'headset-emergency-in-progress',
+          text: '紧急求助已在进行',
+          kind: SpeechKind.emergency,
+        ));
+        return;
+      }
+      _headsetCooldownTimer = Timer(headsetEmergencyCooldown, () {});
       _triggerEmergency();
       return;
     }
@@ -6066,7 +6082,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (alert.urgent) {
       _say(_request(
         id: '$requestId-cane',
-        eventId: 'navhaz-cane-${alert.trackId}',
+        eventId: 'navhaz-cane',
         text: '用盲杖确认。',
         kind: SpeechKind.alert,
       ));
@@ -6128,11 +6144,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
       if (chosen != null) {
         // The announcement text comes from the avoidance
-        // advisor: it names the hazard category and adds a
-        // one-step direction ONLY when all three conditions
-        // hold (central + near, other side clear for 3+
-        // frames, orientation stable); otherwise it is the
-        // stop instruction.
+        // advisor: it names the hazard and instructs the user
+        // to stop and check with a cane.
         Detection? representative;
         for (final Detection d in detections) {
           if (dangerCategoryFor(d.label) == chosen &&
@@ -6997,25 +7010,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// fixed downgrade sentence through its gate.
   bool _handleAutoVisionFailure(CloudVisionFailure? failure) {
     if (failure == null) return false;
-    if (failure == CloudVisionFailure.rateLimited) {
-      if (mounted) {
-        _logMsg('云端识图：请求过于频繁，已按退避策略处理，其间只用本地检测。');
-      }
-      if (_visionBackoff.onRateLimited(DateTime.now()) &&
-          _visionDowngrade.shouldAnnounce(DateTime.now())) {
-        _say(_request(
-          id: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
-          eventId: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
-          text: '识图暂时繁忙，稍后会自动重试，其间继续用本地检测。',
-          kind: SpeechKind.alert,
-        ));
-      }
-      return true;
-    }
+    final String? speech = autoVisionFailureSpeech(
+        failure, DateTime.now(), _visionBackoff, _visionDowngrade);
     if (mounted) {
-      _logMsg('云端识图：自动触发请求失败，已降级为本地检测。');
+      _logMsg(failure == CloudVisionFailure.rateLimited
+          ? '云端识图：请求过于频繁，已按退避策略处理，其间只用本地检测。'
+          : '云端识图：自动触发请求失败，已降级为本地检测。');
     }
-    _announceVisionDowngrade();
+    if (speech != null) {
+      final id = 'vision-failure-${DateTime.now().millisecondsSinceEpoch}';
+      _say(_request(id: id, eventId: id, text: speech, kind: SpeechKind.alert));
+    }
     return true;
   }
 
@@ -7258,6 +7263,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _visionBackoff.onRateLimited(DateTime.now());
       } else if (runCompleted && runFailure == null) {
         _visionBackoff.onSuccess();
+        _visionDowngrade.noteSuccess();
       }
       if (_manualSlotOwned) {
         // Release the section 3.3 budget's shared

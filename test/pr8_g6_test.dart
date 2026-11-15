@@ -38,7 +38,7 @@ void main() {
     SpeechRequest request(String id, String text, SpeechKind kind) =>
         SpeechRequest(
           id: id,
-          eventId: id,
+          eventId: id.startsWith('cane') ? 'navhaz-cane' : id,
           text: text,
           kind: kind,
           createdAt: now,
@@ -54,6 +54,10 @@ void main() {
     expect(scheduler.active?.text, isNot(contains('用盲杖确认')));
     expect(scheduler.submit(request('cane', '用盲杖确认。', SpeechKind.alert), now),
         isTrue);
+    expect(
+        scheduler.submit(
+            request('cane-track-2', '用盲杖确认。', SpeechKind.alert), now),
+        isFalse);
     expect(scheduler.active?.text, '$phrase。');
     expect(scheduler.queue.single.text, '用盲杖确认。');
     expect(scheduler.queue.single.text, isNot(matches(RegExp('[左右]'))));
@@ -80,6 +84,6 @@ void main() {
     expect(dispatch, contains('kind: alert.speechKind'));
     expect(dispatch, contains('if (alert.urgent)'));
     expect(dispatch, contains('kind: SpeechKind.alert'));
-    expect(dispatch, contains("eventId: 'navhaz-cane-\${alert.trackId}'"));
+    expect(dispatch, contains("eventId: 'navhaz-cane'"));
   });
 }

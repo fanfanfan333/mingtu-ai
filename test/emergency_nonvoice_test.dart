@@ -275,6 +275,16 @@ void main() {
     expect(h.emergencyTriggerCount, 0);
     h.debugHeadsetToggle();
     expect(h.emergencyTriggerCount, 1);
+    h.debugHeadsetToggle();
+    h.debugHeadsetToggle();
+    h.debugHeadsetToggle();
+    expect(h.emergencyTriggerCount, 1);
+    expect(h.debugActiveSpeech?.text, '紧急求助已在进行');
+    await tester.pump(headsetEmergencyCooldown);
+    h.debugHeadsetToggle();
+    h.debugHeadsetToggle();
+    h.debugHeadsetToggle();
+    expect(h.emergencyTriggerCount, 2);
     await tester.pumpWidget(const SizedBox());
     for (var i = 0; i < 10; i++) {
       await tester.pump(const Duration(seconds: 3));

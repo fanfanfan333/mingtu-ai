@@ -91,7 +91,6 @@ final LensSampleScheduler _lensSampleScheduler = LensSampleScheduler();
 void _maybeSampleLensLuma() {
   unawaited(_lensSampleScheduler.request(
     _sampleLensLuma,
-    appliedFps: appliedYoloFrameRateFps,
     analysisCap720p: _appliedAnalysisCap720p,
   ));
 }
@@ -101,6 +100,14 @@ Future<void> _sampleLensLuma() async {
     if (!sharedYoloViewController.isInitialized) return;
     final Uint8List? bytes = await sharedYoloViewController.captureFrame();
     if (bytes == null || bytes.isEmpty) return;
+    unawaited(_submitLensGray(bytes));
+  } catch (_) {
+    // Lens sampling is best-effort and must never break detection.
+  }
+}
+
+Future<void> _submitLensGray(Uint8List bytes) async {
+  try {
     final List<int>? gray = await _tinyGrayFromImageBytes(bytes);
     if (gray != null && gray.isNotEmpty) {
       submitDetectionGrayFrame(gray);

@@ -118,6 +118,25 @@ void main() {
         spoken.where((text) => text == cloudVisionDowngradeSpeech).length, 2);
   });
 
+  test('success re-arms the failure gate', () {
+    final gate = CloudVisionDowngradeGate();
+    final backoff = VisionRateBackoff();
+    final now = DateTime(2026);
+    expect(
+        autoVisionFailureSpeech(
+            CloudVisionFailure.notConfigured, now, backoff, gate),
+        cloudVisionDowngradeSpeech);
+    expect(
+        autoVisionFailureSpeech(
+            CloudVisionFailure.notConfigured, now, backoff, gate),
+        isNull);
+    gate.noteSuccess();
+    expect(
+        autoVisionFailureSpeech(
+            CloudVisionFailure.notConfigured, now, backoff, gate),
+        cloudVisionDowngradeSpeech);
+  });
+
   test('walking 429 records backoff and announces busy once', () async {
     final gate = CloudVisionDowngradeGate();
     final backoff = VisionRateBackoff();
@@ -130,9 +149,8 @@ void main() {
       speak: spoken.add,
       onFailure: (failure) {
         expect(failure, CloudVisionFailure.rateLimited);
-        if (backoff.onRateLimited(now) && gate.shouldAnnounce(now)) {
-          spoken.add('识图暂时繁忙，稍后会自动重试，其间继续用本地检测。');
-        }
+        final speech = autoVisionFailureSpeech(failure, now, backoff, gate);
+        if (speech != null) spoken.add(speech);
       },
       onSuccess: backoff.onSuccess,
       scan: (time) async {

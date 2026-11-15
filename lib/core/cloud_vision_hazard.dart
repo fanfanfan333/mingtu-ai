@@ -337,6 +337,19 @@ class VisionRateBackoff {
   int get strikes => _strikes;
 }
 
+const String cloudVisionBusySpeech = '识图暂时繁忙，稍后会自动重试，其间继续用本地检测。';
+
+/// Records an automatic failure and returns the announcement, if due.
+String? autoVisionFailureSpeech(CloudVisionFailure failure, DateTime now,
+    VisionRateBackoff backoff, CloudVisionDowngradeGate gate) {
+  if (failure == CloudVisionFailure.rateLimited) {
+    return backoff.onRateLimited(now) && gate.shouldAnnounce(now)
+        ? cloudVisionBusySpeech
+        : null;
+  }
+  return gate.shouldAnnounce(now) ? cloudVisionDowngradeSpeech : null;
+}
+
 /// What can start a cloud-vision request (M2 section
 /// 3.3). Exactly three starters exist:
 /// - [crossingStop]: the AUTOMATIC crossing trigger --

@@ -615,6 +615,10 @@ void main() {
       expect(mainDart, contains('_visionBackoff.onRateLimited'));
       expect(mainDart, contains('onFailure: _handleAutoVisionFailure'));
       expect(mainDart, contains('onSuccess: _visionBackoff.onSuccess'));
+      expect(
+          mainDart,
+          contains(
+              '_visionBackoff.onSuccess();\n        _visionDowngrade.noteSuccess();'));
       expect(mainDart, contains('_triggerManualVision()'));
     });
   });
