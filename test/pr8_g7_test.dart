@@ -100,6 +100,47 @@ void main() {
     });
   });
 
+  test('new urgent track is exempt from the rolling cap', () {
+    fakeAsync((clock) {
+      final start = DateTime(2026);
+      final haptics = RecordingHaptics();
+      final controller = TtsRecoveryController(
+        now: () => start.add(clock.elapsed),
+        haptics: () => haptics,
+        rebuild: () async => null,
+        onRecovered: (_, __) {},
+      );
+      controller.fail();
+      controller.danger(trackId: 1, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 20));
+      controller.danger(trackId: 2, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 20));
+      controller.danger(trackId: 3, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 5));
+      expect(controller.vibrating, isFalse);
+      // Escalation starts an urgent episode (already exempt). After that
+      // episode ends, a different urgent track is not an escalation and
+      // must still vibrate under G16 (old code would stay silent).
+      controller.danger(trackId: 4, level: DangerLevel.urgent);
+      clock.elapse(const Duration(seconds: 30));
+      expect(controller.vibrating, isFalse);
+      final count = haptics.calls.length;
+      controller.danger(trackId: 5, level: DangerLevel.urgent);
+      expect(haptics.calls.last, 'urgent');
+      expect(haptics.calls.length, count + 1);
+      clock.elapse(const Duration(milliseconds: 400));
+      expect(haptics.calls.last, 'urgent');
+      expect(haptics.calls.length, count + 2);
+      clock.elapse(const Duration(milliseconds: 29600));
+      expect(controller.vibrating, isFalse);
+      final afterEpisode = haptics.calls.length;
+      controller.danger(trackId: 5, level: DangerLevel.urgent);
+      expect(controller.vibrating, isFalse);
+      expect(haptics.calls.length, afterEpisode);
+      controller.dispose();
+    });
+  });
+
   test('warning and urgent repeat at their respective intervals', () {
     fakeAsync((clock) {
       final haptics = RecordingHaptics();

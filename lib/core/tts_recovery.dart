@@ -108,7 +108,7 @@ class TtsRecoveryController {
     _dangerIntervals.removeWhere((interval) =>
         !interval.$2.isAfter(start.subtract(dangerRollingWindow)));
     Duration episodeDuration = dangerDurationCap;
-    if (!escalated) {
+    if (level != DangerLevel.urgent || !(different || escalated)) {
       // Usage during a continuously running episode is monotonic over this
       // window: old active time can leave no faster than new time enters.
       int usageAt(int micros) {
