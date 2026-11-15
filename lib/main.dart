@@ -287,6 +287,8 @@ class MingtuHomeDebugHandle {
   void planRoute() => _state._planRoute();
   void startNavigating() => _state._startNavigating();
   void debugEndLiveNavigation() => _state._endLiveNavigation();
+  void debugFinishEntranceTrip() => _state._finishEntranceTrip();
+  int? get debugPendingTurnStepIndex => _state._pausedTurnStepIndex;
   void turnAhead() => _state._turn();
   void manualStraight() => _state._manualStraight();
   void reconfirmStraight() => _state._reconfirmStraight();
@@ -1328,6 +1330,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _userPausedDuringTtsFailure = false;
   int? _pausedTurnStepIndex;
   NavigationTracker? _pausedTurnTracker;
+  bool _deferredPausedCatchUp = false;
   bool get _hazardWatchActive {
     if (_tasks.state == TaskState.navigating ||
         _tasks.state == TaskState.avoidingObstacle ||
@@ -2386,6 +2389,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _handleEntranceFix(r);
       return;
     }
+    if (_deferredPausedCatchUp) {
+      if (!_resumeFixQualifies()) return;
+      if (_liveNav!.isOffRoute(r.pointGcj02!)) {
+        _catchUpPausedNavigation();
+        return;
+      }
+    }
     final List<NavEvent> events = _liveNav!.onFix(NavFix(
       point: r.pointGcj02!,
       accuracyM: r.accuracyM,
@@ -2401,8 +2411,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // double-speak. Every other tracker event still
       // flows unchanged.
       if (_amapNaviActive && e.kind == NavEventKind.turnAhead) continue;
+      if (_deferredPausedCatchUp && e.kind == NavEventKind.turnAhead) {
+        _deferredPausedCatchUp = false;
+        _pausedTurnStepIndex = null;
+        _pausedTurnTracker = null;
+      }
       _handleNavEvent(e);
     }
+    if (_deferredPausedCatchUp) _catchUpPausedNavigation();
     if (_pacing.isPaused && !_rerouting && !_userPausedDuringTtsFailure) {
       // A re-planned route whose first segment was not
       // straight stays suspended; a later fix may reach a
@@ -2489,25 +2505,30 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _askDestination(prompt: '还要去别的地方吗？');
   }
 
+  bool _resumeFixQualifies() {
+    final DateTime? fixAt = _lastFixAt;
+    final double? accuracyM = _lastFixAccuracyM;
+    final Duration? age = fixAt == null ? null : DateTime.now().difference(fixAt);
+    return _lastFixPoint != null && accuracyM != null &&
+        accuracyM <= NavigationTracker.weakAccuracyM && age != null &&
+        !age.isNegative && age <= NavHazConfig.gpsSpeedFreshness;
+  }
+
   void _catchUpPausedNavigation() {
     final NavigationTracker? nav = _liveNav;
     final GeoPoint? point = _lastFixPoint;
+    if (nav == null) return;
+    nav.resetOffRouteStreak();
+    if (!_resumeFixQualifies()) {
+      _deferredPausedCatchUp = true;
+      return;
+    }
+    _deferredPausedCatchUp = false;
     final int? turnStep = _pausedTurnStepIndex;
     final bool sameTracker = identical(nav, _pausedTurnTracker);
     _pausedTurnStepIndex = null;
     _pausedTurnTracker = null;
-    if (nav == null) return;
-    nav.resetOffRouteStreak();
-    if (point == null) return;
-    final DateTime? fixAt = _lastFixAt;
-    final double? accuracyM = _lastFixAccuracyM;
-    final Duration? fixAge = fixAt == null ? null : DateTime.now().difference(fixAt);
-    if (accuracyM != null &&
-        accuracyM <= NavigationTracker.weakAccuracyM &&
-        fixAge != null &&
-        !fixAge.isNegative &&
-        fixAge <= NavHazConfig.gpsSpeedFreshness &&
-        nav.isOffRoute(point)) {
+    if (nav.isOffRoute(point!)) {
       nav.markOffRouteAnnounced();
       _handleNavEvent(const NavEvent(NavEventKind.offRoute, '你已偏离路线。'));
       return;
@@ -2663,6 +2684,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _amapNaviActive = false;
     if (naviSource != null) unawaited(naviSource.stop());
     _liveNav = null;
+    _deferredPausedCatchUp = false;
     _pausedTurnStepIndex = null;
     _pausedTurnTracker = null;
     _updateForegroundPolicies();
@@ -7600,6 +7622,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         return;
       case VoiceCommand.cancel:
         _userPausedDuringTtsFailure = false;
+        _deferredPausedCatchUp = false;
         _pausedTurnStepIndex = null;
         _pausedTurnTracker = null;
         if (_tasks.canTransitionTo(TaskState.cancelled)) {
@@ -7757,6 +7780,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   void _triggerEmergency() {
     _userPausedDuringTtsFailure = false;
+    _deferredPausedCatchUp = false;
     _pausedTurnStepIndex = null;
     _pausedTurnTracker = null;
     _ttsRecovery.stopDanger();
@@ -7820,6 +7844,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   void _resetDemo() {
     _userPausedDuringTtsFailure = false;
+    _deferredPausedCatchUp = false;
     _pausedTurnStepIndex = null;
     _pausedTurnTracker = null;
     _ttsRecovery.stopDanger();
