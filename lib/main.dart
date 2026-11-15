@@ -1315,6 +1315,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // no automatic ASR restart); once an ASR error has been announced
   // it is not announced again (no retry/announce loop).
   bool _ttsFailed = false;
+  String? _lastNavHazPhrase;
+  SpeechKind? _lastNavHazKind;
+  bool _lastNavHazUrgent = false;
+  bool _replayHazardAfterRecovery = false;
   bool get _hazardWatchActive {
     if (_tasks.state == TaskState.navigating ||
         _tasks.state == TaskState.avoidingObstacle ||
@@ -1352,19 +1356,33 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (last != null &&
             last.trigger == 'tts-failure' &&
             _tasks.canTransitionTo(last.from)) {
-          _tasks.transitionTo(last.from, trigger: 'tts-recovery');
-          spokenAnnouncement = '语音已恢复，继续导航。';
+          final clearedObstacle = last.from == TaskState.avoidingObstacle &&
+              !_riskActive && !_yoloRiskActive;
+          _tasks.transitionTo(
+            clearedObstacle ? TaskState.navigating : last.from,
+            trigger: 'tts-recovery',
+          );
+          if (last.from == TaskState.avoidingObstacle && !clearedObstacle) {
+            spokenAnnouncement = '语音已恢复。';
+            _replayHazardAfterRecovery = true;
+          } else {
+            spokenAnnouncement = '语音已恢复，继续导航。';
+          }
           recoveredEmergency = last.from == TaskState.emergency;
-          if (last.from == TaskState.navigating) {
+          if (last.from == TaskState.navigating || clearedObstacle) {
             _straightConfirmed = true;
-            _scheduler.resumeStraight(
-              now: _straightNow(),
-              straightSegmentConfirmed: true,
-              riskActive: false,
-              currentNavigationVersion: _navVersion,
-              straightNavigationVersion: _navVersion,
-            );
-            _startStraightTimer();
+            if (_pacing.isPaused) {
+              _recheckStraightResume();
+            } else {
+              _scheduler.resumeStraight(
+                now: _straightNow(),
+                straightSegmentConfirmed: true,
+                riskActive: false,
+                currentNavigationVersion: _navVersion,
+                straightNavigationVersion: _navVersion,
+              );
+              _startStraightTimer();
+            }
           }
         } else {
           spokenAnnouncement = '语音已恢复，导航仍在暂停。';
@@ -3519,6 +3537,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _completedPermissionSpeech.add(id);
       }
       _scheduler.completeActive();
+      if (finished.eventId == 'tts-recovered' &&
+          _replayHazardAfterRecovery) {
+        _replayHazardAfterRecovery = false;
+        if (_riskActive && _lastNavHazPhrase != null && _lastNavHazKind != null) {
+          final id = 'navhaz-recovery-${DateTime.now().microsecondsSinceEpoch}';
+          _say(_request(id: id, eventId: id, text: _lastNavHazPhrase!,
+              kind: _lastNavHazKind!));
+          if (_lastNavHazUrgent) {
+            _say(_request(id: '$id-cane', eventId: 'navhaz-cane',
+                text: '用盲杖确认。', kind: SpeechKind.alert));
+          }
+        }
+      }
       // NAVHAZ M1 arbitration: after a hazard prompt
       // (danger / obstacleAvoidance) finishes and no other
       // urgent prompt is pending, an interrupted navigation
@@ -6123,6 +6154,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // when the request starts playing and the engine's
     // speak-start callback closes the segment.
     _hazardSpeakSegmentStarts[requestId] = pipelineReturnedAt;
+    _lastNavHazPhrase = '$text。';
+    _lastNavHazKind = alert.speechKind;
+    _lastNavHazUrgent = alert.urgent;
     _say(_request(
       id: requestId,
       eventId: 'navhaz-track-${alert.trackId}',

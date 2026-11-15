@@ -215,6 +215,67 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
   });
 
+  for (final scenario in <String>['hazard remains', 'hazard clears', 'demo hazard clears']) {
+    testWidgets('recovery when $scenario during TTS failure', (tester) async {
+      mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+      addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+      await tester.pumpWidget(const MingtuApp());
+      await tester.pump();
+      final handle = mingtuHomeDebugHandle!;
+      var now = DateTime(2026);
+      handle.debugSetStraightClock(() => now);
+      handle.startVoiceDemo();
+      handle.planRoute();
+      handle.startNavigating();
+      final output = FakeOutput();
+      if (scenario == 'demo hazard clears') {
+        handle.debugFailTts(() async => output);
+      }
+      for (final s in <double>[0.20, 0.32, 0.45, 0.60, 0.75]) {
+        handle.simulateDetections(<Detection>[
+          Detection(label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s),
+        ]);
+      }
+      await tester.pump();
+      if (scenario != 'demo hazard clears') {
+        expect(handle.taskState, TaskState.avoidingObstacle);
+        handle.debugFailTts(() async => output);
+      }
+      expect(handle.taskState, TaskState.paused);
+      if (scenario == 'hazard remains') {
+        handle.simulateDetections(<Detection>[
+          const Detection(label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: 0.75, h: 0.75),
+        ]);
+      } else {
+        for (var i = 0; i < 3; i++) {
+          handle.simulateDetections(const <Detection>[]);
+        }
+      }
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+      if (scenario == 'hazard remains') {
+        expect(handle.taskState, TaskState.avoidingObstacle);
+        expect(output.spoken.any((text) => text.contains('语音已恢复')), isTrue);
+        expect(output.spoken.every((text) => !text.contains('继续导航')), isTrue);
+        expect(output.spoken.any((text) => text.contains('车') || text.contains('障碍')), isTrue);
+        expect(output.spoken, contains('用盲杖确认。'));
+      } else {
+        expect(handle.taskState, TaskState.navigating);
+        expect(output.spoken, contains('语音已恢复，继续导航。'));
+        expect(output.spoken.any((text) => text.contains('请说继续')), isFalse);
+        now = now.add(const Duration(seconds: 3));
+        await tester.pump(const Duration(seconds: 3));
+        await tester.pump();
+        expect(output.spoken, contains('直走'));
+      }
+      expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 4));
+    });
+  }
+
   testWidgets('user pause remains quiet after TTS recovery', (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
     addTearDown(() => mingtuStartupTtsFactoryOverride = null);
