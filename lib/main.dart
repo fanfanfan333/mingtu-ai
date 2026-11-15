@@ -136,6 +136,9 @@ class MingtuApp extends StatelessWidget {
 /// one) for a fake in widget tests.
 PermissionGateway? mingtuPermissionGatewayOverride;
 
+@visibleForTesting
+Stream<bool> Function()? mingtuProximityEventsOverride;
+
 /// UI-06: swap the first-launch marker store for a fake in
 /// widget tests.
 GuideStore? mingtuGuideStoreOverride;
@@ -509,6 +512,10 @@ class MingtuHomeDebugHandle {
   /// stale-timer test fires session 1's callback during
   /// session 2 and asserts nothing happens.
   int get pttSessionId => _state._pttSession;
+  int get debugTalkBackCapSessionId => _state._talkBackCapSessionId ?? -1;
+  int get debugPttToggleSessionId => _state._pttToggleSessionId;
+  bool get debugIgnoreTouches => _state._pocketMode.ignoreTouches;
+  void debugSetPocketEnabled(bool enabled) => _state._setPocketMode(enabled);
 
   /// Test-only: engine events ('restarted' /
   /// 'restart_failed') this page has handled, in order.
@@ -1453,7 +1460,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _permissionGateway =
         mingtuPermissionGatewayOverride ?? createPermissionGateway();
     _guideStore = mingtuGuideStoreOverride ?? createGuideStore();
-    _pocketMode = PocketMode(proximity: proximityEvents);
+    _pocketMode =
+        PocketMode(proximity: mingtuProximityEventsOverride ?? proximityEvents);
     unawaited(_loadPocketMode());
     // UI-06-B3: start the first-launch marker read now.
     // The startup gate awaits this future with a bounded
