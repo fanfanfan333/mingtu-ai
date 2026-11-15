@@ -66,9 +66,7 @@ class PermissionHandlerGateway implements PermissionGateway {
       return PermissionOutcome.denied;
     }
     try {
-      return _map(await _pluginPermission(permission)
-          .request()
-          .timeout(AppConfig.effectivePermissionTimeout));
+      return _map(await _pluginPermission(permission).request());
     } catch (_) {
       // A platform without the plugin answers honestly:
       // nothing was granted.

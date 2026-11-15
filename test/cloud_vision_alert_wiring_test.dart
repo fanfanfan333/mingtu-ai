@@ -23,8 +23,11 @@ void main() {
     );
     expect(end, greaterThan(start));
     final String body = source.substring(start, end);
-    // Both speech sites in the function use alert.
-    expect('kind: SpeechKind.alert'.allMatches(body).length, 2);
+    // Every speech site in the function uses alert, including
+    // the camera-permission gate added for UI-06-B8.
+    final int says = '_say(_request('.allMatches(body).length;
+    expect(says, greaterThanOrEqualTo(2));
+    expect('kind: SpeechKind.alert'.allMatches(body).length, says);
     expect(body.contains('SpeechKind.info'), isFalse);
     // The duplicate-trigger refusal creates no token: it goes
     // through VisionRunManager.begin() and returns early.

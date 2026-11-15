@@ -386,6 +386,14 @@ class MingtuHomeDebugHandle {
 
   void setGuideStore(GuideStore store) => _state._guideStore = store;
 
+  void setCameraFrameSourceForTest(CameraFrameSource source) =>
+      _state._frameSource = source;
+
+  void disableVoiceOutputForTest() {
+    _state._ttsFailed = true;
+    _state._voiceOutput = UnavailableVoiceOutput();
+  }
+
   /// UI-06: start the first-launch guide + permission flow
   /// on demand (tests drive it deterministically; in
   /// production startup chains into it automatically).
@@ -1560,6 +1568,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// onboarding speech and is never delayed by it.
   Future<bool> _sayPermissionFlowText(String text,
       {bool alert = false, bool requireDelivery = false}) async {
+    if (_ttsFailed || !_voiceOutput.isAvailable) return false;
     final DateTime deadline =
         _speechNow().add(AppConfig.effectivePermissionSpeechTimeout);
     while (mounted && _speechNow().isBefore(deadline)) {
@@ -1571,6 +1580,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         text: text,
       ));
       while (mounted && _speechNow().isBefore(deadline)) {
+        if (_ttsFailed || !_voiceOutput.isAvailable) return false;
         if (_completedPermissionSpeech.remove(id)) return true;
         final bool failed = !accepted ||
             _scheduler.interruptedLog.contains(id) ||
@@ -1584,6 +1594,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           while (mounted &&
               _scheduler.active != null &&
               _speechNow().isBefore(deadline)) {
+            if (_ttsFailed || !_voiceOutput.isAvailable) return false;
             await _permissionPoll();
           }
           if (mounted && _speechNow().isBefore(deadline)) {
@@ -1637,7 +1648,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         try {
           outcome = await _permissionGateway
               .request(effect.permission)
-              .timeout(AppConfig.effectivePermissionTimeout);
+              .timeout(AppConfig.effectivePermissionRequestTimeout);
+        } on TimeoutException {
+          if (!mounted) return;
+          _deferredPermissionEffects = <Object>[
+            PermissionSpeakEffect(permissionPurposeText(effect.permission)),
+            effect,
+            ...queue,
+          ];
+          _say(_request(
+            id: 'permission-request-timeout-${_permissionSpeechSeq++}',
+            eventId: 'permission-request-timeout-$_permissionSpeechSeq',
+            kind: SpeechKind.alert,
+            text: permissionRequestTimeoutText,
+          ));
+          return;
         } catch (_) {
           outcome = PermissionOutcome.denied;
         }
@@ -1658,6 +1683,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         } catch (_) {}
         return; // paused until the resumed re-check
       } else if (effect is PermissionFlowDoneEffect) {
+        _guideResolvedSeen = true;
         _permissionFlowRunning = false;
         if (_kickoffHeld) {
           _kickoffHeld = false;
@@ -6586,6 +6612,30 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     bool runCompleted = false;
     int seq = 0;
     try {
+      if (_permissionGateway.isAvailable &&
+          !_grantedPermissions.contains(GuidePermission.camera) &&
+          (!_guideResolvedSeen ||
+              await _permissionStatus(GuidePermission.camera) !=
+                  PermissionOutcome.granted)) {
+        if (!mounted) return;
+        _say(_request(
+          id: 'manual-camera-permission-${_permissionSpeechSeq++}',
+          eventId: 'manual-camera-permission-$_permissionSpeechSeq',
+          kind: SpeechKind.alert,
+          text: _guideResolvedSeen
+              ? permissionDeniedText(GuidePermission.camera)
+              : permissionPurposeText(GuidePermission.camera),
+        ));
+        if (!_guideResolvedSeen) {
+          if (_permissionFlowRunning) {
+            _retryDeferredPermissionFlow();
+          } else {
+            unawaited(_runFirstLaunchGuideAndPermissions());
+          }
+        }
+        return;
+      }
+      if (!mounted) return;
       final CloudVisionFlowOutcome outcome = await _cloudVisionFlow.run(
         cancellation: token,
         announce: (String text) {

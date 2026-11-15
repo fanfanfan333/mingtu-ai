@@ -51,9 +51,13 @@
 /// Test-only timeout overrides. Null in production.
 Duration? mingtuPermissionTimeoutOverride;
 Duration? mingtuPermissionSpeechTimeoutOverride;
+Duration? mingtuPermissionRequestTimeoutOverride;
 
 class AppConfig {
   static const Duration permissionTimeout = Duration(seconds: 2);
+  static const Duration permissionRequestTimeout = Duration(seconds: 120);
+  static Duration get effectivePermissionRequestTimeout =>
+      mingtuPermissionRequestTimeoutOverride ?? permissionRequestTimeout;
   static const Duration permissionSpeechTimeout = Duration(seconds: 30);
   static Duration get effectivePermissionTimeout =>
       mingtuPermissionTimeoutOverride ?? permissionTimeout;

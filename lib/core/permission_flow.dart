@@ -130,6 +130,9 @@ const String firstLaunchGuideText = '欢迎使用明途。说话的方法：按�
 const String permissionPurposeUndeliveredText =
     '权限说明没说完，这次先不弹出授权框。下次按下说话键，或回到应用时，我会再说明一次。';
 
+const String permissionRequestTimeoutText =
+    '授权询问没有得到结果，这次先不往下走。系统询问框可能还在，请先处理，或稍后重试。';
+
 String permissionPurposeText(GuidePermission permission) {
   switch (permission) {
     case GuidePermission.microphone:

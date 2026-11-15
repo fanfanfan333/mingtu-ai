@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'dart:io';
+
+import 'package:mingtu_ai/core/camera_frame.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -176,12 +179,26 @@ Future<ui.RecordingVoiceChannels> _openApp(WidgetTester tester,
     } else {
       await tester.pumpWidget(const SizedBox.shrink());
     }
+    if (gateway is _FlowGateway) {
+      for (final pending in gateway.requestHangs.values) {
+        if (!pending.isCompleted) pending.complete(PermissionOutcome.denied);
+      }
+    }
     // Flush the 50 ms purpose-delivery poll that may have
     // been armed just before dispose.
     await tester.pump(const Duration(seconds: 1));
   });
   await tester.pumpWidget(app ?? const MingtuApp());
   return h;
+}
+
+class _CountingFrameSource implements CameraFrameSource {
+  int calls = 0;
+  @override
+  Future<CameraFrameCapture> captureSingleFrame() async {
+    calls++;
+    return CameraFrameCapture.failed(CameraFrameFailure.unavailable);
+  }
 }
 
 void main() {
@@ -203,6 +220,7 @@ void main() {
     mingtuGuideStoreOverride = store;
     mingtuPermissionTimeoutOverride = null;
     mingtuPermissionSpeechTimeoutOverride = null;
+    mingtuPermissionRequestTimeoutOverride = null;
   });
 
   tearDown(() {
@@ -210,6 +228,7 @@ void main() {
     mingtuGuideStoreOverride = null;
     mingtuPermissionTimeoutOverride = null;
     mingtuPermissionSpeechTimeoutOverride = null;
+    mingtuPermissionRequestTimeoutOverride = null;
     mingtuLocationProviderOverride = null;
     mingtuYoloAvailableOverride = null;
     mingtuCameraStartObserver = null;
@@ -220,7 +239,9 @@ void main() {
   test('UI-06-B2 timeout bound is pinned at 2 seconds', () {
     expect(AppConfig.permissionTimeout, const Duration(seconds: 2));
     expect(AppConfig.permissionSpeechTimeout, const Duration(seconds: 30));
+    expect(AppConfig.permissionRequestTimeout, const Duration(seconds: 120));
     expect(containsBannedWord(permissionPurposeUndeliveredText), isFalse);
+    expect(containsBannedWord(permissionRequestTimeoutText), isFalse);
   });
 
   group('UI-06-B2 first-launch order and fail-closed', () {
@@ -354,6 +375,9 @@ void main() {
           () => Future<void>.delayed(const Duration(milliseconds: 150)));
       await _pumpSpeaks(tester, h, rounds: 30);
       expect(mingtuHomeDebugHandle!.microphoneInitializeCalls, 0);
+      gateway.requestHangs[GuidePermission.microphone]!
+          .complete(PermissionOutcome.denied);
+      await tester.pump();
     });
 
     testWidgets(
@@ -375,6 +399,9 @@ void main() {
       await _pumpSpeaks(tester, h, rounds: 30);
       expect(h.events, isNot(contains('tts.speak:$destinationAskText')));
       expect(mingtuHomeDebugHandle!.cameraStartCalls, 0);
+      gateway.requestHangs[GuidePermission.camera]!
+          .complete(PermissionOutcome.denied);
+      await tester.pump();
     });
   });
 
@@ -474,12 +501,28 @@ void main() {
               gateway.requestHangs[permission] = Completer<PermissionOutcome>();
           }
           final h = await _openApp(tester);
-          await _driveUntil(
-              tester,
-              h,
-              () => h.events.contains('tts.speak:$permissionFlowEndText'),
-              'flow finishes after ${permission.name} $failure',
-              rounds: 140);
+          if (failure == 'timeout') {
+            await _driveUntil(
+                tester,
+                h,
+                () => gateway.requested.contains(permission),
+                'request remains in flight');
+            await tester.runAsync(
+                () => Future<void>.delayed(const Duration(milliseconds: 150)));
+            expect(
+                h.events,
+                isNot(
+                    contains('tts.speak:${permissionDeniedText(permission)}')));
+            expect(
+                h.events, isNot(contains('tts.speak:$permissionFlowEndText')));
+          } else {
+            await _driveUntil(
+                tester,
+                h,
+                () => h.events.contains('tts.speak:$permissionFlowEndText'),
+                'flow finishes after ${permission.name} $failure',
+                rounds: 140);
+          }
           await _pumpSpeaks(tester, h, rounds: 8);
           expect(gateway.requested, contains(permission));
           expect(starts(permission), 0);
@@ -492,6 +535,11 @@ void main() {
           }
           if (permission == GuidePermission.camera) {
             expect(h.events, isNot(contains('camera.start')));
+          }
+          if (failure == 'timeout') {
+            gateway.requestHangs[permission]!
+                .complete(PermissionOutcome.denied);
+            await tester.pump();
           }
         });
       }
@@ -921,5 +969,132 @@ void main() {
       expect(announces, 1);
       expect(mingtuHomeDebugHandle!.settingsRecheckStarts, 1);
     });
+  });
+  testWidgets('B8 manual vision checks camera grant before flow',
+      (tester) async {
+    store.seen = true;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    final frames = _CountingFrameSource();
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _driveUntil(
+        tester,
+        h,
+        () => h.events.contains(
+            'tts.speak:${permissionDeniedText(GuidePermission.camera)}'),
+        'camera denial spoken');
+    expect(frames.calls, 0);
+    gateway.statusResults[GuidePermission.camera] = PermissionOutcome.granted;
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _driveUntil(
+        tester,
+        h,
+        () => mingtuHomeDebugHandle!.statusTexts
+            .any((text) => text.contains('识图未配置')),
+        'granted manual vision proceeds');
+  });
+
+  test('B8 production manual flow gates camera before run', () {
+    final source = File('lib/main.dart').readAsStringSync();
+    final manual = source
+        .substring(source.indexOf('Future<void> _runCloudVisionAssist()'));
+    expect(manual.indexOf('_permissionStatus(GuidePermission.camera)'),
+        greaterThan(0));
+    expect(manual.indexOf('_permissionStatus(GuidePermission.camera)'),
+        lessThan(manual.indexOf('_cloudVisionFlow.run(')));
+  });
+
+  testWidgets('B9 long request fallback defers without denial', (tester) async {
+    mingtuPermissionRequestTimeoutOverride = const Duration(milliseconds: 200);
+    gateway.requestHangs[GuidePermission.microphone] =
+        Completer<PermissionOutcome>();
+    final h = await _openApp(tester);
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.microphone),
+        'request');
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 300)));
+    await _driveUntil(
+        tester,
+        h,
+        () => h.events.contains('tts.speak:$permissionRequestTimeoutText'),
+        'timeout fault');
+    expect(
+        h.events,
+        isNot(contains(
+            'tts.speak:${permissionDeniedText(GuidePermission.microphone)}')));
+    expect(mingtuHomeDebugHandle!.microphoneInitializeCalls, 0);
+    expect(gateway.requested, <GuidePermission>[GuidePermission.microphone]);
+  });
+
+  for (final delay in <int>[10, 60]) {
+    testWidgets('B9 request answered after $delay seconds is honored',
+        (tester) async {
+      final answer = Completer<PermissionOutcome>();
+      gateway.requestHangs[GuidePermission.microphone] = answer;
+      final h = await _openApp(tester);
+      await _driveUntil(
+          tester,
+          h,
+          () => gateway.requested.contains(GuidePermission.microphone),
+          'request');
+      await tester.runAsync(() async {
+        await Future<void>.delayed(Duration(seconds: delay));
+        answer.complete(
+            delay == 10 ? PermissionOutcome.granted : PermissionOutcome.denied);
+      });
+      await _driveUntil(
+          tester,
+          h,
+          () => delay == 10
+              ? mingtuHomeDebugHandle!.microphoneInitializeCalls > 0
+              : h.events.contains(
+                  'tts.speak:${permissionDeniedText(GuidePermission.microphone)}'),
+          'answer handled');
+      expect(mingtuHomeDebugHandle!.microphoneInitializeCalls,
+          delay == 10 ? 1 : 0);
+      expect(
+          h.events, isNot(contains('tts.speak:$permissionRequestTimeoutText')));
+    }, timeout: const Timeout(Duration(seconds: 90)));
+  }
+
+  testWidgets('B10 startup with unavailable speech does not request',
+      (tester) async {
+    final h = ui.RecordingVoiceChannels()..install();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(const MethodChannel('flutter_tts'),
+            (call) async {
+      if (call.method == 'getLanguages') return <String>[];
+      return null;
+    });
+    addTearDown(() async {
+      h.completeAllSpeaks();
+      await ui.shutdownVoice(tester, h);
+      await tester.pump(const Duration(seconds: 1));
+    });
+    final watch = Stopwatch()..start();
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump(const Duration(seconds: 1));
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 100)));
+    await tester.pump();
+    expect(watch.elapsed, lessThan(const Duration(seconds: 3)));
+    expect(gateway.requested, isEmpty);
+  });
+
+  testWidgets('B10 unavailable speech defers purpose immediately',
+      (tester) async {
+    store.seen = true;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    mingtuHomeDebugHandle!.disableVoiceOutputForTest();
+    final watch = Stopwatch()..start();
+    await tester
+        .runAsync(() => mingtuHomeDebugHandle!.startPermissionFlowForTest());
+    expect(watch.elapsed, lessThan(const Duration(seconds: 3)));
+    expect(gateway.requested, isEmpty);
   });
 }
