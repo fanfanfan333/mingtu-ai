@@ -255,6 +255,68 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
   });
 
+  for (final bool offRoute in <bool>[false, true]) {
+    testWidgets(
+        offRoute ? 'resume catches up off-route during TTS pause' :
+            'resume catches up turn during TTS pause', (tester) async {
+      mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+      addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+      await tester.pumpWidget(const MingtuApp());
+      await tester.pump();
+      final handle = mingtuHomeDebugHandle!;
+      handle.startVoiceDemo();
+      handle.planRoute();
+      handle.startNavigating();
+      final output = FakeOutput();
+      handle.debugFailTts(() async => output);
+      handle.voiceCommand('暂停');
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pump();
+      expect(handle.taskState, TaskState.paused);
+      const a = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+      const b = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+      const c = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+      handle.debugInstallLiveTracker(
+        steps: const <AmapStep>[
+          AmapStep(action: '直行', orientation: '北', polyline: [a, b],
+              distanceM: 200, durationS: 150),
+          AmapStep(action: '右转', orientation: '东', polyline: [b, c],
+              distanceM: 100, durationS: 75),
+        ],
+        stepTexts: const ['直行', '右转进入林荫道'],
+        destination: c,
+        destinationName: '图书馆',
+      );
+      if (offRoute) {
+        const far = GeoPoint(latitude: 37.730, longitude: 120.450);
+        handle.debugLiveFix(far, 5);
+        handle.debugLiveFix(far, 5);
+      } else {
+        handle.debugLiveFix(GeoPoint(
+            latitude: b.latitude! - 25 / 111194.9, longitude: b.longitude), 5);
+      }
+      await tester.pump();
+      await tester.pump();
+      expect(output.spoken.any((text) => text.contains('右转') ||
+          text.contains('偏离路线') || text.contains('重新规划')), isFalse);
+      handle.voiceCommand('继续');
+      await tester.pump();
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pump();
+      expect(handle.taskState, TaskState.navigating);
+      expect(output.spoken.any((text) => text.contains(
+          offRoute ? '偏离路线' : '右转进入林荫道')), isTrue);
+      expect(output.spoken.any((text) => text.contains('已恢复导航，但直行提醒还没有恢复')), isTrue);
+      if (offRoute) expect(handle.debugRerouting, isTrue);
+      expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 4));
+    });
+  }
+
   testWidgets('recovery restores entrance search with matching wording', (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
     addTearDown(() => mingtuStartupTtsFactoryOverride = null);
