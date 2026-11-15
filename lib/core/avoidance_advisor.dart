@@ -1,22 +1,6 @@
-/// Avoidance advisor: turns one frame of local detections
-/// into the spoken hazard announcement, applying the user's
-/// three-condition rule (2026-11-09) for the ONLY case where
-/// a left/right step may be spoken:
-///
-/// 1. the hazard is in the central corridor and NEAR --
-///    estimated from the detection box (centre-x inside the
-///    corridor, box bottom low in the frame);
-/// 2. the OTHER side has had NO detection of ANY kind --
-///    hazard or not (a chair occupies a side just as much
-///    as a vehicle does) -- for at least
-///    [sideClearFrames] consecutive frames;
-/// 3. the phone orientation is stable (gyroscope / compass
-///    seam; unknown or unstable never passes).
-///
-/// If any condition fails, the announcement names the hazard
-/// and tells the user to stop. Steps, curbs and uncertain
-/// cloud results NEVER produce a direction (they are handled
-/// by the cloud-vision hazard path, caution wording only).
+/// Avoidance advisor: names a local hazard and asks the user
+/// to stop and confirm with a cane. Side-clear streaks and
+/// orientation do not produce a direction command.
 ///
 /// The corridor / zone thresholds follow the reference
 /// approach discussed with the project lead (a virtual
@@ -108,13 +92,9 @@ class AvoidanceDecision {
 
   String get speech {
     final String name = hazardKindName(kind);
-    return switch (advice) {
-      StepAdvice.stepLeft => '前方有$name，向左迈一步。',
-      StepAdvice.stepRight => '前方有$name，向右迈一步。',
-      StepAdvice.stopOnly => kind == HazardKind.person
-          ? '前方有人，请停下。'
-          : '前方有$name，请停下。',
-    };
+    return kind == HazardKind.person
+        ? '前方有人，请停下，用盲杖确认。'
+        : '前方有$name，请停下，用盲杖确认。';
   }
 }
 
@@ -209,41 +189,16 @@ class AvoidanceAdvisor {
   int get rightClearStreak => _rightClearStreak;
   bool get hasPendingAction => _pendingAction != null;
 
-  /// Decide the announcement for [hazard]. Side effects: a
-  /// step decision registers a pending action for
-  /// [observeFrame] to resolve from later frames.
+  /// Decide the announcement for [hazard] without issuing a step action.
   AvoidanceDecision decide({
     required Detection hazard,
     required bool orientationStable,
   }) {
-    final HazardKind kind = hazardKindForLabel(hazard.label) ?? HazardKind.clutter;
-    final bool nearCenter = inCorridor(hazard) &&
-        distanceLevelOf(hazard) == BoxDistanceLevel.near;
-    if (!nearCenter || !orientationStable) {
-      return AvoidanceDecision(
-          kind: kind, advice: StepAdvice.stopOnly, nearCenterHazard: nearCenter);
-    }
-    final bool leftClear = _leftClearStreak >= sideClearFrames;
-    final bool rightClear = _rightClearStreak >= sideClearFrames;
-    if (!leftClear && !rightClear) {
-      return AvoidanceDecision(
-          kind: kind, advice: StepAdvice.stopOnly, nearCenterHazard: true);
-    }
-    final StepAdvice advice;
-    if (leftClear && !rightClear) {
-      advice = StepAdvice.stepLeft;
-    } else if (rightClear && !leftClear) {
-      advice = StepAdvice.stepRight;
-    } else {
-      // Both sides clear: step away from the hazard's offset;
-      // dead centre defaults to the right (keep-right walking
-      // convention), still one step only.
-      advice = hazard.cx <= 0.5 ? StepAdvice.stepRight : StepAdvice.stepLeft;
-    }
-    _pendingAction = advice;
-    _pendingFrames = 0;
-    _pendingCenterClearFrames = 0;
+    final HazardKind kind =
+        hazardKindForLabel(hazard.label) ?? HazardKind.clutter;
+    final bool nearCenter =
+        inCorridor(hazard) && distanceLevelOf(hazard) == BoxDistanceLevel.near;
     return AvoidanceDecision(
-        kind: kind, advice: advice, nearCenterHazard: true);
+        kind: kind, advice: StepAdvice.stopOnly, nearCenterHazard: nearCenter);
   }
 }

@@ -51,7 +51,7 @@ void main() {
     });
   });
 
-  group('the three-condition rule (spec 7.7-11)', () {
+  group('stop-only avoidance (spec 7.7-11)', () {
     AvoidanceAdvisor primed() {
       final AvoidanceAdvisor a = AvoidanceAdvisor();
       // Three frames with the hazard in the corridor only:
@@ -62,13 +62,34 @@ void main() {
       return a;
     }
 
-    test('all three conditions hold -> a one-step direction is spoken', () {
+    test('all three former conditions hold -> stop and confirm with cane', () {
       final AvoidanceAdvisor a = primed();
       final AvoidanceDecision d =
           a.decide(hazard: det('car', 0.45, 0.92), orientationStable: true);
-      expect(d.advice, StepAdvice.stepRight);
-      expect(d.speech, '前方有机动车，向右迈一步。');
-      expect(a.hasPendingAction, isTrue);
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
+      expect(a.hasPendingAction, isFalse);
+      expect(a.leftClearStreak, 3);
+      expect(a.rightClearStreak, 3);
+      for (final String forbidden in <String>[
+        '向左迈步',
+        '向右迈步',
+        '向左迈一步',
+        '向右迈一步',
+        '向左迈',
+        '向右迈',
+        '安全',
+        '可以通行',
+        '放心',
+        '可以过马路',
+      ]) {
+        expect(d.speech, isNot(contains(forbidden)));
+      }
+      for (final StepAdvice advice in StepAdvice.values) {
+        final AvoidanceDecision legacy = AvoidanceDecision(
+            kind: HazardKind.person, advice: advice, nearCenterHazard: true);
+        expect(legacy.speech, '前方有人，请停下，用盲杖确认。');
+      }
     });
 
     test('condition 1 fails (not near) -> stop only', () {
@@ -76,7 +97,7 @@ void main() {
       final AvoidanceDecision d =
           a.decide(hazard: det('car', 0.5, 0.7), orientationStable: true);
       expect(d.advice, StepAdvice.stopOnly);
-      expect(d.speech, '前方有机动车，请停下。');
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
     });
 
     test('condition 1 fails (outside the corridor) -> stop only', () {
@@ -95,8 +116,8 @@ void main() {
     });
 
     test(
-        'condition 2 fails (right side busy recently) -> step left '
-        'only if left is clear', () {
+        'condition 2 fails (right side busy recently) -> stop '
+        'even if left is clear', () {
       final AvoidanceAdvisor a = AvoidanceAdvisor();
       for (int i = 0; i < 3; i++) {
         a.observeFrame(<Detection>[
@@ -108,8 +129,8 @@ void main() {
       expect(a.leftClearStreak, 3);
       final AvoidanceDecision d =
           a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
-      expect(d.advice, StepAdvice.stepLeft);
-      expect(d.speech, '前方有机动车，向左迈一步。');
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
     });
 
     test('condition 3 fails (orientation unstable) -> stop only', () {
@@ -143,17 +164,16 @@ void main() {
       ]);
       expect(a.leftClearStreak, 0);
       expect(a.rightClearStreak, 4);
-      // No step to the left any more; the still-clear right
-      // side remains a legal step.
+      // A clear side does not produce a step command.
       final AvoidanceDecision d =
           a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
-      expect(d.advice, StepAdvice.stepRight);
-      expect(d.speech, '前方有机动车，向右迈一步。');
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
     });
 
     test(
-        'the Codex failure case: a chair on the right for '
-        'three frames forbids the right step', () {
+        'a chair on the right for '
+        'three frames retains stop-only advice', () {
       final AvoidanceAdvisor a = primed();
       // Three consecutive frames with a chair (a NON-hazard
       // label) on the right side, cx > 0.67; the hazard car
@@ -168,10 +188,9 @@ void main() {
       expect(a.leftClearStreak, 6);
       final AvoidanceDecision d =
           a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
-      // The right step is forbidden; the clear left side is
-      // the only legal step.
-      expect(d.advice, StepAdvice.stepLeft);
-      expect(d.speech, '前方有机动车，向左迈一步。');
+      // A clear side does not produce a step command.
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
       expect(d.speech, isNot(contains('向右')));
     });
 
@@ -191,41 +210,48 @@ void main() {
       final AvoidanceDecision d =
           a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
       expect(d.advice, StepAdvice.stopOnly);
-      expect(d.speech, '前方有机动车，请停下。');
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
     });
   });
 
   group(
       'action results come from frames, never from speech '
       '(spec 7.7-12)', () {
-    test('a pending action confirms only when the centre clears', () {
+    test('clear sides do not create an action when the centre clears', () {
       final AvoidanceAdvisor a = AvoidanceAdvisor();
       for (int i = 0; i < 3; i++) {
         a.observeFrame(<Detection>[det('car', 0.5, 0.9)]);
       }
-      a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
-      expect(a.hasPendingAction, isTrue);
-      // Hazard still central: no confirmation.
+      final AvoidanceDecision d =
+          a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
+      expect(d.speech, isNot(contains('向左迈')));
+      expect(d.speech, isNot(contains('向右迈')));
+      expect(a.hasPendingAction, isFalse);
       expect(a.observeFrame(<Detection>[det('car', 0.5, 0.9)]), isNull);
-      expect(a.hasPendingAction, isTrue);
-      // Two clear frames confirm it.
+      expect(a.hasPendingAction, isFalse);
       expect(a.observeFrame(const <Detection>[]), isNull);
-      expect(
-          a.observeFrame(const <Detection>[]), AvoidanceNotice.actionConfirmed);
+      expect(a.observeFrame(const <Detection>[]), isNull);
       expect(a.hasPendingAction, isFalse);
     });
 
-    test('a hazard that stays central makes the action unconfirmed', () {
+    test('a central hazard does not create an unconfirmed action', () {
       final AvoidanceAdvisor a = AvoidanceAdvisor();
       for (int i = 0; i < 3; i++) {
         a.observeFrame(<Detection>[det('car', 0.5, 0.9)]);
       }
-      a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
+      final AvoidanceDecision d =
+          a.decide(hazard: det('car', 0.5, 0.92), orientationStable: true);
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(d.speech, isNot(contains('向左迈')));
+      expect(d.speech, isNot(contains('向右迈')));
+      expect(a.hasPendingAction, isFalse);
       AvoidanceNotice? notice;
       for (int i = 0; i < 6; i++) {
         notice = a.observeFrame(<Detection>[det('car', 0.5, 0.9)]);
       }
-      expect(notice, AvoidanceNotice.actionUncertain);
+      expect(notice, isNull);
       expect(a.hasPendingAction, isFalse);
     });
   });
@@ -262,10 +288,8 @@ void main() {
       }
       final DateTime last = t0.add(const Duration(milliseconds: 400));
       expect(j.isStableAt(last), isTrue);
-      expect(
-          j.isStableAt(last.add(const Duration(milliseconds: 400))), isTrue);
-      expect(
-          j.isStableAt(last.add(const Duration(milliseconds: 500))), isTrue);
+      expect(j.isStableAt(last.add(const Duration(milliseconds: 400))), isTrue);
+      expect(j.isStableAt(last.add(const Duration(milliseconds: 500))), isTrue);
       // The stream stopped more than 500 ms ago: the old
       // quiet samples must NOT keep the verdict stable.
       expect(
@@ -402,8 +426,7 @@ void main() {
   // enum is exactly the two automatic event triggers plus
   // manual, and the deleted starters do not exist anywhere.
   group('vision triggers after section 3.3: event triggers + manual', () {
-    test('the trigger enum is exactly crossingStop, pathBlocked, manual',
-        () {
+    test('the trigger enum is exactly crossingStop, pathBlocked, manual', () {
       expect(
         VisionTrigger.values,
         <VisionTrigger>[

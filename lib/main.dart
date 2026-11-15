@@ -5812,9 +5812,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // the same urgent frame vibrated twice.
     String text = alert.phrase;
     if (alert.urgent) {
-      // A sideways step may ONLY come from the avoidance
-      // advisor's three-condition decision -- the tracking
-      // / TTC pipeline never produces a direction itself.
       final AvoidanceDecision decision = _avoidance.decide(
         hazard: alert.detection,
         orientationStable: _orientation.isStable,
@@ -5822,11 +5819,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // M2 section 3.3 evidence: the advisor's most
       // recent verdict feeds the pathBlocked trigger.
       _lastAdvisorAdvice = decision.advice;
-      if (decision.advice == StepAdvice.stepLeft) {
-        text = '$text，向左迈一步';
-      } else if (decision.advice == StepAdvice.stepRight) {
-        text = '$text，向右迈一步';
-      }
       // (The pre-3.3 automatic cloud hazard frame that
       // used to fire here on a near-centre alert is
       // deleted: automatic cloud calls are now only the
