@@ -24,11 +24,12 @@ void main() {
     expect(end, greaterThan(start));
     final String body = source.substring(start, end);
     // Every speech site in the function uses alert, including
-    // the camera-permission gate added for UI-06-B8.
+    // the camera-permission gate added for UI-06-B8 and the
+    // purpose-undelivered / request-timeout alerts (PR7-H1).
     final sites = RegExp(r'\b_say\s*\(|\b_sayPermissionFlowText\s*\(')
         .allMatches(body)
         .toList();
-    expect(sites.length, 4);
+    expect(sites.length, 6);
     for (final site in sites) {
       final next = sites.indexOf(site) + 1;
       final siteBody = body.substring(

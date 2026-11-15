@@ -10,6 +10,20 @@ import 'push_to_talk_ui_test.dart' as ui;
 import 'ui_a11y_s1_test.dart' as s1;
 
 void main() {
+  test('headset speech ids share their sequence', () {
+    final source = File('lib/main.dart').readAsStringSync();
+    final block = source.substring(
+        source.indexOf('  Future<void> _headsetToggle()'),
+        source.indexOf('  void _startSilenceWatch'));
+    for (final prefix in [
+      'headset-microphone-permission',
+      'headset-microphone-init'
+    ]) {
+      expect(block, contains("final int seq = _permissionSpeechSeq++;\n"));
+      expect(block, contains("id: '$prefix-\$seq',\n"));
+      expect(block, contains("eventId: '$prefix-\$seq',\n"));
+    }
+  });
   testWidgets('headset toggles a live press and ends it', (tester) async {
     final h = ui.RecordingVoiceChannels()..install();
     addTearDown(h.uninstall);

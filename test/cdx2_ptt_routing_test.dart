@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui' show SemanticsAction;
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/widgets.dart';
 import 'package:mingtu_ai/core/voice_commands.dart';
 import 'package:mingtu_ai/main.dart';
 
@@ -53,8 +54,10 @@ void main() {
       (tester) async {
     final proximity = StreamController<bool>.broadcast();
     mingtuProximityEventsOverride = () => proximity.stream;
+    mingtuPocketNowOverride = tester.binding.clock.now;
     addTearDown(() async {
       mingtuProximityEventsOverride = null;
+      mingtuPocketNowOverride = null;
       await proximity.close();
     });
     final h = ui.RecordingVoiceChannels()..install();
@@ -72,8 +75,6 @@ void main() {
         'hold starts listening');
     proximity.add(true);
     await tester.pump();
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 1500)));
     await tester.pump(const Duration(milliseconds: 1500));
     expect(debug.debugIgnoreTouches, isTrue);
     await gesture.up();
@@ -94,8 +95,10 @@ void main() {
       (tester) async {
     final proximity = StreamController<bool>.broadcast();
     mingtuProximityEventsOverride = () => proximity.stream;
+    mingtuPocketNowOverride = tester.binding.clock.now;
     addTearDown(() async {
       mingtuProximityEventsOverride = null;
+      mingtuPocketNowOverride = null;
       await proximity.close();
     });
     final h = ui.RecordingVoiceChannels()..install();
@@ -107,8 +110,6 @@ void main() {
     await ui.drainVoice(tester, h);
     proximity.add(true);
     await tester.pump();
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 1500)));
     await tester.pump(const Duration(milliseconds: 1500));
     expect(debug.debugIgnoreTouches, isTrue);
     final before = h.count('asr.listen');
@@ -129,6 +130,64 @@ void main() {
     await debug.debugHeadsetToggle();
     await s1.pumpUntil(tester, h, () => h.count('asr.listen') > before,
         'headset starts listening in pocket mode');
+    semantics.dispose();
+    await ui.shutdownVoice(tester, h);
+  });
+  testWidgets('toggle pocket lock blocks touch and preserves headset session',
+      (tester) async {
+    final proximity = StreamController<bool>.broadcast();
+    mingtuProximityEventsOverride = () => proximity.stream;
+    mingtuPocketNowOverride = tester.binding.clock.now;
+    addTearDown(() async {
+      mingtuProximityEventsOverride = null;
+      mingtuPocketNowOverride = null;
+      await proximity.close();
+    });
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    final semantics = tester.ensureSemantics();
+    await s1.settleToggleApp(tester, h);
+    final debug = mingtuHomeDebugHandle!;
+    debug.debugSetPocketEnabled(true);
+    await ui.drainVoice(tester, h);
+    proximity.add(true);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 1500));
+    expect(debug.debugIgnoreTouches, isTrue);
+    final before = h.count('asr.listen');
+    final mark = h.events.length;
+    final node =
+        tester.getSemantics(find.bySemanticsLabel(talkBackToggleIdleLabel));
+    node.owner!.performAction(node.id, SemanticsAction.tap);
+    node.owner!.performAction(node.id, SemanticsAction.longPress);
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(h.count('asr.listen'), before);
+    expect(h.events.sublist(mark), isNot(contains('tts.speak:请说')));
+    const hazard = '前方有车辆快速驶来，请立即停下';
+    debug.debugSpeakHazard(hazard);
+    await s1.pumpUntil(tester, h, () => h.events.contains('tts.speak:$hazard'),
+        'danger speech');
+    await ui.drainVoice(tester, h);
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 1600)));
+    await debug.debugHeadsetToggle();
+    await s1.pumpUntil(
+        tester, h, () => h.count('asr.listen') > before, 'headset listening');
+    final session = debug.pttSessionId;
+    proximity.add(false);
+    await tester.pump();
+    proximity.add(true);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 1500));
+    expect(debug.debugIgnoreTouches, isTrue);
+    final detectors =
+        tester.widgetList<GestureDetector>(find.byType(GestureDetector));
+    final detector = detectors
+        .firstWhere((d) => d.onLongPressEnd != null && d.excludeFromSemantics);
+    detector.onLongPressEnd!(const LongPressEndDetails());
+    await tester.pump();
+    expect(debug.pttIdle, isFalse);
+    expect(debug.pttSessionId, session);
     semantics.dispose();
     await ui.shutdownVoice(tester, h);
   });

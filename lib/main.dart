@@ -140,6 +140,7 @@ DateTime Function()? mingtuWatchdogNowOverride;
 
 @visibleForTesting
 Stream<bool> Function()? mingtuProximityEventsOverride;
+DateTime Function()? mingtuPocketNowOverride;
 
 /// UI-06: swap the first-launch marker store for a fake in
 /// widget tests.
@@ -150,6 +151,8 @@ GuideStore? mingtuGuideStoreOverride;
 CurrentLocationProvider? mingtuLocationProviderOverride;
 @visibleForTesting
 bool? mingtuYoloAvailableOverride;
+Widget Function(void Function(Object error) onError)?
+    mingtuYoloViewBuilderOverride;
 @visibleForTesting
 void Function()? mingtuCameraStartObserver;
 @visibleForTesting
@@ -1473,8 +1476,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _permissionGateway =
         mingtuPermissionGatewayOverride ?? createPermissionGateway();
     _guideStore = mingtuGuideStoreOverride ?? createGuideStore();
-    _pocketMode =
-        PocketMode(proximity: mingtuProximityEventsOverride ?? proximityEvents);
+    _pocketMode = PocketMode(
+        proximity: mingtuProximityEventsOverride ?? proximityEvents,
+        now: mingtuPocketNowOverride);
     unawaited(_loadPocketMode());
     // UI-06-B3: start the first-launch marker read now.
     // The startup gate awaits this future with a bounded
@@ -1791,6 +1795,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                 _permissionRequestGeneration[effect.permission] != generation) {
               return;
             }
+            if (lateOutcome != PermissionOutcome.granted) return;
             _deferredPermissionEffects = null;
             if (lateOutcome == PermissionOutcome.granted) {
               _grantedPermissions.add(effect.permission);
@@ -4904,9 +4909,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       final outcome = await _permissionStatus(GuidePermission.microphone);
       if (!mounted || !_foreground) return;
       if (outcome != PermissionOutcome.granted) {
+        final int seq = _permissionSpeechSeq++;
         _say(_request(
-          id: 'headset-microphone-permission-${_permissionSpeechSeq++}',
-          eventId: 'headset-microphone-permission-$_permissionSpeechSeq',
+          id: 'headset-microphone-permission-$seq',
+          eventId: 'headset-microphone-permission-$seq',
           kind: SpeechKind.alert,
           text: _guideResolvedSeen
               ? permissionDeniedText(GuidePermission.microphone)
@@ -4925,9 +4931,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         await _initializeMicrophone();
         if (!mounted || !_foreground) return;
         if (!_microphoneInitialized) {
+          final int seq = _permissionSpeechSeq++;
           _say(_request(
-            id: 'headset-microphone-init-${_permissionSpeechSeq++}',
-            eventId: 'headset-microphone-init-$_permissionSpeechSeq',
+            id: 'headset-microphone-init-$seq',
+            eventId: 'headset-microphone-init-$seq',
             kind: SpeechKind.alert,
             text: '语音识别初始化失败，请稍后重试。',
           ));
@@ -6900,7 +6907,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             alert: true,
             requireDelivery: true,
           );
-          if (!delivered || !mounted || token.isCancelled) return;
+          if (!mounted || token.isCancelled) return;
+          if (!delivered) {
+            final int seq = _permissionSpeechSeq++;
+            _say(_request(
+              id: 'manual-camera-purpose-$seq',
+              eventId: 'manual-camera-purpose-$seq',
+              kind: SpeechKind.alert,
+              text: permissionPurposeUndeliveredText,
+            ));
+            return;
+          }
           final int generation =
               (_permissionRequestGeneration[GuidePermission.camera] ?? 0) + 1;
           _permissionRequestGeneration[GuidePermission.camera] = generation;
@@ -6918,6 +6935,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                 _grantedPermissions.add(GuidePermission.camera);
               }
             }, onError: (Object _, StackTrace __) {}));
+            if (mounted && !token.isCancelled) {
+              final int seq = _permissionSpeechSeq++;
+              _say(_request(
+                id: 'manual-camera-timeout-$seq',
+                eventId: 'manual-camera-timeout-$seq',
+                kind: SpeechKind.alert,
+                text: permissionRequestTimeoutText,
+              ));
+            }
             return;
           } catch (_) {
             status = PermissionOutcome.denied;
@@ -7483,7 +7509,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
               if (!_pocketMode.ignoreTouches) _pushToTalkStart();
             },
             onLongPressEnd: (_) {
-              _pushToTalkEnd();
+              if (!_pocketMode.ignoreTouches ||
+                  _pttToggleSessionId != _pttSession) {
+                _pushToTalkEnd();
+              }
             },
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -7495,16 +7524,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                   child: IgnorePointer(
                     child: ExcludeSemantics(
                       child: _yoloLiveOpen
-                          ? YoloLiveView(
-                              modelPath: AppConfig.yoloModelPath,
-                              onDetections: _onYoloDetections,
-                              onLatencyMs: (double ms) {
-                                setState(() {
-                                  _yoloLatencyMs = ms;
-                                });
-                              },
-                              onError: _onYoloViewError,
-                            )
+                          ? (mingtuYoloViewBuilderOverride
+                                  ?.call(_onYoloViewError) ??
+                              YoloLiveView(
+                                modelPath: AppConfig.yoloModelPath,
+                                onDetections: _onYoloDetections,
+                                onLatencyMs: (double ms) {
+                                  setState(() {
+                                    _yoloLatencyMs = ms;
+                                  });
+                                },
+                                onError: _onYoloViewError,
+                              ))
                           : Container(
                               key:
                                   const ValueKey<String>('camera-preview-area'),
