@@ -15,6 +15,7 @@ class TtsRecoveryController {
         _schedule = schedule ?? Timer.new;
 
   static const announcement = '语音已恢复';
+  static const dangerDurationCap = Duration(seconds: 30);
   final Future<VoiceOutput?> Function() rebuild;
   final void Function(VoiceOutput, String) onRecovered;
   final Haptics Function() haptics;
@@ -22,6 +23,8 @@ class TtsRecoveryController {
   final Timer Function(Duration, void Function()) _schedule;
   Timer? _retry;
   Timer? _vibration;
+  Timer? _dangerCap;
+  bool _dangerExhausted = false;
   bool _failed = false;
   bool _disposed = false;
   int _attempt = 0;
@@ -63,7 +66,15 @@ class TtsRecoveryController {
 
   /// Repeat while recovery is pending and until the caller clears danger.
   void danger() {
-    if (!_failed || _disposed || _vibration != null) return;
+    if (!_failed || _disposed || _vibration != null || _dangerExhausted) {
+      return;
+    }
+    _dangerCap = _schedule(dangerDurationCap, () {
+      _vibration?.cancel();
+      _vibration = null;
+      _dangerCap = null;
+      _dangerExhausted = true;
+    });
     void pulse() {
       if (!_failed || _disposed) return;
       unawaited(haptics().vibrateUrgent());
@@ -74,6 +85,9 @@ class TtsRecoveryController {
   }
 
   void stopDanger() {
+    _dangerCap?.cancel();
+    _dangerCap = null;
+    _dangerExhausted = false;
     _vibration?.cancel();
     _vibration = null;
   }

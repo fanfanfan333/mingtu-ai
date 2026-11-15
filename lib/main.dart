@@ -280,6 +280,7 @@ class MingtuHomeDebugHandle {
   void startVoiceDemo() => _state._startVoice();
   void planRoute() => _state._planRoute();
   void startNavigating() => _state._startNavigating();
+  void debugEndLiveNavigation() => _state._endLiveNavigation();
   void turnAhead() => _state._turn();
   void manualStraight() => _state._manualStraight();
   void reconfirmStraight() => _state._reconfirmStraight();
@@ -1695,6 +1696,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached) {
+      _ttsRecovery.stopDanger();
       if (_yoloLiveOpen && mounted) {
         setState(() {
           _closeYoloLiveView();
@@ -2536,6 +2538,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// microphone/speech stop alone must not leave a phantom
   /// navigation running.
   void _endLiveNavigation() {
+    _ttsRecovery.stopDanger();
     _gpsSub?.cancel();
     _gpsSub = null;
     // M3 TBT spike: the TBT source dies with the trip.
@@ -6171,6 +6174,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _onYoloViewError(Object error) {
+    _ttsRecovery.stopDanger();
     // Classified, never raw: a CAMERA
     // PERMISSION denial and a MODEL LOAD
     // failure get DIFFERENT announcements --
@@ -6247,6 +6251,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// only after the view has actually unmounted
   /// (yoloLiveViewDisposed). Safe to call when not open.
   void _closeYoloLiveView() {
+    _ttsRecovery.stopDanger();
     _yoloLiveOpen = false;
     _updateForegroundPolicies();
     final CameraLease? lease = _yoloLease;
@@ -7580,6 +7585,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _triggerEmergency() {
+    _ttsRecovery.stopDanger();
     _emergencyTriggerCount++;
     final DateTime now = DateTime.now();
     _events.publish(
