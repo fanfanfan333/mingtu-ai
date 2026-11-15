@@ -873,8 +873,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final id = 'ptt-cue-${_cueSequence++}';
     final wait = Completer<void>();
     _cueWaits[id] = wait;
-    final accepted =
-        _say(_request(id: id, eventId: id, text: text, kind: SpeechKind.info));
+    final accepted = _say(
+        _request(id: id, eventId: id, text: text, kind: SpeechKind.info),
+        recordAsSpoken: false);
     if (!accepted && !wait.isCompleted) wait.complete();
     try {
       await wait.future.timeout(AppConfig.effectivePermissionSpeechTimeout);
@@ -1401,10 +1402,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// a just-started danger/emergency utterance whose scheduler entry has
   /// already completed (see _interruptSpeechForPushToTalk).
   DateTime? _lastSpeechStartedAt;
+  String _lastSpeechStartedText = '';
 
   /// The text of the most recent danger (level 1) / emergency
   /// (level 0) utterance actually played; compared against
-  /// _lastSpokenText by the push-to-talk interruption rules.
+  /// _lastSpeechStartedText by the push-to-talk interruption rules.
   String _lastP0SpokenText = '';
 
   /// The scheduler id of that utterance; the scheduler's
@@ -3097,7 +3099,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 
-  bool _say(SpeechRequest request) {
+  bool _say(SpeechRequest request, {bool recordAsSpoken = true}) {
     if (!mounted) return false;
     // NAVHAZ M1 banned-word guard (spec sections 0.1 /
     // 2.4): NO announcement may grant or imply passage. In
@@ -3130,16 +3132,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
     }
     if (accepted) _publishSpeech(request);
-    setState(() {
-      if (accepted && _scheduler.active?.id == request.id) {
-        _currentPrompt = request.text;
-        _lastSpokenText = request.text;
-      } else if (accepted) {
-        _currentPrompt = '已排队：${request.text}';
-      } else {
-        _currentPrompt = '未播报（调度器已丢弃过期或重复提示）：${request.text}';
-      }
-    });
+    if (recordAsSpoken) {
+      setState(() {
+        if (accepted && _scheduler.active?.id == request.id) {
+          _currentPrompt = request.text;
+          _lastSpokenText = request.text;
+        } else if (accepted) {
+          _currentPrompt = '已排队：${request.text}';
+        } else {
+          _currentPrompt = '未播报（调度器已丢弃过期或重复提示）：${request.text}';
+        }
+      });
+    }
     // v0.6: real TTS when the phone's engine is reachable; the
     // prompt completes only when the engine reports completion.
     // Otherwise the old simulated 1200 ms timing is used.
@@ -3288,10 +3292,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _maybeStartListeningAfterSpeech();
         return;
       }
-      setState(() {
-        _currentPrompt = next.text;
-        _lastSpokenText = next.text;
-      });
+      // Queued PTT cues retain their reserved ID when promoted.
+      if (!next.id.startsWith('ptt-cue-')) {
+        setState(() {
+          _currentPrompt = next.text;
+          _lastSpokenText = next.text;
+        });
+      }
       if (finished.kind == SpeechKind.danger ||
           finished.kind == SpeechKind.emergency ||
           finished.kind == SpeechKind.obstacleAvoidance) {
@@ -3408,6 +3415,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   Future<void> _trackedSpeak(SpeechRequest request) async {
     _lastSpeechStartedAt = DateTime.now();
+    _lastSpeechStartedText = request.text;
     // S3 segment 2 arming: if this request is a hazard
     // alert, its pipeline-return stamp moves into the
     // single start-watch slot (playback is serialised, so
@@ -3884,7 +3892,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final DateTime? startedAt = _lastSpeechStartedAt;
     return startedAt != null &&
         _lastP0SpokenText.isNotEmpty &&
-        _lastSpokenText == _lastP0SpokenText &&
+        _lastSpeechStartedText == _lastP0SpokenText &&
         DateTime.now().difference(startedAt) <
             const Duration(milliseconds: 1500);
   }
@@ -4013,9 +4021,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (_pttCloseWaitAnnounced) return;
     _pttCloseWaitAnnounced = true;
     if (!_voiceOutput.isAvailable || _ttsFailed) return;
-    setState(() {
-      _currentPrompt = '请稍等';
-    });
     unawaited(() async {
       try {
         await speakAfterClosingMic(
@@ -4094,9 +4099,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     if (_voiceOutput.isAvailable && !_ttsFailed) {
-      setState(() {
-        _currentPrompt = '请说';
-      });
       try {
         await speakAfterClosingMic(
           input: _voiceInput is SystemVoiceInput
@@ -4808,7 +4810,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (startedAt != null &&
         DateTime.now().difference(startedAt) <
             const Duration(milliseconds: 1500)) {
-      if (_lastSpokenText == _lastP0SpokenText) return;
+      if (_lastSpeechStartedText == _lastP0SpokenText) return;
       await _stopTtsPlayback();
     }
   }
