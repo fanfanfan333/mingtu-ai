@@ -24,6 +24,7 @@ import 'core/event_bus.dart';
 import 'core/cloud_asr.dart';
 import 'core/cloud_vision.dart';
 import 'core/health_monitor.dart';
+import 'core/lens_occlusion.dart';
 import 'core/tts_recovery.dart';
 import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
@@ -172,6 +173,16 @@ class MingtuHomeDebugHandle {
   MingtuHomeDebugHandle._(this._state);
 
   final _MingtuHomePageState _state;
+
+  /// Installs a deterministic monitor for camera-free tests.
+  void debugSetLensClock(DateTime Function() now) =>
+      _state._lensMonitor = LensOcclusionMonitor(now: now);
+
+  void debugPushLuma(double mean, double variance) =>
+      _state._onLensSample(LumaStats(mean, variance));
+
+  List<SpeechRequest> get debugLensSpeechQueue =>
+      List<SpeechRequest>.unmodifiable(_state._scheduler.queue);
 
   /// The in-app diagnostic log joined (state only; the
   /// panel's log area used to render it).
@@ -632,6 +643,23 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     with WidgetsBindingObserver {
   TaskManager _tasks = TaskManager();
   SpeechScheduler _scheduler = SpeechScheduler();
+  LensOcclusionMonitor _lensMonitor = LensOcclusionMonitor();
+  int _lensNoticeSequence = 0;
+
+  void _onLensSample(LumaStats stats) {
+    final LensNotice? notice = _lensMonitor.sample(stats);
+    if (notice == null) return;
+    final String id = 'lens-${_lensNoticeSequence++}';
+    _say(_request(
+      id: id,
+      eventId: id,
+      text: notice == LensNotice.alert
+          ? LensOcclusionMonitor.alertText
+          : LensOcclusionMonitor.recoveryText,
+      kind: notice == LensNotice.alert ? SpeechKind.alert : SpeechKind.info,
+    ));
+  }
+
 
   /// The clock every speech-arbitration timestamp runs on
   /// (CDX3): request creation / expiry stamps, the
@@ -1494,6 +1522,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void initState() {
     super.initState();
     mingtuHomeDebugHandle = MingtuHomeDebugHandle._(this);
+    mingtuLensSampleSink = _onLensSample;
     _headsetChannel.setMethodCallHandler((call) async {
       if (call.method == 'toggle') await _headsetToggle();
     });
@@ -2981,6 +3010,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    if (mingtuLensSampleSink == _onLensSample) {
+      mingtuLensSampleSink = null;
+    }
     _ttsRecovery.dispose();
     _headsetChannel.setMethodCallHandler(null);
     _pocketMode.dispose();
