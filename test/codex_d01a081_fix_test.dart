@@ -219,7 +219,7 @@ void main() {
 
       // YOLO path: the person danger arrives.
       await tapText(tester, '模拟 YOLO 检测：前方行人（演示，无摄像头）');
-      final int personIdx = calls.indexOf('speak:前方有人，请停下。');
+      final int personIdx = calls.indexOf('speak:前方有人，请停下，用盲杖确认。');
       expect(personIdx, greaterThan(straightIdx), reason: 'calls: $calls');
       // A physical stop was issued AFTER the straight speak
       // and BEFORE the danger speak -- unconditionally, not
@@ -232,7 +232,7 @@ void main() {
       // Same-level danger, different event: it preempts the
       // (still playing) person danger the same way.
       await tapText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
-      final int carIdx = calls.indexOf('speak:前方有机动车，请停下。');
+      final int carIdx = calls.indexOf('speak:前方有机动车，请停下，用盲杖确认。');
       expect(carIdx, greaterThan(personIdx), reason: 'calls: $calls');
       final int stop2Idx =
           calls.indexWhere((String c) => c == 'stop', personIdx);
@@ -240,7 +240,7 @@ void main() {
       expect(stop2Idx, lessThan(carIdx), reason: 'calls: $calls');
       // The interrupted person danger is never replayed.
       expect(
-        calls.where((String c) => c == 'speak:前方有人，请停下。').length,
+        calls.where((String c) => c == 'speak:前方有人，请停下，用盲杖确认。').length,
         1,
         reason: 'calls: $calls',
       );
