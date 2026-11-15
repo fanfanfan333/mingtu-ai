@@ -24,6 +24,7 @@ import 'core/event_bus.dart';
 import 'core/cloud_asr.dart';
 import 'core/cloud_vision.dart';
 import 'core/health_monitor.dart';
+import 'core/tts_recovery.dart';
 import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
@@ -134,6 +135,7 @@ class MingtuApp extends StatelessWidget {
 /// the real gateway / store factories are used then.
 /// UI-06: swap the permission gateway (the plugin-backed
 /// one) for a fake in widget tests.
+SystemVoiceOutput Function()? mingtuStartupTtsFactoryOverride;
 PermissionGateway? mingtuPermissionGatewayOverride;
 WakelockGateway? mingtuWakelockGatewayOverride;
 DateTime Function()? mingtuWatchdogNowOverride;
@@ -404,6 +406,11 @@ class MingtuHomeDebugHandle {
 
   void setCameraFrameSourceForTest(CameraFrameSource source) =>
       _state._frameSource = source;
+
+  void debugFailTts(Future<VoiceOutput?> Function() rebuild) {
+    _state._ttsRebuildOverride = rebuild;
+    _state._handleTtsFailure(StateError('test failure'));
+  }
 
   void disableVoiceOutputForTest() {
     _state._ttsFailed = true;
@@ -1246,6 +1253,28 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // no automatic ASR restart); once an ASR error has been announced
   // it is not announced again (no retry/announce loop).
   bool _ttsFailed = false;
+  Future<VoiceOutput?> Function()? _ttsRebuildOverride;
+  late final TtsRecoveryController _ttsRecovery = TtsRecoveryController(
+    haptics: () => _haptics,
+    rebuild: () async {
+      if (_ttsRebuildOverride != null) return _ttsRebuildOverride!();
+      final output = SystemVoiceOutput();
+      if (!await output.initialize() || !output.chineseVoiceVerified) return null;
+      output.onSpeakStart = _onTtsSpeakStart;
+      return output;
+    },
+    onRecovered: (output, announcement) {
+      if (!mounted) return;
+      _voiceOutput = output;
+      _ttsFailed = false;
+      _health.report('voice_output', ServiceHealthStatus.ok, output.status);
+      setState(() {
+        _voiceText = '语音：TTS：${output.status}；ASR：${_voiceInput.status}。';
+      });
+      _say(_request(id: 'tts-recovered-${DateTime.now().microsecondsSinceEpoch}',
+          eventId: 'tts-recovered', text: announcement, kind: SpeechKind.info));
+    },
+  );
 
   /// True while the last-started listening session has not
   /// yet been closed by an app-initiated stop/cancel. The
@@ -2474,6 +2503,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         ownership: _cameraOwnership,
       ),
       log: startupFailures,
+      ttsFactory: mingtuStartupTtsFactoryOverride,
       locationFactory: mingtuLocationProviderOverride == null
           ? null
           : () => mingtuLocationProviderOverride!,
@@ -2951,6 +2981,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    _ttsRecovery.dispose();
     _headsetChannel.setMethodCallHandler(null);
     _pocketMode.dispose();
     _foreground = false;
@@ -3119,6 +3150,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   bool _say(SpeechRequest request, {bool recordAsSpoken = true}) {
     if (!mounted) return false;
+    if (_ttsFailed) {
+      if (request.kind == SpeechKind.danger) {
+        _pauseStraightForRisk();
+        _ttsRecovery.danger();
+      }
+      return false;
+    }
     // NAVHAZ M1 banned-word guard (spec sections 0.1 /
     // 2.4): NO announcement may grant or imply passage. In
     // debug builds the assert fires; in release builds the
@@ -3490,7 +3528,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (mounted) _handleTtsFailure(e);
         return null;
       });
-    } else {
+    } else if (!_ttsFailed) {
       _simulateSpeechCompletion(request.id);
     }
   }
@@ -3508,6 +3546,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _handleTtsFailure(Object error) {
     mingtuVoiceLog('语音合成运行失败：已切换为不可用状态，停止自动聆听');
     _ttsFailed = true;
+    _ttsRecovery.fail();
     _voiceOutput = UnavailableVoiceOutput();
     _health.report(
       'voice_output',
@@ -3532,7 +3571,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// when no real TTS engine is reachable (web / VM / test).
   void _simulateSpeechCompletion(String id) {
     Future<void>.delayed(const Duration(milliseconds: 1200), () {
-      if (!mounted) {
+      if (!mounted || _ttsFailed) {
         return;
       }
       // An entry cancelled while its simulated playback ran
@@ -5785,8 +5824,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // only through the confirmed alert path below.
     if (navigating) {
       for (final ({int trackId, bool urgent}) v in result.vibrations) {
-        unawaited(
-            v.urgent ? _haptics.vibrateUrgent() : _haptics.vibrateWarning());
+        if (_ttsFailed && v.urgent) {
+          _ttsRecovery.danger();
+        } else {
+          unawaited(
+              v.urgent ? _haptics.vibrateUrgent() : _haptics.vibrateWarning());
+        }
       }
     }
     if (result.riskPresent) {
@@ -5802,6 +5845,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     final HazardAlert? alert = result.alert;
     if (alert == null) return;
+    if (_ttsFailed && alert.urgent) _ttsRecovery.danger();
     // NH-M1-13: NO vibration dispatch here any more --
     // the alert's vibration (when its ladder step allows
     // one) was already dispatched in parallel with the
@@ -5810,7 +5854,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // speech; spec section 2.5 timing is unchanged).
     // Dispatching again here was duplicate source (ii):
     // the same urgent frame vibrated twice.
-    String text = alert.phrase;
+    final String text = alert.phrase;
     if (alert.urgent) {
       final AvoidanceDecision decision = _avoidance.decide(
         hazard: alert.detection,
