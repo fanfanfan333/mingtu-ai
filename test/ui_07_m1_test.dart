@@ -95,7 +95,9 @@ void main() {
     for (final name in [
       'android.permission.FOREGROUND_SERVICE',
       'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
+      'android.permission.RECEIVE_BOOT_COMPLETED',
       'androidx.work.impl.foreground.SystemForegroundService',
+      'androidx.work.impl.background.systemalarm.RescheduleReceiver',
       'com.google.android.play.core.assetpacks.ExtractionForegroundService',
       'com.google.android.play.core.assetpacks.AssetPackExtractionService'
     ]) {

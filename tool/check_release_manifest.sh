@@ -24,11 +24,15 @@ if [[ -n "$manifest" ]]; then
 import sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.argv[1]).getroot()
 a = '{http://schemas.android.com/apk/res/android}'
-forbidden = {'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_LOCATION', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC', 'android.permission.ACCESS_BACKGROUND_LOCATION'}
+forbidden = {'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_LOCATION', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC', 'android.permission.ACCESS_BACKGROUND_LOCATION', 'android.permission.RECEIVE_BOOT_COMPLETED'}
 bad = False
 for entry in root:
     if entry.tag in ('uses-permission', 'uses-permission-sdk-23') and entry.get(a+'name') in forbidden:
         print('Forbidden permission:', entry.get(a+'name'), file=sys.stderr)
+        bad = True
+for tag, name in (('receiver', 'androidx.work.impl.background.systemalarm.RescheduleReceiver'), ('action', 'android.intent.action.BOOT_COMPLETED')):
+    if any(entry.get(a+'name') == name for entry in root.iter(tag)):
+        print('Forbidden manifest entry:', name, file=sys.stderr)
         bad = True
 print('Remaining services (name, enabled, exported, foregroundServiceType):')
 geo = 'com.baseflow.geolocator.GeolocatorLocationService'
@@ -52,13 +56,17 @@ if [[ -n "$apk" ]]; then
   aapt=$(find "$sdk" -type f -name aapt | sort -V | tail -n 1)
   [[ -n "$aapt" ]] || { echo 'aapt unavailable' >&2; exit 1; }
   permissions=$("$aapt" dump permissions "$apk")
-  if printf '%s\n' "$permissions" | grep -E "uses-permission[^:]*:.*android.permission.(FOREGROUND_SERVICE(_LOCATION|_DATA_SYNC)?|ACCESS_BACKGROUND_LOCATION)(['\" ]|$)"; then
+  if printf '%s\n' "$permissions" | grep -E "uses-permission[^:]*:.*android.permission.(FOREGROUND_SERVICE(_LOCATION|_DATA_SYNC)?|ACCESS_BACKGROUND_LOCATION|RECEIVE_BOOT_COMPLETED)(['\" ]|$)"; then
     echo 'Forbidden APK permission found.' >&2; exit 1
   fi
   echo 'APK services (name, enabled, exported, foregroundServiceType):'
   "$aapt" dump xmltree "$apk" AndroidManifest.xml | python3 -c '
 import re, sys
 lines = sys.stdin.read().splitlines()
+forbidden = ("androidx.work.impl.background.systemalarm.RescheduleReceiver", "android.intent.action.BOOT_COMPLETED")
+if any(name in line for line in lines for name in forbidden):
+    print("Forbidden APK manifest entry found.", file=sys.stderr)
+    sys.exit(1)
 services = []
 current = None
 for line in lines:

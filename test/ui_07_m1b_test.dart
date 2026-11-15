@@ -76,6 +76,7 @@ void main() {
     expect(script, contains('processReleaseMainManifest'));
     expect(script, contains('android.permission.FOREGROUND_SERVICE_LOCATION'));
     expect(script, contains('android.permission.ACCESS_BACKGROUND_LOCATION'));
+    expect(script, contains('android.permission.RECEIVE_BOOT_COMPLETED'));
     final dir = Directory.systemTemp.createTempSync('mingtu-manifest-');
     addTearDown(() => dir.deleteSync(recursive: true));
     final file = File('${dir.path}/AndroidManifest.xml');
@@ -94,6 +95,9 @@ void main() {
     expect(legal.stdout, contains('GeolocatorLocationService'));
     for (final body in [
       '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/><application>$geo</application>',
+      '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/><application>$geo</application>',
+      '<application>$geo<receiver android:name="androidx.work.impl.background.systemalarm.RescheduleReceiver"/></application>',
+      '<application>$geo<receiver android:name="other"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter></receiver></application>',
       '<application>$geo<service android:name="other" android:foregroundServiceType="dataSync"/></application>',
       '<application><service android:name="com.baseflow.geolocator.GeolocatorLocationService" android:foregroundServiceType="dataSync"/></application>',
       '<application/>',
