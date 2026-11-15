@@ -32,6 +32,7 @@ import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 
 import '../config/app_config.dart';
 import '../core/lens_occlusion.dart';
+import '../core/lens_sample_scheduler.dart';
 import '../core/navhaz_config.dart';
 import '../modules/visual_perception.dart';
 import 'yolo_detector.dart';
@@ -85,16 +86,14 @@ YOLOStreamingConfig yoloStreamingConfigForFps(int fps,
   );
 }
 
-DateTime? _lastLensLumaAt;
+final LensSampleScheduler _lensSampleScheduler = LensSampleScheduler();
 
 void _maybeSampleLensLuma() {
-  final DateTime now = DateTime.now();
-  if (_lastLensLumaAt != null &&
-      now.difference(_lastLensLumaAt!) < const Duration(milliseconds: 500)) {
-    return;
-  }
-  _lastLensLumaAt = now;
-  unawaited(_sampleLensLuma());
+  unawaited(_lensSampleScheduler.request(
+    _sampleLensLuma,
+    appliedFps: appliedYoloFrameRateFps,
+    analysisCap720p: _appliedAnalysisCap720p,
+  ));
 }
 
 Future<void> _sampleLensLuma() async {
@@ -112,8 +111,7 @@ Future<void> _sampleLensLuma() async {
 }
 
 Future<List<int>?> _tinyGrayFromImageBytes(Uint8List bytes) async {
-  final ui.Codec codec =
-      await ui.instantiateImageCodec(bytes, targetWidth: 32);
+  final ui.Codec codec = await ui.instantiateImageCodec(bytes, targetWidth: 32);
   final ui.FrameInfo frame = await codec.getNextFrame();
   final ByteData? data =
       await frame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
@@ -126,8 +124,6 @@ Future<List<int>?> _tinyGrayFromImageBytes(Uint8List bytes) async {
   }
   return gray;
 }
-
-
 
 /// The frame-rate target most recently handed to the plugin
 /// (null before the first application and whenever the
