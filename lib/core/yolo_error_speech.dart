@@ -9,20 +9,26 @@
 /// both possibilities instead of guessing one.
 library;
 
+import '../config/app_config.dart';
+
 enum YoloViewErrorKind { cameraPermissionDenied, modelLoadFailed, unknown }
 
 YoloViewErrorKind classifyYoloViewError(Object error) {
   final String s = error.toString().toLowerCase();
-  // Permission first: 'denied' is decisive even when the
-  // message also mentions the camera pipeline.
-  if (s.contains('permission') ||
-      s.contains('denied') ||
-      s.contains('not authorized') ||
-      s.contains('unauthorized') ||
+  if ((s.contains('camera') &&
+          (s.contains('permission') ||
+              s.contains('denied') ||
+              s.contains('not authorized') ||
+              s.contains('unauthorized'))) ||
       s.contains('camera_access')) {
     return YoloViewErrorKind.cameraPermissionDenied;
   }
-  if (s.contains('model') ||
+  if (s.contains('securityexception') ||
+      s.contains('platformexception') ||
+      s.contains('missingpluginexception') ||
+      s.contains('foreground') ||
+      s.contains('fgs') ||
+      s.contains('model') ||
       s.contains('tflite') ||
       s.contains('litert') ||
       s.contains('load')) {
@@ -34,7 +40,7 @@ YoloViewErrorKind classifyYoloViewError(Object error) {
 String yoloViewErrorSpeech(YoloViewErrorKind kind) => switch (kind) {
       YoloViewErrorKind.cameraPermissionDenied =>
         '没有摄像头权限，无法检测危险，请在设置中开启摄像头权限。',
-      YoloViewErrorKind.modelLoadFailed => '目标检测模型加载失败，YOLO 实时检测不可用。',
+      YoloViewErrorKind.modelLoadFailed => localDetectionFaultText,
       YoloViewErrorKind.unknown => 'YOLO 实时检测不可用：摄像头或模型加载失败。',
     };
 

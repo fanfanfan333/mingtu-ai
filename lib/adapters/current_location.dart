@@ -169,9 +169,16 @@ class GeolocatorCurrentLocation implements CurrentLocationProvider {
         );
         return LocationResult.fix(gcj02, position.accuracy,
             speedMps: position.speed >= 0 ? position.speed : null);
-      });
+      }).transform(
+          StreamTransformer<LocationResult, LocationResult>.fromHandlers(
+        handleError: (error, stackTrace, sink) {
+          sink.add(LocationResult.error(LocationFailure.failed, '定位信号中断。'));
+        },
+      ));
     } catch (_) {
-      return const Stream<LocationResult>.empty();
+      return Stream<LocationResult>.value(
+        LocationResult.error(LocationFailure.failed, '定位信号中断。'),
+      );
     }
   }
 }

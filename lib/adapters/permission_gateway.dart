@@ -35,5 +35,5 @@ class UnavailablePermissionGateway implements PermissionGateway {
       PermissionOutcome.denied;
 
   @override
-  Future<void> openSettings() async {}
+  Future<bool> openSettings() async => false;
 }

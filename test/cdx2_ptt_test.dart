@@ -41,12 +41,12 @@ void cdx2Group() {
   group('CDX2 streak / bounded cancel / TalkBack timer', () {
     /// One full press whose session errors once with
     Future<void> errorPress(
-        WidgetTester tester, RecordingVoiceChannels h,
-        String code) async {
+        WidgetTester tester, RecordingVoiceChannels h, String code) async {
       final int baseline = processFakeStt!.listenCalls;
       final TestGesture g = await startPttGesture(tester);
       await pressUntilCapture(tester, h, g,
-          expectRecorder: false, useFakeListen: true,
+          expectRecorder: false,
+          useFakeListen: true,
           fakeListenBaseline: baseline);
       await deliverError(tester, code, true);
       await holdPastThreshold(tester);
@@ -70,10 +70,8 @@ void cdx2Group() {
     testWidgets(
         'CDX2 streak: busy, client, busy does NOT escalate '
         '-- a different code breaks the streak, and the '
-        'fourth press still listens locally',
-        (WidgetTester tester) async {
-      final RecordingVoiceChannels h = RecordingVoiceChannels()
-        ..install();
+        'fourth press still listens locally', (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
       await installFakeBackedInput(tester);
@@ -104,7 +102,8 @@ void cdx2Group() {
       final int listensBefore = processFakeStt!.listenCalls;
       final TestGesture g4 = await startPttGesture(tester);
       await pressUntilCapture(tester, h, g4,
-          expectRecorder: false, useFakeListen: true,
+          expectRecorder: false,
+          useFakeListen: true,
           fakeListenBaseline: listensBefore);
       expect(processFakeStt!.listenCalls, listensBefore + 1,
           reason: 'the fourth press must listen, not record');
@@ -121,10 +120,8 @@ void cdx2Group() {
     testWidgets(
         'CDX2: a platform cancel that NEVER returns -- the '
         'recovery bounds its wait at 1 s, still initializes, '
-        'and the press listens (never wedges)',
-        (WidgetTester tester) async {
-      final RecordingVoiceChannels h = RecordingVoiceChannels()
-        ..install();
+        'and the press listens (never wedges)', (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
       await installFakeBackedInput(tester);
@@ -142,10 +139,10 @@ void cdx2Group() {
       // the 1 s timeout fires inside those rounds and the
       // recovery proceeds to initialize -> listen.
       await pressUntilCapture(tester, h, g2,
-          expectRecorder: false, useFakeListen: true,
+          expectRecorder: false,
+          useFakeListen: true,
           fakeListenBaseline: listensBefore);
-      expect(processFakeStt!.initializeCalls,
-          greaterThan(initBefore),
+      expect(processFakeStt!.initializeCalls, greaterThan(initBefore),
           reason: 'initialize ran despite the hanging cancel');
       expect(processFakeStt!.listenCalls, listensBefore + 1,
           reason: 'the press reached listen -- it did not wedge');
@@ -164,15 +161,13 @@ void cdx2Group() {
     /// Drive a TalkBack long press (the debug seam calls
     /// the very method the Semantics action calls) until
     /// the recorder has started.
-    Future<void> talkBackUntilRecording(
-        WidgetTester tester, RecordingVoiceChannels h,
-        FakeRecorder recorder) async {
+    Future<void> talkBackUntilRecording(WidgetTester tester,
+        RecordingVoiceChannels h, FakeRecorder recorder) async {
       mingtuHomeDebugHandle!.debugTalkBackLongPress();
       for (int i = 0;
           i < 40 &&
-              !h.speakQueue.any(
-                  (MapEntry<String, Completer<dynamic>> e) =>
-                      e.key == '请说' && !e.value.isCompleted);
+              !h.speakQueue.any((MapEntry<String, Completer<dynamic>> e) =>
+                  e.key == '请说' && !e.value.isCompleted);
           i++) {
         h.completeAllSpeaks();
         await tester.runAsync(
@@ -193,17 +188,14 @@ void cdx2Group() {
     testWidgets(
         'CDX2 TalkBack: a recording started by the TalkBack '
         'long press caps through the unified point -- cap '
-        'notice spoken, transcribed exactly once',
-        (WidgetTester tester) async {
-      final RecordingVoiceChannels h = RecordingVoiceChannels()
-        ..install();
+        'notice spoken, transcribed exactly once', (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
       h.events.clear();
 
       final FakeRecorder recorder = FakeRecorder();
-      await armFallbackRecorderOnly(tester, h, recorder,
-          asrText: '去图书馆');
+      await armFallbackRecorderOnly(tester, h, recorder, asrText: '去图书馆');
       mingtuHomeDebugHandle!.setRecordCapMs(300);
 
       await talkBackUntilRecording(tester, h, recorder);
@@ -227,17 +219,14 @@ void cdx2Group() {
     testWidgets(
         'CDX2 TalkBack: session 1 cap timer fired LATE, '
         'during session 2, is a no-op -- session 2 records '
-        'on and caps only at its own fire',
-        (WidgetTester tester) async {
-      final RecordingVoiceChannels h = RecordingVoiceChannels()
-        ..install();
+        'on and caps only at its own fire', (WidgetTester tester) async {
+      final RecordingVoiceChannels h = RecordingVoiceChannels()..install();
       addTearDown(h.uninstall);
       await settleRecordedApp(tester, h);
       h.events.clear();
 
       final FakeRecorder recorder = FakeRecorder();
-      await armFallbackRecorderOnly(tester, h, recorder,
-          asrText: '去图书馆');
+      await armFallbackRecorderOnly(tester, h, recorder, asrText: '去图书馆');
       mingtuHomeDebugHandle!.setRecordCapMs(300);
 
       // Session 1: TalkBack recording, capped normally.
@@ -282,24 +271,34 @@ void cdx2Group() {
         'Future.delayed(10 s) TalkBack auto-end is gone, and '
         'the Semantics action routes through the shared-timer '
         'entry', () {
-      final String mainDart =
-          File('lib/main.dart').readAsStringSync();
+      final String mainDart = File('lib/main.dart').readAsStringSync();
       expect(
-          mainDart.contains(
-              'Future<void>.delayed(const Duration(seconds: 10)'),
+          mainDart.contains('Future<void>.delayed(const Duration(seconds: 10)'),
           isFalse,
           reason: 'no second, unbound 10 s auto-end may exist');
-      // UI-A11Y UI-01 adjustment: in TalkBack toggle mode
-      // the Semantics long-press routes to _pttToggleStart;
-      // outside toggle mode it still routes to
-      // _talkBackLongPress (the shared-timer entry), which
-      // is what this guard pins.
-      expect(mainDart.contains('onLongPress:'), isTrue);
-      expect(mainDart.contains(': _talkBackLongPress'), isTrue,
-          reason: 'the hold-mode Semantics long-press must '
-              'keep routing through _talkBackLongPress');
+      // UI-08 wraps the same routing in a pocket-mode
+      // ignoreTouches gate: toggle still goes to
+      // _pttToggleStart, hold mode still goes to
+      // _talkBackLongPress (the shared-timer entry).
+      expect(mainDart.contains('_pttToggleStart()'), isTrue);
+      expect(mainDart.contains('_talkBackLongPress()'), isTrue);
+      expect(mainDart.contains('if (!_pocketMode.ignoreTouches)'), isTrue);
+      expect(
+          mainDart.contains(
+              'onLongPress: toggleMode ? _pttToggleStart : _talkBackLongPress'),
+          isFalse,
+          reason: 'the one-liner was replaced by the pocket gate');
+      final longPress = mainDart.substring(
+          mainDart.indexOf('onLongPress: () {'),
+          mainDart.indexOf('child: GestureDetector('));
+      expect(longPress, contains('if (!_pocketMode.ignoreTouches)'));
+      expect(longPress, contains('if (toggleMode)'));
+      expect(longPress, contains('_pttToggleStart()'));
+      expect(longPress, contains('_talkBackLongPress()'));
+      final elseIndex = longPress.indexOf('} else {');
+      expect(elseIndex, greaterThan(longPress.indexOf('_pttToggleStart()')));
+      expect(longPress.indexOf('_talkBackLongPress()'), greaterThan(elseIndex));
       expect(mainDart.contains('_onPttCapTimerFired'), isTrue);
     });
   });
 }
-

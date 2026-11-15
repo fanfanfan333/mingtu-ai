@@ -167,6 +167,7 @@ const Map<TaskState, Set<TaskState>> _legal = {
 };
 
 class TaskManager {
+  void Function()? onStateChanged;
   TaskState _state = TaskState.idle;
   String? taskId;
   String? goal;
@@ -193,6 +194,7 @@ class TaskManager {
     }
     history.add(TaskTransition(_state, next, trigger, DateTime.now()));
     _state = next;
+    onStateChanged?.call();
     return true;
   }
 

@@ -52,6 +52,7 @@ import 'core/hazard/hazard_policy.dart';
 import 'core/destination_dialogue.dart';
 import 'core/entrance_guidance.dart';
 import 'core/navigation_tracker.dart';
+import 'core/nav_event_speech.dart';
 import 'core/straight_pacing.dart';
 import 'core/yolo_error_speech.dart';
 import 'core/real_navigation.dart';
@@ -59,9 +60,15 @@ import 'core/startup_guard.dart';
 import 'core/voice_log.dart';
 import 'adapters/startup_initializer.dart';
 import 'core/voice_commands.dart';
+import 'core/pocket_mode.dart';
+import 'adapters/pocket_mode_gateway.dart';
 import 'core/voice_startup.dart';
 import 'core/permission_flow.dart';
 import 'core/recording_silence.dart';
+import 'core/wakelock_control.dart';
+import 'core/foreground_watchdog.dart';
+import 'core/location_signal_speech.dart';
+import 'core/ptt_feedback.dart';
 import 'adapters/permission_gateway.dart';
 import 'adapters/guide_store.dart';
 import 'core/risk_engine.dart';
@@ -128,6 +135,11 @@ class MingtuApp extends StatelessWidget {
 /// UI-06: swap the permission gateway (the plugin-backed
 /// one) for a fake in widget tests.
 PermissionGateway? mingtuPermissionGatewayOverride;
+WakelockGateway? mingtuWakelockGatewayOverride;
+DateTime Function()? mingtuWatchdogNowOverride;
+
+@visibleForTesting
+Stream<bool> Function()? mingtuProximityEventsOverride;
 
 /// UI-06: swap the first-launch marker store for a fake in
 /// widget tests.
@@ -372,6 +384,7 @@ class MingtuHomeDebugHandle {
 
   Future<void> openYoloLive() => _state._openYoloLive();
   void closeYoloLive() => _state._closeYoloLiveView();
+  void debugYoloViewError(Object error) => _state._onYoloViewError(error);
   bool get yoloLiveOpen => _state._yoloLiveOpen;
 
   /// Cloud-ASR fallback seams: substitute the recorder /
@@ -402,6 +415,12 @@ class MingtuHomeDebugHandle {
 
   /// UI-06: whether the permission flow is live right now.
   bool get permissionFlowRunning => _state._permissionFlowRunning;
+  GuidePermission? get awaitingSettingsFor =>
+      _state._permissionFlow.awaitingSettingsFor;
+  bool get pttIdle => _state._pttState == _PttState.idle;
+  bool get awaitingDestination => _state._awaitingDestination;
+  SpeechKind? get activeSpeechKind => _state._scheduler.active?.kind;
+  String? get activeSpeechText => _state._scheduler.active?.text;
 
   bool get debugPurposeQueued => _state._scheduler.queue
       .any((request) => request.id.startsWith('permission-flow-'));
@@ -435,6 +454,11 @@ class MingtuHomeDebugHandle {
   /// UI-01: the toggle tap the Semantics onTap dispatches
   /// to, callable directly in unit-style widget tests.
   void debugPttToggleTap() => _state._pttToggleTap();
+  Future<void> debugHeadsetToggle() => _state._headsetToggle();
+  void debugResetMicrophoneInitialized() =>
+      _state._microphoneInitialized = false;
+  void debugPttCloseWait() => _state._announcePttCloseWait();
+  void debugAsrError(String code) => _state._handleAsrError(code);
 
   /// UI-01: the clock the recording-silence tracker reads,
   /// so a test can advance scripted silence deterministically
@@ -493,6 +517,10 @@ class MingtuHomeDebugHandle {
   /// stale-timer test fires session 1's callback during
   /// session 2 and asserts nothing happens.
   int get pttSessionId => _state._pttSession;
+  int get debugTalkBackCapSessionId => _state._talkBackCapSessionId ?? -1;
+  int get debugPttToggleSessionId => _state._pttToggleSessionId;
+  bool get debugIgnoreTouches => _state._pocketMode.ignoreTouches;
+  void debugSetPocketEnabled(bool enabled) => _state._setPocketMode(enabled);
 
   /// Test-only: engine events ('restarted' /
   /// 'restart_failed') this page has handled, in order.
@@ -576,6 +604,9 @@ class MingtuHomePage extends StatefulWidget {
 
 /// Push-to-talk press states. See the state fields on
 /// _MingtuHomePageState for the transition contract.
+const String talkBackToggleNoContentText = '没有听清，请双击再说一次。';
+const String holdNoContentText = '没有听清，请按住按钮再说一次。';
+
 enum _PttState { idle, prompting, starting, listening, stopping }
 
 /// Test-only hook (set by widget tests before a press):
@@ -818,8 +849,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// initState (debug overrides first, factories after).
   late PermissionGateway _permissionGateway;
   late GuideStore _guideStore;
+  late final PocketMode _pocketMode;
+  final PocketModeStore _pocketStore = FilePocketModeStore();
+  bool _pocketSettingChanged = false;
   final PermissionFlow _permissionFlow = PermissionFlow();
   bool _permissionFlowRunning = false;
+  final Map<GuidePermission, int> _permissionRequestGeneration = {};
 
   late Future<bool> _guideSeenFuture;
   final Set<String> _completedPermissionSpeech = <String>{};
@@ -834,6 +869,26 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     });
     _permissionWaits[timer] = completer;
     return completer.future;
+  }
+
+  final Map<String, Completer<void>> _cueWaits = {};
+  int _cueSequence = 0;
+
+  Future<void> _sayPttCue(String text) async {
+    final id = 'ptt-cue-${_cueSequence++}';
+    final wait = Completer<void>();
+    _cueWaits[id] = wait;
+    final accepted = _say(
+        _request(id: id, eventId: id, text: text, kind: SpeechKind.info),
+        recordAsSpoken: false);
+    if (!accepted && !wait.isCompleted) wait.complete();
+    try {
+      await wait.future.timeout(AppConfig.effectivePermissionSpeechTimeout);
+    } on TimeoutException {
+      // A stalled engine must not trap the press forever.
+    } finally {
+      _cueWaits.remove(id);
+    }
   }
 
   List<Object>? _deferredPermissionEffects;
@@ -1143,6 +1198,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   StreamSubscription<AsrStatusEvent>? _asrSessionSub;
   StreamSubscription<String>? _asrEngineSub;
   bool _yoloErrorAnnounced = false;
+  bool _yoloModelFailed = false;
 
   // Step 2 voice navigation flow state.
   NavigationTracker? _liveNav;
@@ -1231,7 +1287,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   set _pttState(_PttState value) {
     final bool wasIdle = _pttStateValue == _PttState.idle;
+    final bool wasListening = _pttStateValue == _PttState.listening;
     _pttStateValue = value;
+    if (!wasListening && value == _PttState.listening) {
+      _updateForegroundPolicies();
+    } else if (wasListening && value != _PttState.listening) {
+      unawaited((mingtuPttFeedbackOverride ?? SystemPttFeedback()).end());
+      _updateForegroundPolicies();
+    }
     final bool isIdle = value == _PttState.idle;
     if (wasIdle != isIdle && _toggleModeNow && mounted) {
       setState(() {});
@@ -1344,10 +1407,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// a just-started danger/emergency utterance whose scheduler entry has
   /// already completed (see _interruptSpeechForPushToTalk).
   DateTime? _lastSpeechStartedAt;
+  String _lastSpeechStartedText = '';
 
   /// The text of the most recent danger (level 1) / emergency
   /// (level 0) utterance actually played; compared against
-  /// _lastSpokenText by the push-to-talk interruption rules.
+  /// _lastSpeechStartedText by the push-to-talk interruption rules.
   String _lastP0SpokenText = '';
 
   /// The scheduler id of that utterance; the scheduler's
@@ -1360,10 +1424,44 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// utterance's first moments; see _trackedSpeak.
   DateTime? _pttStoppedUtteranceAt;
 
+  final WakelockControl _wakelock =
+      WakelockControl(mingtuWakelockGatewayOverride ?? PluginWakelockGateway());
+  late final ForegroundWatchdog _watchdog = ForegroundWatchdog(
+    now: mingtuWatchdogNowOverride ?? DateTime.now,
+    onFault: (text) => _say(_request(
+        id: 'foreground-fault-${DateTime.now().microsecondsSinceEpoch}',
+        eventId: text,
+        text: text,
+        kind: SpeechKind.alert)),
+  );
+  static const MethodChannel _headsetChannel = MethodChannel('mingtu/headset');
+  bool _headsetGatePending = false;
+  bool _foreground = true;
+  Timer? _foregroundTimer;
+
+  void _updateForegroundPolicies() {
+    final bool navigating = _tasks.state == TaskState.navigating ||
+        _tasks.state == TaskState.avoidingObstacle ||
+        _liveNav != null;
+    unawaited(_wakelock.update(
+        foreground: _foreground,
+        camera: _yoloLiveOpen,
+        navigation: navigating,
+        listening: _pttState == _PttState.listening));
+    _watchdog.update(
+        foreground: _foreground,
+        camera: _yoloLiveOpen,
+        location: _liveNav != null);
+  }
+
   @override
   void initState() {
     super.initState();
     mingtuHomeDebugHandle = MingtuHomeDebugHandle._(this);
+    _headsetChannel.setMethodCallHandler((call) async {
+      if (call.method == 'toggle') await _headsetToggle();
+    });
+    _tasks.onStateChanged = _updateForegroundPolicies;
     _recorder = createVoiceRecorder();
     // UI-06 seams: pre-pump debug overrides win; production
     // uses the factories (plugin-backed on a phone,
@@ -1371,12 +1469,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _permissionGateway =
         mingtuPermissionGatewayOverride ?? createPermissionGateway();
     _guideStore = mingtuGuideStoreOverride ?? createGuideStore();
+    _pocketMode =
+        PocketMode(proximity: mingtuProximityEventsOverride ?? proximityEvents);
+    unawaited(_loadPocketMode());
     // UI-06-B3: start the first-launch marker read now.
     // The startup gate awaits this future with a bounded
     // timeout; a slow/failed/timed-out read is treated as
     // not seen, so purpose speech still precedes requests.
     _guideSeenFuture = _readGuideSeen();
     WidgetsBinding.instance.addObserver(this);
+    _foreground = WidgetsBinding.instance.lifecycleState == null ||
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+    _pocketMode.setForeground(_foreground);
+    _updateForegroundPolicies();
+    _foregroundTimer = Timer.periodic(
+        const Duration(milliseconds: 250), (_) => _updateForegroundPolicies());
     // _initRealIntegrations never throws (every module is
     // guarded inside the production initializer, and startup
     // always ends with the unified announcement).
@@ -1390,6 +1497,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// same via [dispose].
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    _pocketMode.setForeground(_foreground);
+    _updateForegroundPolicies();
     // UI-06: returning to the foreground while the
     // permission flow waits on the system settings page
     // re-checks exactly that permission and announces the
@@ -1614,6 +1724,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final List<Object>? effects = _deferredPermissionEffects;
     if (effects == null) return;
     _deferredPermissionEffects = null;
+    for (final effect in effects) {
+      if (effect is PermissionRequestEffect) {
+        // Retrying supersedes the old request even while its purpose is spoken.
+        _permissionRequestGeneration[effect.permission] =
+            (_permissionRequestGeneration[effect.permission] ?? 0) + 1;
+        break;
+      }
+    }
     unawaited(_executePermissionEffects(effects));
   }
 
@@ -1645,9 +1763,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
       } else if (effect is PermissionRequestEffect) {
         PermissionOutcome outcome;
+        final int generation =
+            (_permissionRequestGeneration[effect.permission] ?? 0) + 1;
+        _permissionRequestGeneration[effect.permission] = generation;
+        final Future<PermissionOutcome> request =
+            Future.sync(() => _permissionGateway.request(effect.permission));
         try {
-          outcome = await _permissionGateway
-              .request(effect.permission)
+          outcome = await request
               .timeout(AppConfig.effectivePermissionRequestTimeout);
         } on TimeoutException {
           if (!mounted) return;
@@ -1656,6 +1778,29 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             effect,
             ...queue,
           ];
+          // A newer request for this step supersedes this late answer.
+          unawaited(request.then((lateOutcome) async {
+            if (!mounted ||
+                _permissionRequestGeneration[effect.permission] != generation) {
+              return;
+            }
+            _deferredPermissionEffects = null;
+            if (lateOutcome == PermissionOutcome.granted) {
+              _grantedPermissions.add(effect.permission);
+              if (effect.permission == GuidePermission.microphone) {
+                await _initializeMicrophone();
+              }
+            }
+            if (!mounted ||
+                _permissionRequestGeneration[effect.permission] != generation) {
+              return;
+            }
+            await _executePermissionEffects(<Object>[
+              ..._permissionFlow.onRequestResult(
+                  effect.permission, lateOutcome),
+              ...queue,
+            ]);
+          }, onError: (Object _, StackTrace __) {}));
           _say(_request(
             id: 'permission-request-timeout-${_permissionSpeechSeq++}',
             eventId: 'permission-request-timeout-$_permissionSpeechSeq',
@@ -1678,10 +1823,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         queue.insertAll(
             0, _permissionFlow.onRequestResult(effect.permission, outcome));
       } else if (effect is PermissionOpenSettingsEffect) {
+        bool opened = false;
         try {
-          await _permissionGateway.openSettings();
+          opened = await _permissionGateway
+              .openSettings()
+              .timeout(AppConfig.effectivePermissionTimeout);
         } catch (_) {}
-        return; // paused until the resumed re-check
+        if (!mounted) return;
+        if (!opened) {
+          _permissionFlow.onSettingsOpenFailed(effect.permission);
+          _permissionFlowRunning = false;
+          _kickoffHeld = false;
+          await _sayPermissionFlowText(permissionSettingsOpenFailedText,
+              alert: true);
+        }
+        return; // successful opens pause until the resumed re-check
       } else if (effect is PermissionFlowDoneEffect) {
         _guideResolvedSeen = true;
         _permissionFlowRunning = false;
@@ -1846,6 +2002,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       destinationName: destinationName,
       budget: _tripRerouteBudget ??= RerouteBudget(),
     );
+    _updateForegroundPolicies();
     _liveNavDestName = destinationName;
     _liveNavRemainingM = _liveNav!.remainingM;
     // A newly installed route supersedes any entrance phase
@@ -1931,6 +2088,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   void _onLiveNavFix(LocationResult r) {
     if (!mounted || _liveNav == null) return;
+    _watchdog.locationCallback();
     if (!r.ok) {
       final DateTime now = DateTime.now();
       if (_lastGpsErrorAt == null ||
@@ -1939,8 +2097,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _say(_request(
           id: 'gps-lost-$now',
           eventId: 'gps-lost',
-          text: '定位信号中断，暂时无法更新你的位置。',
-          kind: SpeechKind.info,
+          text: locationSignalLostText,
+          kind: SpeechKind.alert,
         ));
       }
       return;
@@ -2062,25 +2220,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   void _handleNavEvent(NavEvent e) {
     final String ts = '${DateTime.now().millisecondsSinceEpoch}';
+    void speak(NavEventSpeech speech) => _say(_request(
+          id: speech.id,
+          eventId: speech.eventId,
+          text: speech.text,
+          kind: speech.kind,
+          navStepIndex: speech.navStepIndex,
+          replay: speech.replay,
+        ));
     switch (e.kind) {
       case NavEventKind.turnAhead:
-        _say(_request(
-          id: 'nav-turn-$ts',
-          eventId: 'nav-turn-$ts',
-          text: e.text,
-          kind: SpeechKind.turn,
-          // NAVHAZ M1: an interrupted turn is regenerated
-          // from the latest fix, never replayed verbatim.
-          navStepIndex: e.stepIndex,
-          replay: NavReplay.regenerate,
-        ));
       case NavEventKind.weakSignal:
-        _say(_request(
-          id: 'nav-weak-$ts',
-          eventId: 'nav-weak-$ts',
-          text: e.text,
-          kind: SpeechKind.info,
-        ));
+        speak(navEventSpeech(e,
+            timestamp: ts, destinationName: _liveNavDestName));
       case NavEventKind.arrived:
         // Step D hand-over: the route is done but the trip is
         // NOT. Route-following speech stops (pacing halts);
@@ -2108,45 +2260,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                 headingDeg: _currentHeadingDeg(),
               );
         final bool doneNow = _entrance!.completed;
-        _say(_request(
-          id: 'entrance-${doneNow ? 'arrived' : 'start'}-$ts',
-          eventId: doneNow ? 'entrance-arrived' : 'entrance-start',
-          text: firstText ?? _entrance!.startAnnouncement(),
-          kind: doneNow ? SpeechKind.alert : SpeechKind.turn,
-        ));
+        speak(navEventSpeech(e,
+            timestamp: ts,
+            destinationName: _liveNavDestName,
+            entranceText: firstText ?? _entrance!.startAnnouncement(),
+            entranceCompleted: doneNow));
         if (doneNow) _finishEntranceTrip();
       case NavEventKind.offRoute:
         final RerouteDecision decision =
             _liveNav!.rerouteDecision(DateTime.now());
-        if (decision == RerouteDecision.doIt) {
-          _say(_request(
-            id: 'nav-offroute-$ts',
-            eventId: 'nav-offroute-$ts',
-            text: '你已偏离路线，正在重新规划。',
-            kind: SpeechKind.info,
-            replay: NavReplay.shortenedReplay,
-          ));
-          unawaited(_rerouteLiveNavigation());
-        } else if (decision == RerouteDecision.exhausted) {
-          _say(_request(
-            id: 'nav-offroute-max-$ts',
-            eventId: 'nav-offroute-max',
-            text: '你已偏离路线。已经多次重新规划仍未回到路线，'
-                '先停下来确认位置，再说“去$_liveNavDestName”重新开始。',
-            kind: SpeechKind.alert,
-          ));
-        } else {
-          // Throttled: re-arm the tracker so a later
-          // off-route event can retry once the interval has
-          // passed (the trip budget still bounds retries).
+        if (decision == RerouteDecision.throttled) {
           _liveNav?.resetOffRouteStreak();
-          _say(_request(
-            id: 'nav-offroute-wait-$ts',
-            eventId: 'nav-offroute-wait-$ts',
-            text: '你已偏离路线。',
-            kind: SpeechKind.info,
-            replay: NavReplay.shortenedReplay,
-          ));
+        }
+        speak(navEventSpeech(e,
+            timestamp: ts,
+            destinationName: _liveNavDestName,
+            rerouteDecision: decision));
+        if (decision == RerouteDecision.doIt) {
+          unawaited(_rerouteLiveNavigation());
         }
     }
   }
@@ -2219,6 +2350,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _amapNaviActive = false;
     if (naviSource != null) unawaited(naviSource.stop());
     _liveNav = null;
+    _updateForegroundPolicies();
     _liveNavRemainingM = null;
     _entrance = null;
     _entranceActive = false;
@@ -2637,6 +2769,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// error additionally marks the local recogniser broken,
   /// so subsequent presses use the recording fallback.
   void _handleAsrError(String error) {
+    _pttSession++;
+    _pttNoContentTimer?.cancel();
+    _pttState = _PttState.idle;
+    _setPttStoppingWindow(false);
+    _pushToTalkHeld = false;
+    _pttPendingStop = false;
     // The stream carries '<code>|permanent=<bool>' with the
     // code already whitelisted by the adapter; every surface
     // below uses the code's FIXED Chinese text, never a raw
@@ -2801,11 +2939,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    _headsetChannel.setMethodCallHandler(null);
+    _pocketMode.dispose();
+    _foreground = false;
+    _foregroundTimer?.cancel();
+    unawaited(_wakelock.update(
+        foreground: false, camera: false, navigation: false, listening: false));
     for (final entry in _permissionWaits.entries) {
       entry.key.cancel();
       if (!entry.value.isCompleted) entry.value.complete();
     }
     _permissionWaits.clear();
+    for (final cue in _cueWaits.values) {
+      if (!cue.isCompleted) cue.complete();
+    }
+    _cueWaits.clear();
     WidgetsBinding.instance.removeObserver(this);
     // MT-1111-PTT-D(4): dispose releases the microphone. A
     // press still capturing is cancelled (voided, never
@@ -2957,7 +3105,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 
-  bool _say(SpeechRequest request) {
+  bool _say(SpeechRequest request, {bool recordAsSpoken = true}) {
     if (!mounted) return false;
     // NAVHAZ M1 banned-word guard (spec sections 0.1 /
     // 2.4): NO announcement may grant or imply passage. In
@@ -2981,18 +3129,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // emergency prompt speaks (Codex re-test of d01a081).
       _pauseStraightForRisk();
     }
+    final previousId = _scheduler.active?.id;
     final bool accepted = _scheduler.submit(request, now);
-    if (accepted) _publishSpeech(request);
-    setState(() {
-      if (accepted && _scheduler.active?.id == request.id) {
-        _currentPrompt = request.text;
-        _lastSpokenText = request.text;
-      } else if (accepted) {
-        _currentPrompt = '已排队：${request.text}';
-      } else {
-        _currentPrompt = '未播报（调度器已丢弃过期或重复提示）：${request.text}';
+    if (previousId != null && previousId != _scheduler.active?.id) {
+      final previousCue = _cueWaits[previousId];
+      if (previousCue != null && !previousCue.isCompleted) {
+        previousCue.complete();
       }
-    });
+    }
+    if (accepted) _publishSpeech(request);
+    if (recordAsSpoken) {
+      setState(() {
+        if (accepted && _scheduler.active?.id == request.id) {
+          _currentPrompt = request.text;
+          _lastSpokenText = request.text;
+        } else if (accepted) {
+          _currentPrompt = '已排队：${request.text}';
+        } else {
+          _currentPrompt = '未播报（调度器已丢弃过期或重复提示）：${request.text}';
+        }
+      });
+    }
     // v0.6: real TTS when the phone's engine is reachable; the
     // prompt completes only when the engine reports completion.
     // Otherwise the old simulated 1200 ms timing is used.
@@ -3089,6 +3246,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// promote the next queued prompt if it is still valid -- and speak
   /// it too, through the same real-or-simulated path.
   void _finishSpeech(String id, {bool ttsCompleted = false}) {
+    final cue = _cueWaits[id];
+    if (cue != null && !cue.isCompleted) cue.complete();
     if (_scheduler.active?.id == id) {
       final SpeechRequest finished = _scheduler.active!;
       if (ttsCompleted && id.startsWith('permission-flow-')) {
@@ -3103,8 +3262,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // active prompt, promoteNext below finds the seat
       // taken and correctly does nothing.
       if ((finished.kind == SpeechKind.danger ||
+              finished.kind == SpeechKind.emergency ||
               finished.kind == SpeechKind.obstacleAvoidance) &&
           !_dangerPending) {
+        final SpeechRequest? locationReplay =
+            takeInterruptedLocationSignalReplay(_scheduler, _speechNow());
+        if (locationReplay != null) _say(locationReplay);
         final SpeechRequest? replay = _buildInterruptedReplay();
         if (replay != null) _say(replay);
       }
@@ -3135,12 +3298,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _maybeStartListeningAfterSpeech();
         return;
       }
-      setState(() {
-        _currentPrompt = next.text;
-        _lastSpokenText = next.text;
-      });
+      // Queued PTT cues retain their reserved ID when promoted.
+      if (!next.id.startsWith('ptt-cue-')) {
+        setState(() {
+          _currentPrompt = next.text;
+          _lastSpokenText = next.text;
+        });
+      }
       if (finished.kind == SpeechKind.danger ||
-          finished.kind == SpeechKind.emergency) {
+          finished.kind == SpeechKind.emergency ||
+          finished.kind == SpeechKind.obstacleAvoidance) {
         _maybeEnterPttAfterP0();
       }
       _speakActive(next);
@@ -3254,6 +3421,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   Future<void> _trackedSpeak(SpeechRequest request) async {
     _lastSpeechStartedAt = DateTime.now();
+    _lastSpeechStartedText = request.text;
     // S3 segment 2 arming: if this request is a hazard
     // alert, its pipeline-return stamp moves into the
     // single start-watch slot (playback is serialised, so
@@ -3709,7 +3877,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// recent danger/emergency text. Used to refuse
   /// push-to-talk presses during danger announcements.
   bool get _p0SpeechPlaying {
-    if (_dangerPending) return true;
+    if (_dangerPending ||
+        _scheduler.active?.kind == SpeechKind.obstacleAvoidance ||
+        _scheduler.queue.any((r) => r.kind == SpeechKind.obstacleAvoidance)) {
+      return true;
+    }
     final List<String> interrupted = _scheduler.interruptedLog;
     final List<String> cancelled = _scheduler.cancelledLog;
     bool recentP0(List<String> log) {
@@ -3726,7 +3898,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final DateTime? startedAt = _lastSpeechStartedAt;
     return startedAt != null &&
         _lastP0SpokenText.isNotEmpty &&
-        _lastSpokenText == _lastP0SpokenText &&
+        _lastSpeechStartedText == _lastP0SpokenText &&
         DateTime.now().difference(startedAt) <
             const Duration(milliseconds: 1500);
   }
@@ -3772,7 +3944,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pushToTalkPressedAt = DateTime.now();
     _autoListenWasActive = _voiceInput is SystemVoiceInput &&
         (_voiceInput as SystemVoiceInput).isListening;
-    HapticFeedback.vibrate();
+    unawaited((mingtuPttFeedbackOverride ?? SystemPttFeedback()).start());
     if (_p0SpeechPlaying) {
       // Danger/emergency gate: during a danger/emergency announcement
       // the press only vibrates -- no cue, no ASR. It waits
@@ -3846,10 +4018,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   /// The one-time wait notice of a press blocked by an
-  /// unconfirmed close. Spoken DIRECTLY through the voice
-  /// output (like the '请说' cue), never through the
-  /// scheduler: a scheduler finish would consult the
-  /// automatic loop mid-press. The close itself guarantees
+  /// unconfirmed close. The scheduler arbitrates this low-priority
+  /// cue with hazards. The close itself guarantees
   /// the microphone is shut (or shutting) before the
   /// notice can be heard -- a notice spoken here is never
   /// recorded by the session being closed.
@@ -3857,16 +4027,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (_pttCloseWaitAnnounced) return;
     _pttCloseWaitAnnounced = true;
     if (!_voiceOutput.isAvailable || _ttsFailed) return;
-    setState(() {
-      _currentPrompt = '请稍等';
-    });
     unawaited(() async {
       try {
         await speakAfterClosingMic(
           input: _voiceInput is SystemVoiceInput
               ? _voiceInput as SystemVoiceInput
               : null,
-          speak: () => _voiceOutput.speak('请稍等'),
+          speak: () async {
+            await _sayPttCue('请稍等');
+          },
         );
       } catch (e) {
         if (mounted) _handleTtsFailure(e);
@@ -3936,15 +4105,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     if (_voiceOutput.isAvailable && !_ttsFailed) {
-      setState(() {
-        _currentPrompt = '请说';
-      });
       try {
         await speakAfterClosingMic(
           input: _voiceInput is SystemVoiceInput
               ? _voiceInput as SystemVoiceInput
               : null,
-          speak: () => _voiceOutput.speak('请说'),
+          speak: () async {
+            await _sayPttCue('请说');
+          },
         );
       } catch (e) {
         if (mounted) _handleTtsFailure(e);
@@ -3953,6 +4121,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!mounted || sid != _pttSession) return;
     if (_pttPendingStop) {
       _pttFinishTooShort(sid);
+      return;
+    }
+    if (_p0SpeechPlaying) {
+      _pttDeferredByP0 = true;
       return;
     }
     if (!_localAsrBroken && _asrRecoveryPending) {
@@ -4624,13 +4796,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // A queued danger/emergency prompt is about to play: clearing the
     // queue for a cue would kill it. Leave everything.
     if (_scheduler.queue.any((SpeechRequest r) =>
-        r.kind == SpeechKind.danger || r.kind == SpeechKind.emergency)) {
+        r.kind == SpeechKind.danger ||
+        r.kind == SpeechKind.emergency ||
+        r.kind == SpeechKind.obstacleAvoidance)) {
       return;
     }
     final SpeechRequest? active = _scheduler.active;
     if (active != null) {
       if (active.kind == SpeechKind.danger ||
-          active.kind == SpeechKind.emergency) {
+          active.kind == SpeechKind.emergency ||
+          active.kind == SpeechKind.obstacleAvoidance) {
         return; // Danger/emergency playing: never interrupt.
       }
       _scheduler.cancelAll();
@@ -4641,7 +4816,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (startedAt != null &&
         DateTime.now().difference(startedAt) <
             const Duration(milliseconds: 1500)) {
-      if (_lastSpokenText == _lastP0SpokenText) return;
+      if (_lastSpeechStartedText == _lastP0SpokenText) return;
       await _stopTtsPlayback();
     }
   }
@@ -4711,6 +4886,53 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  Future<void> _headsetToggle() async {
+    if (!mounted || !_foreground || _headsetGatePending) return;
+    if (_pttState != _PttState.idle || !_permissionGateway.isAvailable) {
+      _pttToggleTap();
+      return;
+    }
+    _headsetGatePending = true;
+    try {
+      final outcome = await _permissionStatus(GuidePermission.microphone);
+      if (!mounted || !_foreground) return;
+      if (outcome != PermissionOutcome.granted) {
+        _say(_request(
+          id: 'headset-microphone-permission-${_permissionSpeechSeq++}',
+          eventId: 'headset-microphone-permission-$_permissionSpeechSeq',
+          kind: SpeechKind.alert,
+          text: _guideResolvedSeen
+              ? permissionDeniedText(GuidePermission.microphone)
+              : permissionPurposeText(GuidePermission.microphone),
+        ));
+        if (!_guideResolvedSeen) {
+          if (_permissionFlowRunning) {
+            _retryDeferredPermissionFlow();
+          } else {
+            unawaited(_runFirstLaunchGuideAndPermissions());
+          }
+        }
+        return;
+      }
+      if (!_microphoneInitialized) {
+        await _initializeMicrophone();
+        if (!mounted || !_foreground) return;
+        if (!_microphoneInitialized || _localAsrBroken) {
+          _say(_request(
+            id: 'headset-microphone-init-${_permissionSpeechSeq++}',
+            eventId: 'headset-microphone-init-$_permissionSpeechSeq',
+            kind: SpeechKind.alert,
+            text: '语音识别初始化失败，请稍后重试。',
+          ));
+          return;
+        }
+      }
+      _pttToggleTap();
+    } finally {
+      _headsetGatePending = false;
+    }
+  }
+
   /// UI-01: arm the amplitude silence watch for a toggle
   /// recording. Samples feed the pure tracker
   /// (core/recording_silence.dart); when it fires, the
@@ -4771,7 +4993,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _say(_request(
         id: 'ptt-empty-${DateTime.now().millisecondsSinceEpoch}',
         eventId: 'ptt-empty-${DateTime.now().millisecondsSinceEpoch}',
-        text: '没有听清，请按住按钮再说一次。',
+        text: _toggleModeNow ? talkBackToggleNoContentText : holdNoContentText,
         kind: SpeechKind.alert,
       ));
     }
@@ -5149,6 +5371,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // at delivery (null for simulated / scripted frames,
     // which then stamp no frame-to-callback segment).
     final DateTime now = DateTime.now();
+    _watchdog.cameraCallback();
     // M3: merge the pothole scanner's latest results
     // into THIS frame at the shared intake, BEFORE every
     // downstream gate (the thermal class restriction
@@ -5712,11 +5935,48 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
+  void _onYoloViewError(Object error) {
+    // Classified, never raw: a CAMERA
+    // PERMISSION denial and a MODEL LOAD
+    // failure get DIFFERENT announcements --
+    // the remedies differ (open system
+    // settings vs fix the bundled model). One
+    // shared sentence for both was a Codex
+    // re-test finding.
+    final YoloViewErrorKind errorKind = classifyYoloViewError(error);
+    mingtuVoiceLog('YOLO 实时视图出错类别：${errorKind.name}');
+    _logMsg('YOLO 实时视图出错：${yoloViewErrorStatus(errorKind)}。');
+    setState(() {
+      _yoloText = yoloViewErrorStatus(errorKind);
+      if (errorKind == YoloViewErrorKind.modelLoadFailed) {
+        _yoloModelFailed = true;
+        _closeYoloLiveView();
+        _yoloAvailableAtStartup = false;
+        _yoloDetector = UnavailableYoloDetector();
+      }
+    });
+    if (!_yoloErrorAnnounced) {
+      _yoloErrorAnnounced = true;
+      _health.report(
+        'yolo',
+        ServiceHealthStatus.unavailable,
+        yoloViewErrorStatus(errorKind),
+      );
+      _say(_request(
+        id: 'yolo-view-error',
+        eventId: 'yolo-view-error',
+        text: yoloViewErrorSpeech(errorKind),
+        kind: SpeechKind.alert,
+      ));
+    }
+  }
+
   /// Open the YOLO live view under the shared arbiter. The
   /// acquire first waits for any pending physical release; when
   /// the camera is busy (or the wait times out) the view does NOT
   /// open and the user hears exactly that.
   Future<void> _openYoloLive() async {
+    if (_yoloModelFailed) return;
     if (_permissionGateway.isAvailable &&
         !_grantedPermissions.contains(GuidePermission.camera) &&
         (!_guideResolvedSeen ||
@@ -5744,6 +6004,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     setState(() {
       _yoloLiveOpen = true;
     });
+    _updateForegroundPolicies();
   }
 
   /// Close the YOLO live view and hand the camera back to the
@@ -5752,6 +6013,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// (yoloLiveViewDisposed). Safe to call when not open.
   void _closeYoloLiveView() {
     _yoloLiveOpen = false;
+    _updateForegroundPolicies();
     final CameraLease? lease = _yoloLease;
     _yoloLease = null;
     if (lease != null) {
@@ -6613,27 +6875,58 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     int seq = 0;
     try {
       if (_permissionGateway.isAvailable &&
-          !_grantedPermissions.contains(GuidePermission.camera) &&
-          (!_guideResolvedSeen ||
-              await _permissionStatus(GuidePermission.camera) !=
-                  PermissionOutcome.granted)) {
-        if (!mounted) return;
-        _say(_request(
-          id: 'manual-camera-permission-${_permissionSpeechSeq++}',
-          eventId: 'manual-camera-permission-$_permissionSpeechSeq',
-          kind: SpeechKind.alert,
-          text: _guideResolvedSeen
-              ? permissionDeniedText(GuidePermission.camera)
-              : permissionPurposeText(GuidePermission.camera),
-        ));
+          !_grantedPermissions.contains(GuidePermission.camera)) {
         if (!_guideResolvedSeen) {
           if (_permissionFlowRunning) {
             _retryDeferredPermissionFlow();
           } else {
             unawaited(_runFirstLaunchGuideAndPermissions());
           }
+          return;
         }
-        return;
+        PermissionOutcome status =
+            await _permissionStatus(GuidePermission.camera);
+        if (!mounted || token.isCancelled) return;
+        if (status == PermissionOutcome.denied) {
+          final bool delivered = await _sayPermissionFlowText(
+            permissionPurposeText(GuidePermission.camera),
+            alert: true,
+            requireDelivery: true,
+          );
+          if (!delivered || !mounted || token.isCancelled) return;
+          final int generation =
+              (_permissionRequestGeneration[GuidePermission.camera] ?? 0) + 1;
+          _permissionRequestGeneration[GuidePermission.camera] = generation;
+          final Future<PermissionOutcome> request = Future.sync(
+              () => _permissionGateway.request(GuidePermission.camera));
+          try {
+            status = await request
+                .timeout(AppConfig.effectivePermissionRequestTimeout);
+          } on TimeoutException {
+            unawaited(request.then((outcome) {
+              if (mounted &&
+                  _permissionRequestGeneration[GuidePermission.camera] ==
+                      generation &&
+                  outcome == PermissionOutcome.granted) {
+                _grantedPermissions.add(GuidePermission.camera);
+              }
+            }, onError: (Object _, StackTrace __) {}));
+            return;
+          } catch (_) {
+            status = PermissionOutcome.denied;
+          }
+          if (!mounted || token.isCancelled) return;
+        }
+        if (status != PermissionOutcome.granted) {
+          _say(_request(
+            id: 'manual-camera-permission-${_permissionSpeechSeq++}',
+            eventId: 'manual-camera-permission-$_permissionSpeechSeq',
+            kind: SpeechKind.alert,
+            text: permissionDeniedText(GuidePermission.camera),
+          ));
+          return;
+        }
+        _grantedPermissions.add(GuidePermission.camera);
       }
       if (!mounted) return;
       final CloudVisionFlowOutcome outcome = await _cloudVisionFlow.run(
@@ -6737,9 +7030,35 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   /// Execute one recognised voice command. Illegal transitions are
   /// answered, never silently applied, and emergency never auto-resumes.
+  Future<void> _loadPocketMode() async {
+    bool enabled = false;
+    try {
+      enabled = await _pocketStore.load();
+    } catch (_) {}
+    if (mounted && !_pocketSettingChanged) _pocketMode.setEnabled(enabled);
+  }
+
+  void _setPocketMode(bool enabled) {
+    _pocketSettingChanged = true;
+    _pocketMode.setEnabled(enabled);
+    unawaited(_pocketStore.save(enabled).catchError((Object _) {}));
+    final id = 'pocket-mode-${DateTime.now().microsecondsSinceEpoch}';
+    _say(_request(
+        id: id,
+        eventId: id,
+        text: enabled ? pocketEnabledSpeech : pocketDisabledSpeech,
+        kind: SpeechKind.info));
+  }
+
   void _handleVoiceCommand(String raw) {
     final VoiceCommand command = parseVoiceCommand(raw);
     switch (command) {
+      case VoiceCommand.enablePocketMode:
+        _setPocketMode(true);
+        break;
+      case VoiceCommand.disablePocketMode:
+        _setPocketMode(false);
+        break;
       case VoiceCommand.emergency:
         _endLiveNavigation();
         _triggerEmergency();
@@ -7043,7 +7362,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _tasks.reset();
     }
     setState(() {
-      _tasks = TaskManager();
+      _tasks = TaskManager()..onStateChanged = _updateForegroundPolicies;
+      _updateForegroundPolicies();
       _scheduler = SpeechScheduler();
       _mapService = MapNavigationService(StubMapProvider());
       _routeSkill = RoutePlanningSkill(_mapService);
@@ -7122,98 +7442,97 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _toggleModeNow = toggleMode;
     final bool pttActive = _pttState != _PttState.idle;
     return Scaffold(
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          // Camera preview area (upper half). While the
-          // live view is open it hosts YoloLiveView;
-          // otherwise the area is simply blank.
-          Expanded(
-            child: _yoloLiveOpen
-                ? YoloLiveView(
-                    modelPath: AppConfig.yoloModelPath,
-                    onDetections: _onYoloDetections,
-                    onLatencyMs: (double ms) {
-                      setState(() {
-                        _yoloLatencyMs = ms;
-                      });
-                    },
-                    onError: (Object error) {
-                      // Classified, never raw: a CAMERA
-                      // PERMISSION denial and a MODEL LOAD
-                      // failure get DIFFERENT announcements --
-                      // the remedies differ (open system
-                      // settings vs fix the bundled model). One
-                      // shared sentence for both was a Codex
-                      // re-test finding.
-                      final YoloViewErrorKind errorKind =
-                          classifyYoloViewError(error);
-                      mingtuVoiceLog('YOLO 实时视图出错类别：${errorKind.name}');
-                      _logMsg('YOLO 实时视图出错：${yoloViewErrorStatus(errorKind)}。');
-                      setState(() {
-                        _yoloText = yoloViewErrorStatus(errorKind);
-                      });
-                      if (!_yoloErrorAnnounced) {
-                        _yoloErrorAnnounced = true;
-                        _health.report(
-                          'yolo',
-                          ServiceHealthStatus.unavailable,
-                          yoloViewErrorStatus(errorKind),
-                        );
-                        _say(_request(
-                          id: 'yolo-view-error',
-                          eventId: 'yolo-view-error',
-                          text: yoloViewErrorSpeech(errorKind),
-                          kind: SpeechKind.alert,
-                        ));
-                      }
-                    },
-                  )
-                : Container(
-                    key: const ValueKey<String>('camera-preview-area'),
-                    color: Colors.black12,
-                  ),
-          ),
-          // The one very large push-to-talk area (lower
-          // half): a plain colour block with no caption.
-          // Hold: vibrate, stop any lower-priority speech, speak
-          // the cue and await it, then listen while held.
-          // Release: stop listening and submit the result.
-          // The area is never disabled: with no recogniser
-          // the press still produces the vibrated, spoken
-          // failure feedback instead of dead silence. The
-          // semantics node carries a long-press action so
-          // TalkBack users can trigger the same
-          // press-and-hold flow.
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
-              child: Semantics(
-                button: true,
-                container: true,
-                label: toggleMode
-                    ? (pttActive
-                        ? talkBackToggleListeningLabel
-                        : talkBackToggleIdleLabel)
-                    : '按住说话按钮，按住后说话，松开结束',
-                value: toggleMode ? _bigStatusText() : null,
-                onTap: toggleMode ? _pttToggleTap : null,
-                onLongPress: toggleMode ? _pttToggleStart : _talkBackLongPress,
-                child: GestureDetector(
-                  onLongPressStart: (_) => _pushToTalkStart(),
-                  onLongPressEnd: (_) => _pushToTalkEnd(),
-                  child: Container(
-                    key: const ValueKey<String>('push-to-talk-area'),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.primaryContainer,
-                      borderRadius: BorderRadius.circular(16),
+      body: SafeArea(
+        left: false,
+        right: false,
+        bottom: false,
+        child: Semantics(
+          button: true,
+          container: true,
+          label: toggleMode
+              ? (pttActive
+                  ? talkBackToggleListeningLabel
+                  : talkBackToggleIdleLabel)
+              : '按住说话按钮，按住后说话，松开结束',
+          value: _bigStatusText(),
+          onTap: toggleMode
+              ? () {
+                  if (!_pocketMode.ignoreTouches) _pttToggleTap();
+                }
+              : null,
+          onLongPress: () {
+            if (!_pocketMode.ignoreTouches) {
+              if (toggleMode) {
+                _pttToggleStart();
+              } else {
+                _talkBackLongPress();
+              }
+            }
+          },
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            excludeFromSemantics: true,
+            onLongPressStart: (_) {
+              if (!_pocketMode.ignoreTouches) _pushToTalkStart();
+            },
+            onLongPressEnd: (_) {
+              _pushToTalkEnd();
+            },
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                // Camera preview area (upper half). While the
+                // live view is open it hosts YoloLiveView;
+                // otherwise the area is simply blank.
+                Expanded(
+                  child: IgnorePointer(
+                    child: ExcludeSemantics(
+                      child: _yoloLiveOpen
+                          ? YoloLiveView(
+                              modelPath: AppConfig.yoloModelPath,
+                              onDetections: _onYoloDetections,
+                              onLatencyMs: (double ms) {
+                                setState(() {
+                                  _yoloLatencyMs = ms;
+                                });
+                              },
+                              onError: _onYoloViewError,
+                            )
+                          : Container(
+                              key:
+                                  const ValueKey<String>('camera-preview-area'),
+                              color: Colors.black12,
+                            ),
                     ),
                   ),
                 ),
-              ),
+                // The one very large push-to-talk area (lower
+                // half): a plain colour block with no caption.
+                // Hold: vibrate, stop any lower-priority speech, speak
+                // the cue and await it, then listen while held.
+                // Release: stop listening and submit the result.
+                // The area is never disabled: with no recogniser
+                // the press still produces the vibrated, spoken
+                // failure feedback instead of dead silence. The
+                // semantics node carries a long-press action so
+                // TalkBack users can trigger the same
+                // press-and-hold flow.
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
+                    child: Container(
+                      key: const ValueKey<String>('push-to-talk-area'),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.primaryContainer,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
-        ],
+        ),
       ),
     );
   }

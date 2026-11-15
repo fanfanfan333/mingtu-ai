@@ -74,8 +74,9 @@ class _FlowGateway implements PermissionGateway {
   }
 
   @override
-  Future<void> openSettings() async {
+  Future<bool> openSettings() async {
     openSettingsCalls++;
+    return true;
   }
 }
 
@@ -973,6 +974,7 @@ void main() {
   testWidgets('B8 manual vision checks camera grant before flow',
       (tester) async {
     store.seen = true;
+    gateway.requestResults[GuidePermission.camera] = PermissionOutcome.denied;
     final h = await _openApp(tester);
     await _pumpSpeaks(tester, h);
     final frames = _CountingFrameSource();
@@ -993,6 +995,84 @@ void main() {
         () => mingtuHomeDebugHandle!.statusTexts
             .any((text) => text.contains('识图未配置')),
         'granted manual vision proceeds');
+  });
+
+  testWidgets('B12 camera purpose completes before re-request', (tester) async {
+    store.seen = true;
+    gateway.requestResults[GuidePermission.camera] = PermissionOutcome.denied;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    final frames = _CountingFrameSource();
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
+    final purpose = permissionPurposeText(GuidePermission.camera);
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _driveUntil(tester, h, () => h.events.contains('tts.speak:$purpose'),
+        'camera purpose',
+        hold: {purpose});
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+    expect(frames.calls, 0);
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.camera),
+        'camera request');
+    expect(h.events.indexOf('tts.speak:$purpose'),
+        lessThan(h.events.indexOf('request:camera')));
+    await _pumpSpeaks(tester, h, rounds: 5);
+    expect(frames.calls, 0);
+    expect(containsBannedWord(purpose), isFalse);
+    expect(containsBannedWord(permissionDeniedText(GuidePermission.camera)),
+        isFalse);
+  });
+
+  testWidgets('B12 unfinished camera purpose prevents request', (tester) async {
+    store.seen = true;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    final frames = _CountingFrameSource();
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
+    final purpose = permissionPurposeText(GuidePermission.camera);
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _driveUntil(tester, h, () => h.events.contains('tts.speak:$purpose'),
+        'camera purpose',
+        hold: {purpose});
+    await _pumpSpeaks(tester, h, rounds: 10, hold: {purpose});
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+    expect(frames.calls, 0);
+    expect(containsBannedWord(purpose), isFalse);
+  });
+
+  testWidgets('B12 permanent camera denial does not request', (tester) async {
+    store.seen = true;
+    gateway.statusResults[GuidePermission.camera] =
+        PermissionOutcome.permanentlyDenied;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    final frames = _CountingFrameSource();
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
+    mingtuHomeDebugHandle!.triggerManualVision();
+    final denial = permissionDeniedText(GuidePermission.camera);
+    await _driveUntil(tester, h, () => h.events.contains('tts.speak:$denial'),
+        'camera denial');
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+    expect(frames.calls, 0);
+    expect(containsBannedWord(denial), isFalse);
+  });
+
+  testWidgets('B12 mid-guide manual vision keeps microphone first',
+      (tester) async {
+    final h = await _openApp(tester);
+    final mic = permissionPurposeText(GuidePermission.microphone);
+    final camera = permissionPurposeText(GuidePermission.camera);
+    await _driveUntil(tester, h, () => h.events.contains('tts.speak:$mic'),
+        'microphone purpose',
+        hold: {mic});
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _pumpSpeaks(tester, h, rounds: 5, hold: {mic});
+    expect(h.events, isNot(contains('tts.speak:$camera')));
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+    expect(containsBannedWord(mic), isFalse);
+    expect(containsBannedWord(camera), isFalse);
   });
 
   test('B8 production manual flow gates camera before run', () {
@@ -1041,11 +1121,9 @@ void main() {
           h,
           () => gateway.requested.contains(GuidePermission.microphone),
           'request');
-      await tester.runAsync(() async {
-        await Future<void>.delayed(Duration(seconds: delay));
-        answer.complete(
-            delay == 10 ? PermissionOutcome.granted : PermissionOutcome.denied);
-      });
+      await tester.pump(Duration(seconds: delay));
+      answer.complete(
+          delay == 10 ? PermissionOutcome.granted : PermissionOutcome.denied);
       await _driveUntil(
           tester,
           h,
@@ -1060,6 +1138,35 @@ void main() {
           h.events, isNot(contains('tts.speak:$permissionRequestTimeoutText')));
     }, timeout: const Timeout(Duration(seconds: 90)));
   }
+
+  testWidgets('B13 late grant after 120 second fallback resumes flow',
+      (tester) async {
+    final answer = Completer<PermissionOutcome>();
+    gateway.requestHangs[GuidePermission.microphone] = answer;
+    final h = await _openApp(tester);
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.microphone),
+        'request');
+    await tester.pump(const Duration(seconds: 120));
+    await _driveUntil(
+        tester,
+        h,
+        () => h.events.contains('tts.speak:$permissionRequestTimeoutText'),
+        'timeout speech');
+    answer.complete(PermissionOutcome.granted);
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.camera),
+        'next request');
+    expect(mingtuHomeDebugHandle!.microphoneInitializeCalls, 1);
+    expect(
+        h.events,
+        isNot(contains(
+            'tts.speak:${permissionDeniedText(GuidePermission.microphone)}')));
+  });
 
   testWidgets('B10 startup with unavailable speech does not request',
       (tester) async {

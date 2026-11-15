@@ -25,9 +25,19 @@ void main() {
     final String body = source.substring(start, end);
     // Every speech site in the function uses alert, including
     // the camera-permission gate added for UI-06-B8.
-    final int says = '_say(_request('.allMatches(body).length;
-    expect(says, greaterThanOrEqualTo(2));
-    expect('kind: SpeechKind.alert'.allMatches(body).length, says);
+    final sites = RegExp(r'\b_say\s*\(|\b_sayPermissionFlowText\s*\(')
+        .allMatches(body)
+        .toList();
+    expect(sites.length, 4);
+    for (final site in sites) {
+      final next = sites.indexOf(site) + 1;
+      final siteBody = body.substring(
+          site.start, next < sites.length ? sites[next].start : body.length);
+      expect(
+          RegExp(r'kind\s*:\s*SpeechKind\.alert|alert\s*:\s*true')
+              .hasMatch(siteBody),
+          isTrue);
+    }
     expect(body.contains('SpeechKind.info'), isFalse);
     // The duplicate-trigger refusal creates no token: it goes
     // through VisionRunManager.begin() and returns early.

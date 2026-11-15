@@ -21,8 +21,11 @@ dependencies:
   # Exact pin, MIT licence (verified against the pub.dev
   # archive, Copyright (c) 2018 Baseflow).
   permission_handler: 13.0.2
+  # Exact pin, MIT licence, Copyright (c) 2021 jung hyun, ko.
+  proximity_sensor: 2.0.0
   byte_track_dart: 0.4.0
   path_provider: ^2.1.6
+  wakelock_plus: 1.8.2
 
 # Flutter 3.47.9 sets compileSdk 36. permission_handler 13.0.2
 # otherwise pulls permission_handler_android 14.x, which requires
