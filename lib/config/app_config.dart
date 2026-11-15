@@ -54,6 +54,8 @@ Duration? mingtuPermissionSpeechTimeoutOverride;
 Duration? mingtuPermissionRequestTimeoutOverride;
 
 class AppConfig {
+  static const foregroundCameraStallThreshold = Duration(seconds: 10);
+  static const foregroundLocationStallThreshold = Duration(seconds: 30);
   static const Duration permissionTimeout = Duration(seconds: 2);
   static const Duration permissionRequestTimeout = Duration(seconds: 120);
   static Duration get effectivePermissionRequestTimeout =>

@@ -240,6 +240,9 @@ const String permissionFlowEndText = '权限问完了。想再听使用说明，
 /// No implementation may request
 /// [GuidePermission.backgroundLocationService] from the
 /// platform in this phase.
+const String permissionSettingsOpenFailedText =
+    '没法打开系统设置。请稍后重试，或到手机的设置里找到明途，打开这项权限。';
+
 abstract class PermissionGateway {
   /// False when this platform has no permission system to
   /// talk to (web / VM): the flow then never starts, which
@@ -254,7 +257,7 @@ abstract class PermissionGateway {
   Future<PermissionOutcome> status(GuidePermission permission);
 
   /// Open this app's system settings page.
-  Future<void> openSettings();
+  Future<bool> openSettings();
 }
 
 /// Persistence seam for the first-launch marker (the guide
@@ -340,6 +343,14 @@ class PermissionFlow {
           PermissionOpenSettingsEffect(permission),
         ];
     }
+  }
+
+  void onSettingsOpenFailed(GuidePermission permission) {
+    if (_awaitingSettingsFor != permission) {
+      throw StateError('Unexpected settings failure for $permission');
+    }
+    _awaitingSettingsFor = null;
+    _done = true;
   }
 
   /// The app came back to the foreground and [permission]

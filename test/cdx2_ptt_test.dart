@@ -294,8 +294,8 @@ void cdx2Group() {
       // outside toggle mode it still routes to
       // _talkBackLongPress (the shared-timer entry), which
       // is what this guard pins.
-      expect(mainDart.contains('onLongPress:'), isTrue);
-      expect(mainDart.contains(': _talkBackLongPress'), isTrue,
+      expect(mainDart.contains(
+          'onLongPress: toggleMode ? _pttToggleStart : _talkBackLongPress'), isTrue,
           reason: 'the hold-mode Semantics long-press must '
               'keep routing through _talkBackLongPress');
       expect(mainDart.contains('_onPttCapTimerFired'), isTrue);

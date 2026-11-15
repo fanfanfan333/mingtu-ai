@@ -154,6 +154,8 @@ class FakePermissionGateway implements PermissionGateway {
       <GuidePermission, PermissionOutcome>{};
   final List<GuidePermission> requested = <GuidePermission>[];
   int openSettingsCalls = 0;
+  bool openSettingsResult = true;
+  Object? openSettingsError;
 
   @override
   bool get isAvailable => true;
@@ -169,8 +171,10 @@ class FakePermissionGateway implements PermissionGateway {
       statusResults[permission] ?? PermissionOutcome.granted;
 
   @override
-  Future<void> openSettings() async {
+  Future<bool> openSettings() async {
     openSettingsCalls++;
+    if (openSettingsError != null) throw openSettingsError!;
+    return openSettingsResult;
   }
 }
 
@@ -428,7 +432,7 @@ void main() {
           tester,
           h,
           () => h.events
-              .contains('tts.speak:没有听清，请按住按钮再说一次。'),
+              .contains('tts.speak:没有听清，请双击再说一次。'),
           'no-match toggle press announced no-content');
       final SemanticsNode node =
           pttSemanticsNode(tester, talkBackToggleIdleLabel);
@@ -914,6 +918,7 @@ void main() {
         firstLaunchGuideText,
         permissionFlowEndText,
         permissionPurposeUndeliveredText,
+        permissionSettingsOpenFailedText,
         for (final List<String> texts in pinned.values) ...texts,
       ];
       for (final String text in all) {

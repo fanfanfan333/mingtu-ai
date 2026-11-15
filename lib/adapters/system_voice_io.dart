@@ -79,6 +79,11 @@ class SystemVoiceOutput implements VoiceOutput {
   bool get chineseVoiceVerified => _chineseVerified;
 
   Future<void> _doInitialize(FlutterTts tts) async {
+    try {
+      await tts.setAudioAttributesForNavigation();
+    } catch (_) {
+      // Navigation attributes are optional on unsupported engines.
+    }
     await tts.awaitSpeakCompletion(true);
     tts.setStartHandler(() {
       onSpeakStart?.call();

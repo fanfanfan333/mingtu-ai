@@ -80,22 +80,24 @@ class PermissionHandlerGateway implements PermissionGateway {
       return PermissionOutcome.denied;
     }
     try {
-      return _map(await _pluginPermission(permission)
-          .status
-          .timeout(AppConfig.effectivePermissionTimeout));
+      return _map(
+        await _pluginPermission(permission)
+            .status
+            .timeout(AppConfig.effectivePermissionTimeout),
+      );
     } catch (_) {
       return PermissionOutcome.denied;
     }
   }
 
   @override
-  Future<void> openSettings() async {
+  Future<bool> openSettings() async {
     try {
-      await ph.openAppSettings();
+      return await ph.openAppSettings().timeout(
+            AppConfig.effectivePermissionTimeout,
+          );
     } catch (_) {
-      // No settings page to open on this platform; the
-      // flow's announcement already told the user the
-      // manual path.
+      return false;
     }
   }
 }

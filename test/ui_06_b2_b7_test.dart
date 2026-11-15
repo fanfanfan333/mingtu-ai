@@ -74,8 +74,9 @@ class _FlowGateway implements PermissionGateway {
   }
 
   @override
-  Future<void> openSettings() async {
+  Future<bool> openSettings() async {
     openSettingsCalls++;
+    return true;
   }
 }
 
