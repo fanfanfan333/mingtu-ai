@@ -133,6 +133,16 @@ PermissionGateway? mingtuPermissionGatewayOverride;
 /// widget tests.
 GuideStore? mingtuGuideStoreOverride;
 
+/// Test-only injection points for observing startup permission ordering.
+@visibleForTesting
+CurrentLocationProvider? mingtuLocationProviderOverride;
+@visibleForTesting
+bool? mingtuYoloAvailableOverride;
+@visibleForTesting
+void Function()? mingtuCameraStartObserver;
+@visibleForTesting
+void Function()? mingtuMicrophoneStartObserver;
+
 /// Test/debug seam (MT-1111-PTT-C): the app's interface is
 /// deliberately minimal -- camera preview + one big
 /// hold-to-talk area, no visible text or other controls --
@@ -166,8 +176,7 @@ class MingtuHomeDebugHandle {
   /// channel's plugin object belongs to the first app
   /// instance in the process, so channel delivery cannot
   /// reach a later app's adapter.
-  Future<void> debugAttachFakeSpeech(
-      stt.SpeechToText speech) async {
+  Future<void> debugAttachFakeSpeech(stt.SpeechToText speech) async {
     final VoiceInput input = _state._voiceInput;
     if (input is SystemVoiceInput) {
       input.debugAttachSpeechForTest(speech);
@@ -186,7 +195,8 @@ class MingtuHomeDebugHandle {
   /// The on-screen state line's text form, kept as state:
   /// '当前任务状态：<state>' with the same Chinese state name
   /// the panel used to render.
-  String get taskStateText => '当前任务状态：${_state._stateText(_state._tasks.state)}';
+  String get taskStateText =>
+      '当前任务状态：${_state._stateText(_state._tasks.state)}';
 
   /// The on-screen prompt line's text form, kept as state:
   /// '当前提示：<prompt>'.
@@ -204,8 +214,7 @@ class MingtuHomeDebugHandle {
       : '系统健康：${_state._health.announcementText()}';
 
   /// The configuration status line's text form (state).
-  String get configStatusText =>
-      '配置状态：地图：${AppConfig.routeProxyStatus}；'
+  String get configStatusText => '配置状态：地图：${AppConfig.routeProxyStatus}；'
       'YOLO：${AppConfig.yoloStatus}；'
       '云端模型：${AppConfig.llmStatus}；'
       '云端识图：${AppConfig.visionProxyStatus}。';
@@ -386,6 +395,25 @@ class MingtuHomeDebugHandle {
   /// UI-06: whether the permission flow is live right now.
   bool get permissionFlowRunning => _state._permissionFlowRunning;
 
+  bool get debugPurposeQueued => _state._scheduler.queue
+      .any((request) => request.id.startsWith('permission-flow-'));
+
+  int get microphoneInitializeCalls => _state._microphoneInitializeCalls;
+  int get cameraStartCalls => _state._cameraStartCalls;
+  int get settingsRecheckStarts => _state._settingsRecheckStarts;
+
+  /// Test seam: speak a hazard through the scheduler so
+  /// permission-purpose delivery can be interrupted or
+  /// queued behind it. Production never calls this.
+  void debugSpeakHazard(String text) {
+    _state._say(_state._request(
+      id: 'test-hazard-${DateTime.now().microsecondsSinceEpoch}',
+      eventId: 'test-hazard-${DateTime.now().microsecondsSinceEpoch}',
+      text: text,
+      kind: SpeechKind.danger,
+    ));
+  }
+
   /// UI-01 debug/test seam: force (or, with null, unforce)
   /// the TalkBack toggle-mode decision, bypassing the
   /// MediaQuery. Widget tests primarily drive the real
@@ -406,6 +434,7 @@ class MingtuHomeDebugHandle {
   void debugSetSilenceClock(DateTime Function()? clock) {
     _state._silenceClock = clock ?? DateTime.now;
   }
+
   void setCloudAsrClient(CloudAsrClient client) =>
       _state._cloudAsrClient = client;
   bool get localAsrBroken => _state._localAsrBroken;
@@ -476,16 +505,14 @@ class MingtuHomeDebugHandle {
   /// Test-only: run the same engine-epoch accounting a
   /// listen attempt performs (the missed-watchdog-restart
   /// replay path), without starting a listen.
-  void debugEnsureEngineSubscription() =>
-      _state._ensureEngineSubscription();
+  void debugEnsureEngineSubscription() => _state._ensureEngineSubscription();
 
   /// Test-only: identity of the engineEvents stream this
   /// page believes it is subscribed to (-1 when none).
-  int get debugSubscribedEngineStreamIdentity => _state
-              ._subscribedEngineEvents ==
-          null
-      ? -1
-      : identityHashCode(_state._subscribedEngineEvents);
+  int get debugSubscribedEngineStreamIdentity =>
+      _state._subscribedEngineEvents == null
+          ? -1
+          : identityHashCode(_state._subscribedEngineEvents);
 
   /// Test-only: identity of the LIVE adapter's
   /// engineEvents stream object.
@@ -503,15 +530,13 @@ class MingtuHomeDebugHandle {
   /// missed-restart replay scenario to stay inside the
   /// restart window with a live waiter when the restart
   /// lands.
-  void debugConfirmClose() =>
-      unawaited(_state._ensureAsrCloseConfirmed());
+  void debugConfirmClose() => unawaited(_state._ensureAsrCloseConfirmed());
 
   /// Test-only: drop this page's live engine-events
   /// subscription (and keep it dropped) -- the
   /// subscription-gap half of the missed-restart replay
   /// scenario.
-  void debugDropEngineSubscription() =>
-      _state._debugDropEngineSubscription();
+  void debugDropEngineSubscription() => _state._debugDropEngineSubscription();
 
   /// Test-only: how many engine events the LIVE adapter
   /// has EMITTED in total (its broadcast stream drops an
@@ -524,6 +549,7 @@ class MingtuHomeDebugHandle {
         ? input.debugEngineEventsEmitted.length
         : -1;
   }
+
   void debugTalkBackLongPress() => _state._talkBackLongPress();
   void debugFireCapTimerFor(int sid) =>
       unawaited(_state._onPttCapTimerFired(sid));
@@ -539,8 +565,6 @@ class MingtuHomePage extends StatefulWidget {
   @override
   State<MingtuHomePage> createState() => _MingtuHomePageState();
 }
-
-
 
 /// Push-to-talk press states. See the state fields on
 /// _MingtuHomePageState for the transition contract.
@@ -789,17 +813,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   final PermissionFlow _permissionFlow = PermissionFlow();
   bool _permissionFlowRunning = false;
 
-  /// UI-06 first-launch marker cache: null while the
-  /// priming read is in flight, then the read's answer.
-  bool? _guideSeenCache;
+  late Future<bool> _guideSeenFuture;
+  final Set<String> _completedPermissionSpeech = <String>{};
+  final Map<Timer, Completer<void>> _permissionWaits = {};
 
-  /// UI-06: true once the startup gate has decided (so a
-  /// late marker read knows the kickoff already went).
-  bool _guideGateDecided = false;
+  Future<void> _permissionPoll() {
+    final completer = Completer<void>();
+    late final Timer timer;
+    timer = Timer(const Duration(milliseconds: 50), () {
+      _permissionWaits.remove(timer);
+      if (!completer.isCompleted) completer.complete();
+    });
+    _permissionWaits[timer] = completer;
+    return completer.future;
+  }
 
-  /// UI-06: whether speech worked at startup, remembered
-  /// for a late first-launch guide run.
-  bool _speechUsableAtStartup = false;
+  List<Object>? _deferredPermissionEffects;
+  SystemVoiceInput? _deferredAsr;
+  bool _microphoneInitialized = false;
+  int _microphoneInitializeCalls = 0;
+  int _cameraStartCalls = 0;
+  int _settingsRecheckStarts = 0;
+  bool _guideResolvedSeen = false;
+  bool _kickoffHeld = false;
+  bool _settingsRecheckInFlight = false;
+  final Set<GuidePermission> _grantedPermissions = <GuidePermission>{};
 
   /// Monotonic counter making each flow announcement's
   /// request id unique (ids carry the speech-settle wait).
@@ -808,7 +846,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// Test-only log of handled engine events (see the
   /// debug handle).
   final List<String> _debugEngineEvents = <String>[];
-
 
   /// Subscription to the adapter's no-match outcome stream.
   StreamSubscription<String>? _asrNoMatchSub;
@@ -1011,6 +1048,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   AmapWalkingClient _amapClient = AmapWalkingClient(proxyBaseUrl: '');
   CurrentLocationProvider _locationProvider =
       const UnavailableCurrentLocation();
+
   /// The voice input whose ASR event streams this page is
   /// currently subscribed to. Subscriptions are (re)made
   /// whenever the input OBJECT changes: the startup flow
@@ -1267,8 +1305,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// the TTS engine reports the utterance actually started
   /// (SystemVoiceOutput.onSpeakStart -> _onTtsSpeakStart).
   /// Stamps carry stage name + milliseconds only.
-  final Map<String, DateTime> _hazardSpeakSegmentStarts =
-      <String, DateTime>{};
+  final Map<String, DateTime> _hazardSpeakSegmentStarts = <String, DateTime>{};
   DateTime? _speakStartSegmentFrom;
 
   /// NH-M1-10 segment-test clock + collection seam: the
@@ -1326,10 +1363,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _permissionGateway =
         mingtuPermissionGatewayOverride ?? createPermissionGateway();
     _guideStore = mingtuGuideStoreOverride ?? createGuideStore();
-    // UI-06: start the first-launch marker read now; it
-    // is never awaited on the startup path (see
-    // _primeGuideSeenCache).
-    unawaited(_primeGuideSeenCache());
+    // UI-06-B3: start the first-launch marker read now.
+    // The startup gate awaits this future with a bounded
+    // timeout; a slow/failed/timed-out read is treated as
+    // not seen, so purpose speech still precedes requests.
+    _guideSeenFuture = _readGuideSeen();
     WidgetsBinding.instance.addObserver(this);
     // _initRealIntegrations never throws (every module is
     // guarded inside the production initializer, and startup
@@ -1351,6 +1389,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // on resume (no background behaviour of any kind).
     if (state == AppLifecycleState.resumed) {
       unawaited(_onPermissionSettingsReturn());
+      _retryDeferredPermissionFlow();
     }
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
@@ -1438,7 +1477,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // how to talk). Off a first launch -- and off-device,
     // where the store answers "seen" -- this completes
     // immediately and startup is exactly as before.
-    _speechUsableAtStartup = speechUsable;
     unawaited(() async {
       await _maybeRunFirstLaunchGuide(speechUsable);
       if (!mounted) return;
@@ -1446,55 +1484,52 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }());
   }
 
-  /// UI-06: the first-launch marker read. Any failure --
-  /// or a platform with no permission system -- answers
-  /// "seen": without storage there is no honest way to
-  /// know this is a first launch, and guessing "first"
-  /// would re-run onboarding on every start.
   Future<bool> _readGuideSeen() async {
     if (!_permissionGateway.isAvailable) return true;
     try {
-      return await _guideStore.hasSeenGuide();
+      return await _guideStore
+          .hasSeenGuide()
+          .timeout(AppConfig.effectivePermissionTimeout);
     } catch (_) {
-      return true;
+      return false;
     }
   }
 
-  /// UI-06: prime the marker cache from initState. The
-  /// read is a platform round-trip; it must never be
-  /// awaited on the startup path (an unanswered platform
-  /// would stall the kickoff behind it). On a real phone
-  /// it lands during module initialisation, well before
-  /// the gate below reads the cache. If it lands only
-  /// AFTER the gate already let the kickoff go and it
-  /// reports a first launch, the guide runs late instead
-  /// (see [_maybeRunFirstLaunchGuide]).
-  Future<void> _primeGuideSeenCache() async {
-    final bool seen = await _readGuideSeen();
-    _guideSeenCache = seen;
-    if (!seen &&
-        _guideGateDecided &&
-        mounted &&
-        _speechUsableAtStartup) {
-      unawaited(_runFirstLaunchGuideAndPermissions());
-    }
-  }
-
-  /// UI-06 first-launch gate: the guide + permission flow
-  /// runs only when speech works, a real permission system
-  /// exists on this platform, and the guide marker says
-  /// this is a first launch. Every other combination
-  /// returns immediately (existing startup untouched).
   Future<void> _maybeRunFirstLaunchGuide(bool speechUsable) async {
-    _guideGateDecided = true;
-    if (!speechUsable) return;
-    if (!_permissionGateway.isAvailable) return;
-    // Only a COMPLETED marker read may hold back the
-    // kickoff. An in-flight read proceeds as "seen" here;
-    // if it later reports a first launch, its completion
-    // handler (_primeGuideSeenCache) runs the guide then.
-    if (_guideSeenCache != false) return;
-    await _runFirstLaunchGuideAndPermissions();
+    final bool seen = await _guideSeenFuture;
+    if (!speechUsable || !_permissionGateway.isAvailable) return;
+    if (!seen) {
+      await _runFirstLaunchGuideAndPermissions();
+    } else if ((_guideResolvedSeen = true) &&
+        await _permissionStatus(GuidePermission.microphone) ==
+            PermissionOutcome.granted) {
+      await _initializeMicrophone();
+    }
+  }
+
+  Future<PermissionOutcome> _permissionStatus(
+      GuidePermission permission) async {
+    try {
+      return await _permissionGateway
+          .status(permission)
+          .timeout(AppConfig.effectivePermissionTimeout);
+    } catch (_) {
+      return PermissionOutcome.denied;
+    }
+  }
+
+  Future<void> _initializeMicrophone() async {
+    if (_microphoneInitialized || _deferredAsr == null) return;
+    _microphoneInitialized = true;
+    _microphoneInitializeCalls++;
+    mingtuMicrophoneStartObserver?.call();
+    try {
+      final bool ok =
+          await _deferredAsr!.initialize().timeout(const Duration(seconds: 3));
+      _localAsrBroken = !ok;
+    } catch (_) {
+      _localAsrBroken = true;
+    }
   }
 
   /// UI-06: speak the first-launch guide, then run the
@@ -1523,30 +1558,52 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// purposes/confirmations ride info, so an emergency or
   /// danger prompt (levels 0 and 1) always outranks
   /// onboarding speech and is never delayed by it.
-  Future<void> _sayPermissionFlowText(String text,
-      {bool alert = false}) async {
-    final String id =
-        'permission-flow-${_permissionSpeechSeq++}';
-    _say(_request(
-      id: id,
-      eventId: id,
-      kind: alert ? SpeechKind.alert : SpeechKind.info,
-      text: text,
-    ));
-    await _waitForSpeechSettled(id);
+  Future<bool> _sayPermissionFlowText(String text,
+      {bool alert = false, bool requireDelivery = false}) async {
+    final DateTime deadline =
+        _speechNow().add(AppConfig.effectivePermissionSpeechTimeout);
+    while (mounted && _speechNow().isBefore(deadline)) {
+      final String id = 'permission-flow-${_permissionSpeechSeq++}';
+      final bool accepted = _say(_request(
+        id: id,
+        eventId: id,
+        kind: alert ? SpeechKind.alert : SpeechKind.info,
+        text: text,
+      ));
+      while (mounted && _speechNow().isBefore(deadline)) {
+        if (_completedPermissionSpeech.remove(id)) return true;
+        final bool failed = !accepted ||
+            _scheduler.interruptedLog.contains(id) ||
+            _scheduler.cancelledLog.contains(id) ||
+            _scheduler.droppedExpiredLog.contains(id) ||
+            _scheduler.droppedDuplicateLog.contains(id) ||
+            _scheduler.droppedConflictLog.contains(id);
+        if (failed) {
+          if (!requireDelivery) return false;
+          // Wait for the interrupting speech to complete before replaying.
+          while (mounted &&
+              _scheduler.active != null &&
+              _speechNow().isBefore(deadline)) {
+            await _permissionPoll();
+          }
+          if (mounted && _speechNow().isBefore(deadline)) {
+            await _permissionPoll();
+            break;
+          }
+        }
+        await _permissionPoll();
+      }
+      if (!mounted) return false;
+      if (!_speechNow().isBefore(deadline)) return false;
+    }
+    return false;
   }
 
-  /// Poll until request [id] is neither the scheduler's
-  /// active item nor queued. Bounded (~30 s): a wedged
-  /// speech engine must never wedge onboarding or startup.
-  Future<void> _waitForSpeechSettled(String id) async {
-    for (int i = 0; i < 600 && mounted; i++) {
-      final bool active = _scheduler.active?.id == id;
-      final bool queued =
-          _scheduler.queue.any((SpeechRequest r) => r.id == id);
-      if (!active && !queued) return;
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-    }
+  void _retryDeferredPermissionFlow() {
+    final List<Object>? effects = _deferredPermissionEffects;
+    if (effects == null) return;
+    _deferredPermissionEffects = null;
+    unawaited(_executePermissionEffects(effects));
   }
 
   /// UI-06: execute a batch of machine effects in order.
@@ -1561,19 +1618,40 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (!mounted) return;
       final Object effect = queue.removeAt(0);
       if (effect is PermissionSpeakEffect) {
-        await _sayPermissionFlowText(effect.text, alert: effect.alert);
+        final bool purpose =
+            queue.isNotEmpty && queue.first is PermissionRequestEffect;
+        final bool delivered = await _sayPermissionFlowText(effect.text,
+            alert: effect.alert, requireDelivery: purpose);
+        if (!mounted) return;
+        if (purpose && !delivered) {
+          _deferredPermissionEffects = <Object>[effect, ...queue];
+          _say(_request(
+              id: 'permission-undelivered-${_permissionSpeechSeq++}',
+              eventId: 'permission-undelivered-$_permissionSpeechSeq',
+              kind: SpeechKind.alert,
+              text: permissionPurposeUndeliveredText));
+          return;
+        }
       } else if (effect is PermissionRequestEffect) {
         PermissionOutcome outcome;
         try {
-          outcome = await _permissionGateway.request(effect.permission);
+          outcome = await _permissionGateway
+              .request(effect.permission)
+              .timeout(AppConfig.effectivePermissionTimeout);
         } catch (_) {
           outcome = PermissionOutcome.denied;
         }
         if (!mounted) return;
+        if (outcome == PermissionOutcome.granted) {
+          _grantedPermissions.add(effect.permission);
+        }
+        if (outcome == PermissionOutcome.granted &&
+            effect.permission == GuidePermission.microphone) {
+          await _initializeMicrophone();
+        }
+        if (!mounted) return;
         queue.insertAll(
-            0,
-            _permissionFlow.onRequestResult(
-                effect.permission, outcome));
+            0, _permissionFlow.onRequestResult(effect.permission, outcome));
       } else if (effect is PermissionOpenSettingsEffect) {
         try {
           await _permissionGateway.openSettings();
@@ -1581,6 +1659,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         return; // paused until the resumed re-check
       } else if (effect is PermissionFlowDoneEffect) {
         _permissionFlowRunning = false;
+        if (_kickoffHeld) {
+          _kickoffHeld = false;
+          unawaited(_kickoffVoiceNavFlow(true));
+        }
         try {
           await _guideStore.markGuideSeen();
         } catch (_) {}
@@ -1594,17 +1676,34 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// announce the result and continue the flow. A resume
   /// at any other time does nothing at all.
   Future<void> _onPermissionSettingsReturn() async {
-    final GuidePermission? step = _permissionFlow.awaitingSettingsFor;
-    if (step == null || !_permissionFlowRunning) return;
-    PermissionOutcome outcome;
+    // A resume received during this re-check belongs to the same return
+    // from settings. Do not apply it to a later permission step.
+    if (_settingsRecheckInFlight) return;
+    _settingsRecheckInFlight = true;
     try {
-      outcome = await _permissionGateway.status(step);
-    } catch (_) {
-      outcome = PermissionOutcome.denied;
+      final GuidePermission? step = _permissionFlow.awaitingSettingsFor;
+      if (step == null || !_permissionFlowRunning) return;
+      _settingsRecheckStarts++;
+      PermissionOutcome outcome;
+      try {
+        outcome = await _permissionGateway
+            .status(step)
+            .timeout(AppConfig.effectivePermissionTimeout);
+      } catch (_) {
+        outcome = PermissionOutcome.denied;
+      }
+      if (!mounted || _permissionFlow.awaitingSettingsFor != step) return;
+      if (outcome == PermissionOutcome.granted) _grantedPermissions.add(step);
+      if (outcome == PermissionOutcome.granted &&
+          step == GuidePermission.microphone) {
+        await _initializeMicrophone();
+      }
+      if (!mounted || _permissionFlow.awaitingSettingsFor != step) return;
+      await _executePermissionEffects(
+          _permissionFlow.onSettingsReturn(step, outcome));
+    } finally {
+      _settingsRecheckInFlight = false;
     }
-    if (!mounted) return;
-    await _executePermissionEffects(
-        _permissionFlow.onSettingsReturn(step, outcome));
   }
 
   /// Step 2 kickoff, after the startup announcements: request
@@ -1617,7 +1716,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   Future<void> _kickoffVoiceNavFlow(bool speechUsable) async {
     try {
       if (!speechUsable) return;
-      final bool locOk = await _locationProvider.ensurePermission();
+      if (_permissionFlowRunning) {
+        _kickoffHeld = true;
+        return;
+      }
+      final bool locationGranted = !_permissionGateway.isAvailable ||
+          _grantedPermissions.contains(GuidePermission.location) ||
+          (_guideResolvedSeen &&
+              await _permissionStatus(GuidePermission.location) ==
+                  PermissionOutcome.granted);
+      final bool locOk =
+          locationGranted && await _locationProvider.ensurePermission();
       if (!mounted) return;
       if (_yoloAvailableAtStartup) {
         unawaited(_openYoloLive());
@@ -2195,6 +2304,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         ownership: _cameraOwnership,
       ),
       log: startupFailures,
+      locationFactory: mingtuLocationProviderOverride == null
+          ? null
+          : () => mingtuLocationProviderOverride!,
+      deferAsrInitialization: _permissionGateway.isAvailable,
     );
     _frameSource = init.frameSource;
     // M3: construct the pothole scanner ONLY when its
@@ -2240,13 +2353,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _amapClient = init.amapClient;
     _locationProvider = init.locationProvider;
     _yoloDetector = init.yolo;
-    _yoloAvailableAtStartup = init.yolo.isAvailable;
+    _yoloAvailableAtStartup =
+        mingtuYoloAvailableOverride ?? init.yolo.isAvailable;
     final SystemVoiceOutput? tts = init.tts;
     final bool ttsOk = init.ttsOk;
     final SystemVoiceInput? asr = init.asr;
     final bool asrOk = init.asrOk;
+    if (_permissionGateway.isAvailable) _deferredAsr = asr;
     if (!mounted) return false;
-    if (!asrOk || asr == null || !asr.isAvailable) {
+    if (!asrOk ||
+        asr == null ||
+        (!_permissionGateway.isAvailable && !asr.isAvailable)) {
       // MT-1111-PTT-D(5): the engine is unavailable AT
       // STARTUP -- the very first press goes straight to
       // the recording + cloud ASR fallback instead of
@@ -2399,8 +2516,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         // this is the app-side second line.
         final int stamp = asr.currentSessionId;
         if (stamp != _asrLiveSessionId && !_asrCloseInFlight) {
-          mingtuVoiceLog(
-              '已作废会话的识别错误按关闭处理：${error.split('|').first}');
+          mingtuVoiceLog('已作废会话的识别错误按关闭处理：${error.split('|').first}');
           return;
         }
         _handleAsrError(error);
@@ -2659,14 +2775,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    for (final entry in _permissionWaits.entries) {
+      entry.key.cancel();
+      if (!entry.value.isCompleted) entry.value.complete();
+    }
+    _permissionWaits.clear();
     WidgetsBinding.instance.removeObserver(this);
     // MT-1111-PTT-D(4): dispose releases the microphone. A
     // press still capturing is cancelled (voided, never
     // submitted); the recorder is cancelled likewise. The
     // adapter outlives the page by design, so this is the
     // app-side release: stop/cancel on the live session.
-    if (_pttState == _PttState.listening ||
-        _pttState == _PttState.starting) {
+    if (_pttState == _PttState.listening || _pttState == _PttState.starting) {
       _pttSessionVoided = true;
       if (_pttRecording) {
         _stopSilenceWatch();
@@ -2715,6 +2835,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _logMsg(String message) {
+    if (!mounted) return;
     setState(() {
       _log.insert(0, message);
       if (_log.length > 50) {
@@ -2811,6 +2932,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   bool _say(SpeechRequest request) {
+    if (!mounted) return false;
     // NAVHAZ M1 banned-word guard (spec sections 0.1 /
     // 2.4): NO announcement may grant or imply passage. In
     // debug builds the assert fires; in release builds the
@@ -2870,8 +2992,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // 15.000 s expired at the production 15 s window).
     final DateTime now = _speechNow();
     const Duration expiry = NavHazConfig.replayExpiry;
-    for (final SpeechRequest r
-        in _scheduler.interruptedNavigationRequests()) {
+    for (final SpeechRequest r in _scheduler.interruptedNavigationRequests()) {
       final DateTime? at = _scheduler.interruptedAtOf(r);
       if (at != null && now.difference(at) >= expiry) {
         _scheduler.discardInterrupted(r);
@@ -2941,9 +3062,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// Shared completion step: mark the active prompt spoken, then
   /// promote the next queued prompt if it is still valid -- and speak
   /// it too, through the same real-or-simulated path.
-  void _finishSpeech(String id) {
+  void _finishSpeech(String id, {bool ttsCompleted = false}) {
     if (_scheduler.active?.id == id) {
       final SpeechRequest finished = _scheduler.active!;
+      if (ttsCompleted && id.startsWith('permission-flow-')) {
+        _completedPermissionSpeech.add(id);
+      }
       _scheduler.completeActive();
       // NAVHAZ M1 arbitration: after a hazard prompt
       // (danger / obstacleAvoidance) finishes and no other
@@ -3149,7 +3273,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           _logMsg('已取消播报的迟到完成回调已忽略（${request.id}）。');
           return;
         }
-        _finishSpeech(request.id);
+        _finishSpeech(request.id, ttsCompleted: true);
       }).catchError((Object e) {
         // Same guard for the error path: a cancelled utterance
         // failing late is not a new TTS failure.
@@ -3602,6 +3726,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// failure vibrates and speaks the fixed ASR-unavailable
   /// notice like every other ASR failure path.
   void _pushToTalkStart() {
+    if (_deferredPermissionEffects != null) {
+      _retryDeferredPermissionFlow();
+      return;
+    }
+    if (_permissionGateway.isAvailable && !_microphoneInitialized) return;
     if (_pttState != _PttState.idle) return;
     mingtuPttPressDebugHook?.call(_voiceInput);
     final int sid = ++_pttSession;
@@ -3826,8 +3955,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           // the recording route below.
           await (_voiceInput as SystemVoiceInput)
               .cancelForRecovery()
-              .timeout(const Duration(seconds: 1),
-                  onTimeout: () {});
+              .timeout(const Duration(seconds: 1), onTimeout: () {});
         } catch (e) {
           _logMsg('恢复前取消语音识别失败，继续重新初始化：$e');
         }
@@ -3837,8 +3965,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           return;
         }
         try {
-          recovered = await (_voiceInput as SystemVoiceInput)
-              .restartForRecovery();
+          recovered =
+              await (_voiceInput as SystemVoiceInput).restartForRecovery();
         } catch (_) {
           recovered = false;
         }
@@ -4061,8 +4189,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // does not gate the capture.
       _say(_request(
         id: 'ptt-cloud-switch-${DateTime.now().millisecondsSinceEpoch}',
-        eventId:
-            'ptt-cloud-switch-${DateTime.now().millisecondsSinceEpoch}',
+        eventId: 'ptt-cloud-switch-${DateTime.now().millisecondsSinceEpoch}',
         text: asrCloudSwitchSpeechText,
         kind: SpeechKind.alert,
       ));
@@ -4569,8 +4696,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final VoiceRecorder recorder = _recorder;
     if (recorder is! VoiceRecorderAmplitude) return;
     final RecordingSilenceTracker tracker = RecordingSilenceTracker();
-    _silenceSub =
-        (recorder as VoiceRecorderAmplitude).amplitudeDbfs().listen(
+    _silenceSub = (recorder as VoiceRecorderAmplitude).amplitudeDbfs().listen(
       (double dbfs) {
         if (!mounted || sid != _pttSession || !_pttRecording) return;
         if (tracker.addSample(dbfs, _silenceClock())) {
@@ -4793,8 +4919,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // model the subscription-rebuild gap in which a
     // restart's notification (and with it, its epoch
     // accounting) is genuinely missed.
-    final List<String> markers =
-        input.debugDrainTestMarkers();
+    final List<String> markers = input.debugDrainTestMarkers();
     if (markers.contains('restartInit')) {
       mingtuVoiceLog('测试缝：模拟丢失一次引擎重启的纪元核算');
       _suppressNextEngineEpochCheck = true;
@@ -4875,8 +5000,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     HapticFeedback.vibrate();
     _say(_request(
       id: 'asr-restart-failed-${DateTime.now().millisecondsSinceEpoch}',
-      eventId:
-          'asr-restart-failed-${DateTime.now().millisecondsSinceEpoch}',
+      eventId: 'asr-restart-failed-${DateTime.now().millisecondsSinceEpoch}',
       text: voiceNoticeText(VoiceNoticeKind.asrUnavailable),
       kind: SpeechKind.alert,
     ));
@@ -5134,8 +5258,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _enterYoloRiskState() {
     _yoloRiskActive = true;
     if (_tasks.state == TaskState.navigating) {
-      _tasks.transitionTo(TaskState.avoidingObstacle,
-          trigger: 'yolo-obstacle');
+      _tasks.transitionTo(TaskState.avoidingObstacle, trigger: 'yolo-obstacle');
       _stopStraightTimer();
     }
     _pauseStraightForRisk();
@@ -5228,8 +5351,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // drop and the scope restriction are degradations the
     // user must hear about (alert); the recovery notice
     // is informational (info).
-    final ({String text, SpeechKind kind})? spoken =
-        switch (cap.announcement) {
+    final ({String text, SpeechKind kind})? spoken = switch (cap.announcement) {
       ThermalAnnouncement.fpsDrop => (
           text: NavHazConfig.thermalCriticalAnnouncementText,
           kind: SpeechKind.alert,
@@ -5283,8 +5405,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final int target = _frameRatePolicy.evaluate(
       now: now,
       motion: ego,
-      dangerPresent:
-          FrameRatePolicy.dangerPresentIn(result.estimates),
+      dangerPresent: FrameRatePolicy.dangerPresentIn(result.estimates),
       // Estimates exist only for tracks seen on THIS
       // frame (the pipeline skips lost-coast tracks), so
       // any estimate at all means a live track.
@@ -5303,8 +5424,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// what (if anything) is announced; the policy also
   /// drives the risk state (three consecutive risk-free
   /// frames clear it, same as the legacy chain).
-  void _onYoloDetectionsPipeline(List<Detection> detections, DateTime now,
-      DateTime? frameCapturedAt) {
+  void _onYoloDetectionsPipeline(
+      List<Detection> detections, DateTime now, DateTime? frameCapturedAt) {
     // Latency stamps (FIX3B + FIX4-FINAL S3): the
     // pipeline's own segment (frame -> alert / pre-urgent
     // emission, wired through onLatency below) plus the
@@ -5570,6 +5691,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// the camera is busy (or the wait times out) the view does NOT
   /// open and the user hears exactly that.
   Future<void> _openYoloLive() async {
+    if (_permissionGateway.isAvailable &&
+        !_grantedPermissions.contains(GuidePermission.camera) &&
+        (!_guideResolvedSeen ||
+            await _permissionStatus(GuidePermission.camera) !=
+                PermissionOutcome.granted)) {
+      return;
+    }
+    if (!mounted) return;
+    _cameraStartCalls++;
+    mingtuCameraStartObserver?.call();
     final CameraLease? lease =
         await _cameraOwnership.tryAcquire(CameraUse.yoloLive);
     if (lease == null) {
@@ -6211,8 +6342,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (!e.confirmed || !e.willHit || e.approaching) continue;
       final double? closing = e.closingSpeedMps;
       if (closing != null &&
-          closing >
-              egoSpeed + NavHazConfig.cloudBlockedStaticClosingSlackMps) {
+          closing > egoSpeed + NavHazConfig.cloudBlockedStaticClosingSlackMps) {
         continue;
       }
       first ??= e;
@@ -6246,10 +6376,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (nav == null) return;
     if (!_cloudVisionClient.isConfigured) return;
     final int stepIndex = nav.currentStepIndex;
-    final String? stepText =
-        stepIndex >= 0 && stepIndex < nav.stepTexts.length
-            ? nav.stepTexts[stepIndex]
-            : null;
+    final String? stepText = stepIndex >= 0 && stepIndex < nav.stepTexts.length
+        ? nav.stepTexts[stepIndex]
+        : null;
     final GeoPoint? fix = _lastFixPoint;
     final CloudTriggerSnapshot snapshot = CloudTriggerSnapshot(
       currentStepText: stepText,
@@ -6292,6 +6421,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   Future<void> _runCloudAutoTrigger(VisionTrigger kind) async {
     try {
       if (!_cloudVisionClient.tryReserve(DateTime.now())) return;
+      if (_permissionGateway.isAvailable &&
+          !_grantedPermissions.contains(GuidePermission.camera) &&
+          (!_guideResolvedSeen ||
+              await _permissionStatus(GuidePermission.camera) !=
+                  PermissionOutcome.granted)) {
+        return;
+      }
       final CameraFrameCapture capture =
           await _frameSource.captureSingleFrame();
       if (!capture.ok || capture.bytes == null) {
@@ -7012,16 +7148,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                     : '按住说话按钮，按住后说话，松开结束',
                 value: toggleMode ? _bigStatusText() : null,
                 onTap: toggleMode ? _pttToggleTap : null,
-                onLongPress:
-                    toggleMode ? _pttToggleStart : _talkBackLongPress,
+                onLongPress: toggleMode ? _pttToggleStart : _talkBackLongPress,
                 child: GestureDetector(
                   onLongPressStart: (_) => _pushToTalkStart(),
                   onLongPressEnd: (_) => _pushToTalkEnd(),
                   child: Container(
                     key: const ValueKey<String>('push-to-talk-area'),
                     decoration: BoxDecoration(
-                      color:
-                          Theme.of(context).colorScheme.primaryContainer,
+                      color: Theme.of(context).colorScheme.primaryContainer,
                       borderRadius: BorderRadius.circular(16),
                     ),
                   ),
@@ -7034,4 +7168,3 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
   }
 }
-

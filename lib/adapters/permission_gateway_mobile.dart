@@ -18,15 +18,18 @@
 /// flow's step list never contains it anyway.
 library;
 
+import 'dart:io' show Platform;
+
 import 'package:permission_handler/permission_handler.dart' as ph;
 
 import '../core/permission_flow.dart';
+import '../config/app_config.dart';
 
 PermissionGateway createPermissionGateway() => PermissionHandlerGateway();
 
 class PermissionHandlerGateway implements PermissionGateway {
   @override
-  bool get isAvailable => true;
+  bool get isAvailable => Platform.isAndroid || Platform.isIOS;
 
   ph.Permission _pluginPermission(GuidePermission permission) {
     switch (permission) {
@@ -63,7 +66,9 @@ class PermissionHandlerGateway implements PermissionGateway {
       return PermissionOutcome.denied;
     }
     try {
-      return _map(await _pluginPermission(permission).request());
+      return _map(await _pluginPermission(permission)
+          .request()
+          .timeout(AppConfig.effectivePermissionTimeout));
     } catch (_) {
       // A platform without the plugin answers honestly:
       // nothing was granted.
@@ -77,7 +82,9 @@ class PermissionHandlerGateway implements PermissionGateway {
       return PermissionOutcome.denied;
     }
     try {
-      return _map(await _pluginPermission(permission).status);
+      return _map(await _pluginPermission(permission)
+          .status
+          .timeout(AppConfig.effectivePermissionTimeout));
     } catch (_) {
       return PermissionOutcome.denied;
     }

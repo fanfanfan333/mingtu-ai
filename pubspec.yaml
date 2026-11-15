@@ -24,6 +24,15 @@ dependencies:
   byte_track_dart: 0.4.0
   path_provider: ^2.1.6
 
+# Flutter 3.47.9 sets compileSdk 36. permission_handler 13.0.2
+# otherwise pulls permission_handler_android 14.x, which requires
+# compileSdk >= 37 and breaks the release APK. Pin the newest
+# Android implementation that still builds with compileSdk 36:
+# permission_handler_android 13.0.1 (its android/build.gradle
+# sets compileSdkVersion 35). Do not raise compileSdk.
+dependency_overrides:
+  permission_handler_android: 13.0.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

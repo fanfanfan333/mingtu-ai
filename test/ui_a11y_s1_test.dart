@@ -913,6 +913,7 @@ void main() {
       final List<String> all = <String>[
         firstLaunchGuideText,
         permissionFlowEndText,
+        permissionPurposeUndeliveredText,
         for (final List<String> texts in pinned.values) ...texts,
       ];
       for (final String text in all) {

@@ -1,9 +1,7 @@
 /// Phone guide store: the first-launch marker is one
 /// small file in the app support directory (path_provider,
 /// already a dependency of this app). Any failure to reach
-/// storage answers "seen" -- see the [GuideStore]
-/// contract for why guessing "first launch" would be the
-/// dishonest direction.
+/// storage answers "not seen" so permission explanations precede requests.
 library;
 
 import 'dart:io';
@@ -29,11 +27,11 @@ class FileGuideStore implements GuideStore {
   @override
   Future<bool> hasSeenGuide() async {
     final File? file = await _markerFile();
-    if (file == null) return true;
+    if (file == null) return false;
     try {
       return await file.exists();
     } catch (_) {
-      return true;
+      return false;
     }
   }
 

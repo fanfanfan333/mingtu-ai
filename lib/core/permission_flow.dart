@@ -120,14 +120,16 @@ class PermissionFlowDoneEffect {
 /// The first-launch spoken guide: how to talk, how to
 /// stop, what to do on a danger prompt, and how to hear
 /// this again (the voice command for help replays it).
-const String firstLaunchGuideText =
-    '欢迎使用明途。说话的方法：按住屏幕下方的大按钮，说完松开；'
+const String firstLaunchGuideText = '欢迎使用明途。说话的方法：按住屏幕下方的大按钮，说完松开；'
     '开着读屏软件时，双击按钮开始说话，再双击一次结束。'
     '走路时听到危险提醒，先停下脚步，再听说明。'
     '想再听这段说明，任何时候说一声帮助就可以。';
 
 /// Purpose announcement per permission: what is needed
 /// and what it is for, spoken BEFORE the system dialog.
+const String permissionPurposeUndeliveredText =
+    '权限说明没说完，这次先不弹出授权框。下次按下说话键，或回到应用时，我会再说明一次。';
+
 String permissionPurposeText(GuidePermission permission) {
   switch (permission) {
     case GuidePermission.microphone:
@@ -324,15 +326,13 @@ class PermissionFlow {
         ];
       case PermissionOutcome.denied:
         return <Object>[
-          PermissionSpeakEffect(permissionDeniedText(permission),
-              alert: true),
+          PermissionSpeakEffect(permissionDeniedText(permission), alert: true),
           ..._advance(),
         ];
       case PermissionOutcome.permanentlyDenied:
         _awaitingSettingsFor = permission;
         return <Object>[
-          PermissionSpeakEffect(
-              permissionPermanentlyDeniedText(permission),
+          PermissionSpeakEffect(permissionPermanentlyDeniedText(permission),
               alert: true),
           PermissionOpenSettingsEffect(permission),
         ];

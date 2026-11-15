@@ -48,7 +48,18 @@
 /// NOT_CONFIGURED and the app must NOT fake a route, a detection or a
 /// voice result. Values are never printed or logged: only the status
 /// (configured / not configured) is shown.
+/// Test-only timeout overrides. Null in production.
+Duration? mingtuPermissionTimeoutOverride;
+Duration? mingtuPermissionSpeechTimeoutOverride;
+
 class AppConfig {
+  static const Duration permissionTimeout = Duration(seconds: 2);
+  static const Duration permissionSpeechTimeout = Duration(seconds: 30);
+  static Duration get effectivePermissionTimeout =>
+      mingtuPermissionTimeoutOverride ?? permissionTimeout;
+  static Duration get effectivePermissionSpeechTimeout =>
+      mingtuPermissionSpeechTimeoutOverride ?? permissionSpeechTimeout;
+
   /// Base URL of the self-hosted Amap route proxy (server side
   /// holds the Amap key). A URL is not a credential. Empty = the
   /// proxy is not deployed/configured, and real routes are
