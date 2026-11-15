@@ -1306,6 +1306,21 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // no automatic ASR restart); once an ASR error has been announced
   // it is not announced again (no retry/announce loop).
   bool _ttsFailed = false;
+  bool get _hazardWatchActive {
+    if (_tasks.state == TaskState.navigating ||
+        _tasks.state == TaskState.avoidingObstacle) {
+      return true;
+    }
+    if (!_ttsFailed ||
+        _tasks.state != TaskState.paused ||
+        _tasks.history.isEmpty) {
+      return false;
+    }
+    final TaskTransition last = _tasks.history.last;
+    return last.trigger == 'tts-failure' &&
+        (last.from == TaskState.navigating ||
+            last.from == TaskState.avoidingObstacle);
+  }
   Future<VoiceOutput?> Function()? _ttsRebuildOverride;
   late final TtsRecoveryController _ttsRecovery = TtsRecoveryController(
     haptics: () => _haptics,
@@ -5912,7 +5927,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // vehicle's relative closing speed must beat v_ego
       // by the configured margin to count as "approaching".
       ego: egoNow,
-      commit: navigating,
+      commit: _hazardWatchActive,
     );
     // M2 section 3.1: the adaptive frame rate follows the
     // pipeline's own frame (danger and live tracks come
@@ -5984,7 +5999,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // for a warning alert's step. No speech accompanies a
     // pre-urgent entry -- the urgent speech still comes
     // only through the confirmed alert path below.
-    if (navigating) {
+    if (_hazardWatchActive) {
       for (final ({int trackId, bool urgent}) v in result.vibrations) {
         if (_ttsFailed && v.urgent && result.riskPresent) {
           _ttsRecovery.danger();
@@ -5996,7 +6011,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     if (result.riskPresent) {
       _yoloEmptyFrames = 0;
-      if (navigating && !_yoloRiskActive) {
+      if (_hazardWatchActive && !_yoloRiskActive) {
         _enterYoloRiskState();
       }
     } else {
@@ -6075,9 +6090,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         .where((PerceptionEvent e) =>
             e.isNewTrack && _yoloObstacleLabels.containsKey(e.label))
         .toList();
-    if (newObstacles.isNotEmpty &&
-        (_tasks.state == TaskState.navigating ||
-            _tasks.state == TaskState.avoidingObstacle)) {
+    if (newObstacles.isNotEmpty && _hazardWatchActive) {
       // Risk onset (only the FIRST obstacle flips the state
       // and enters the unified straight pause). The danger
       // SPEECH below is deliberately NOT gated on
