@@ -3323,7 +3323,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (_ttsFailed) {
       if (request.kind == SpeechKind.danger) {
         _pauseStraightForRisk();
-        _ttsRecovery.danger();
+        _ttsRecovery.danger(
+            eventId: request.eventId, level: DangerLevel.urgent);
       } else if (request.kind == SpeechKind.emergency) {
         unawaited(_haptics.vibrateUrgent());
       } else if (request.kind == SpeechKind.alert) {
@@ -6020,8 +6021,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // only through the confirmed alert path below.
     if (_hazardWatchActive) {
       for (final ({int trackId, bool urgent}) v in result.vibrations) {
-        if (_ttsFailed && v.urgent && result.riskPresent) {
-          _ttsRecovery.danger();
+        if (_ttsFailed && result.riskPresent) {
+          _ttsRecovery.danger(
+            trackId: v.trackId,
+            level: v.urgent ? DangerLevel.urgent : DangerLevel.warning,
+          );
         } else {
           unawaited(
               v.urgent ? _haptics.vibrateUrgent() : _haptics.vibrateWarning());
@@ -6042,7 +6046,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final HazardAlert? alert = result.alert;
     if (alert == null) return;
     if (_ttsFailed && alert.urgent && _yoloRiskActive) {
-      _ttsRecovery.danger();
+      _ttsRecovery.danger(
+        trackId: alert.trackId,
+        level: alert.urgent ? DangerLevel.urgent : DangerLevel.warning,
+      );
     }
     // NH-M1-13: NO vibration dispatch here any more --
     // the alert's vibration (when its ladder step allows

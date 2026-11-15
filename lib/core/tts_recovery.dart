@@ -4,6 +4,8 @@ import '../adapters/voice_io.dart';
 import 'haptics.dart';
 
 /// Retries after delays measured from the end of each failed attempt.
+enum DangerLevel { warning, urgent }
+
 class TtsRecoveryController {
   TtsRecoveryController({
     required this.rebuild,
@@ -25,6 +27,9 @@ class TtsRecoveryController {
   Timer? _vibration;
   Timer? _dangerCap;
   bool _dangerExhausted = false;
+  int? _dangerTrackId;
+  String? _dangerEventId;
+  DangerLevel? _dangerLevel;
   bool _failed = false;
   bool _disposed = false;
   int _attempt = 0;
@@ -65,10 +70,34 @@ class TtsRecoveryController {
   }
 
   /// Repeat while recovery is pending and until the caller clears danger.
-  void danger() {
-    if (!_failed || _disposed || _vibration != null || _dangerExhausted) {
-      return;
+  void danger(
+      {int? trackId, String? eventId, DangerLevel level = DangerLevel.urgent}) {
+    if (!_failed || _disposed) return;
+    final different = (trackId != null &&
+            _dangerTrackId != null &&
+            trackId != _dangerTrackId) ||
+        (eventId != null &&
+            _dangerEventId != null &&
+            eventId != _dangerEventId);
+    final escalated = _dangerLevel != null && level.index > _dangerLevel!.index;
+    if (different || escalated) {
+      _dangerCap?.cancel();
+      _vibration?.cancel();
+      _dangerCap = null;
+      _vibration = null;
+      _dangerExhausted = false;
+      if (different) {
+        _dangerTrackId = null;
+        _dangerEventId = null;
+        _dangerLevel = null;
+      }
     }
+    _dangerTrackId ??= trackId;
+    _dangerEventId ??= eventId;
+    if (_dangerLevel == null || level.index > _dangerLevel!.index) {
+      _dangerLevel = level;
+    }
+    if (_vibration != null || _dangerExhausted) return;
     _dangerCap = _schedule(dangerDurationCap, () {
       _vibration?.cancel();
       _vibration = null;
@@ -77,7 +106,9 @@ class TtsRecoveryController {
     });
     void pulse() {
       if (!_failed || _disposed) return;
-      unawaited(haptics().vibrateUrgent());
+      unawaited(_dangerLevel == DangerLevel.warning
+          ? haptics().vibrateWarning()
+          : haptics().vibrateUrgent());
       _vibration = _schedule(const Duration(milliseconds: 400), pulse);
     }
 
@@ -88,6 +119,9 @@ class TtsRecoveryController {
     _dangerCap?.cancel();
     _dangerCap = null;
     _dangerExhausted = false;
+    _dangerTrackId = null;
+    _dangerEventId = null;
+    _dangerLevel = null;
     _vibration?.cancel();
     _vibration = null;
   }
