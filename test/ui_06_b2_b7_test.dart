@@ -1121,11 +1121,9 @@ void main() {
           h,
           () => gateway.requested.contains(GuidePermission.microphone),
           'request');
-      await tester.runAsync(() async {
-        await Future<void>.delayed(Duration(seconds: delay));
-        answer.complete(
-            delay == 10 ? PermissionOutcome.granted : PermissionOutcome.denied);
-      });
+      await tester.pump(Duration(seconds: delay));
+      answer.complete(
+          delay == 10 ? PermissionOutcome.granted : PermissionOutcome.denied);
       await _driveUntil(
           tester,
           h,
@@ -1140,6 +1138,35 @@ void main() {
           h.events, isNot(contains('tts.speak:$permissionRequestTimeoutText')));
     }, timeout: const Timeout(Duration(seconds: 90)));
   }
+
+  testWidgets('B13 late grant after 120 second fallback resumes flow',
+      (tester) async {
+    final answer = Completer<PermissionOutcome>();
+    gateway.requestHangs[GuidePermission.microphone] = answer;
+    final h = await _openApp(tester);
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.microphone),
+        'request');
+    await tester.pump(const Duration(seconds: 120));
+    await _driveUntil(
+        tester,
+        h,
+        () => h.events.contains('tts.speak:$permissionRequestTimeoutText'),
+        'timeout speech');
+    answer.complete(PermissionOutcome.granted);
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.camera),
+        'next request');
+    expect(mingtuHomeDebugHandle!.microphoneInitializeCalls, 1);
+    expect(
+        h.events,
+        isNot(contains(
+            'tts.speak:${permissionDeniedText(GuidePermission.microphone)}')));
+  });
 
   testWidgets('B10 startup with unavailable speech does not request',
       (tester) async {

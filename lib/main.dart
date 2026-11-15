@@ -849,6 +849,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _pocketSettingChanged = false;
   final PermissionFlow _permissionFlow = PermissionFlow();
   bool _permissionFlowRunning = false;
+  final Map<GuidePermission, int> _permissionRequestGeneration = {};
 
   late Future<bool> _guideSeenFuture;
   final Set<String> _completedPermissionSpeech = <String>{};
@@ -1715,6 +1716,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final List<Object>? effects = _deferredPermissionEffects;
     if (effects == null) return;
     _deferredPermissionEffects = null;
+    for (final effect in effects) {
+      if (effect is PermissionRequestEffect) {
+        // Retrying supersedes the old request even while its purpose is spoken.
+        _permissionRequestGeneration[effect.permission] =
+            (_permissionRequestGeneration[effect.permission] ?? 0) + 1;
+        break;
+      }
+    }
     unawaited(_executePermissionEffects(effects));
   }
 
@@ -1746,9 +1755,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
       } else if (effect is PermissionRequestEffect) {
         PermissionOutcome outcome;
+        final int generation =
+            (_permissionRequestGeneration[effect.permission] ?? 0) + 1;
+        _permissionRequestGeneration[effect.permission] = generation;
+        final Future<PermissionOutcome> request =
+            Future.sync(() => _permissionGateway.request(effect.permission));
         try {
-          outcome = await _permissionGateway
-              .request(effect.permission)
+          outcome = await request
               .timeout(AppConfig.effectivePermissionRequestTimeout);
         } on TimeoutException {
           if (!mounted) return;
@@ -1757,6 +1770,29 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             effect,
             ...queue,
           ];
+          // A newer request for this step supersedes this late answer.
+          unawaited(request.then((lateOutcome) async {
+            if (!mounted ||
+                _permissionRequestGeneration[effect.permission] != generation) {
+              return;
+            }
+            _deferredPermissionEffects = null;
+            if (lateOutcome == PermissionOutcome.granted) {
+              _grantedPermissions.add(effect.permission);
+              if (effect.permission == GuidePermission.microphone) {
+                await _initializeMicrophone();
+              }
+            }
+            if (!mounted ||
+                _permissionRequestGeneration[effect.permission] != generation) {
+              return;
+            }
+            await _executePermissionEffects(<Object>[
+              ..._permissionFlow.onRequestResult(
+                  effect.permission, lateOutcome),
+              ...queue,
+            ]);
+          }, onError: (Object _, StackTrace __) {}));
           _say(_request(
             id: 'permission-request-timeout-${_permissionSpeechSeq++}',
             eventId: 'permission-request-timeout-$_permissionSpeechSeq',
@@ -6801,10 +6837,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             requireDelivery: true,
           );
           if (!delivered || !mounted || token.isCancelled) return;
+          final int generation =
+              (_permissionRequestGeneration[GuidePermission.camera] ?? 0) + 1;
+          _permissionRequestGeneration[GuidePermission.camera] = generation;
+          final Future<PermissionOutcome> request = Future.sync(
+              () => _permissionGateway.request(GuidePermission.camera));
           try {
-            status = await _permissionGateway
-                .request(GuidePermission.camera)
+            status = await request
                 .timeout(AppConfig.effectivePermissionRequestTimeout);
+          } on TimeoutException {
+            unawaited(request.then((outcome) {
+              if (mounted &&
+                  _permissionRequestGeneration[GuidePermission.camera] ==
+                      generation &&
+                  outcome == PermissionOutcome.granted) {
+                _grantedPermissions.add(GuidePermission.camera);
+              }
+            }, onError: (Object _, StackTrace __) {}));
+            return;
           } catch (_) {
             status = PermissionOutcome.denied;
           }
