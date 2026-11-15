@@ -1316,9 +1316,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _tasks.state == TaskState.avoidingObstacle) {
       return true;
     }
-    if (!_ttsFailed ||
-        _tasks.state != TaskState.paused ||
-        _tasks.history.isEmpty) {
+    if (_tasks.state != TaskState.paused || _tasks.history.isEmpty) {
       return false;
     }
     final TaskTransition last = _tasks.history.last;
@@ -1341,6 +1339,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     onRecovered: (output, announcement) {
       if (!mounted) return;
       _voiceOutput = output;
+      var spokenAnnouncement = announcement;
+      if (_tasks.state == TaskState.paused) {
+        final last = _tasks.history.isEmpty ? null : _tasks.history.last;
+        if (last != null &&
+            last.trigger == 'tts-failure' &&
+            _tasks.canTransitionTo(last.from)) {
+          _tasks.transitionTo(last.from, trigger: 'tts-recovery');
+          spokenAnnouncement = '语音已恢复，继续导航。';
+        } else {
+          spokenAnnouncement = '语音已恢复，导航仍在暂停。';
+        }
+      }
       _ttsFailed = false;
       _health.report('voice_output', ServiceHealthStatus.ok, output.status);
       setState(() {
@@ -1349,7 +1359,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _say(_request(
           id: 'tts-recovered-${DateTime.now().microsecondsSinceEpoch}',
           eventId: 'tts-recovered',
-          text: announcement,
+          text: spokenAnnouncement,
           kind: SpeechKind.info));
     },
   );
