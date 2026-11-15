@@ -100,6 +100,33 @@ void main() {
     });
   });
 
+  test('warning after danger clears remains limited by the rolling cap', () {
+    fakeAsync((clock) {
+      final start = DateTime(2026);
+      final haptics = RecordingHaptics();
+      final controller = TtsRecoveryController(
+        now: () => start.add(clock.elapsed),
+        haptics: () => haptics,
+        rebuild: () async => null,
+        onRecovered: (_, __) {},
+      );
+      controller.fail();
+      controller.danger(trackId: 1, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 20));
+      controller.danger(trackId: 2, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 20));
+      controller.danger(trackId: 3, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 5));
+      expect(controller.vibrating, isFalse);
+      controller.stopDanger();
+      final count = haptics.calls.length;
+      controller.danger(trackId: 4, level: DangerLevel.warning);
+      expect(controller.vibrating, isFalse);
+      expect(haptics.calls.length, count);
+      controller.dispose();
+    });
+  });
+
   test('new urgent after danger clears is exempt from the rolling cap', () {
     fakeAsync((clock) {
       final start = DateTime(2026);

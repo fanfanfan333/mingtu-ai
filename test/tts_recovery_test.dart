@@ -123,6 +123,11 @@ void main() {
     expect(output.spoken.every((text) => !text.contains('继续导航')), isTrue);
     expect(output.spoken.any((text) => text.contains('车') || text.contains('障碍')), isTrue);
     expect(output.spoken, contains('用盲杖确认。'));
+    final recoveryIndex = output.spoken.indexWhere((text) => text.contains('语音已恢复'));
+    final hazardIndex = output.spoken.indexWhere(
+        (text) => text.contains('车') || text.contains('障碍'));
+    expect(recoveryIndex, lessThan(hazardIndex));
+    expect(recoveryIndex, lessThan(output.spoken.indexOf('用盲杖确认。')));
     expect(output.spoken.every((text) => !text.contains('直走')), isTrue);
     await tester.pump(const Duration(seconds: 3));
     await tester.pump();
@@ -249,6 +254,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 800));
     await tester.pump();
     expect(haptics.calls.any((c) => c == 'urgent' || c == 'warning'), isTrue);
+    expect(output.spoken.any((text) => text.contains('车') ||
+        text.contains('障碍') || text.contains('用盲杖确认。')), isTrue);
     expect(handle.taskState, TaskState.paused);
     expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
     await tester.pumpWidget(const SizedBox.shrink());
