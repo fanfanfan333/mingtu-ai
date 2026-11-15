@@ -43,6 +43,10 @@ void main() {
     }
     expect(classifyYoloViewError(Exception('Camera permission denied')),
         YoloViewErrorKind.cameraPermissionDenied);
+    expect(
+        classifyYoloViewError(PlatformException(
+            code: 'camera_error', message: 'Camera permission denied')),
+        YoloViewErrorKind.cameraPermissionDenied);
     expect(yoloViewErrorSpeech(YoloViewErrorKind.modelLoadFailed),
         localDetectionFaultText);
     expect(localDetectionFaultText, isNot(contains('安全')));

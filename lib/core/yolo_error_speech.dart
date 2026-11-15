@@ -15,6 +15,14 @@ enum YoloViewErrorKind { cameraPermissionDenied, modelLoadFailed, unknown }
 
 YoloViewErrorKind classifyYoloViewError(Object error) {
   final String s = error.toString().toLowerCase();
+  if ((s.contains('camera') &&
+          (s.contains('permission') ||
+              s.contains('denied') ||
+              s.contains('not authorized') ||
+              s.contains('unauthorized'))) ||
+      s.contains('camera_access')) {
+    return YoloViewErrorKind.cameraPermissionDenied;
+  }
   if (s.contains('securityexception') ||
       s.contains('platformexception') ||
       s.contains('missingpluginexception') ||
@@ -25,14 +33,6 @@ YoloViewErrorKind classifyYoloViewError(Object error) {
       s.contains('litert') ||
       s.contains('load')) {
     return YoloViewErrorKind.modelLoadFailed;
-  }
-  if ((s.contains('camera') &&
-          (s.contains('permission') ||
-              s.contains('denied') ||
-              s.contains('not authorized') ||
-              s.contains('unauthorized'))) ||
-      s.contains('camera_access')) {
-    return YoloViewErrorKind.cameraPermissionDenied;
   }
   return YoloViewErrorKind.unknown;
 }

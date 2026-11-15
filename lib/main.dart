@@ -455,6 +455,8 @@ class MingtuHomeDebugHandle {
   /// to, callable directly in unit-style widget tests.
   void debugPttToggleTap() => _state._pttToggleTap();
   Future<void> debugHeadsetToggle() => _state._headsetToggle();
+  void debugResetMicrophoneInitialized() =>
+      _state._microphoneInitialized = false;
   void debugPttCloseWait() => _state._announcePttCloseWait();
   void debugAsrError(String code) => _state._handleAsrError(code);
 
@@ -4894,7 +4896,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     try {
       final outcome = await _permissionStatus(GuidePermission.microphone);
       if (!mounted || !_foreground) return;
-      if (outcome != PermissionOutcome.granted || !_microphoneInitialized) {
+      if (outcome != PermissionOutcome.granted) {
         _say(_request(
           id: 'headset-microphone-permission-${_permissionSpeechSeq++}',
           eventId: 'headset-microphone-permission-$_permissionSpeechSeq',
@@ -4911,6 +4913,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           }
         }
         return;
+      }
+      if (!_microphoneInitialized) {
+        await _initializeMicrophone();
+        if (!mounted || !_foreground) return;
+        if (!_microphoneInitialized || _localAsrBroken) {
+          _say(_request(
+            id: 'headset-microphone-init-${_permissionSpeechSeq++}',
+            eventId: 'headset-microphone-init-$_permissionSpeechSeq',
+            kind: SpeechKind.alert,
+            text: '语音识别初始化失败，请稍后重试。',
+          ));
+          return;
+        }
       }
       _pttToggleTap();
     } finally {
@@ -7461,7 +7476,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
               if (!_pocketMode.ignoreTouches) _pushToTalkStart();
             },
             onLongPressEnd: (_) {
-              if (!_pocketMode.ignoreTouches) _pushToTalkEnd();
+              _pushToTalkEnd();
             },
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,

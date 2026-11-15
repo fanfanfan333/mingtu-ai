@@ -49,6 +49,46 @@ void main() {
     });
   }
 
+  testWidgets('pocket lock permits release but blocks a new hold',
+      (tester) async {
+    final proximity = StreamController<bool>.broadcast();
+    mingtuProximityEventsOverride = () => proximity.stream;
+    addTearDown(() async {
+      mingtuProximityEventsOverride = null;
+      await proximity.close();
+    });
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    final semantics = tester.ensureSemantics();
+    await ui.settleRecordedApp(tester, h);
+    final debug = mingtuHomeDebugHandle!;
+    debug.debugSetPocketEnabled(true);
+    await ui.drainVoice(tester, h);
+    final before = h.count('asr.listen');
+    final gesture = await tester
+        .startGesture(tester.getCenter(find.bySemanticsLabel(holdLabel)));
+    await tester.pump(const Duration(milliseconds: 600));
+    await s1.pumpUntil(tester, h, () => h.count('asr.listen') > before,
+        'hold starts listening');
+    proximity.add(true);
+    await tester.pump();
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 1500)));
+    await tester.pump(const Duration(milliseconds: 1500));
+    expect(debug.debugIgnoreTouches, isTrue);
+    await gesture.up();
+    await s1.pumpUntil(tester, h, () => debug.pttIdle, 'release ends hold');
+    final after = h.count('asr.listen');
+    final node = tester.getSemantics(find.bySemanticsLabel(holdLabel));
+    node.owner!.performAction(node.id, SemanticsAction.longPress);
+    await tester.longPress(find.bySemanticsLabel(holdLabel));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(h.count('asr.listen'), after);
+    expect(debug.pttIdle, isTrue);
+    semantics.dispose();
+    await ui.shutdownVoice(tester, h);
+  });
+
   testWidgets(
       'pocket lock blocks semantics while danger and headset still work',
       (tester) async {

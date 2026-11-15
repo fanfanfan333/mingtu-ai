@@ -61,6 +61,38 @@ void main() {
     await ui.shutdownVoice(tester, h);
   });
 
+  testWidgets('granted headset initializes microphone before listening',
+      (tester) async {
+    final gateway = s1.FakePermissionGateway();
+    gateway.statusResults[GuidePermission.microphone] =
+        PermissionOutcome.granted;
+    gateway.requestResults[GuidePermission.microphone] =
+        PermissionOutcome.granted;
+    mingtuPermissionGatewayOverride = gateway;
+    mingtuGuideStoreOverride = s1.FakeGuideStore(seen: true);
+    addTearDown(() {
+      mingtuPermissionGatewayOverride = null;
+      mingtuGuideStoreOverride = null;
+    });
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    await s1.settleToggleApp(tester, h);
+    final debug = mingtuHomeDebugHandle!;
+    debug.debugResetMicrophoneInitialized();
+    final initialized = debug.microphoneInitializeCalls;
+    h.events.clear();
+    await debug.debugHeadsetToggle();
+    await s1.pumpUntil(tester, h, () => h.count('asr.listen') > 0,
+        'headset starts listening after initialization');
+    expect(debug.microphoneInitializeCalls, initialized + 1);
+    expect(
+        h.events,
+        isNot(contains(
+            'tts.speak:${permissionDeniedText(GuidePermission.microphone)}')));
+    expect(h.count('asr.listen'), greaterThan(0));
+    await ui.shutdownVoice(tester, h);
+  });
+
   testWidgets('background headset event is ignored', (tester) async {
     final h = ui.RecordingVoiceChannels()..install();
     addTearDown(h.uninstall);

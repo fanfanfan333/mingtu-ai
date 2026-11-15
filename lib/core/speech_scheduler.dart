@@ -25,8 +25,8 @@
 /// submission nor promotion can drop them as "expired" -- for a
 /// blind user a silently dropped safety/failure message is worse
 /// than a late one. An alert (level 2) can be interrupted ONLY by a
-/// strictly higher priority (an emergency, level 0); the user's own
-/// "停下" is not an interruption but an explicit cancelAll(),
+/// strictly higher priority (danger, level 1, or emergency, level 0);
+/// the user's own "停下" is not an interruption but an explicit cancelAll(),
 /// which is the one sanctioned way to clear everything.
 enum SpeechKind {
   emergency,
