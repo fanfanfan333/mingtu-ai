@@ -25,6 +25,9 @@ import 'package:mingtu_ai/adapters/amap_navi_mock_source.dart';
 import 'package:mingtu_ai/adapters/amap_navi_source.dart';
 import 'package:mingtu_ai/config/app_config.dart';
 import 'package:mingtu_ai/core/navigation_tracker.dart';
+import 'package:mingtu_ai/core/nav_event_speech.dart';
+import 'package:mingtu_ai/core/entrance_guidance.dart';
+import 'package:mingtu_ai/core/speech_scheduler.dart';
 import 'package:mingtu_ai/modules/map_navigation.dart';
 
 const GeoPoint _destPoint =
@@ -55,36 +58,47 @@ Future<void> _flush() async {
   await Future<void>.delayed(Duration.zero);
 }
 
-/// The arbitration-facing projection of a NavEvent
-/// stream, mirroring main.dart's _handleNavEvent
-/// exactly at the speech surface: turn prompts speak
-/// their text at turn level; weak signals speak their
-/// text at info level; an off-route event with re-plan
-/// budget speaks the fixed re-plan text (the event's
-/// own text is the shorter marker); arrival hands over
-/// (the event text is the hand-over marker, recorded
-/// as such). Both sources are projected through this
-/// ONE function, so the equivalence assertion compares
-/// what the user would hear, in order.
-List<(String, String)> _spokenFor(
-  List<NavEvent> events,
-  RerouteBudget budget,
-) {
-  final List<(String, String)> spoken = <(String, String)>[];
-  for (final NavEvent e in events) {
-    switch (e.kind) {
-      case NavEventKind.turnAhead:
-        spoken.add(('turn', e.text));
-      case NavEventKind.weakSignal:
-        spoken.add(('info', e.text));
-      case NavEventKind.offRoute:
-        final RerouteDecision d = budget.decision(DateTime.now());
-        spoken.add((
-          'info',
-          d == RerouteDecision.doIt ? '你已偏离路线，正在重新规划。' : e.text,
-        ));
-      case NavEventKind.arrived:
-        spoken.add(('hand-over', e.text));
+List<(SpeechKind, String)> _scheduledSpeech(
+    List<NavEvent> events, DateTime now) {
+  final scheduler = SpeechScheduler();
+  final budget = RerouteBudget();
+  final spoken = <(SpeechKind, String)>[];
+  for (var i = 0; i < events.length; i++) {
+    final event = events[i];
+    final entrance =
+        EntranceGuidance(destinationName: _destName, destination: _destPoint);
+    final entranceText = event.kind == NavEventKind.arrived
+        ? entrance.onFix(
+            const GeoPoint(latitude: 37.725307, longitude: 120.442290), 10, now)
+        : null;
+    final speech = navEventSpeech(event,
+        timestamp: '$i',
+        destinationName: _destName,
+        rerouteDecision:
+            event.kind == NavEventKind.offRoute ? budget.decision(now) : null,
+        entranceText: entranceText ??
+            (event.kind == NavEventKind.arrived
+                ? entrance.startAnnouncement()
+                : null),
+        entranceCompleted: entrance.completed);
+    final request = SpeechRequest(
+        id: speech.id,
+        eventId: speech.eventId,
+        text: speech.text,
+        kind: speech.kind,
+        createdAt: now,
+        expiresAt: now.add(const Duration(seconds: 5)),
+        navigationStateVersion: 'test',
+        neverExpires: speech.kind == SpeechKind.alert,
+        navStepIndex: speech.navStepIndex,
+        replay: speech.replay);
+    scheduler.submit(request, now);
+    while (scheduler.active != null) {
+      final active = scheduler.active!;
+      spoken.add((active.kind, active.text));
+      scheduler.completeActive();
+      scheduler.promoteNext(now,
+          straightSegmentConfirmed: true, riskActive: false);
     }
   }
   return spoken;
@@ -92,7 +106,8 @@ List<(String, String)> _spokenFor(
 
 void main() {
   group('(a) mapping: local samples -> NavEvent / state', () {
-    test('text maps verbatim (trimmed), stepIndex stays null; '
+    test(
+        'text maps verbatim (trimmed), stepIndex stays null; '
         'empty text drops', () {
       final NavEvent? e = mapAmapNaviText('  前方100米右转  ');
       expect(e, isNotNull);
@@ -105,7 +120,8 @@ void main() {
       expect(mapAmapNaviText('   '), isNull);
     });
 
-    test('an exact repeat of the previous text is suppressed; '
+    test(
+        'an exact repeat of the previous text is suppressed; '
         'a later repeat after a different text is not', () async {
       final ScriptedAmapNaviScenario s = ScriptedAmapNaviScenario(
         const <AmapNaviMockStep>[
@@ -117,7 +133,9 @@ void main() {
       );
       final List<NavEvent> got = <NavEvent>[];
       final sub = s.source.events.listen(got.add);
-      expect(await s.source.start(destination: _destPoint, destinationName: _destName),
+      expect(
+          await s.source
+              .start(destination: _destPoint, destinationName: _destName),
           isTrue);
       await _flush();
       expect(got.map((NavEvent e) => e.text).toList(),
@@ -127,7 +145,8 @@ void main() {
       await s.source.dispose();
     });
 
-    test('info: pathRetainDistance lands in remainingM (the tracker '
+    test(
+        'info: pathRetainDistance lands in remainingM (the tracker '
         'state role); curStep fields stay on the raw sample; '
         'info emits NO event', () async {
       final ScriptedAmapNaviScenario s = ScriptedAmapNaviScenario(
@@ -136,7 +155,9 @@ void main() {
       final List<NavEvent> got = <NavEvent>[];
       final sub = s.source.events.listen(got.add);
       expect(s.source.remainingM, isNull);
-      expect(await s.source.start(destination: _destPoint, destinationName: _destName),
+      expect(
+          await s.source
+              .start(destination: _destPoint, destinationName: _destName),
           isTrue);
       await _flush();
       expect(got, isEmpty, reason: 'info is state only, never speech');
@@ -153,7 +174,8 @@ void main() {
       await s.source.dispose();
     });
 
-    test('location: every field lands on lastLocation; a good fix '
+    test(
+        'location: every field lands on lastLocation; a good fix '
         'emits nothing', () async {
       const AmapNaviLocationSample sample = AmapNaviLocationSample(
         latitude: 37.7245,
@@ -169,7 +191,9 @@ void main() {
       );
       final List<NavEvent> got = <NavEvent>[];
       final sub = s.source.events.listen(got.add);
-      expect(await s.source.start(destination: _destPoint, destinationName: _destName),
+      expect(
+          await s.source
+              .start(destination: _destPoint, destinationName: _destName),
           isTrue);
       await _flush();
       expect(got, isEmpty);
@@ -185,7 +209,8 @@ void main() {
       await s.source.dispose();
     });
 
-    test('weak threshold matches the tracker exactly (null or '
+    test(
+        'weak threshold matches the tracker exactly (null or '
         '> weakAccuracyM); cooldown throttles repeats', () async {
       expect(amapNaviLocationIsWeak(null), isTrue);
       expect(amapNaviLocationIsWeak(80), isTrue);
@@ -208,7 +233,9 @@ void main() {
       );
       final List<NavEvent> got = <NavEvent>[];
       final sub = s.source.events.listen(got.add);
-      expect(await s.source.start(destination: _destPoint, destinationName: _destName),
+      expect(
+          await s.source
+              .start(destination: _destPoint, destinationName: _destName),
           isTrue);
       await _flush();
       expect(got.length, 1, reason: 'same-instant repeats are throttled');
@@ -218,7 +245,8 @@ void main() {
       await s.source.dispose();
     });
 
-    test('arrived / yaw texts are the tracker\'s own texts '
+    test(
+        'arrived / yaw texts are the tracker\'s own texts '
         '(pinned against a real tracker drive)', () async {
       // Tracker-side ground truth for the same destination.
       final NavigationTracker tracker = _demoTracker();
@@ -237,14 +265,19 @@ void main() {
             accuracyM: 10,
             at: t0.add(const Duration(seconds: 20)))),
         ...tracker.onFix(NavFix(
-            point: _destPoint, accuracyM: 10, at: t0.add(const Duration(seconds: 30)))),
+            point: _destPoint,
+            accuracyM: 10,
+            at: t0.add(const Duration(seconds: 30)))),
       ];
-      final String trackerWeak =
-          trackerEvents.firstWhere((NavEvent e) => e.kind == NavEventKind.weakSignal).text;
-      final String trackerOff =
-          trackerEvents.firstWhere((NavEvent e) => e.kind == NavEventKind.offRoute).text;
-      final String trackerArr =
-          trackerEvents.firstWhere((NavEvent e) => e.kind == NavEventKind.arrived).text;
+      final String trackerWeak = trackerEvents
+          .firstWhere((NavEvent e) => e.kind == NavEventKind.weakSignal)
+          .text;
+      final String trackerOff = trackerEvents
+          .firstWhere((NavEvent e) => e.kind == NavEventKind.offRoute)
+          .text;
+      final String trackerArr = trackerEvents
+          .firstWhere((NavEvent e) => e.kind == NavEventKind.arrived)
+          .text;
       expect(trackerWeak, amapNaviWeakSignalText);
       expect(trackerOff, amapNaviOffRouteText);
       expect(trackerArr, amapNaviArrivedText(_destName));
@@ -258,7 +291,9 @@ void main() {
       );
       final List<NavEvent> got = <NavEvent>[];
       final sub = s.source.events.listen(got.add);
-      expect(await s.source.start(destination: _destPoint, destinationName: _destName),
+      expect(
+          await s.source
+              .start(destination: _destPoint, destinationName: _destName),
           isTrue);
       await _flush();
       expect(
@@ -274,7 +309,8 @@ void main() {
   });
 
   group('(b) source equivalence over one scripted sequence', () {
-    test('Web-source events and TBT mock-source events produce '
+    test(
+        'Web-source events and TBT mock-source events produce '
         'the identical spoken sequence, item by item', () async {
       final DateTime t0 = DateTime.fromMillisecondsSinceEpoch(0);
       NavFix fix(double lat, double lng, double? acc, int s) => NavFix(
@@ -307,29 +343,33 @@ void main() {
             longitude: 120.441723,
             accuracyM: 90,
           )),
-          AmapNaviMockStep.info(_info(pathM: 160, pathS: 125, stepM: 100, stepS: 75, step: 0)),
+          AmapNaviMockStep.info(
+              _info(pathM: 160, pathS: 125, stepM: 100, stepS: 75, step: 0)),
           const AmapNaviMockStep.text('左转进入林荫道'),
           const AmapNaviMockStep.yaw(),
-          AmapNaviMockStep.info(_info(pathM: 10, pathS: 8, stepM: 10, stepS: 8, step: 1)),
+          AmapNaviMockStep.info(
+              _info(pathM: 10, pathS: 8, stepM: 10, stepS: 8, step: 1)),
           const AmapNaviMockStep.arrived(),
         ],
         clock: () => t0,
       );
       final List<NavEvent> tbtEvents = <NavEvent>[];
       final sub = s.source.events.listen(tbtEvents.add);
-      expect(await s.source.start(destination: _destPoint, destinationName: _destName),
+      expect(
+          await s.source
+              .start(destination: _destPoint, destinationName: _destName),
           isTrue);
       await _flush();
 
-      final List<(String, String)> webSpoken =
-          _spokenFor(webEvents, RerouteBudget());
-      final List<(String, String)> tbtSpoken =
-          _spokenFor(tbtEvents, RerouteBudget());
-      const List<(String, String)> expected = <(String, String)>[
-        ('info', 'GPS 信号较差，定位可能不准，导航提示仅供参考。'),
-        ('turn', '左转进入林荫道'),
-        ('info', '你已偏离路线，正在重新规划。'),
-        ('hand-over', '已到达图书馆附近，进入入口指引。'),
+      final List<(SpeechKind, String)> webSpoken =
+          _scheduledSpeech(webEvents, t0);
+      final List<(SpeechKind, String)> tbtSpoken =
+          _scheduledSpeech(tbtEvents, t0);
+      const List<(SpeechKind, String)> expected = <(SpeechKind, String)>[
+        (SpeechKind.info, 'GPS 信号较差，定位可能不准，导航提示仅供参考。'),
+        (SpeechKind.turn, '左转进入林荫道'),
+        (SpeechKind.info, '你已偏离路线，正在重新规划。'),
+        (SpeechKind.alert, entranceArrivedSpeech),
       ];
       expect(webSpoken, expected,
           reason: 'the Web drive itself must hit every beat');
@@ -337,6 +377,11 @@ void main() {
           reason: 'the TBT drive must hit the same beats');
       expect(tbtSpoken, webSpoken,
           reason: 'item-by-item identical spoken sequences');
+
+      for (final (_, text) in [...webSpoken, ...tbtSpoken]) {
+        expect(text, isNot(contains('安全')));
+        expect(text, isNot(contains('可以过马路')));
+      }
 
       // Structured remaining distance: the TBT source's
       // state ends at the last info sample's
@@ -354,7 +399,8 @@ void main() {
       expect(AppConfig.amapNaviEnabled, isFalse);
     });
 
-    test('production wiring constructs the source only under '
+    test(
+        'production wiring constructs the source only under '
         'the switch, and the mock is not wired anywhere', () {
       final String main = File('lib/main.dart').readAsStringSync();
       final int gate = main.indexOf('if (AppConfig.amapNaviEnabled)');
@@ -374,12 +420,11 @@ void main() {
       // the pin is on import lines, not mentions).
       for (final FileSystemEntity f
           in Directory('lib').listSync(recursive: true)) {
-        if (f is File && f.path.endsWith('.dart') &&
+        if (f is File &&
+            f.path.endsWith('.dart') &&
             !f.path.endsWith('amap_navi_mock_source.dart')) {
-          final bool importsMock = f
-              .readAsStringSync()
-              .split('\n')
-              .any((String line) =>
+          final bool importsMock = f.readAsStringSync().split('\n').any(
+              (String line) =>
                   line.trimLeft().startsWith('import') &&
                   line.contains('amap_navi_mock_source'));
           expect(importsMock, isFalse,
@@ -388,15 +433,16 @@ void main() {
       }
     });
 
-    test('the factory in this build yields the unavailable stub',
-        () {
+    test('the factory in this build yields the unavailable stub', () {
       expect(createAmapNaviBinding(), isA<UnavailableAmapNaviBinding>());
     });
   });
 
-  group('(d) switch on, stub binding: fallback, fixed log, '
+  group(
+      '(d) switch on, stub binding: fallback, fixed log, '
       'no crash, no new speech', () {
-    test('start reports failure, stays inactive, emits nothing; '
+    test(
+        'start reports failure, stays inactive, emits nothing; '
         'stop and re-start are safe', () async {
       final AmapNaviSource source =
           AmapNaviSource(binding: createAmapNaviBinding());
@@ -419,15 +465,16 @@ void main() {
       await source.dispose();
     });
 
-    test('a scripted initialize failure behaves the same way',
-        () async {
+    test('a scripted initialize failure behaves the same way', () async {
       final ScriptedAmapNaviScenario s = ScriptedAmapNaviScenario(
         const <AmapNaviMockStep>[AmapNaviMockStep.text('前方右转')],
         failInitialize: true,
       );
       final List<NavEvent> got = <NavEvent>[];
       final sub = s.source.events.listen(got.add);
-      expect(await s.source.start(destination: _destPoint, destinationName: _destName),
+      expect(
+          await s.source
+              .start(destination: _destPoint, destinationName: _destName),
           isFalse);
       expect(s.binding.initializeCalls, 1);
       expect(s.binding.startCalls, 0,
@@ -438,7 +485,8 @@ void main() {
       await s.source.dispose();
     });
 
-    test('the wiring fallback is exactly the fixed log line and '
+    test(
+        'the wiring fallback is exactly the fixed log line and '
         'contains no speech call', () {
       final String main = File('lib/main.dart').readAsStringSync();
       const String logLine = '高德 TBT 导航源启动失败，已回退 Web 源导航';

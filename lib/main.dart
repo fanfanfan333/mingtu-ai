@@ -52,6 +52,7 @@ import 'core/hazard/hazard_policy.dart';
 import 'core/destination_dialogue.dart';
 import 'core/entrance_guidance.dart';
 import 'core/navigation_tracker.dart';
+import 'core/nav_event_speech.dart';
 import 'core/straight_pacing.dart';
 import 'core/yolo_error_speech.dart';
 import 'core/real_navigation.dart';
@@ -2167,25 +2168,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   void _handleNavEvent(NavEvent e) {
     final String ts = '${DateTime.now().millisecondsSinceEpoch}';
+    void speak(NavEventSpeech speech) => _say(_request(
+          id: speech.id,
+          eventId: speech.eventId,
+          text: speech.text,
+          kind: speech.kind,
+          navStepIndex: speech.navStepIndex,
+          replay: speech.replay,
+        ));
     switch (e.kind) {
       case NavEventKind.turnAhead:
-        _say(_request(
-          id: 'nav-turn-$ts',
-          eventId: 'nav-turn-$ts',
-          text: e.text,
-          kind: SpeechKind.turn,
-          // NAVHAZ M1: an interrupted turn is regenerated
-          // from the latest fix, never replayed verbatim.
-          navStepIndex: e.stepIndex,
-          replay: NavReplay.regenerate,
-        ));
       case NavEventKind.weakSignal:
-        _say(_request(
-          id: 'nav-weak-$ts',
-          eventId: 'nav-weak-$ts',
-          text: e.text,
-          kind: SpeechKind.info,
-        ));
+        speak(navEventSpeech(e,
+            timestamp: ts, destinationName: _liveNavDestName));
       case NavEventKind.arrived:
         // Step D hand-over: the route is done but the trip is
         // NOT. Route-following speech stops (pacing halts);
@@ -2213,45 +2208,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                 headingDeg: _currentHeadingDeg(),
               );
         final bool doneNow = _entrance!.completed;
-        _say(_request(
-          id: 'entrance-${doneNow ? 'arrived' : 'start'}-$ts',
-          eventId: doneNow ? 'entrance-arrived' : 'entrance-start',
-          text: firstText ?? _entrance!.startAnnouncement(),
-          kind: doneNow ? SpeechKind.alert : SpeechKind.turn,
-        ));
+        speak(navEventSpeech(e,
+            timestamp: ts,
+            destinationName: _liveNavDestName,
+            entranceText: firstText ?? _entrance!.startAnnouncement(),
+            entranceCompleted: doneNow));
         if (doneNow) _finishEntranceTrip();
       case NavEventKind.offRoute:
         final RerouteDecision decision =
             _liveNav!.rerouteDecision(DateTime.now());
-        if (decision == RerouteDecision.doIt) {
-          _say(_request(
-            id: 'nav-offroute-$ts',
-            eventId: 'nav-offroute-$ts',
-            text: '你已偏离路线，正在重新规划。',
-            kind: SpeechKind.info,
-            replay: NavReplay.shortenedReplay,
-          ));
-          unawaited(_rerouteLiveNavigation());
-        } else if (decision == RerouteDecision.exhausted) {
-          _say(_request(
-            id: 'nav-offroute-max-$ts',
-            eventId: 'nav-offroute-max',
-            text: '你已偏离路线。已经多次重新规划仍未回到路线，'
-                '先停下来确认位置，再说“去$_liveNavDestName”重新开始。',
-            kind: SpeechKind.alert,
-          ));
-        } else {
-          // Throttled: re-arm the tracker so a later
-          // off-route event can retry once the interval has
-          // passed (the trip budget still bounds retries).
+        if (decision == RerouteDecision.throttled) {
           _liveNav?.resetOffRouteStreak();
-          _say(_request(
-            id: 'nav-offroute-wait-$ts',
-            eventId: 'nav-offroute-wait-$ts',
-            text: '你已偏离路线。',
-            kind: SpeechKind.info,
-            replay: NavReplay.shortenedReplay,
-          ));
+        }
+        speak(navEventSpeech(e,
+            timestamp: ts,
+            destinationName: _liveNavDestName,
+            rerouteDecision: decision));
+        if (decision == RerouteDecision.doIt) {
+          unawaited(_rerouteLiveNavigation());
         }
     }
   }
@@ -6926,7 +6900,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// answered, never silently applied, and emergency never auto-resumes.
   Future<void> _loadPocketMode() async {
     bool enabled = false;
-    try { enabled = await _pocketStore.load(); } catch (_) {}
+    try {
+      enabled = await _pocketStore.load();
+    } catch (_) {}
     if (mounted && !_pocketSettingChanged) _pocketMode.setEnabled(enabled);
   }
 
@@ -6935,7 +6911,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pocketMode.setEnabled(enabled);
     unawaited(_pocketStore.save(enabled).catchError((Object _) {}));
     final id = 'pocket-mode-${DateTime.now().microsecondsSinceEpoch}';
-    _say(_request(id: id, eventId: id,
+    _say(_request(
+        id: id,
+        eventId: id,
         text: enabled ? pocketEnabledSpeech : pocketDisabledSpeech,
         kind: SpeechKind.info));
   }
@@ -7345,13 +7323,29 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                   : talkBackToggleIdleLabel)
               : '按住说话按钮，按住后说话，松开结束',
           value: _bigStatusText(),
-          onTap: toggleMode ? () { if (!_pocketMode.ignoreTouches) _pttToggleTap(); } : null,
-          onLongPress: () { if (!_pocketMode.ignoreTouches) { if (toggleMode) { _pttToggleStart(); } else { _talkBackLongPress(); } } },
+          onTap: toggleMode
+              ? () {
+                  if (!_pocketMode.ignoreTouches) _pttToggleTap();
+                }
+              : null,
+          onLongPress: () {
+            if (!_pocketMode.ignoreTouches) {
+              if (toggleMode) {
+                _pttToggleStart();
+              } else {
+                _talkBackLongPress();
+              }
+            }
+          },
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             excludeFromSemantics: true,
-            onLongPressStart: (_) { if (!_pocketMode.ignoreTouches) _pushToTalkStart(); },
-            onLongPressEnd: (_) { if (!_pocketMode.ignoreTouches) _pushToTalkEnd(); },
+            onLongPressStart: (_) {
+              if (!_pocketMode.ignoreTouches) _pushToTalkStart();
+            },
+            onLongPressEnd: (_) {
+              if (!_pocketMode.ignoreTouches) _pushToTalkEnd();
+            },
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
