@@ -93,6 +93,77 @@ void main() {
     await ui.shutdownVoice(tester, h);
   });
 
+  testWidgets('headset uses cloud recording when local initialization fails',
+      (tester) async {
+    final gateway = s1.FakePermissionGateway();
+    gateway.statusResults[GuidePermission.microphone] =
+        PermissionOutcome.granted;
+    mingtuPermissionGatewayOverride = gateway;
+    mingtuGuideStoreOverride = s1.FakeGuideStore(seen: true);
+    addTearDown(() {
+      mingtuPermissionGatewayOverride = null;
+      mingtuGuideStoreOverride = null;
+    });
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    await s1.settleToggleApp(tester, h);
+    final debug = mingtuHomeDebugHandle!;
+    final recorder = s1.AmplitudeFakeRecorder();
+    debug.setRecorder(recorder);
+    debug.debugResetMicrophoneInitialized();
+    debug.debugForceMicrophoneInitializeFailure();
+    final initialized = debug.microphoneInitializeCalls;
+    h.events.clear();
+    await debug.debugHeadsetToggle();
+    await s1.pumpUntil(
+        tester, h, () => recorder.started, 'cloud recording starts');
+    expect(debug.microphoneInitializeCalls, initialized + 1);
+    expect(debug.localAsrBroken, isTrue);
+    expect(recorder.startCount, 1);
+    expect(h.events, isNot(contains('tts.speak:语音识别初始化失败，请稍后重试。')));
+    expect(
+        h.events,
+        isNot(contains(
+            'tts.speak:${permissionDeniedText(GuidePermission.microphone)}')));
+    await ui.shutdownVoice(tester, h);
+    await recorder.amplitudes.close();
+  });
+
+  testWidgets('headset announces when microphone initialization cannot happen',
+      (tester) async {
+    final gateway = s1.FakePermissionGateway();
+    gateway.statusResults[GuidePermission.microphone] =
+        PermissionOutcome.granted;
+    mingtuPermissionGatewayOverride = gateway;
+    mingtuGuideStoreOverride = s1.FakeGuideStore(seen: true);
+    addTearDown(() {
+      mingtuPermissionGatewayOverride = null;
+      mingtuGuideStoreOverride = null;
+    });
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    await s1.settleToggleApp(tester, h);
+    final debug = mingtuHomeDebugHandle!;
+    final recorder = s1.AmplitudeFakeRecorder();
+    debug.setRecorder(recorder);
+    debug.debugResetMicrophoneInitialized();
+    debug.debugClearDeferredAsr();
+    final initialized = debug.microphoneInitializeCalls;
+    h.events.clear();
+    final listens = h.count('asr.listen');
+    await debug.debugHeadsetToggle();
+    await s1.pumpUntil(
+        tester,
+        h,
+        () => h.events.contains('tts.speak:语音识别初始化失败，请稍后重试。'),
+        'microphone initialization failure alert');
+    expect(debug.microphoneInitializeCalls, initialized);
+    expect(h.count('asr.listen'), listens);
+    expect(recorder.startCount, 0);
+    await ui.shutdownVoice(tester, h);
+    await recorder.amplitudes.close();
+  });
+
   testWidgets('background headset event is ignored', (tester) async {
     final h = ui.RecordingVoiceChannels()..install();
     addTearDown(h.uninstall);

@@ -457,6 +457,9 @@ class MingtuHomeDebugHandle {
   Future<void> debugHeadsetToggle() => _state._headsetToggle();
   void debugResetMicrophoneInitialized() =>
       _state._microphoneInitialized = false;
+  void debugForceMicrophoneInitializeFailure() =>
+      _state._debugForceMicrophoneInitializeFailure = true;
+  void debugClearDeferredAsr() => _state._deferredAsr = null;
   void debugPttCloseWait() => _state._announcePttCloseWait();
   void debugAsrError(String code) => _state._handleAsrError(code);
 
@@ -712,6 +715,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// to the recording fallback. Never reset by an error --
   /// a working press clears nothing; the flag only routes.
   bool _localAsrBroken = false;
+  bool _debugForceMicrophoneInitializeFailure = false;
 
   /// True while the current press is served by the recorder
   /// instead of the system recogniser.
@@ -1642,8 +1646,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _microphoneInitializeCalls++;
     mingtuMicrophoneStartObserver?.call();
     try {
-      final bool ok =
-          await _deferredAsr!.initialize().timeout(const Duration(seconds: 3));
+      final bool ok = _debugForceMicrophoneInitializeFailure
+          ? false
+          : await _deferredAsr!
+              .initialize()
+              .timeout(const Duration(seconds: 3));
       _localAsrBroken = !ok;
     } catch (_) {
       _localAsrBroken = true;
@@ -4917,7 +4924,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (!_microphoneInitialized) {
         await _initializeMicrophone();
         if (!mounted || !_foreground) return;
-        if (!_microphoneInitialized || _localAsrBroken) {
+        if (!_microphoneInitialized) {
           _say(_request(
             id: 'headset-microphone-init-${_permissionSpeechSeq++}',
             eventId: 'headset-microphone-init-$_permissionSpeechSeq',
