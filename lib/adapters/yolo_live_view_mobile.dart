@@ -100,7 +100,7 @@ Future<void> _sampleLensLuma() async {
     if (!sharedYoloViewController.isInitialized) return;
     final Uint8List? bytes = await sharedYoloViewController.captureFrame();
     if (bytes == null || bytes.isEmpty) return;
-    unawaited(_submitLensGray(bytes));
+    await _submitLensGray(bytes);
   } catch (_) {
     // Lens sampling is best-effort and must never break detection.
   }

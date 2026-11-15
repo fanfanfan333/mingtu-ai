@@ -18,6 +18,11 @@ class TtsRecoveryController {
 
   static const announcement = '语音已恢复';
   static const dangerDurationCap = Duration(seconds: 30);
+  static const dangerRollingWindow = Duration(seconds: 60);
+  static const dangerRollingCap = Duration(seconds: 45);
+  final List<(DateTime, DateTime)> _dangerIntervals = [];
+  DateTime? _dangerStartedAt;
+
   final Future<VoiceOutput?> Function() rebuild;
   final void Function(VoiceOutput, String) onRecovered;
   final Haptics Function() haptics;
@@ -81,6 +86,7 @@ class TtsRecoveryController {
             eventId != _dangerEventId);
     final escalated = _dangerLevel != null && level.index > _dangerLevel!.index;
     if (different || escalated) {
+      _endDangerInterval();
       _dangerCap?.cancel();
       _vibration?.cancel();
       _dangerCap = null;
@@ -98,7 +104,43 @@ class TtsRecoveryController {
       _dangerLevel = level;
     }
     if (_vibration != null || _dangerExhausted) return;
-    _dangerCap = _schedule(dangerDurationCap, () {
+    final start = now();
+    _dangerIntervals.removeWhere((interval) =>
+        !interval.$2.isAfter(start.subtract(dangerRollingWindow)));
+    Duration episodeDuration = dangerDurationCap;
+    if (!escalated) {
+      // Usage during a continuously running episode is monotonic over this
+      // window: old active time can leave no faster than new time enters.
+      int usageAt(int micros) {
+        final end = start.add(Duration(microseconds: micros));
+        final cutoff = end.subtract(dangerRollingWindow);
+        var used = micros;
+        for (final interval in _dangerIntervals) {
+          final from = interval.$1.isAfter(cutoff) ? interval.$1 : cutoff;
+          if (interval.$2.isAfter(from)) {
+            used += interval.$2.difference(from).inMicroseconds;
+          }
+        }
+        return used;
+      }
+
+      final cap = dangerRollingCap.inMicroseconds;
+      if (usageAt(0) >= cap) return;
+      var low = 0;
+      var high = dangerDurationCap.inMicroseconds;
+      while (low < high) {
+        final mid = (low + high + 1) ~/ 2;
+        if (usageAt(mid) <= cap) {
+          low = mid;
+        } else {
+          high = mid - 1;
+        }
+      }
+      episodeDuration = Duration(microseconds: low);
+    }
+    _dangerStartedAt = start;
+    _dangerCap = _schedule(episodeDuration, () {
+      _endDangerInterval();
       _vibration?.cancel();
       _vibration = null;
       _dangerCap = null;
@@ -109,13 +151,26 @@ class TtsRecoveryController {
       unawaited(_dangerLevel == DangerLevel.warning
           ? haptics().vibrateWarning()
           : haptics().vibrateUrgent());
-      _vibration = _schedule(const Duration(milliseconds: 400), pulse);
+      _vibration = _schedule(
+          _dangerLevel == DangerLevel.warning
+              ? const Duration(milliseconds: 1500)
+              : const Duration(milliseconds: 400),
+          pulse);
     }
 
     pulse();
   }
 
+  void _endDangerInterval() {
+    final start = _dangerStartedAt;
+    if (start != null) {
+      _dangerIntervals.add((start, now()));
+      _dangerStartedAt = null;
+    }
+  }
+
   void stopDanger() {
+    _endDangerInterval();
     _dangerCap?.cancel();
     _dangerCap = null;
     _dangerExhausted = false;

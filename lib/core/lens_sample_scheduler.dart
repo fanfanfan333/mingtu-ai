@@ -16,7 +16,6 @@ class LensSampleScheduler {
   /// Starts [sample] if the current cadence and in-flight state allow it.
   Future<void> request(
     Future<void> Function() sample, {
-    int? appliedFps,
     bool analysisCap720p = false,
   }) async {
     final DateTime now = _now();

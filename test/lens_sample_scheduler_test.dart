@@ -78,9 +78,9 @@ void main() {
       captures++;
     }
 
-    await scheduler.request(capture, appliedFps: 10);
+    await scheduler.request(capture);
     now = now.add(const Duration(milliseconds: 500));
-    await scheduler.request(capture, appliedFps: 10);
+    await scheduler.request(capture);
     expect(captures, 2);
   });
 

@@ -51,7 +51,40 @@ void main() {
       ]);
     }
     await tester.pump(const Duration(milliseconds: 800));
-    expect(haptics.calls.any((c) => c == 'urgent' || c == 'warning'), isTrue);
+    expect(haptics.calls.where((c) => c == 'urgent').length,
+        greaterThanOrEqualTo(2));
+    expect(handle.activeSpeechKind, isNull);
+    expect(handle.debugSpeechQueueLength, 0);
+    expect(output.spoken, isEmpty);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('entrance search keeps watching hazards during TTS failure',
+      (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    handle.destinationApproach();
+    expect(handle.taskState, TaskState.findingEntrance);
+    final haptics = RecordingHaptics();
+    final output = FakeOutput();
+    handle.debugSetHaptics(haptics);
+    handle.debugFailTts(() async => output);
+    expect(handle.taskState, TaskState.paused);
+    for (final s in <double>[0.20, 0.32, 0.45, 0.60, 0.75]) {
+      handle.simulateDetections(<Detection>[
+        Detection(label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s),
+      ]);
+    }
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(haptics.calls.where((c) => c == 'urgent').length,
+        greaterThanOrEqualTo(2));
     expect(handle.activeSpeechKind, isNull);
     expect(handle.debugSpeechQueueLength, 0);
     expect(output.spoken, isEmpty);

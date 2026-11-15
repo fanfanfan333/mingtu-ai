@@ -70,6 +70,60 @@ void main() {
     });
   });
 
+  test('rolling cap limits new tracks and urgent escalation is exempt', () {
+    fakeAsync((clock) {
+      final start = DateTime(2026);
+      final haptics = RecordingHaptics();
+      final controller = TtsRecoveryController(
+        now: () => start.add(clock.elapsed),
+        haptics: () => haptics,
+        rebuild: () async => null,
+        onRecovered: (_, __) {},
+      );
+      controller.fail();
+      controller.danger(trackId: 1, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 20));
+      controller.danger(trackId: 2, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 20));
+      controller.danger(trackId: 3, level: DangerLevel.warning);
+      clock.elapse(const Duration(seconds: 5));
+      expect(controller.vibrating, isFalse);
+      final count = haptics.calls.length;
+      controller.danger(trackId: 4, level: DangerLevel.warning);
+      expect(haptics.calls.length, count);
+      controller.danger(trackId: 4, level: DangerLevel.urgent);
+      expect(haptics.calls.last, 'urgent');
+      expect(haptics.calls.length, count + 1);
+      clock.elapse(const Duration(milliseconds: 400));
+      expect(haptics.calls.length, count + 2);
+      controller.dispose();
+    });
+  });
+
+  test('warning and urgent repeat at their respective intervals', () {
+    fakeAsync((clock) {
+      final haptics = RecordingHaptics();
+      final controller = TtsRecoveryController(
+        haptics: () => haptics,
+        rebuild: () async => null,
+        onRecovered: (_, __) {},
+      );
+      controller.fail();
+      controller.danger(level: DangerLevel.warning);
+      clock.elapse(const Duration(milliseconds: 1499));
+      expect(haptics.calls, ['warning']);
+      clock.elapse(const Duration(milliseconds: 1));
+      expect(haptics.calls, ['warning', 'warning']);
+      controller.danger(level: DangerLevel.urgent);
+      expect(haptics.calls.last, 'urgent');
+      clock.elapse(const Duration(milliseconds: 399));
+      expect(haptics.calls.where((c) => c == 'urgent').length, 1);
+      clock.elapse(const Duration(milliseconds: 1));
+      expect(haptics.calls.where((c) => c == 'urgent').length, 2);
+      controller.dispose();
+    });
+  });
+
   Future<(MingtuHomeDebugHandle, RecordingHaptics)> setup(
       WidgetTester tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;

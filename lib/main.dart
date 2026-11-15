@@ -1313,7 +1313,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _ttsFailed = false;
   bool get _hazardWatchActive {
     if (_tasks.state == TaskState.navigating ||
-        _tasks.state == TaskState.avoidingObstacle) {
+        _tasks.state == TaskState.avoidingObstacle ||
+        _tasks.state == TaskState.findingEntrance) {
       return true;
     }
     if (_tasks.state != TaskState.paused || _tasks.history.isEmpty) {
@@ -1322,7 +1323,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final TaskTransition last = _tasks.history.last;
     return last.trigger == 'tts-failure' &&
         (last.from == TaskState.navigating ||
-            last.from == TaskState.avoidingObstacle);
+            last.from == TaskState.avoidingObstacle ||
+            last.from == TaskState.findingEntrance);
   }
   Future<VoiceOutput?> Function()? _ttsRebuildOverride;
   late final TtsRecoveryController _ttsRecovery = TtsRecoveryController(
