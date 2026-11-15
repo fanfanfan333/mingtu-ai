@@ -94,6 +94,44 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
   });
 
+  testWidgets('navigation recovery replays a hazard that appeared during failure',
+      (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    expect(handle.taskState, TaskState.navigating);
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    expect(handle.taskState, TaskState.paused);
+    for (final s in <double>[0.20, 0.32, 0.45, 0.60, 0.75]) {
+      handle.simulateDetections(<Detection>[
+        Detection(label: 'car', confidence: 0.9, cx: 0.5, cy: 0.55, w: s, h: s),
+      ]);
+    }
+    expect(handle.taskState, TaskState.paused);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump();
+    await tester.pump();
+    expect(handle.taskState, TaskState.navigating);
+    expect(output.spoken.any((text) => text.contains('语音已恢复')), isTrue);
+    expect(output.spoken.every((text) => !text.contains('继续导航')), isTrue);
+    expect(output.spoken.any((text) => text.contains('车') || text.contains('障碍')), isTrue);
+    expect(output.spoken, contains('用盲杖确认。'));
+    expect(output.spoken.every((text) => !text.contains('直走')), isTrue);
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump();
+    expect(output.spoken.every((text) => !text.contains('直走')), isTrue);
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
   testWidgets('recovery resumes navigation and announces subsequent hazards',
       (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;

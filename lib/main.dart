@@ -1360,11 +1360,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             _tasks.canTransitionTo(last.from)) {
           final clearedObstacle = last.from == TaskState.avoidingObstacle &&
               !_riskActive && !_yoloRiskActive;
+          final navigatingWithRisk = last.from == TaskState.navigating &&
+              (_riskActive || _yoloRiskActive);
           _tasks.transitionTo(
             clearedObstacle ? TaskState.navigating : last.from,
             trigger: 'tts-recovery',
           );
-          if (last.from == TaskState.avoidingObstacle && !clearedObstacle) {
+          if ((last.from == TaskState.avoidingObstacle && !clearedObstacle) ||
+              navigatingWithRisk) {
             spokenAnnouncement = '语音已恢复。';
             _replayHazardAfterRecovery = true;
           } else if (last.from == TaskState.findingEntrance) {
@@ -1373,7 +1376,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             spokenAnnouncement = '语音已恢复，继续导航。';
           }
           recoveredEmergency = last.from == TaskState.emergency;
-          if (last.from == TaskState.navigating || clearedObstacle) {
+          if ((last.from == TaskState.navigating && !navigatingWithRisk) ||
+              clearedObstacle) {
             _straightConfirmed = true;
             _recheckStraightResume(rearmIfRunning: true);
           }
