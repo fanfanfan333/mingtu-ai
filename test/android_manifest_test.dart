@@ -54,8 +54,7 @@ void main() {
             reason: 'expected at least one comment to actually be checked');
       });
 
-      test('declares speech-service queries (RecognitionService + TTS)',
-          () {
+      test('declares speech-service queries (RecognitionService + TTS)', () {
         // MT-1111-PTT-D(1): Android 11+ package visibility --
         // both intents must be inside <queries> on the MAIN
         // manifest (they were added in the 9f6542b round;
@@ -66,8 +65,7 @@ void main() {
         expect(qOpen, greaterThanOrEqualTo(0));
         expect(qClose, greaterThan(qOpen));
         final String queries = content.substring(qOpen, qClose);
-        expect(queries,
-            contains('android.intent.action.TTS_SERVICE'));
+        expect(queries, contains('android.intent.action.TTS_SERVICE'));
         expect(queries, contains('android.speech.RecognitionService'));
       });
 
@@ -141,10 +139,9 @@ void main() {
       expect(gradle, contains('"lib/x86_64/**"'));
       expect(gradle, contains('"lib/x86/**"'));
       expect(gradle, contains('"lib/armeabi-v7a/**"'));
-      // ABI choice stays in the build command (README), never
-      // in a hardcoded filter that would fight --split-per-abi.
-      expect(gradle, isNot(contains('abiFilters =')));
-      expect(gradle, isNot(contains('abiFilters +=')));
+      expect(gradle, contains('abiFilters += "arm64-v8a"'));
+      expect(gradle, contains('if (includeX86) abiFilters += "x86_64"'));
+      expect(gradle, contains('if (!includeX86) excludes += "lib/x86_64/**"'));
     });
   });
 
@@ -155,16 +152,17 @@ void main() {
       expect(mainManifest, contains('android:label="明途"'));
     });
 
-    test(
-        'ABI is chosen by the build command, not a hardcoded '
-        'abiFilters (which conflicts with --split-per-abi)', () {
+    test('release ABI defaults to arm64 with x86_64 only via test switch', () {
       final String gradle =
           File('android/app/build.gradle.kts').readAsStringSync();
-      expect(gradle, isNot(contains('abiFilters +=')));
-      expect(gradle, isNot(contains('abiFilters =')));
+      expect(gradle, contains('abiFilters += "arm64-v8a"'));
+      expect(
+          gradle,
+          contains(
+              'providers.gradleProperty("mingtuIncludeX86_64").orNull == "true"'));
       final String readme = File('README.md').readAsStringSync();
       expect(readme, contains('--target-platform android-arm64'));
-      expect(readme, contains('--split-per-abi'));
+      expect(readme, contains('-PmingtuIncludeX86_64=true'));
     });
 
     test(

@@ -10,6 +10,20 @@ import 'push_to_talk_ui_test.dart' as ui;
 import 'ui_a11y_s1_test.dart' as s1;
 
 void main() {
+  test('headset speech ids share their sequence', () {
+    final source = File('lib/main.dart').readAsStringSync();
+    final block = source.substring(
+        source.indexOf('  Future<void> _headsetToggle()'),
+        source.indexOf('  void _startSilenceWatch'));
+    for (final prefix in [
+      'headset-microphone-permission',
+      'headset-microphone-init'
+    ]) {
+      expect(block, contains("final int seq = _permissionSpeechSeq++;\n"));
+      expect(block, contains("id: '$prefix-\$seq',\n"));
+      expect(block, contains("eventId: '$prefix-\$seq',\n"));
+    }
+  });
   testWidgets('headset toggles a live press and ends it', (tester) async {
     final h = ui.RecordingVoiceChannels()..install();
     addTearDown(h.uninstall);
@@ -91,6 +105,77 @@ void main() {
             'tts.speak:${permissionDeniedText(GuidePermission.microphone)}')));
     expect(h.count('asr.listen'), greaterThan(0));
     await ui.shutdownVoice(tester, h);
+  });
+
+  testWidgets('headset uses cloud recording when local initialization fails',
+      (tester) async {
+    final gateway = s1.FakePermissionGateway();
+    gateway.statusResults[GuidePermission.microphone] =
+        PermissionOutcome.granted;
+    mingtuPermissionGatewayOverride = gateway;
+    mingtuGuideStoreOverride = s1.FakeGuideStore(seen: true);
+    addTearDown(() {
+      mingtuPermissionGatewayOverride = null;
+      mingtuGuideStoreOverride = null;
+    });
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    await s1.settleToggleApp(tester, h);
+    final debug = mingtuHomeDebugHandle!;
+    final recorder = s1.AmplitudeFakeRecorder();
+    debug.setRecorder(recorder);
+    debug.debugResetMicrophoneInitialized();
+    debug.debugForceMicrophoneInitializeFailure();
+    final initialized = debug.microphoneInitializeCalls;
+    h.events.clear();
+    await debug.debugHeadsetToggle();
+    await s1.pumpUntil(
+        tester, h, () => recorder.started, 'cloud recording starts');
+    expect(debug.microphoneInitializeCalls, initialized + 1);
+    expect(debug.localAsrBroken, isTrue);
+    expect(recorder.startCount, 1);
+    expect(h.events, isNot(contains('tts.speak:语音识别初始化失败，请稍后重试。')));
+    expect(
+        h.events,
+        isNot(contains(
+            'tts.speak:${permissionDeniedText(GuidePermission.microphone)}')));
+    await ui.shutdownVoice(tester, h);
+    await recorder.amplitudes.close();
+  });
+
+  testWidgets('headset announces when microphone initialization cannot happen',
+      (tester) async {
+    final gateway = s1.FakePermissionGateway();
+    gateway.statusResults[GuidePermission.microphone] =
+        PermissionOutcome.granted;
+    mingtuPermissionGatewayOverride = gateway;
+    mingtuGuideStoreOverride = s1.FakeGuideStore(seen: true);
+    addTearDown(() {
+      mingtuPermissionGatewayOverride = null;
+      mingtuGuideStoreOverride = null;
+    });
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    await s1.settleToggleApp(tester, h);
+    final debug = mingtuHomeDebugHandle!;
+    final recorder = s1.AmplitudeFakeRecorder();
+    debug.setRecorder(recorder);
+    debug.debugResetMicrophoneInitialized();
+    debug.debugClearDeferredAsr();
+    final initialized = debug.microphoneInitializeCalls;
+    h.events.clear();
+    final listens = h.count('asr.listen');
+    await debug.debugHeadsetToggle();
+    await s1.pumpUntil(
+        tester,
+        h,
+        () => h.events.contains('tts.speak:语音识别初始化失败，请稍后重试。'),
+        'microphone initialization failure alert');
+    expect(debug.microphoneInitializeCalls, initialized);
+    expect(h.count('asr.listen'), listens);
+    expect(recorder.startCount, 0);
+    await ui.shutdownVoice(tester, h);
+    await recorder.amplitudes.close();
   });
 
   testWidgets('background headset event is ignored', (tester) async {

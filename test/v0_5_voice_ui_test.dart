@@ -36,7 +36,7 @@ Future<void> drivePanelAction(WidgetTester tester, String label) async {
       h.obstacleUncertain();
     case '障碍已移开，重新评估并恢复直行':
       h.obstacleUncertainResolved();
-    case '模拟障碍：侧方已确认（仅演示数据给一步）':
+    case '模拟障碍：侧方已确认（演示数据，仍须停下）':
       h.obstacleConfirmed();
     case '动作后重新感知，确认后恢复导航':
       h.obstacleConfirmedVerified();

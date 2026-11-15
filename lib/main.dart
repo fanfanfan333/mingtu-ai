@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart' show CustomSemanticsAction;
 import 'package:flutter/services.dart';
 
 import 'adapters/amap_client.dart';
@@ -24,6 +25,8 @@ import 'core/event_bus.dart';
 import 'core/cloud_asr.dart';
 import 'core/cloud_vision.dart';
 import 'core/health_monitor.dart';
+import 'core/lens_occlusion.dart';
+import 'core/tts_recovery.dart';
 import 'core/route_scoring.dart';
 import 'core/llm_gateway.dart';
 import 'core/contracts.dart';
@@ -31,6 +34,7 @@ import 'core/asr_errors.dart';
 import 'core/danger_alerts.dart';
 import 'core/avoidance_advisor.dart';
 import 'core/cloud_vision_hazard.dart';
+import 'core/walking_hazard_scan.dart';
 import 'core/cloud_trigger_policy.dart';
 import 'core/pothole_scan.dart';
 import 'core/orientation.dart';
@@ -134,12 +138,18 @@ class MingtuApp extends StatelessWidget {
 /// the real gateway / store factories are used then.
 /// UI-06: swap the permission gateway (the plugin-backed
 /// one) for a fake in widget tests.
+SystemVoiceOutput Function()? mingtuStartupTtsFactoryOverride;
 PermissionGateway? mingtuPermissionGatewayOverride;
 WakelockGateway? mingtuWakelockGatewayOverride;
 DateTime Function()? mingtuWatchdogNowOverride;
 
 @visibleForTesting
+const emergencyConfirmTimeout = Duration(seconds: 10);
+const headsetEmergencyCooldown = Duration(seconds: 10);
+
+@visibleForTesting
 Stream<bool> Function()? mingtuProximityEventsOverride;
+DateTime Function()? mingtuPocketNowOverride;
 
 /// UI-06: swap the first-launch marker store for a fake in
 /// widget tests.
@@ -150,6 +160,8 @@ GuideStore? mingtuGuideStoreOverride;
 CurrentLocationProvider? mingtuLocationProviderOverride;
 @visibleForTesting
 bool? mingtuYoloAvailableOverride;
+Widget Function(void Function(Object error) onError)?
+    mingtuYoloViewBuilderOverride;
 @visibleForTesting
 void Function()? mingtuCameraStartObserver;
 @visibleForTesting
@@ -167,6 +179,18 @@ class MingtuHomeDebugHandle {
   MingtuHomeDebugHandle._(this._state);
 
   final _MingtuHomePageState _state;
+
+  /// Installs a deterministic monitor for camera-free tests.
+  void debugSetLensClock(DateTime Function() now) =>
+      _state._lensMonitor = LensOcclusionMonitor(now: now);
+
+  void debugPushLuma(double mean, double variance) =>
+      _state._onLensSample(LumaStats(mean, variance));
+
+  SpeechRequest? get debugActiveSpeech => _state._scheduler.active;
+
+  List<SpeechRequest> get debugLensSpeechQueue =>
+      List<SpeechRequest>.unmodifiable(_state._scheduler.queue);
 
   /// The in-app diagnostic log joined (state only; the
   /// panel's log area used to render it).
@@ -260,6 +284,7 @@ class MingtuHomeDebugHandle {
   void startVoiceDemo() => _state._startVoice();
   void planRoute() => _state._planRoute();
   void startNavigating() => _state._startNavigating();
+  void debugEndLiveNavigation() => _state._endLiveNavigation();
   void turnAhead() => _state._turn();
   void manualStraight() => _state._manualStraight();
   void reconfirmStraight() => _state._reconfirmStraight();
@@ -279,6 +304,7 @@ class MingtuHomeDebugHandle {
   void llmDemo() => _state._llmDemo();
   void triggerManualVision() => _state._triggerManualVision();
   void triggerEmergency() => _state._triggerEmergency();
+  int get emergencyTriggerCount => _state._emergencyTriggerCount;
   void resetDemo() => _state._resetDemo();
   void fetchAmapRoute() => _state._fetchAmapRoute();
 
@@ -320,6 +346,9 @@ class MingtuHomeDebugHandle {
   /// the wall clock. Production never calls this.
   void debugSetSpeechClock(DateTime Function()? clock) =>
       _state._speechNow = clock ?? DateTime.now;
+
+  void debugSetStraightClock(DateTime Function() clock) =>
+      _state._straightNow = clock;
 
   /// NAVHAZ M1 seam (EGOUNK round): inject a fixed camera
   /// pitch for tests. The widget environment has no
@@ -402,6 +431,11 @@ class MingtuHomeDebugHandle {
   void setCameraFrameSourceForTest(CameraFrameSource source) =>
       _state._frameSource = source;
 
+  void debugFailTts(Future<VoiceOutput?> Function() rebuild) {
+    _state._ttsRebuildOverride = rebuild;
+    _state._handleTtsFailure(StateError('test failure'));
+  }
+
   void disableVoiceOutputForTest() {
     _state._ttsFailed = true;
     _state._voiceOutput = UnavailableVoiceOutput();
@@ -441,6 +475,15 @@ class MingtuHomeDebugHandle {
     ));
   }
 
+  bool debugSayForTest(SpeechKind kind) => _state._say(_state._request(
+        id: 'test-fallback-${kind.name}',
+        eventId: 'test-fallback-${kind.name}',
+        text: '测试提示',
+        kind: kind,
+      ));
+
+  int get debugSpeechQueueLength => _state._scheduler.queue.length;
+
   /// UI-01 debug/test seam: force (or, with null, unforce)
   /// the TalkBack toggle-mode decision, bypassing the
   /// MediaQuery. Widget tests primarily drive the real
@@ -457,6 +500,9 @@ class MingtuHomeDebugHandle {
   Future<void> debugHeadsetToggle() => _state._headsetToggle();
   void debugResetMicrophoneInitialized() =>
       _state._microphoneInitialized = false;
+  void debugForceMicrophoneInitializeFailure() =>
+      _state._debugForceMicrophoneInitializeFailure = true;
+  void debugClearDeferredAsr() => _state._deferredAsr = null;
   void debugPttCloseWait() => _state._announcePttCloseWait();
   void debugAsrError(String code) => _state._handleAsrError(code);
 
@@ -619,6 +665,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     with WidgetsBindingObserver {
   TaskManager _tasks = TaskManager();
   SpeechScheduler _scheduler = SpeechScheduler();
+  LensOcclusionMonitor _lensMonitor = LensOcclusionMonitor();
+  int _lensNoticeSequence = 0;
+
+  void _onLensSample(LumaStats stats) {
+    final LensNotice? notice = _lensMonitor.sample(stats);
+    if (notice == null) return;
+    final String id = 'lens-${_lensNoticeSequence++}';
+    _say(_request(
+      id: id,
+      eventId: id,
+      text: notice == LensNotice.alert
+          ? LensOcclusionMonitor.alertText
+          : LensOcclusionMonitor.recoveryText,
+      kind: notice == LensNotice.alert ? SpeechKind.alert : SpeechKind.info,
+    ));
+  }
 
   /// The clock every speech-arbitration timestamp runs on
   /// (CDX3): request creation / expiry stamps, the
@@ -635,6 +697,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// time bases for the same judgement invited exactly
   /// the confusion the CDX3 round removed.)
   DateTime Function() _speechNow = DateTime.now;
+  DateTime Function() _straightNow = DateTime.now;
 
   /// NH-M1-10: install the fake segment clock + stamp
   /// collection for the segment-2 test (debug handle
@@ -712,6 +775,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// to the recording fallback. Never reset by an error --
   /// a working press clears nothing; the flag only routes.
   bool _localAsrBroken = false;
+  bool _debugForceMicrophoneInitializeFailure = false;
 
   /// True while the current press is served by the recorder
   /// instead of the system recogniser.
@@ -1002,6 +1066,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // automatic event triggers alike).
   final VisionRateBackoff _visionBackoff = VisionRateBackoff();
   final CloudVisionDowngradeGate _visionDowngrade = CloudVisionDowngradeGate();
+  late final WalkingHazardScan _walkingHazardScan = WalkingHazardScan(
+    gate: _visionDowngrade,
+    scan: _captureWalkingHazard,
+    onFailure: _handleAutoVisionFailure,
+    onSuccess: _visionBackoff.onSuccess,
+    speak: (String text) {
+      if (!mounted || _liveNav == null) return;
+      final String id =
+          'walking-hazard-${DateTime.now().microsecondsSinceEpoch}';
+      _say(_request(id: id, eventId: id, text: text, kind: SpeechKind.alert));
+    },
+  );
   GeoPoint? _lastFixPoint;
   double? _lastFixAccuracyM;
   // Latest GPS ground speed carried by a live fix, and
@@ -1239,6 +1315,95 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   // no automatic ASR restart); once an ASR error has been announced
   // it is not announced again (no retry/announce loop).
   bool _ttsFailed = false;
+  String? _lastNavHazPhrase;
+  SpeechKind? _lastNavHazKind;
+  bool _lastNavHazUrgent = false;
+  bool _replayHazardAfterRecovery = false;
+  bool _userPausedDuringTtsFailure = false;
+  bool get _hazardWatchActive {
+    if (_tasks.state == TaskState.navigating ||
+        _tasks.state == TaskState.avoidingObstacle ||
+        _tasks.state == TaskState.findingEntrance) {
+      return true;
+    }
+    if (_tasks.state != TaskState.paused || _tasks.history.isEmpty) {
+      return false;
+    }
+    final TaskTransition last = _tasks.history.last;
+    return last.trigger == 'tts-failure' &&
+        (last.from == TaskState.navigating ||
+            last.from == TaskState.avoidingObstacle ||
+            last.from == TaskState.findingEntrance);
+  }
+  Future<VoiceOutput?> Function()? _ttsRebuildOverride;
+  late final TtsRecoveryController _ttsRecovery = TtsRecoveryController(
+    haptics: () => _haptics,
+    rebuild: () async {
+      if (_ttsRebuildOverride != null) return _ttsRebuildOverride!();
+      final output = SystemVoiceOutput();
+      if (!await output.initialize() || !output.chineseVoiceVerified) {
+        return null;
+      }
+      output.onSpeakStart = _onTtsSpeakStart;
+      return output;
+    },
+    onRecovered: (output, announcement) {
+      if (!mounted) return;
+      _voiceOutput = output;
+      var spokenAnnouncement = announcement;
+      var recoveredEmergency = false;
+      if (_tasks.state == TaskState.paused) {
+        final last = _tasks.history.isEmpty ? null : _tasks.history.last;
+        if (last != null &&
+            last.trigger == 'tts-failure' &&
+            !_userPausedDuringTtsFailure &&
+            _tasks.canTransitionTo(last.from)) {
+          final clearedObstacle = last.from == TaskState.avoidingObstacle &&
+              !_riskActive && !_yoloRiskActive;
+          _tasks.transitionTo(
+            clearedObstacle ? TaskState.navigating : last.from,
+            trigger: 'tts-recovery',
+          );
+          if (last.from == TaskState.avoidingObstacle && !clearedObstacle) {
+            spokenAnnouncement = '语音已恢复。';
+            _replayHazardAfterRecovery = true;
+          } else if (last.from == TaskState.findingEntrance) {
+            spokenAnnouncement = '语音已恢复，仍在寻找入口。';
+          } else {
+            spokenAnnouncement = '语音已恢复，继续导航。';
+          }
+          recoveredEmergency = last.from == TaskState.emergency;
+          if (last.from == TaskState.navigating || clearedObstacle) {
+            _straightConfirmed = true;
+            _recheckStraightResume(rearmIfRunning: true);
+          }
+        } else {
+          spokenAnnouncement = '语音已恢复，导航仍在暂停。';
+        }
+      }
+      _ttsFailed = false;
+      _health.report('voice_output', ServiceHealthStatus.ok, output.status);
+      setState(() {
+        _voiceText = '语音：TTS：${output.status}；ASR：${_voiceInput.status}。';
+      });
+      if (recoveredEmergency) {
+        final result = _emergency.trigger(
+          triggerType: 'voice-小途，我需要帮助（演示）',
+          networkAvailable: false,
+          llmAvailable: false,
+        );
+        _speakEmergencyFallback(result,
+            prefix: '语音已恢复。',
+            eventId: 'emergency-1-recovery-${DateTime.now().microsecondsSinceEpoch}');
+      } else {
+        _say(_request(
+            id: 'tts-recovered-${DateTime.now().microsecondsSinceEpoch}',
+            eventId: 'tts-recovered',
+            text: spokenAnnouncement,
+            kind: SpeechKind.info));
+      }
+    },
+  );
 
   /// True while the last-started listening session has not
   /// yet been closed by an app-initiated stop/cancel. The
@@ -1435,7 +1600,80 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         kind: SpeechKind.alert)),
   );
   static const MethodChannel _headsetChannel = MethodChannel('mingtu/headset');
+  int _emergencyTriggerCount = 0;
   bool _headsetGatePending = false;
+  final Set<int> _emergencyPointers = <int>{};
+  Timer? _emergencyHoldTimer;
+  Timer? _emergencyConfirmTimer;
+  int _emergencyConfirmSequence = 0;
+  Timer? _headsetCooldownTimer;
+  Timer? _headsetPressTimer;
+  int _headsetPressCount = 0;
+  bool _emergencyHoldTriggered = false;
+
+  void _emergencyPointerDown(int pointer) {
+    if (_pocketMode.ignoreTouches) return;
+    _emergencyPointers.add(pointer);
+    if (_emergencyPointers.length >= 3 &&
+        !_emergencyHoldTriggered &&
+        _emergencyHoldTimer == null) {
+      _emergencyHoldTimer = Timer(const Duration(milliseconds: 900), () {
+        _emergencyHoldTimer = null;
+        if (mounted &&
+            !_pocketMode.ignoreTouches &&
+            _emergencyPointers.length >= 3) {
+          _emergencyHoldTriggered = true;
+          _requestEmergencyConfirm();
+        }
+      });
+    }
+  }
+
+  void _requestEmergencyConfirm({
+    String confirmationText = '即将发起紧急求助，再次三指长按确认',
+  }) {
+    if (_emergencyConfirmTimer != null) {
+      _emergencyConfirmTimer!.cancel();
+      _emergencyConfirmTimer = null;
+      _triggerEmergency();
+      return;
+    }
+    _emergencyConfirmTimer = Timer(emergencyConfirmTimeout, () {
+      _emergencyConfirmTimer = null;
+    });
+    final id = 'emergency-confirm-${_emergencyConfirmSequence++}';
+    _say(_request(
+      id: id,
+      eventId: id,
+      text: confirmationText,
+      kind: SpeechKind.alert,
+    ));
+  }
+
+  void _emergencyPointerUp(int pointer) {
+    _emergencyPointers.remove(pointer);
+    if (_emergencyPointers.length < 3) {
+      _emergencyHoldTimer?.cancel();
+      _emergencyHoldTimer = null;
+    }
+    if (_emergencyPointers.isEmpty) _emergencyHoldTriggered = false;
+  }
+
+  bool _countHeadsetPress() {
+    if (_headsetPressCount == 0) {
+      _headsetPressTimer = Timer(const Duration(milliseconds: 1500), () {
+        _headsetPressCount = 0;
+        _headsetPressTimer = null;
+      });
+    }
+    _headsetPressCount++;
+    if (_headsetPressCount < 3) return false;
+    _headsetPressTimer?.cancel();
+    _headsetPressTimer = null;
+    _headsetPressCount = 0;
+    return true;
+  }
+
   bool _foreground = true;
   Timer? _foregroundTimer;
 
@@ -1458,6 +1696,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void initState() {
     super.initState();
     mingtuHomeDebugHandle = MingtuHomeDebugHandle._(this);
+    mingtuLensSampleSink = _onLensSample;
     _headsetChannel.setMethodCallHandler((call) async {
       if (call.method == 'toggle') await _headsetToggle();
     });
@@ -1469,8 +1708,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _permissionGateway =
         mingtuPermissionGatewayOverride ?? createPermissionGateway();
     _guideStore = mingtuGuideStoreOverride ?? createGuideStore();
-    _pocketMode =
-        PocketMode(proximity: mingtuProximityEventsOverride ?? proximityEvents);
+    _pocketMode = PocketMode(
+        proximity: mingtuProximityEventsOverride ?? proximityEvents,
+        now: mingtuPocketNowOverride);
     unawaited(_loadPocketMode());
     // UI-06-B3: start the first-launch marker read now.
     // The startup gate awaits this future with a bounded
@@ -1512,6 +1752,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached) {
+      _ttsRecovery.stopDanger();
       if (_yoloLiveOpen && mounted) {
         setState(() {
           _closeYoloLiveView();
@@ -1642,8 +1883,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _microphoneInitializeCalls++;
     mingtuMicrophoneStartObserver?.call();
     try {
-      final bool ok =
-          await _deferredAsr!.initialize().timeout(const Duration(seconds: 3));
+      final bool ok = _debugForceMicrophoneInitializeFailure
+          ? false
+          : await _deferredAsr!
+              .initialize()
+              .timeout(const Duration(seconds: 3));
       _localAsrBroken = !ok;
     } catch (_) {
       _localAsrBroken = true;
@@ -1784,6 +2028,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                 _permissionRequestGeneration[effect.permission] != generation) {
               return;
             }
+            if (lateOutcome != PermissionOutcome.granted) return;
             _deferredPermissionEffects = null;
             if (lateOutcome == PermissionOutcome.granted) {
               _grantedPermissions.add(effect.permission);
@@ -1984,6 +2229,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// subscribe to the (once-converted) position stream.
   void _beginLiveNavigation(
       RealNavigationOutcome outcome, String destinationName) {
+    if (_liveNav == null) {
+      final String id =
+          'walking-disclaimer-${DateTime.now().microsecondsSinceEpoch}';
+      _say(_request(
+          id: id,
+          eventId: id,
+          text: walkingNavigationDisclaimer,
+          kind: SpeechKind.alert));
+    }
     // A route was just installed: any earlier reroute-failure
     // notice belongs to a finished episode.
     _rerouteFailureAnnounced = false;
@@ -2214,6 +2468,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (_tasks.state == TaskState.navigating) {
       _tasks.transitionTo(TaskState.completed, trigger: 'entrance-arrived');
       _tasks.reset();
+      _userPausedDuringTtsFailure = false;
     }
     _askDestination(prompt: '还要去别的地方吗？');
   }
@@ -2340,6 +2595,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// microphone/speech stop alone must not leave a phantom
   /// navigation running.
   void _endLiveNavigation() {
+    _ttsRecovery.stopDanger();
     _gpsSub?.cancel();
     _gpsSub = null;
     // M3 TBT spike: the TBT source dies with the trip.
@@ -2462,6 +2718,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         ownership: _cameraOwnership,
       ),
       log: startupFailures,
+      ttsFactory: mingtuStartupTtsFactoryOverride,
       locationFactory: mingtuLocationProviderOverride == null
           ? null
           : () => mingtuLocationProviderOverride!,
@@ -2939,6 +3196,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    _emergencyHoldTimer?.cancel();
+    _emergencyConfirmTimer?.cancel();
+    _headsetPressTimer?.cancel();
+    _headsetCooldownTimer?.cancel();
+    if (mingtuLensSampleSink == _onLensSample) {
+      mingtuLensSampleSink = null;
+    }
+    _ttsRecovery.dispose();
     _headsetChannel.setMethodCallHandler(null);
     _pocketMode.dispose();
     _foreground = false;
@@ -3107,6 +3372,18 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   bool _say(SpeechRequest request, {bool recordAsSpoken = true}) {
     if (!mounted) return false;
+    if (_ttsFailed) {
+      if (request.kind == SpeechKind.danger) {
+        _pauseStraightForRisk();
+        _ttsRecovery.danger(
+            eventId: request.eventId, level: DangerLevel.urgent);
+      } else if (request.kind == SpeechKind.emergency) {
+        unawaited(_haptics.vibrateUrgent());
+      } else if (request.kind == SpeechKind.alert) {
+        unawaited(_haptics.vibrateWarning());
+      }
+      return false;
+    }
     // NAVHAZ M1 banned-word guard (spec sections 0.1 /
     // 2.4): NO announcement may grant or imply passage. In
     // debug builds the assert fires; in release builds the
@@ -3254,6 +3531,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _completedPermissionSpeech.add(id);
       }
       _scheduler.completeActive();
+      if (finished.eventId == 'tts-recovered' &&
+          _replayHazardAfterRecovery) {
+        _replayHazardAfterRecovery = false;
+        if (_riskActive && _lastNavHazPhrase != null && _lastNavHazKind != null) {
+          final id = 'navhaz-recovery-${DateTime.now().microsecondsSinceEpoch}';
+          _say(_request(id: id, eventId: id, text: _lastNavHazPhrase!,
+              kind: _lastNavHazKind!));
+          if (_lastNavHazUrgent) {
+            _say(_request(id: '$id-cane', eventId: 'navhaz-cane',
+                text: '用盲杖确认。', kind: SpeechKind.alert));
+          }
+        }
+      }
       // NAVHAZ M1 arbitration: after a hazard prompt
       // (danger / obstacleAvoidance) finishes and no other
       // urgent prompt is pending, an interrupted navigation
@@ -3478,7 +3768,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (mounted) _handleTtsFailure(e);
         return null;
       });
-    } else {
+    } else if (!_ttsFailed) {
       _simulateSpeechCompletion(request.id);
     }
   }
@@ -3496,6 +3786,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _handleTtsFailure(Object error) {
     mingtuVoiceLog('语音合成运行失败：已切换为不可用状态，停止自动聆听');
     _ttsFailed = true;
+    _ttsRecovery.fail();
     _voiceOutput = UnavailableVoiceOutput();
     _health.report(
       'voice_output',
@@ -3520,7 +3811,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// when no real TTS engine is reachable (web / VM / test).
   void _simulateSpeechCompletion(String id) {
     Future<void>.delayed(const Duration(milliseconds: 1200), () {
-      if (!mounted) {
+      if (!mounted || _ttsFailed) {
         return;
       }
       // An entry cancelled while its simulated playback ran
@@ -3572,7 +3863,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// machine judges the state at THIS moment (risk, pending
   /// danger, reroute tracker readiness, current segment);
   /// see StraightPacingMachine.recheck.
-  void _recheckStraightResume() {
+  void _recheckStraightResume({bool rearmIfRunning = false}) {
+    if (rearmIfRunning && _pacing.canTick) {
+      _pacing.hold(_navVersion);
+    }
     final bool resumed = _pacing.recheck(
       riskActive: _riskActive,
       dangerPending: _dangerPending,
@@ -3589,7 +3883,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // re-confirmation used to, bypassing the persistent
     // pacing state entirely).
     _scheduler.resumeStraight(
-      now: DateTime.now(),
+      now: _straightNow(),
       straightSegmentConfirmed: true,
       riskActive: false,
       currentNavigationVersion: _navVersion,
@@ -3621,7 +3915,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _riskActive) {
       return;
     }
-    final DateTime now = DateTime.now();
+    final DateTime now = _straightNow();
     if (!_scheduler.shouldPlayStraight(
       now: now,
       straightSegmentConfirmed: true,
@@ -4887,7 +5181,28 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   Future<void> _headsetToggle() async {
-    if (!mounted || !_foreground || _headsetGatePending) return;
+    if (!mounted || !_foreground) return;
+    if (_countHeadsetPress()) {
+      if (_headsetCooldownTimer?.isActive ?? false) {
+        if (_scheduler.active?.kind == SpeechKind.emergency ||
+            _scheduler.queue
+                .any((request) => request.kind == SpeechKind.emergency)) {
+          unawaited(_haptics.vibrateCooldown());
+          return;
+        }
+        _say(_request(
+          id: 'headset-emergency-in-progress',
+          eventId: 'headset-emergency-in-progress',
+          text: '紧急求助已在进行',
+          kind: SpeechKind.info,
+        ));
+        return;
+      }
+      _headsetCooldownTimer = Timer(headsetEmergencyCooldown, () {});
+      _triggerEmergency();
+      return;
+    }
+    if (_headsetGatePending) return;
     if (_pttState != _PttState.idle || !_permissionGateway.isAvailable) {
       _pttToggleTap();
       return;
@@ -4897,9 +5212,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       final outcome = await _permissionStatus(GuidePermission.microphone);
       if (!mounted || !_foreground) return;
       if (outcome != PermissionOutcome.granted) {
+        final int seq = _permissionSpeechSeq++;
         _say(_request(
-          id: 'headset-microphone-permission-${_permissionSpeechSeq++}',
-          eventId: 'headset-microphone-permission-$_permissionSpeechSeq',
+          id: 'headset-microphone-permission-$seq',
+          eventId: 'headset-microphone-permission-$seq',
           kind: SpeechKind.alert,
           text: _guideResolvedSeen
               ? permissionDeniedText(GuidePermission.microphone)
@@ -4917,10 +5233,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (!_microphoneInitialized) {
         await _initializeMicrophone();
         if (!mounted || !_foreground) return;
-        if (!_microphoneInitialized || _localAsrBroken) {
+        if (!_microphoneInitialized) {
+          final int seq = _permissionSpeechSeq++;
           _say(_request(
-            id: 'headset-microphone-init-${_permissionSpeechSeq++}',
-            eventId: 'headset-microphone-init-$_permissionSpeechSeq',
+            id: 'headset-microphone-init-$seq',
+            eventId: 'headset-microphone-init-$seq',
             kind: SpeechKind.alert,
             text: '语音识别初始化失败，请稍后重试。',
           ));
@@ -5523,6 +5840,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// restarts the straight timer so the re-armed 3 s cadence
   /// can actually fire.
   void _exitYoloRiskState(DateTime now) {
+    _ttsRecovery.stopDanger();
     _yoloRiskActive = false;
     if (_tasks.state == TaskState.avoidingObstacle) {
       _tasks.transitionTo(TaskState.navigating, trigger: 'yolo-cleared');
@@ -5703,7 +6021,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // vehicle's relative closing speed must beat v_ego
       // by the configured margin to count as "approaching".
       ego: egoNow,
-      commit: navigating,
+      commit: _hazardWatchActive,
     );
     // M2 section 3.1: the adaptive frame rate follows the
     // pipeline's own frame (danger and live tracks come
@@ -5734,6 +6052,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // no live navigation is running.
     _updateCloudTriggerEvidence(result, egoNow, now);
     _evaluateCloudAutoTriggers(now);
+    unawaited(_walkingHazardScan.tick(
+      navigating: _liveNav != null && navigating,
+      walking: egoNow.isWalking,
+      busy: _cloudAutoBudget.inFlight || _cloudVisionFlow.inFlight,
+      now: now,
+    ));
     // S3 segment 2 START: the pipeline has returned.
     // (Stamped on the segment clock -- the wall clock in
     // production; a test may install a fake through the
@@ -5769,15 +6093,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // for a warning alert's step. No speech accompanies a
     // pre-urgent entry -- the urgent speech still comes
     // only through the confirmed alert path below.
-    if (navigating) {
+    if (_hazardWatchActive) {
       for (final ({int trackId, bool urgent}) v in result.vibrations) {
-        unawaited(
-            v.urgent ? _haptics.vibrateUrgent() : _haptics.vibrateWarning());
+        if (_ttsFailed && result.riskPresent) {
+          _ttsRecovery.danger(
+            trackId: v.trackId,
+            level: v.urgent ? DangerLevel.urgent : DangerLevel.warning,
+          );
+        } else {
+          unawaited(
+              v.urgent ? _haptics.vibrateUrgent() : _haptics.vibrateWarning());
+        }
       }
     }
     if (result.riskPresent) {
       _yoloEmptyFrames = 0;
-      if (navigating && !_yoloRiskActive) {
+      if (_hazardWatchActive && !_yoloRiskActive) {
         _enterYoloRiskState();
       }
     } else {
@@ -5788,6 +6119,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     final HazardAlert? alert = result.alert;
     if (alert == null) return;
+    if (_ttsFailed && alert.urgent && _yoloRiskActive) {
+      _ttsRecovery.danger(
+        trackId: alert.trackId,
+        level: alert.urgent ? DangerLevel.urgent : DangerLevel.warning,
+      );
+    }
     // NH-M1-13: NO vibration dispatch here any more --
     // the alert's vibration (when its ladder step allows
     // one) was already dispatched in parallel with the
@@ -5796,11 +6133,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // speech; spec section 2.5 timing is unchanged).
     // Dispatching again here was duplicate source (ii):
     // the same urgent frame vibrated twice.
-    String text = alert.phrase;
+    final String text = alert.phrase;
     if (alert.urgent) {
-      // A sideways step may ONLY come from the avoidance
-      // advisor's three-condition decision -- the tracking
-      // / TTC pipeline never produces a direction itself.
       final AvoidanceDecision decision = _avoidance.decide(
         hazard: alert.detection,
         orientationStable: _orientation.isStable,
@@ -5808,11 +6142,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // M2 section 3.3 evidence: the advisor's most
       // recent verdict feeds the pathBlocked trigger.
       _lastAdvisorAdvice = decision.advice;
-      if (decision.advice == StepAdvice.stepLeft) {
-        text = '$text，向左迈一步';
-      } else if (decision.advice == StepAdvice.stepRight) {
-        text = '$text，向右迈一步';
-      }
       // (The pre-3.3 automatic cloud hazard frame that
       // used to fire here on a near-centre alert is
       // deleted: automatic cloud calls are now only the
@@ -5825,12 +6154,23 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // when the request starts playing and the engine's
     // speak-start callback closes the segment.
     _hazardSpeakSegmentStarts[requestId] = pipelineReturnedAt;
+    _lastNavHazPhrase = '$text。';
+    _lastNavHazKind = alert.speechKind;
+    _lastNavHazUrgent = alert.urgent;
     _say(_request(
       id: requestId,
       eventId: 'navhaz-track-${alert.trackId}',
       text: '$text。',
       kind: alert.speechKind,
     ));
+    if (alert.urgent) {
+      _say(_request(
+        id: '$requestId-cane',
+        eventId: 'navhaz-cane',
+        text: '用盲杖确认。',
+        kind: SpeechKind.alert,
+      ));
+    }
     _logMsg('NAVHAZ ${alert.urgent ? '紧急' : '警示'}：$text'
         '（track ${alert.trackId}）。');
   }
@@ -5853,9 +6193,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         .where((PerceptionEvent e) =>
             e.isNewTrack && _yoloObstacleLabels.containsKey(e.label))
         .toList();
-    if (newObstacles.isNotEmpty &&
-        (_tasks.state == TaskState.navigating ||
-            _tasks.state == TaskState.avoidingObstacle)) {
+    if (newObstacles.isNotEmpty && _hazardWatchActive) {
       // Risk onset (only the FIRST obstacle flips the state
       // and enters the unified straight pause). The danger
       // SPEECH below is deliberately NOT gated on
@@ -5890,11 +6228,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
       if (chosen != null) {
         // The announcement text comes from the avoidance
-        // advisor: it names the hazard category and adds a
-        // one-step direction ONLY when all three conditions
-        // hold (central + near, other side clear for 3+
-        // frames, orientation stable); otherwise it is the
-        // stop instruction.
+        // advisor: it names the hazard and instructs the user
+        // to stop and check with a cane.
         Detection? representative;
         for (final Detection d in detections) {
           if (dangerCategoryFor(d.label) == chosen &&
@@ -5936,6 +6271,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _onYoloViewError(Object error) {
+    _ttsRecovery.stopDanger();
     // Classified, never raw: a CAMERA
     // PERMISSION denial and a MODEL LOAD
     // failure get DIFFERENT announcements --
@@ -6012,6 +6348,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// only after the view has actually unmounted
   /// (yoloLiveViewDisposed). Safe to call when not open.
   void _closeYoloLiveView() {
+    _ttsRecovery.stopDanger();
     _yoloLiveOpen = false;
     _updateForegroundPolicies();
     final CameraLease? lease = _yoloLease;
@@ -6227,6 +6564,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     _tasks.transitionTo(TaskState.navigating, trigger: 'obstacle-cleared');
+    _ttsRecovery.stopDanger();
     setState(() {
       _riskActive = false;
       _straightConfirmed = true;
@@ -6280,7 +6618,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           '步数方向：${assessment.stepDirection?.name ?? 'none'}。'
           '注意：播报完成不等于动作完成，需下一步重新感知确认。';
     });
-    _logMsg('障碍（侧方已确认）：仅在演示数据确认右侧可通行时才给出一步指令。');
+    _logMsg('障碍（侧方已确认）：请停下，用盲杖确认。');
     _say(_request(
       id: 'obstacle-confirmed-prompt',
       eventId: 'obstacle-confirmed',
@@ -6300,6 +6638,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       now,
     );
     _tasks.transitionTo(TaskState.navigating, trigger: 'action-verified');
+    _ttsRecovery.stopDanger();
     setState(() {
       _riskActive = false;
       _straightConfirmed = true;
@@ -6583,7 +6922,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _logMsg('云端视觉：429 退避中，手动识图已跳过，只用本地检测。');
       return;
     }
-    if (!_cloudAutoBudget.tryBegin(VisionTrigger.manual, now)) {
+    if (_walkingHazardScan.inFlight ||
+        !_cloudAutoBudget.tryBegin(VisionTrigger.manual, now)) {
       _logMsg('云端视觉：已有云端请求在进行中，手动识图已跳过。');
       _say(_request(
         id: 'cloud-vision-busy-${now.millisecondsSinceEpoch}',
@@ -6659,6 +6999,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// budget records a dispatch only when a request will
   /// actually go out.
   void _evaluateCloudAutoTriggers(DateTime now) {
+    if (_walkingHazardScan.inFlight) return;
     if (!NavHazConfig.cloudAutoTriggerEnabled) return;
     final NavigationTracker? nav = _liveNav;
     if (nav == null) return;
@@ -6745,7 +7086,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
   }
 
-  /// Shared failure handling for the two automatic
+  /// Shared failure handling for automatic
   /// triggers. Returns true when [failure] was non-null
   /// and has been fully handled: a 429 records a backoff
   /// strike (and speaks the once-per-episode notice when
@@ -6753,24 +7094,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// fixed downgrade sentence through its gate.
   bool _handleAutoVisionFailure(CloudVisionFailure? failure) {
     if (failure == null) return false;
-    if (failure == CloudVisionFailure.rateLimited) {
-      if (mounted) {
-        _logMsg('云端识图：请求过于频繁，已按退避策略处理，其间只用本地检测。');
-      }
-      if (_visionBackoff.onRateLimited(DateTime.now())) {
-        _say(_request(
-          id: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
-          eventId: 'vision-429-${DateTime.now().millisecondsSinceEpoch}',
-          text: '识图暂时繁忙，稍后会自动重试，其间继续用本地检测。',
-          kind: SpeechKind.alert,
-        ));
-      }
-      return true;
-    }
+    final String? speech = autoVisionFailureSpeech(
+        failure, DateTime.now(), _visionBackoff, _visionDowngrade);
     if (mounted) {
-      _logMsg('云端识图：自动触发请求失败，已降级为本地检测。');
+      _logMsg(failure == CloudVisionFailure.rateLimited
+          ? '云端识图：请求过于频繁，已按退避策略处理，其间只用本地检测。'
+          : '云端识图：自动触发请求失败，已降级为本地检测。');
     }
-    _announceVisionDowngrade();
+    if (speech != null) {
+      final id = 'vision-failure-${DateTime.now().millisecondsSinceEpoch}';
+      _say(_request(id: id, eventId: id, text: speech, kind: SpeechKind.alert));
+    }
     return true;
   }
 
@@ -6836,7 +7170,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// Speak the fixed cloud-vision downgrade sentence,
   /// rate-limited by [_visionDowngrade]: repeated cloud
   /// failures (for example while the FC still runs an
-  /// older build) announce ONCE per cooldown window,
+  /// older build) announce ONCE per failure episode,
   /// never on every trigger.
   void _announceVisionDowngrade() {
     if (!mounted) return;
@@ -6847,6 +7181,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       text: cloudVisionDowngradeSpeech,
       kind: SpeechKind.alert,
     ));
+  }
+
+  Future<HazardScanOutcome?> _captureWalkingHazard(DateTime now) async {
+    if (!_cloudVisionClient.isConfigured) {
+      return const HazardScanOutcome.failed(CloudVisionFailure.notConfigured);
+    }
+    if (!_visionBackoff.allow(now)) return null;
+    if (!_cloudVisionClient.tryReserve(now)) return null;
+    if (_permissionGateway.isAvailable &&
+        !_grantedPermissions.contains(GuidePermission.camera) &&
+        (!_guideResolvedSeen ||
+            await _permissionStatus(GuidePermission.camera) !=
+                PermissionOutcome.granted)) {
+      return null;
+    }
+    final CameraFrameCapture capture = await _frameSource.captureSingleFrame();
+    if (!capture.ok || capture.bytes == null) {
+      return const HazardScanOutcome.failed(CloudVisionFailure.noImage);
+    }
+    return _cloudVisionClient.describeHazardReserved(
+        imageBytes: capture.bytes!);
   }
 
   Future<void> _runCloudVisionAssist() async {
@@ -6893,7 +7248,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             alert: true,
             requireDelivery: true,
           );
-          if (!delivered || !mounted || token.isCancelled) return;
+          if (!mounted || token.isCancelled) return;
+          if (!delivered) {
+            final int seq = _permissionSpeechSeq++;
+            _say(_request(
+              id: 'manual-camera-purpose-$seq',
+              eventId: 'manual-camera-purpose-$seq',
+              kind: SpeechKind.alert,
+              text: permissionPurposeUndeliveredText,
+            ));
+            return;
+          }
           final int generation =
               (_permissionRequestGeneration[GuidePermission.camera] ?? 0) + 1;
           _permissionRequestGeneration[GuidePermission.camera] = generation;
@@ -6911,6 +7276,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                 _grantedPermissions.add(GuidePermission.camera);
               }
             }, onError: (Object _, StackTrace __) {}));
+            if (mounted && !token.isCancelled) {
+              final int seq = _permissionSpeechSeq++;
+              _say(_request(
+                id: 'manual-camera-timeout-$seq',
+                eventId: 'manual-camera-timeout-$seq',
+                kind: SpeechKind.alert,
+                text: permissionRequestTimeoutText,
+              ));
+            }
             return;
           } catch (_) {
             status = PermissionOutcome.denied;
@@ -6973,6 +7347,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _visionBackoff.onRateLimited(DateTime.now());
       } else if (runCompleted && runFailure == null) {
         _visionBackoff.onSuccess();
+        _visionDowngrade.noteSuccess();
       }
       if (_manualSlotOwned) {
         // Release the section 3.3 budget's shared
@@ -7081,7 +7456,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.pause:
-        if (_tasks.canTransitionTo(TaskState.paused)) {
+        if (_tasks.state == TaskState.paused &&
+            _tasks.history.isNotEmpty &&
+            _tasks.history.last.trigger == 'tts-failure') {
+          _userPausedDuringTtsFailure = true;
+          unawaited(_stopSpeechThenConfirm(
+            idPrefix: 'voice-pause',
+            confirmText: '已暂停导航，直行提醒已停止。说继续可以恢复，但要重新确认直行路段。',
+          ));
+        } else if (_tasks.canTransitionTo(TaskState.paused)) {
           _tasks.transitionTo(TaskState.paused, trigger: 'voice-pause');
           _stopStraightTimer();
           _scheduler.pauseStraight();
@@ -7114,6 +7497,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.resume:
+        _userPausedDuringTtsFailure = false;
         // v0.7: while navigating with straight unconfirmed and no
         // risk, "继续" re-confirms the straight segment (e.g. after a
         // YOLO obstacle cleared). It never resumes straight while a
@@ -7146,6 +7530,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.cancel:
+        _userPausedDuringTtsFailure = false;
         if (_tasks.canTransitionTo(TaskState.cancelled)) {
           _tasks.transitionTo(TaskState.cancelled, trigger: 'voice-cancel');
           _endLiveNavigation();
@@ -7300,6 +7685,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _triggerEmergency() {
+    _userPausedDuringTtsFailure = false;
+    _ttsRecovery.stopDanger();
+    _emergencyTriggerCount++;
     final DateTime now = DateTime.now();
     _events.publish(
       MingtuEvent(
@@ -7344,15 +7732,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // A blind user in an emergency cannot read the screen for them,
     // and must never be left waiting for a help station that was
     // never actually contacted.
+    _speakEmergencyFallback(result);
+  }
+
+  void _speakEmergencyFallback(EmergencyResult result,
+      {String prefix = '', String eventId = 'emergency-1'}) {
     _say(_request(
-      id: 'emergency-1',
-      eventId: 'emergency-1',
-      text: '${result.statusText}备用办法：${result.fallbackOptions.join('；')}。',
+      id: eventId,
+      eventId: eventId,
+      text: '$prefix${result.statusText}备用办法：${result.fallbackOptions.join('；')}。',
       kind: SpeechKind.emergency,
     ));
   }
 
   void _resetDemo() {
+    _userPausedDuringTtsFailure = false;
+    _ttsRecovery.stopDanger();
     _stopStraightTimer();
     if (_tasks.state == TaskState.emergency || _tasks.isTerminal) {
       _tasks.reset();
@@ -7442,94 +7837,114 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _toggleModeNow = toggleMode;
     final bool pttActive = _pttState != _PttState.idle;
     return Scaffold(
-      body: SafeArea(
-        left: false,
-        right: false,
-        bottom: false,
-        child: Semantics(
-          button: true,
-          container: true,
-          label: toggleMode
-              ? (pttActive
-                  ? talkBackToggleListeningLabel
-                  : talkBackToggleIdleLabel)
-              : '按住说话按钮，按住后说话，松开结束',
-          value: _bigStatusText(),
-          onTap: toggleMode
-              ? () {
-                  if (!_pocketMode.ignoreTouches) _pttToggleTap();
+      body: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (event) => _emergencyPointerDown(event.pointer),
+        onPointerUp: (event) => _emergencyPointerUp(event.pointer),
+        onPointerCancel: (event) => _emergencyPointerUp(event.pointer),
+        child: SafeArea(
+          left: false,
+          right: false,
+          bottom: false,
+          child: Semantics(
+            button: true,
+            container: true,
+            label: toggleMode
+                ? (pttActive
+                    ? talkBackToggleListeningLabel
+                    : talkBackToggleIdleLabel)
+                : '按住说话按钮，按住后说话，松开结束',
+            value: _bigStatusText(),
+            onTap: toggleMode
+                ? () {
+                    if (!_pocketMode.ignoreTouches) _pttToggleTap();
+                  }
+                : null,
+            customSemanticsActions: <CustomSemanticsAction, VoidCallback>{
+              const CustomSemanticsAction(label: '紧急求助'): () {
+                if (!_pocketMode.ignoreTouches) {
+                  _requestEmergencyConfirm(
+                    confirmationText: '即将发起紧急求助，再次选择紧急求助确认',
+                  );
                 }
-              : null,
-          onLongPress: () {
-            if (!_pocketMode.ignoreTouches) {
-              if (toggleMode) {
-                _pttToggleStart();
-              } else {
-                _talkBackLongPress();
+              },
+            },
+            onLongPress: () {
+              if (!_pocketMode.ignoreTouches) {
+                if (toggleMode) {
+                  _pttToggleStart();
+                } else {
+                  _talkBackLongPress();
+                }
               }
-            }
-          },
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            excludeFromSemantics: true,
-            onLongPressStart: (_) {
-              if (!_pocketMode.ignoreTouches) _pushToTalkStart();
             },
-            onLongPressEnd: (_) {
-              _pushToTalkEnd();
-            },
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                // Camera preview area (upper half). While the
-                // live view is open it hosts YoloLiveView;
-                // otherwise the area is simply blank.
-                Expanded(
-                  child: IgnorePointer(
-                    child: ExcludeSemantics(
-                      child: _yoloLiveOpen
-                          ? YoloLiveView(
-                              modelPath: AppConfig.yoloModelPath,
-                              onDetections: _onYoloDetections,
-                              onLatencyMs: (double ms) {
-                                setState(() {
-                                  _yoloLatencyMs = ms;
-                                });
-                              },
-                              onError: _onYoloViewError,
-                            )
-                          : Container(
-                              key:
-                                  const ValueKey<String>('camera-preview-area'),
-                              color: Colors.black12,
-                            ),
-                    ),
-                  ),
-                ),
-                // The one very large push-to-talk area (lower
-                // half): a plain colour block with no caption.
-                // Hold: vibrate, stop any lower-priority speech, speak
-                // the cue and await it, then listen while held.
-                // Release: stop listening and submit the result.
-                // The area is never disabled: with no recogniser
-                // the press still produces the vibrated, spoken
-                // failure feedback instead of dead silence. The
-                // semantics node carries a long-press action so
-                // TalkBack users can trigger the same
-                // press-and-hold flow.
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
-                    child: Container(
-                      key: const ValueKey<String>('push-to-talk-area'),
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.primaryContainer,
-                        borderRadius: BorderRadius.circular(16),
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              excludeFromSemantics: true,
+              onLongPressStart: (_) {
+                if (!_pocketMode.ignoreTouches) _pushToTalkStart();
+              },
+              onLongPressEnd: (_) {
+                if (!_pocketMode.ignoreTouches ||
+                    _pttToggleSessionId != _pttSession) {
+                  _pushToTalkEnd();
+                }
+              },
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  // Camera preview area (upper half). While the
+                  // live view is open it hosts YoloLiveView;
+                  // otherwise the area is simply blank.
+                  Expanded(
+                    child: IgnorePointer(
+                      child: ExcludeSemantics(
+                        child: _yoloLiveOpen
+                            ? (mingtuYoloViewBuilderOverride
+                                    ?.call(_onYoloViewError) ??
+                                YoloLiveView(
+                                  modelPath: AppConfig.yoloModelPath,
+                                  onDetections: _onYoloDetections,
+                                  onLatencyMs: (double ms) {
+                                    setState(() {
+                                      _yoloLatencyMs = ms;
+                                    });
+                                  },
+                                  onError: _onYoloViewError,
+                                ))
+                            : Container(
+                                key: const ValueKey<String>(
+                                    'camera-preview-area'),
+                                color: Colors.black12,
+                              ),
                       ),
                     ),
                   ),
-                ),
-              ],
+                  // The one very large push-to-talk area (lower
+                  // half): a plain colour block with no caption.
+                  // Hold: vibrate, stop any lower-priority speech, speak
+                  // the cue and await it, then listen while held.
+                  // Release: stop listening and submit the result.
+                  // The area is never disabled: with no recogniser
+                  // the press still produces the vibrated, spoken
+                  // failure feedback instead of dead silence. The
+                  // semantics node carries a long-press action so
+                  // TalkBack users can trigger the same
+                  // press-and-hold flow.
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
+                      child: Container(
+                        key: const ValueKey<String>('push-to-talk-area'),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.primaryContainer,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),

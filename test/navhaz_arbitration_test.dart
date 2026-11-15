@@ -446,6 +446,9 @@ void main() {
 
 /// Recording haptics on the test's shared timeline.
 class _FakeHaptics implements Haptics {
+  @override
+  Future<void> vibrateCooldown() async {}
+
   final List<String> timeline;
   _FakeHaptics(this.timeline);
 

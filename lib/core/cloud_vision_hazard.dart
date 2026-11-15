@@ -230,7 +230,7 @@ String? hazardGroundSpeech(HazardAssessment a) {
 /// and no direction is derived from it.
 String? hazardPavingSpeech(HazardAssessment a) {
   if (!a.parsed || a.type != HazardType.tactilePaving) return null;
-  return '识别到前方有盲道，是否畅通无法确认，请以盲杖探测为准。'
+  return '识别到前方有盲道，是否被占用无法确认，请以盲杖探测为准。'
       '提醒：$cloudVisionDisclaimer';
 }
 
@@ -281,38 +281,19 @@ String hazardDescriptionSpeech(HazardAssessment a) {
 /// no server string is ever copied into it.
 const String cloudVisionDowngradeSpeech = '云端识图暂不可用，请慢行。';
 
-/// Announce-once + rate limit for
-/// [cloudVisionDowngradeSpeech]. A cloud path that keeps
-/// failing (for example against an old FC deployment) must
-/// tell the user ONCE that cloud vision is unavailable and
-/// then stay quiet for [announceCooldown]; without the gate,
-/// a repeating trigger would repeat the sentence forever.
-/// A successful call resets the gate, so the next failure
-/// episode may speak once again.
+/// Announces once per failure episode. A successful call re-arms the gate.
 class CloudVisionDowngradeGate {
-  final Duration announceCooldown;
+  bool _announced = false;
 
-  DateTime? _lastAnnouncedAt;
-
-  CloudVisionDowngradeGate({
-    this.announceCooldown = const Duration(seconds: 60),
-  });
-
-  /// True when the downgrade sentence may be spoken at
-  /// [now]; records the announcement when it returns true.
+  /// Records the first announcement until [noteSuccess] resets the gate.
   bool shouldAnnounce(DateTime now) {
-    final DateTime? last = _lastAnnouncedAt;
-    if (last != null && now.difference(last) < announceCooldown) {
-      return false;
-    }
-    _lastAnnouncedAt = now;
+    if (_announced) return false;
+    _announced = true;
     return true;
   }
 
-  /// A scan succeeded: the next failure is a new episode
-  /// and may be announced once again.
   void noteSuccess() {
-    _lastAnnouncedAt = null;
+    _announced = false;
   }
 }
 
@@ -354,6 +335,19 @@ class VisionRateBackoff {
 
   DateTime? get blockedUntil => _blockedUntil;
   int get strikes => _strikes;
+}
+
+const String cloudVisionBusySpeech = '识图暂时繁忙，稍后会自动重试，其间继续用本地检测。';
+
+/// Records an automatic failure and returns the announcement, if due.
+String? autoVisionFailureSpeech(CloudVisionFailure failure, DateTime now,
+    VisionRateBackoff backoff, CloudVisionDowngradeGate gate) {
+  if (failure == CloudVisionFailure.rateLimited) {
+    return backoff.onRateLimited(now) && gate.shouldAnnounce(now)
+        ? cloudVisionBusySpeech
+        : null;
+  }
+  return gate.shouldAnnounce(now) ? cloudVisionDowngradeSpeech : null;
 }
 
 /// What can start a cloud-vision request (M2 section

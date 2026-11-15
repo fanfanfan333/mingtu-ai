@@ -36,6 +36,12 @@ class DeviceHaptics extends NoOpHaptics {
       );
 
   @override
+  Future<void> vibrateCooldown() => vibratePattern(
+        NavHazConfig.cooldownVibrationTimings,
+        NavHazConfig.cooldownVibrationAmplitudes,
+      );
+
+  @override
   Future<void> vibratePattern(
       List<int> timings, List<int> amplitudes) async {
     try {

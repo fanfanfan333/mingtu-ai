@@ -77,8 +77,7 @@ class RiskAssessment {
 }
 
 class RiskEngine {
-  /// Minimum spatial confidence required before any precise step
-  /// instruction may be produced.
+  /// Minimum spatial confidence for confirmed-side evidence.
   static const double minSpatialConfidenceForStep = 0.6;
 
   RiskAssessment assess(RiskEvent event, DateTime now) {
@@ -147,19 +146,16 @@ class RiskEngine {
         reason: 'close-moving-towards-user',
       );
     }
-    // Confirmed safe side + sufficient spatial evidence -> step allowed.
-    final sideText =
-        ev.confirmedSafeSide == StepDirection.left ? '向左移动一步' : '向右移动一步';
+    // Confirmed side evidence still requires stopping and cane confirmation.
     final level = (ev.distanceM != null && ev.distanceM! < 3.0)
         ? RiskLevel.r3
         : RiskLevel.r2;
     return RiskAssessment(
       level: level,
-      action: RiskAction.caution,
-      speechText:
-          '前方有障碍，已确认${ev.confirmedSafeSide == StepDirection.left ? '左侧' : '右侧'}有可通行空间。$sideText',
+      action: RiskAction.stop,
+      speechText: '前方有障碍，请停下，用盲杖确认。',
       reason: 'confirmed-side-space',
-      stepDirection: ev.confirmedSafeSide,
+      stepDirection: StepDirection.none,
     );
   }
 

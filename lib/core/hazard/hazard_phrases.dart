@@ -9,10 +9,8 @@
 ///   10 m, 5 m steps beyond).
 /// - Templates stay short (the spec's examples run to about
 ///   a dozen characters) and imperative for urgent alerts.
-/// - A step direction is NEVER produced here: sideways-step
-///   wording may only come from the avoidance advisor's
-///   three-condition rule, appended by the caller at urgent
-///   level. TTC and tracking results cannot produce one.
+/// - No sideways-step command is produced by the advisor or
+///   appended by the caller. TTC and tracking cannot produce one.
 library;
 
 import '../avoidance_advisor.dart';
@@ -27,6 +25,10 @@ const List<String> bannedAnnouncementWords = <String>[
   '可以' '通行',
   '放' '心',
   '可以过' '马路',
+  '畅' '通',
+  '没有' '障碍',
+  '放' '心走',
+  '安' '全通过',
 ];
 
 /// Fixed replacement spoken when an announcement fails the
@@ -624,10 +626,7 @@ Set<String> reachableMetresTexts() {
 ///   category -- so these two entries exceed the cap
 ///   rather than lie; every label in the current
 ///   detector vocabulary fits the cap.
-/// NO distance figure and NO step direction, as before
-/// (a sideways step still comes only from the avoidance
-/// advisor's three-condition rule, appended at speech
-/// time exactly as for the normal form). Every form
+/// NO distance figure and NO step direction. Every form
 /// passes the banned-word scan (asserted in the phrase
 /// tests and the exhaustion corpus: this table is part
 /// of [enumerateAllHazardPhrases]' space via

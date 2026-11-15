@@ -28,6 +28,11 @@ abstract class Haptics {
         NavHazConfig.warningVibrationTimings,
         NavHazConfig.warningVibrationAmplitudes,
       );
+  /// Cooldown feedback, distinct from hazard warnings.
+  Future<void> vibrateCooldown() => vibratePattern(
+        NavHazConfig.cooldownVibrationTimings,
+        NavHazConfig.cooldownVibrationAmplitudes,
+      );
 }
 
 /// No-op haptics: tests that do not care about vibration,
@@ -44,10 +49,13 @@ class NoOpHaptics implements Haptics {
 
   @override
   Future<void> vibrateWarning() async {}
+
+  @override
+  Future<void> vibrateCooldown() async {}
 }
 
 /// Recording fake for tests: every call is logged with its
-/// kind ('urgent' / 'warning' / 'pattern') in call order.
+/// kind ('urgent' / 'warning' / 'cooldown' / 'pattern') in call order.
 class RecordingHaptics implements Haptics {
   final List<String> calls = <String>[];
   final List<List<int>> patterns = <List<int>>[];
@@ -70,6 +78,12 @@ class RecordingHaptics implements Haptics {
     calls.add('warning');
     patterns.add(NavHazConfig.warningVibrationTimings);
   }
+  @override
+  Future<void> vibrateCooldown() async {
+    calls.add('cooldown');
+    patterns.add(NavHazConfig.cooldownVibrationTimings);
+  }
+
 }
 
 /// Observable record of vibration failures reported by

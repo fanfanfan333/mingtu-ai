@@ -904,8 +904,8 @@ void main() {
       // The danger lands: a physical stop is issued AFTER
       // the turn speak and BEFORE the danger speak.
       await tapPanelText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
-      await pumpUntilSpeak(tester, h, '前方有机动车，请停下。');
-      final int dangerIdx = h.events.indexOf('tts.speak:前方有机动车，请停下。');
+      await pumpUntilSpeak(tester, h, '前方有机动车，请停下，用盲杖确认。');
+      final int dangerIdx = h.events.indexOf('tts.speak:前方有机动车，请停下，用盲杖确认。');
       expect(dangerIdx, greaterThan(turnIdx), reason: '${h.events}');
       final int stopIdx =
           h.events.indexWhere((String e) => e == 'tts.stop', turnIdx);
@@ -1197,8 +1197,8 @@ void main() {
       await drainVoice(tester, h, rounds: 6);
       h.events.clear();
       await tapPanelText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
-      await pumpUntilSpeak(tester, h, '前方有机动车，请停下。');
-      final int dangerIdx = h.events.indexOf('tts.speak:前方有机动车，请停下。');
+      await pumpUntilSpeak(tester, h, '前方有机动车，请停下，用盲杖确认。');
+      final int dangerIdx = h.events.indexOf('tts.speak:前方有机动车，请停下，用盲杖确认。');
       expect(dangerIdx, greaterThanOrEqualTo(0),
           reason: '${h.events}');
 
@@ -1215,7 +1215,7 @@ void main() {
           reason: '${h.events}');
       expect(
         h.speakQueue.any((MapEntry<String, Completer<dynamic>> e) =>
-            e.key == '前方有机动车，请停下。' && !e.value.isCompleted),
+            e.key == '前方有机动车，请停下，用盲杖确认。' && !e.value.isCompleted),
         isTrue,
         reason: '${h.events}',
       );
@@ -1230,7 +1230,7 @@ void main() {
 
       // The danger finishes NORMALLY: the still-held
       // press now enters prompting on its own.
-      expect(h.completeSpeak('前方有机动车，请停下。'), isTrue);
+      expect(h.completeSpeak('前方有机动车，请停下，用盲杖确认。'), isTrue);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
       await pumpUntilSpeak(tester, h, '请说');
@@ -1278,7 +1278,7 @@ void main() {
       await drainVoice(tester, h, rounds: 6);
       h.events.clear();
       await tapPanelText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
-      await pumpUntilSpeak(tester, h, '前方有机动车，请停下。');
+      await pumpUntilSpeak(tester, h, '前方有机动车，请停下，用盲杖确认。');
 
       // Press during the P0 prompt: vibration only.
       final TestGesture gesture = await pressPtt(tester, h);
@@ -1296,7 +1296,7 @@ void main() {
       // The danger now finishes normally -- and nothing
       // about the dead press may appear afterwards: no
       // cue, no session, no PTT notice of any kind.
-      expect(h.completeSpeak('前方有机动车，请停下。'), isTrue);
+      expect(h.completeSpeak('前方有机动车，请停下，用盲杖确认。'), isTrue);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 300));
       await tester.pump(const Duration(seconds: 2));

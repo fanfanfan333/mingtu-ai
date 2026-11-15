@@ -541,6 +541,17 @@ void main() {
       expect(containsBannedWord(urgentCar), isFalse);
     });
 
+    test('expanded banned phrases are detected in announcements', () {
+      for (final String phrase in <String>[
+        '畅通', '没有障碍', '放心走', '安全通过',
+      ]) {
+        expect(containsBannedWord('前方$phrase'), isTrue, reason: phrase);
+        expect(() => assertNoBannedWords('前方$phrase'),
+            throwsA(isA<AssertionError>()), reason: phrase);
+      }
+      expect(containsBannedWord('前方不可以走，请停下。'), isFalse);
+    });
+
     test('the fallback sentence itself is clean', () {
       expect(containsBannedWord(bannedWordFallbackPhrase), isFalse);
     });
@@ -587,6 +598,10 @@ void main() {
         <String>['可以', '通行'].join(),
         <String>['放', '心'].join(),
         <String>['可以', '过马路'].join(),
+        <String>['畅', '通'].join(),
+        <String>['没有', '障碍'].join(),
+        <String>['放心', '走'].join(),
+        <String>['安全', '通过'].join(),
       ];
       final List<File> files = Directory('lib')
           .listSync(recursive: true)
@@ -622,6 +637,10 @@ void main() {
         <String>['可以', '通行'].join(),
         <String>['放', '心'].join(),
         <String>['可以', '过马路'].join(),
+        <String>['畅', '通'].join(),
+        <String>['没有', '障碍'].join(),
+        <String>['放心', '走'].join(),
+        <String>['安全', '通过'].join(),
       ];
       final List<File> files = Directory('lib')
           .listSync(recursive: true)

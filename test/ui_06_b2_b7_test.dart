@@ -1032,6 +1032,8 @@ void main() {
     final frames = _CountingFrameSource();
     mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
     final purpose = permissionPurposeText(GuidePermission.camera);
+    var now = DateTime(2026);
+    mingtuHomeDebugHandle!.debugSetSpeechClock(() => now);
     mingtuHomeDebugHandle!.triggerManualVision();
     await _driveUntil(tester, h, () => h.events.contains('tts.speak:$purpose'),
         'camera purpose',
@@ -1040,6 +1042,40 @@ void main() {
     expect(gateway.requested, isNot(contains(GuidePermission.camera)));
     expect(frames.calls, 0);
     expect(containsBannedWord(purpose), isFalse);
+    now = now.add(const Duration(seconds: 31));
+    await tester.pump(const Duration(seconds: 1));
+    await _pumpSpeaks(tester, h, rounds: 3);
+    await _driveUntil(
+        tester,
+        h,
+        () => h.events.contains('tts.speak:$permissionPurposeUndeliveredText'),
+        'undelivered alert',
+        hold: {purpose});
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
+  });
+
+  testWidgets('B12 manual camera request timeout announces alert',
+      (tester) async {
+    store.seen = true;
+    gateway.requestHangs[GuidePermission.camera] =
+        Completer<PermissionOutcome>();
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    final frames = _CountingFrameSource();
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(frames);
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.camera),
+        'camera request');
+    await tester.pump(const Duration(seconds: 120));
+    await _driveUntil(
+        tester,
+        h,
+        () => h.events.contains('tts.speak:$permissionRequestTimeoutText'),
+        'timeout alert');
+    expect(frames.calls, 0);
   });
 
   testWidgets('B12 permanent camera denial does not request', (tester) async {
@@ -1166,6 +1202,28 @@ void main() {
         h.events,
         isNot(contains(
             'tts.speak:${permissionDeniedText(GuidePermission.microphone)}')));
+  });
+
+  testWidgets('B13 late denial does not resume flow', (tester) async {
+    final answer = Completer<PermissionOutcome>();
+    gateway.requestHangs[GuidePermission.microphone] = answer;
+    final h = await _openApp(tester);
+    await _driveUntil(
+        tester,
+        h,
+        () => gateway.requested.contains(GuidePermission.microphone),
+        'request');
+    await tester.pump(const Duration(seconds: 120));
+    await _driveUntil(
+        tester,
+        h,
+        () => h.events.contains('tts.speak:$permissionRequestTimeoutText'),
+        'timeout speech');
+    final before = mingtuHomeDebugHandle!.microphoneInitializeCalls;
+    answer.complete(PermissionOutcome.denied);
+    await _pumpSpeaks(tester, h, rounds: 10);
+    expect(mingtuHomeDebugHandle!.microphoneInitializeCalls, before);
+    expect(gateway.requested, isNot(contains(GuidePermission.camera)));
   });
 
   testWidgets('B10 startup with unavailable speech does not request',

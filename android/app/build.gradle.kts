@@ -4,6 +4,8 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+val includeX86 = providers.gradleProperty("mingtuIncludeX86_64").orNull == "true"
+
 android {
     namespace = "com.mingtu.ai.mingtu_ai"
     compileSdk = flutter.compileSdkVersion
@@ -29,34 +31,24 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // ABI selection is deliberately NOT fixed here: a
-        // hardcoded ndk.abiFilters conflicts with Flutter's
-        // --split-per-abi / --target-platform. The build
-        // command chooses the ABI (see the root README):
-        // --target-platform android-arm64 for 64-bit-only
-        // phones such as Xiaomi 15, no flag for a universal APK.
+        // Official releases use flutter build apk --release --target-platform android-arm64.
+        // --split-per-abi is not the official path and can conflict with these filters.
+        ndk {
+            abiFilters += "arm64-v8a"
+            if (includeX86) abiFilters += "x86_64"
+        }
     }
 
-    // APK size (the demo APK is delivered by chat, 25 MB
-    // ceiling): legacy packaging COMPRESSES the .so files
-    // inside the APK, and the jniLibs excludes drop every
-    // non-arm64 native library -- plugins such as LiteRT
-    // ship x86_64 / x86 / armeabi-v7a .so files that an
-    // android-arm64 build would otherwise still bundle
-    // (that combination produced a 61 MB package). An
-    // earlier multi-ABI build measured legacy packaging as
-    // larger; with the excludes the arm64 package is the
-    // deliverable and the target is ~20 MB. ABI selection
-    // stays in the build command: no ndk.abiFilters here
-    // (it conflicts with --split-per-abi).
+    // Compress native libraries and exclude unsupported ABIs. x86_64 is
+    // included only when explicitly enabled for tests or emulator use.
     packaging {
         jniLibs {
             useLegacyPackaging = true
             excludes += listOf(
-                "lib/x86_64/**",
                 "lib/x86/**",
                 "lib/armeabi-v7a/**"
             )
+            if (!includeX86) excludes += "lib/x86_64/**"
         }
     }
     buildTypes {

@@ -24,11 +24,15 @@
 library;
 
 import 'dart:async';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/widgets.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 
 import '../config/app_config.dart';
+import '../core/lens_occlusion.dart';
+import '../core/lens_sample_scheduler.dart';
 import '../core/navhaz_config.dart';
 import '../modules/visual_perception.dart';
 import 'yolo_detector.dart';
@@ -72,6 +76,7 @@ const Size yoloAnalysisResolution720p = Size(1280, 720);
 /// under heat): callers pass [yoloAnalysisResolution720p]
 /// while the thermal cap demands it and null otherwise
 /// (the plugin's own default analysis size).
+
 YOLOStreamingConfig yoloStreamingConfigForFps(int fps,
     {Size? analysisResolution}) {
   return YOLOStreamingConfig(
@@ -79,6 +84,52 @@ YOLOStreamingConfig yoloStreamingConfigForFps(int fps,
     inferenceFrequency: fps,
     analysisResolution: analysisResolution,
   );
+}
+
+final LensSampleScheduler _lensSampleScheduler = LensSampleScheduler();
+
+void _maybeSampleLensLuma() {
+  unawaited(_lensSampleScheduler.request(
+    _sampleLensLuma,
+    analysisCap720p: _appliedAnalysisCap720p,
+  ));
+}
+
+Future<void> _sampleLensLuma() async {
+  try {
+    if (!sharedYoloViewController.isInitialized) return;
+    final Uint8List? bytes = await sharedYoloViewController.captureFrame();
+    if (bytes == null || bytes.isEmpty) return;
+    await _submitLensGray(bytes);
+  } catch (_) {
+    // Lens sampling is best-effort and must never break detection.
+  }
+}
+
+Future<void> _submitLensGray(Uint8List bytes) async {
+  try {
+    final List<int>? gray = await _tinyGrayFromImageBytes(bytes);
+    if (gray != null && gray.isNotEmpty) {
+      submitDetectionGrayFrame(gray);
+    }
+  } catch (_) {
+    // Lens sampling is best-effort and must never break detection.
+  }
+}
+
+Future<List<int>?> _tinyGrayFromImageBytes(Uint8List bytes) async {
+  final ui.Codec codec = await ui.instantiateImageCodec(bytes, targetWidth: 32);
+  final ui.FrameInfo frame = await codec.getNextFrame();
+  final ByteData? data =
+      await frame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
+  frame.image.dispose();
+  if (data == null) return null;
+  final Uint8List rgba = data.buffer.asUint8List();
+  final List<int> gray = <int>[];
+  for (int i = 0; i + 3 < rgba.length; i += 4) {
+    gray.add((rgba[i] * 299 + rgba[i + 1] * 587 + rgba[i + 2] * 114) ~/ 1000);
+  }
+  return gray;
 }
 
 /// The frame-rate target most recently handed to the plugin
@@ -230,6 +281,7 @@ class _YoloLiveViewHostState extends State<_YoloLiveViewHost> {
                       ))
                   .toList(),
               frameCapturedAt);
+          _maybeSampleLensLuma();
         },
         onPerformanceMetrics: (YOLOPerformanceMetrics metrics) {
           widget.onLatencyMs?.call(metrics.processingTimeMs);

@@ -317,7 +317,7 @@ void main() {
       final AvoidanceAdvisor a1 = AvoidanceAdvisor();
       AvoidanceDecision d = a1.decide(hazard: car, orientationStable: true);
       expect(d.advice, StepAdvice.stopOnly);
-      expect(d.speech, '前方有机动车，请停下。');
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
       // (b) A side has cleared, but the orientation is not
       // stable: still stop only.
       final AvoidanceAdvisor a2 = AvoidanceAdvisor();
@@ -336,8 +336,8 @@ void main() {
     });
 
     test(
-        '7.7-12 a spoken avoidance instruction is not treated '
-        'as a completed avoidance: frame evidence decides', () {
+        '7.7-12 stop-only advice creates no pending action '
+        'when sides are clear and orientation is stable', () {
       const Detection car = Detection(
           label: 'car', confidence: 0.9, cx: 0.5, cy: 0.8, w: 0.4, h: 0.5);
       AvoidanceAdvisor primed() {
@@ -348,30 +348,35 @@ void main() {
         return a;
       }
 
-      // A step IS advised when all three conditions hold...
+      // Clear sides and stable orientation still yield stop-only advice.
       final AvoidanceAdvisor a1 = primed();
       final AvoidanceDecision d =
           a1.decide(hazard: car, orientationStable: true);
-      expect(d.advice, isNot(StepAdvice.stopOnly));
-      expect(a1.hasPendingAction, isTrue);
-      // ...but while the hazard stays central, the action
-      // never confirms itself; after the window it resolves
-      // as UNCERTAIN (main speaks a stop instruction then).
+      expect(d.advice, StepAdvice.stopOnly);
+      expect(a1.hasPendingAction, isFalse);
+      expect(d.speech, '前方有机动车，请停下，用盲杖确认。');
+      expect(d.speech, isNot(contains('向左迈')));
+      expect(d.speech, isNot(contains('向右迈')));
+      // Subsequent frames do not resolve an action that was never created.
       AvoidanceNotice? notice;
       for (int i = 0; i < 6; i++) {
         notice = a1.observeFrame(const <Detection>[car]);
       }
-      expect(notice, AvoidanceNotice.actionUncertain);
+      expect(notice, isNull);
       expect(a1.hasPendingAction, isFalse);
-      // Only frame evidence -- the centre clear on
-      // consecutive frames -- confirms an action.
+      // Clearing the centre likewise produces no action notice.
       final AvoidanceAdvisor a2 = primed();
-      a2.decide(hazard: car, orientationStable: true);
+      final AvoidanceDecision d2 =
+          a2.decide(hazard: car, orientationStable: true);
+      expect(d2.advice, StepAdvice.stopOnly);
+      expect(a2.hasPendingAction, isFalse);
+      expect(d2.speech, isNot(contains('向左迈')));
+      expect(d2.speech, isNot(contains('向右迈')));
       AvoidanceNotice? notice2;
       for (int i = 0; i < 2; i++) {
         notice2 = a2.observeFrame(const <Detection>[]);
       }
-      expect(notice2, AvoidanceNotice.actionConfirmed);
+      expect(notice2, isNull);
     });
 
     test(

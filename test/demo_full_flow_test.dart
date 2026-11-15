@@ -5,7 +5,7 @@ import 'package:mingtu_ai/main.dart';
 ///
 /// Covers, in order: voice start, route plan, navigate, turn,
 /// turn recovery, uncertain-side obstacle (stop, no step), its
-/// resolution, confirmed-side obstacle (one step in demo data),
+/// resolution, confirmed-side obstacle (stop and check with a cane),
 /// action re-perception, destination approach, entrance finding,
 /// indoor steps, task verification, task completion and local
 /// recording save. It does NOT prove real sensor navigation:
@@ -40,7 +40,7 @@ Future<void> drivePanelAction(WidgetTester tester, String label) async {
       h.obstacleUncertain();
     case '障碍已移开，重新评估并恢复直行':
       h.obstacleUncertainResolved();
-    case '模拟障碍：侧方已确认（仅演示数据给一步）':
+    case '模拟障碍：侧方已确认（演示数据，仍须停下）':
       h.obstacleConfirmed();
     case '动作后重新感知，确认后恢复导航':
       h.obstacleConfirmedVerified();
@@ -142,14 +142,18 @@ void main() {
     await tapText('障碍已移开，重新评估并恢复直行');
     expectTaskState('当前任务状态：正在导航');
 
-    await tapText('模拟障碍：侧方已确认（仅演示数据给一步）');
+    await tapText('模拟障碍：侧方已确认（演示数据，仍须停下）');
     expectTaskState('当前任务状态：正在避障');
-    // Prompt text plus obstacle detail text both contain the step.
-    // Prompt line + obstacle detail both carried the step;
-    // both are state now: prompt text on the handle and the
-    // detail inside the joined status texts.
-    expect(mingtuHomeDebugHandle!.currentPromptText, contains('向右移动一步'));
-    expect(mingtuHomeDebugHandle!.allStatusText, contains('向右移动一步'));
+    expect(
+        mingtuHomeDebugHandle!.currentPromptText, contains('前方有障碍，请停下，用盲杖确认。'));
+    expect(mingtuHomeDebugHandle!.allStatusText, contains('前方有障碍，请停下，用盲杖确认。'));
+    for (final text in [
+      mingtuHomeDebugHandle!.currentPromptText,
+      mingtuHomeDebugHandle!.allStatusText
+    ]) {
+      expect(text, isNot(contains('向左移动')));
+      expect(text, isNot(contains('向右移动')));
+    }
     await tapText('动作后重新感知，确认后恢复导航');
     expectTaskState('当前任务状态：正在导航');
 

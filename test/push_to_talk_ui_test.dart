@@ -942,8 +942,8 @@ void main() {
       await drainVoice(tester, h, rounds: 6);
       h.events.clear();
       await tapPanelText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
-      await pumpUntilSpeak(tester, h, '前方有机动车，请停下。');
-      final int dangerIdx = h.events.indexOf('tts.speak:前方有机动车，请停下。');
+      await pumpUntilSpeak(tester, h, '前方有机动车，请停下，用盲杖确认。');
+      final int dangerIdx = h.events.indexOf('tts.speak:前方有机动车，请停下，用盲杖确认。');
       expect(dangerIdx, greaterThanOrEqualTo(0),
           reason: '${h.events}');
 
@@ -965,7 +965,7 @@ void main() {
       // not completed early.
       expect(
         h.speakQueue.any((MapEntry<String, Completer<dynamic>> e) =>
-            e.key == '前方有机动车，请停下。' && !e.value.isCompleted),
+            e.key == '前方有机动车，请停下，用盲杖确认。' && !e.value.isCompleted),
         isTrue,
         reason: '${h.events}',
       );
@@ -984,7 +984,7 @@ void main() {
       // cancelled): the still-held deferred press now
       // enters prompting -- the cue is spoken, and
       // completing it opens the session.
-      expect(h.completeSpeak('前方有机动车，请停下。'), isTrue);
+      expect(h.completeSpeak('前方有机动车，请停下，用盲杖确认。'), isTrue);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
       expect(mingtuHomeDebugHandle!.logText,

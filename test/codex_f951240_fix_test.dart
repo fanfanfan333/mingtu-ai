@@ -48,7 +48,7 @@ Future<void> drivePanelAction(WidgetTester tester, String label) async {
       h.obstacleUncertain();
     case '障碍已移开，重新评估并恢复直行':
       h.obstacleUncertainResolved();
-    case '模拟障碍：侧方已确认（仅演示数据给一步）':
+    case '模拟障碍：侧方已确认（演示数据，仍须停下）':
       h.obstacleConfirmed();
     case '动作后重新感知，确认后恢复导航':
       h.obstacleConfirmedVerified();
@@ -215,14 +215,14 @@ void main() {
       // Same level, different event: the vehicle danger
       // replaces the playing person danger IMMEDIATELY -- it
       // does not queue behind it.
-      expectPromptLine('当前提示：前方有机动车，请停下。', present: true);
+      expectPromptLine('当前提示：前方有机动车，请停下，用盲杖确认。', present: true);
       expectTaskState('当前任务状态：正在避障');
 
       // The interrupted person danger is never replayed:
       // after the vehicle danger completes, the person text
       // does not come back as the current prompt.
       await tester.pump(const Duration(milliseconds: 1300));
-      expectPromptLine('当前提示：前方有人，请停下。', present: false);
+      expectPromptLine('当前提示：前方有人，请停下，用盲杖确认。', present: false);
       await drain(tester);
     });
 
@@ -236,7 +236,7 @@ void main() {
       // playing (simulated speech completes after 1200 ms;
       // no time has been pumped since).
       await tapText(tester, '模拟 YOLO 检测：前方行人（演示，无摄像头）');
-      expectPromptLine('当前提示：前方有人，请停下。', present: true);
+      expectPromptLine('当前提示：前方有人，请停下，用盲杖确认。', present: true);
       expectTaskState('当前任务状态：正在避障');
       await drain(tester);
     });
@@ -250,7 +250,7 @@ void main() {
       // Same-level preemption: the vehicle danger is the
       // ACTIVE prompt now, not a queued one.
       await tapText(tester, '模拟 YOLO 检测：前方车辆（演示，无摄像头）');
-      expectPromptLine('当前提示：前方有机动车，请停下。', present: true);
+      expectPromptLine('当前提示：前方有机动车，请停下，用盲杖确认。', present: true);
       // Clear the obstacles while the vehicle danger is
       // still playing: the cleared info queues behind it.
       await tapText(tester, '模拟 YOLO：连续 3 帧前方无障碍（演示）');
