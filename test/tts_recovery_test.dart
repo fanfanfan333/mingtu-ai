@@ -150,6 +150,57 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
   });
 
+  testWidgets('pause during TTS failure remains paused after recovery', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    handle.voiceCommand('暂停');
+    expect(handle.taskState, TaskState.paused);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(handle.taskState, TaskState.paused);
+    expect(output.spoken, contains('语音已恢复，导航仍在暂停。'));
+    expect(output.spoken.any((text) => text.contains('直走')), isFalse);
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('recovery restores entrance search with matching wording', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    handle.destinationApproach();
+    expect(handle.taskState, TaskState.findingEntrance);
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+    expect(handle.taskState, TaskState.findingEntrance);
+    expect(output.spoken, contains('语音已恢复，仍在寻找入口。'));
+    expect(output.spoken.any((text) => text.contains('继续')), isFalse);
+    expect(output.spoken.any((text) => text.contains('直走')), isFalse);
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
   testWidgets('recovery preserves a user initiated pause', (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
     addTearDown(() => mingtuStartupTtsFactoryOverride = null);

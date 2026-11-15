@@ -871,6 +871,9 @@ void main() {
 
 /// Recording haptics on the test's stamped timeline().
 class _StampedHaptics implements Haptics {
+  @override
+  Future<void> vibrateCooldown() async {}
+
   final List<(int, String)> events;
   final int Function() clock;
   _StampedHaptics(this.events, this.clock);

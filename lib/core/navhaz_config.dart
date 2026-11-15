@@ -520,6 +520,9 @@ static const List<int> urgentVibrationAmplitudes = <int>[0, 255, 0, 255, 0, 255]
 static const List<int> warningVibrationTimings = <int>[0, 40, 60, 40];
 static const List<int> warningVibrationAmplitudes = <int>[0, 128, 0, 128];
 
+static const List<int> cooldownVibrationTimings = <int>[0, 80, 80, 80];
+static const List<int> cooldownVibrationAmplitudes = <int>[0, 128, 0, 128];
+
 // ---- Adaptive frame rate (M2 section 3.1) ----------------------------
 
 /// Master switch for the adaptive frame-rate policy

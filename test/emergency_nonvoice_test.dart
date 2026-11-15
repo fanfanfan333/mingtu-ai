@@ -288,7 +288,7 @@ void main() {
     expect(h.debugActiveSpeech, same(fallback));
     expect(h.debugLensSpeechQueue.map((speech) => speech.text),
         isNot(contains('紧急求助已在进行')));
-    expect(haptics.calls, ['warning']);
+    expect(haptics.calls, ['cooldown']);
     await tester.pump(headsetEmergencyCooldown);
     h.debugHeadsetToggle();
     h.debugHeadsetToggle();

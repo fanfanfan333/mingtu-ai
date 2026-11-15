@@ -1319,6 +1319,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   SpeechKind? _lastNavHazKind;
   bool _lastNavHazUrgent = false;
   bool _replayHazardAfterRecovery = false;
+  bool _userPausedDuringTtsFailure = false;
   bool get _hazardWatchActive {
     if (_tasks.state == TaskState.navigating ||
         _tasks.state == TaskState.avoidingObstacle ||
@@ -1355,6 +1356,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         final last = _tasks.history.isEmpty ? null : _tasks.history.last;
         if (last != null &&
             last.trigger == 'tts-failure' &&
+            !_userPausedDuringTtsFailure &&
             _tasks.canTransitionTo(last.from)) {
           final clearedObstacle = last.from == TaskState.avoidingObstacle &&
               !_riskActive && !_yoloRiskActive;
@@ -1365,24 +1367,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           if (last.from == TaskState.avoidingObstacle && !clearedObstacle) {
             spokenAnnouncement = '语音已恢复。';
             _replayHazardAfterRecovery = true;
+          } else if (last.from == TaskState.findingEntrance) {
+            spokenAnnouncement = '语音已恢复，仍在寻找入口。';
           } else {
             spokenAnnouncement = '语音已恢复，继续导航。';
           }
           recoveredEmergency = last.from == TaskState.emergency;
           if (last.from == TaskState.navigating || clearedObstacle) {
             _straightConfirmed = true;
-            if (_pacing.isPaused) {
-              _recheckStraightResume();
-            } else {
-              _scheduler.resumeStraight(
-                now: _straightNow(),
-                straightSegmentConfirmed: true,
-                riskActive: false,
-                currentNavigationVersion: _navVersion,
-                straightNavigationVersion: _navVersion,
-              );
-              _startStraightTimer();
-            }
+            _recheckStraightResume(rearmIfRunning: true);
           }
         } else {
           spokenAnnouncement = '语音已恢复，导航仍在暂停。';
@@ -2475,6 +2468,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (_tasks.state == TaskState.navigating) {
       _tasks.transitionTo(TaskState.completed, trigger: 'entrance-arrived');
       _tasks.reset();
+      _userPausedDuringTtsFailure = false;
     }
     _askDestination(prompt: '还要去别的地方吗？');
   }
@@ -3869,7 +3863,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// machine judges the state at THIS moment (risk, pending
   /// danger, reroute tracker readiness, current segment);
   /// see StraightPacingMachine.recheck.
-  void _recheckStraightResume() {
+  void _recheckStraightResume({bool rearmIfRunning = false}) {
+    if (rearmIfRunning && _pacing.canTick) {
+      _pacing.hold(_navVersion);
+    }
     final bool resumed = _pacing.recheck(
       riskActive: _riskActive,
       dangerPending: _dangerPending,
@@ -3880,8 +3877,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!resumed) return;
     // The machine judged the resume valid on current state;
     // re-arm the scheduler's 3 s clock from NOW (no catch-up)
-    // and restart the single timer when the pacing hold clears.
-    // TTS recovery separately re-arms an already-running session.
+    // and restart the single timer. This is the ONLY place
+    // either happens for a resume: no flow may call the
+    // scheduler's resume or the timer directly (the demo
+    // re-confirmation used to, bypassing the persistent
+    // pacing state entirely).
     _scheduler.resumeStraight(
       now: _straightNow(),
       straightSegmentConfirmed: true,
@@ -5187,7 +5187,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         if (_scheduler.active?.kind == SpeechKind.emergency ||
             _scheduler.queue
                 .any((request) => request.kind == SpeechKind.emergency)) {
-          unawaited(_haptics.vibrateWarning());
+          unawaited(_haptics.vibrateCooldown());
           return;
         }
         _say(_request(
@@ -7456,7 +7456,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.pause:
-        if (_tasks.canTransitionTo(TaskState.paused)) {
+        if (_tasks.state == TaskState.paused &&
+            _tasks.history.isNotEmpty &&
+            _tasks.history.last.trigger == 'tts-failure') {
+          _userPausedDuringTtsFailure = true;
+          unawaited(_stopSpeechThenConfirm(
+            idPrefix: 'voice-pause',
+            confirmText: '已暂停导航，直行提醒已停止。说继续可以恢复，但要重新确认直行路段。',
+          ));
+        } else if (_tasks.canTransitionTo(TaskState.paused)) {
           _tasks.transitionTo(TaskState.paused, trigger: 'voice-pause');
           _stopStraightTimer();
           _scheduler.pauseStraight();
@@ -7489,6 +7497,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.resume:
+        _userPausedDuringTtsFailure = false;
         // v0.7: while navigating with straight unconfirmed and no
         // risk, "继续" re-confirms the straight segment (e.g. after a
         // YOLO obstacle cleared). It never resumes straight while a
@@ -7521,6 +7530,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.cancel:
+        _userPausedDuringTtsFailure = false;
         if (_tasks.canTransitionTo(TaskState.cancelled)) {
           _tasks.transitionTo(TaskState.cancelled, trigger: 'voice-cancel');
           _endLiveNavigation();
@@ -7675,6 +7685,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _triggerEmergency() {
+    _userPausedDuringTtsFailure = false;
     _ttsRecovery.stopDanger();
     _emergencyTriggerCount++;
     final DateTime now = DateTime.now();
@@ -7735,6 +7746,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _resetDemo() {
+    _userPausedDuringTtsFailure = false;
     _ttsRecovery.stopDanger();
     _stopStraightTimer();
     if (_tasks.state == TaskState.emergency || _tasks.isTerminal) {
