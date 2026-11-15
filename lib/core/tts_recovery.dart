@@ -61,7 +61,7 @@ class TtsRecoveryController {
     onRecovered(output, announcement);
   }
 
-  /// Repeat the urgent waveform for as long as recovery is pending.
+  /// Repeat while recovery is pending and until the caller clears danger.
   void danger() {
     if (!_failed || _disposed || _vibration != null) return;
     void pulse() {

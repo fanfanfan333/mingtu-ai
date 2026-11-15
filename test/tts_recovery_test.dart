@@ -6,6 +6,7 @@ import 'package:mingtu_ai/adapters/system_voice_io.dart';
 import 'package:mingtu_ai/core/haptics.dart';
 import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
 import 'package:mingtu_ai/core/tts_recovery.dart';
+import 'package:mingtu_ai/core/speech_scheduler.dart';
 import 'package:mingtu_ai/main.dart';
 
 class FakeStartupTts extends SystemVoiceOutput {
@@ -62,7 +63,8 @@ void main() {
     });
   });
 
-  test('danger repeats until recovery and can start on another failure', () {
+  test('active danger repeats until recovery and can start on another failure',
+      () {
     fakeAsync((clock) {
       final haptics = RecordingHaptics();
       var attempts = 0;
@@ -93,6 +95,53 @@ void main() {
       controller.dispose();
     });
   });
+  test('cleared danger stops while failed and a new danger can restart', () {
+    fakeAsync((clock) {
+      final haptics = RecordingHaptics();
+      final controller = TtsRecoveryController(
+        haptics: () => haptics,
+        rebuild: () async => null,
+        onRecovered: (_, __) {},
+      );
+      controller.fail();
+      controller.danger();
+      clock.elapse(const Duration(milliseconds: 800));
+      expect(haptics.calls, ['urgent', 'urgent', 'urgent']);
+      controller.stopDanger();
+      expect(controller.failed, isTrue);
+      expect(controller.vibrating, isFalse);
+      clock.elapse(const Duration(seconds: 2));
+      expect(haptics.calls, ['urgent', 'urgent', 'urgent']);
+      controller.danger();
+      expect(haptics.calls, ['urgent', 'urgent', 'urgent', 'urgent']);
+      clock.elapse(const Duration(milliseconds: 400));
+      expect(haptics.calls, ['urgent', 'urgent', 'urgent', 'urgent', 'urgent']);
+      controller.dispose();
+    });
+  });
+
+  testWidgets('failed emergency and alert use one-shot haptics without speech',
+      (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    final haptics = RecordingHaptics();
+    final output = FakeOutput();
+    handle.debugSetHaptics(haptics);
+    handle.debugFailTts(() async => output);
+    expect(handle.debugSayForTest(SpeechKind.emergency), isFalse);
+    expect(handle.debugSayForTest(SpeechKind.alert), isFalse);
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(haptics.calls, ['urgent', 'warning']);
+    expect(handle.activeSpeechKind, isNull);
+    expect(handle.debugSpeechQueueLength, 0);
+    expect(output.spoken, isEmpty);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
   testWidgets(
       'failed danger is not completed as speech; recovery restores speech',
       (tester) async {

@@ -464,6 +464,15 @@ class MingtuHomeDebugHandle {
     ));
   }
 
+  bool debugSayForTest(SpeechKind kind) => _state._say(_state._request(
+        id: 'test-fallback-${kind.name}',
+        eventId: 'test-fallback-${kind.name}',
+        text: '测试提示',
+        kind: kind,
+      ));
+
+  int get debugSpeechQueueLength => _state._scheduler.queue.length;
+
   /// UI-01 debug/test seam: force (or, with null, unforce)
   /// the TalkBack toggle-mode decision, bypassing the
   /// MediaQuery. Widget tests primarily drive the real
@@ -3259,6 +3268,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (request.kind == SpeechKind.danger) {
         _pauseStraightForRisk();
         _ttsRecovery.danger();
+      } else if (request.kind == SpeechKind.emergency) {
+        unawaited(_haptics.vibrateUrgent());
+      } else if (request.kind == SpeechKind.alert) {
+        unawaited(_haptics.vibrateWarning());
       }
       return false;
     }
@@ -5686,6 +5699,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// restarts the straight timer so the re-armed 3 s cadence
   /// can actually fire.
   void _exitYoloRiskState(DateTime now) {
+    _ttsRecovery.stopDanger();
     _yoloRiskActive = false;
     if (_tasks.state == TaskState.avoidingObstacle) {
       _tasks.transitionTo(TaskState.navigating, trigger: 'yolo-cleared');
@@ -5940,7 +5954,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // only through the confirmed alert path below.
     if (navigating) {
       for (final ({int trackId, bool urgent}) v in result.vibrations) {
-        if (_ttsFailed && v.urgent) {
+        if (_ttsFailed && v.urgent && result.riskPresent) {
           _ttsRecovery.danger();
         } else {
           unawaited(
@@ -5961,7 +5975,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     final HazardAlert? alert = result.alert;
     if (alert == null) return;
-    if (_ttsFailed && alert.urgent) _ttsRecovery.danger();
+    if (_ttsFailed && alert.urgent && _yoloRiskActive) {
+      _ttsRecovery.danger();
+    }
     // NH-M1-13: NO vibration dispatch here any more --
     // the alert's vibration (when its ladder step allows
     // one) was already dispatched in parallel with the
@@ -6393,6 +6409,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     _tasks.transitionTo(TaskState.navigating, trigger: 'obstacle-cleared');
+    _ttsRecovery.stopDanger();
     setState(() {
       _riskActive = false;
       _straightConfirmed = true;
@@ -6466,6 +6483,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       now,
     );
     _tasks.transitionTo(TaskState.navigating, trigger: 'action-verified');
+    _ttsRecovery.stopDanger();
     setState(() {
       _riskActive = false;
       _straightConfirmed = true;
@@ -7562,6 +7580,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _resetDemo() {
+    _ttsRecovery.stopDanger();
     _stopStraightTimer();
     if (_tasks.state == TaskState.emergency || _tasks.isTerminal) {
       _tasks.reset();
