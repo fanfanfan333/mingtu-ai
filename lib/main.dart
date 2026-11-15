@@ -2389,7 +2389,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (_amapNaviActive && e.kind == NavEventKind.turnAhead) continue;
       _handleNavEvent(e);
     }
-    if (_pacing.isPaused && !_rerouting) {
+    if (_pacing.isPaused && !_rerouting && !_userPausedDuringTtsFailure) {
       // A re-planned route whose first segment was not
       // straight stays suspended; a later fix may reach a
       // straight segment, judged by the NEW tracker only.
@@ -2474,6 +2474,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _handleNavEvent(NavEvent e) {
+    if (_userPausedDuringTtsFailure &&
+        (e.kind == NavEventKind.turnAhead || e.kind == NavEventKind.offRoute)) {
+      return;
+    }
     final String ts = '${DateTime.now().millisecondsSinceEpoch}';
     void speak(NavEventSpeech speech) => _say(_request(
           id: speech.id,
@@ -3453,6 +3457,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     final DateTime now = _speechNow();
     const Duration expiry = NavHazConfig.replayExpiry;
     for (final SpeechRequest r in _scheduler.interruptedNavigationRequests()) {
+      if (_userPausedDuringTtsFailure &&
+          (r.eventId.startsWith('nav-turn') ||
+              r.eventId.startsWith('nav-offroute') ||
+              (r.replay == NavReplay.regenerate && r.navStepIndex != null))) {
+        _scheduler.discardInterrupted(r);
+        continue;
+      }
       final DateTime? at = _scheduler.interruptedAtOf(r);
       if (at != null && now.difference(at) >= expiry) {
         _scheduler.discardInterrupted(r);
