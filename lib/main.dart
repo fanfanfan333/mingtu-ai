@@ -296,6 +296,7 @@ class MingtuHomeDebugHandle {
   void llmDemo() => _state._llmDemo();
   void triggerManualVision() => _state._triggerManualVision();
   void triggerEmergency() => _state._triggerEmergency();
+  int get emergencyTriggerCount => _state._emergencyTriggerCount;
   void resetDemo() => _state._resetDemo();
   void fetchAmapRoute() => _state._fetchAmapRoute();
 
@@ -1514,7 +1515,53 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         kind: SpeechKind.alert)),
   );
   static const MethodChannel _headsetChannel = MethodChannel('mingtu/headset');
+  int _emergencyTriggerCount = 0;
   bool _headsetGatePending = false;
+  final Set<int> _emergencyPointers = <int>{};
+  Timer? _emergencyHoldTimer;
+  Timer? _headsetPressTimer;
+  int _headsetPressCount = 0;
+  bool _emergencyHoldTriggered = false;
+
+  void _emergencyPointerDown(int pointer) {
+    _emergencyPointers.add(pointer);
+    if (_emergencyPointers.length >= 3 &&
+        !_emergencyHoldTriggered &&
+        _emergencyHoldTimer == null) {
+      _emergencyHoldTimer = Timer(const Duration(milliseconds: 900), () {
+        _emergencyHoldTimer = null;
+        if (mounted && _emergencyPointers.length >= 3) {
+          _emergencyHoldTriggered = true;
+          _triggerEmergency();
+        }
+      });
+    }
+  }
+
+  void _emergencyPointerUp(int pointer) {
+    _emergencyPointers.remove(pointer);
+    if (_emergencyPointers.length < 3) {
+      _emergencyHoldTimer?.cancel();
+      _emergencyHoldTimer = null;
+    }
+    if (_emergencyPointers.isEmpty) _emergencyHoldTriggered = false;
+  }
+
+  bool _countHeadsetPress() {
+    if (_headsetPressCount == 0) {
+      _headsetPressTimer = Timer(const Duration(milliseconds: 1500), () {
+        _headsetPressCount = 0;
+        _headsetPressTimer = null;
+      });
+    }
+    _headsetPressCount++;
+    if (_headsetPressCount < 3) return false;
+    _headsetPressTimer?.cancel();
+    _headsetPressTimer = null;
+    _headsetPressCount = 0;
+    return true;
+  }
+
   bool _foreground = true;
   Timer? _foregroundTimer;
 
@@ -3034,6 +3081,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    _emergencyHoldTimer?.cancel();
+    _headsetPressTimer?.cancel();
     if (mingtuLensSampleSink == _onLensSample) {
       mingtuLensSampleSink = null;
     }
@@ -4994,7 +5043,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   Future<void> _headsetToggle() async {
-    if (!mounted || !_foreground || _headsetGatePending) return;
+    if (!mounted || !_foreground) return;
+    if (_countHeadsetPress()) {
+      _triggerEmergency();
+      return;
+    }
+    if (_headsetGatePending) return;
     if (_pttState != _PttState.idle || !_permissionGateway.isAvailable) {
       _pttToggleTap();
       return;
@@ -7454,6 +7508,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _triggerEmergency() {
+    _emergencyTriggerCount++;
     final DateTime now = DateTime.now();
     _events.publish(
       MingtuEvent(
@@ -7596,99 +7651,105 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _toggleModeNow = toggleMode;
     final bool pttActive = _pttState != _PttState.idle;
     return Scaffold(
-      body: SafeArea(
-        left: false,
-        right: false,
-        bottom: false,
-        child: Semantics(
-          button: true,
-          container: true,
-          label: toggleMode
-              ? (pttActive
-                  ? talkBackToggleListeningLabel
-                  : talkBackToggleIdleLabel)
-              : '按住说话按钮，按住后说话，松开结束',
-          value: _bigStatusText(),
-          onTap: toggleMode
-              ? () {
-                  if (!_pocketMode.ignoreTouches) _pttToggleTap();
+      body: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (event) => _emergencyPointerDown(event.pointer),
+        onPointerUp: (event) => _emergencyPointerUp(event.pointer),
+        onPointerCancel: (event) => _emergencyPointerUp(event.pointer),
+        child: SafeArea(
+          left: false,
+          right: false,
+          bottom: false,
+          child: Semantics(
+            button: true,
+            container: true,
+            label: toggleMode
+                ? (pttActive
+                    ? talkBackToggleListeningLabel
+                    : talkBackToggleIdleLabel)
+                : '按住说话按钮，按住后说话，松开结束',
+            value: _bigStatusText(),
+            onTap: toggleMode
+                ? () {
+                    if (!_pocketMode.ignoreTouches) _pttToggleTap();
+                  }
+                : null,
+            onLongPress: () {
+              if (!_pocketMode.ignoreTouches) {
+                if (toggleMode) {
+                  _pttToggleStart();
+                } else {
+                  _talkBackLongPress();
                 }
-              : null,
-          onLongPress: () {
-            if (!_pocketMode.ignoreTouches) {
-              if (toggleMode) {
-                _pttToggleStart();
-              } else {
-                _talkBackLongPress();
-              }
-            }
-          },
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            excludeFromSemantics: true,
-            onLongPressStart: (_) {
-              if (!_pocketMode.ignoreTouches) _pushToTalkStart();
-            },
-            onLongPressEnd: (_) {
-              if (!_pocketMode.ignoreTouches ||
-                  _pttToggleSessionId != _pttSession) {
-                _pushToTalkEnd();
               }
             },
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                // Camera preview area (upper half). While the
-                // live view is open it hosts YoloLiveView;
-                // otherwise the area is simply blank.
-                Expanded(
-                  child: IgnorePointer(
-                    child: ExcludeSemantics(
-                      child: _yoloLiveOpen
-                          ? (mingtuYoloViewBuilderOverride
-                                  ?.call(_onYoloViewError) ??
-                              YoloLiveView(
-                                modelPath: AppConfig.yoloModelPath,
-                                onDetections: _onYoloDetections,
-                                onLatencyMs: (double ms) {
-                                  setState(() {
-                                    _yoloLatencyMs = ms;
-                                  });
-                                },
-                                onError: _onYoloViewError,
-                              ))
-                          : Container(
-                              key:
-                                  const ValueKey<String>('camera-preview-area'),
-                              color: Colors.black12,
-                            ),
-                    ),
-                  ),
-                ),
-                // The one very large push-to-talk area (lower
-                // half): a plain colour block with no caption.
-                // Hold: vibrate, stop any lower-priority speech, speak
-                // the cue and await it, then listen while held.
-                // Release: stop listening and submit the result.
-                // The area is never disabled: with no recogniser
-                // the press still produces the vibrated, spoken
-                // failure feedback instead of dead silence. The
-                // semantics node carries a long-press action so
-                // TalkBack users can trigger the same
-                // press-and-hold flow.
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
-                    child: Container(
-                      key: const ValueKey<String>('push-to-talk-area'),
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.primaryContainer,
-                        borderRadius: BorderRadius.circular(16),
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              excludeFromSemantics: true,
+              onLongPressStart: (_) {
+                if (!_pocketMode.ignoreTouches) _pushToTalkStart();
+              },
+              onLongPressEnd: (_) {
+                if (!_pocketMode.ignoreTouches ||
+                    _pttToggleSessionId != _pttSession) {
+                  _pushToTalkEnd();
+                }
+              },
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  // Camera preview area (upper half). While the
+                  // live view is open it hosts YoloLiveView;
+                  // otherwise the area is simply blank.
+                  Expanded(
+                    child: IgnorePointer(
+                      child: ExcludeSemantics(
+                        child: _yoloLiveOpen
+                            ? (mingtuYoloViewBuilderOverride
+                                    ?.call(_onYoloViewError) ??
+                                YoloLiveView(
+                                  modelPath: AppConfig.yoloModelPath,
+                                  onDetections: _onYoloDetections,
+                                  onLatencyMs: (double ms) {
+                                    setState(() {
+                                      _yoloLatencyMs = ms;
+                                    });
+                                  },
+                                  onError: _onYoloViewError,
+                                ))
+                            : Container(
+                                key: const ValueKey<String>(
+                                    'camera-preview-area'),
+                                color: Colors.black12,
+                              ),
                       ),
                     ),
                   ),
-                ),
-              ],
+                  // The one very large push-to-talk area (lower
+                  // half): a plain colour block with no caption.
+                  // Hold: vibrate, stop any lower-priority speech, speak
+                  // the cue and await it, then listen while held.
+                  // Release: stop listening and submit the result.
+                  // The area is never disabled: with no recogniser
+                  // the press still produces the vibrated, spoken
+                  // failure feedback instead of dead silence. The
+                  // semantics node carries a long-press action so
+                  // TalkBack users can trigger the same
+                  // press-and-hold flow.
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
+                      child: Container(
+                        key: const ValueKey<String>('push-to-talk-area'),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.primaryContainer,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
