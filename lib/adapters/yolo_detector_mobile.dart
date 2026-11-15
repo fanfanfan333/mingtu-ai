@@ -1,14 +1,5 @@
-/// Phone YOLO detector (v0.6), via the official ultralytics_yolo
-/// plugin: YOLO single-image inference, LiteRT (.tflite) on Android,
-/// Core ML on iOS. [modelPath] is an official model id such as
-/// 'yolo11n' (downloaded on the phone) or an asset / file path such
-/// as 'assets/models/custom.tflite'.
-///
-/// The model is loaded lazily on the first [detectImage] call.
-/// Failure to load or infer returns [] and marks the detector
-/// unavailable -- a missing model must never become a spoken
-/// "no obstacle" claim. Confidence below 0.3 never becomes a track:
-/// that filter lives in VisualPerception.processFrame, not here.
+/// Phone YOLO detector using the packaged asset only. Failures are terminal
+/// for this detector instance and never produce a fabricated detection.
 library;
 
 import 'dart:typed_data';
@@ -16,6 +7,7 @@ import 'dart:typed_data';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 
 import '../modules/visual_perception.dart';
+import '../config/app_config.dart';
 import 'yolo_detector.dart';
 
 YoloDetector createYoloDetector(String modelPath) =>
@@ -23,12 +15,19 @@ YoloDetector createYoloDetector(String modelPath) =>
 
 class MobileYoloDetector implements YoloDetector {
   final String modelPath;
-  final YOLO _yolo;
+  YOLO? _yolo;
+  final YOLO Function(String) _createModel;
+  bool _failed = false;
   bool _available = false;
   String _detail = '未初始化';
 
-  MobileYoloDetector({required this.modelPath})
-      : _yolo = YOLO(modelPath: modelPath, task: YOLOTask.detect);
+  MobileYoloDetector(
+      {required String modelPath, YOLO Function(String)? createModel})
+      : modelPath = resolvePackagedYoloModelPath(modelPath),
+        _createModel = createModel ?? _defaultCreateModel;
+
+  static YOLO _defaultCreateModel(String path) =>
+      YOLO(modelPath: path, task: YOLOTask.detect);
 
   @override
   bool get isAvailable => _available;
@@ -38,16 +37,19 @@ class MobileYoloDetector implements YoloDetector {
 
   @override
   Future<List<Detection>> detectImage(List<int> imageBytes) async {
+    if (_failed) return <Detection>[];
     try {
-      if (!_yolo.isInitialized) {
-        final bool ok = await _yolo.loadModel();
+      final YOLO yolo = _yolo ??= _createModel(modelPath);
+      if (!yolo.isInitialized) {
+        final bool ok = await yolo.loadModel();
         if (!ok) {
+          _failed = true;
           _available = false;
-          _detail = 'NOT_CONFIGURED（YOLO 模型加载失败：$modelPath）';
+          _detail = 'NOT_CONFIGURED（YOLO 模型加载失败）';
           return <Detection>[];
         }
       }
-      final Map<String, dynamic> result = await _yolo.predict(
+      final Map<String, dynamic> result = await yolo.predict(
         Uint8List.fromList(imageBytes),
         confidenceThreshold: 0.25,
       );
@@ -77,9 +79,10 @@ class MobileYoloDetector implements YoloDetector {
       _available = true;
       _detail = 'YOLO 已接入（$modelPath），最近一帧 ${detections.length} 个检测。';
       return detections;
-    } catch (e) {
+    } catch (_) {
+      _failed = true;
       _available = false;
-      _detail = 'NOT_CONFIGURED（YOLO 推理失败：$e）';
+      _detail = 'NOT_CONFIGURED（YOLO 模型或推理不可用）';
       return <Detection>[];
     }
   }

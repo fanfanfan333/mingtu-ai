@@ -1176,6 +1176,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   StreamSubscription<AsrStatusEvent>? _asrSessionSub;
   StreamSubscription<String>? _asrEngineSub;
   bool _yoloErrorAnnounced = false;
+  bool _yoloModelFailed = false;
 
   // Step 2 voice navigation flow state.
   NavigationTracker? _liveNav;
@@ -5844,6 +5845,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// the camera is busy (or the wait times out) the view does NOT
   /// open and the user hears exactly that.
   Future<void> _openYoloLive() async {
+    if (_yoloModelFailed) return;
     if (_permissionGateway.isAvailable &&
         !_grantedPermissions.contains(GuidePermission.camera) &&
         (!_guideResolvedSeen ||
@@ -7306,6 +7308,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                                     'YOLO 实时视图出错：${yoloViewErrorStatus(errorKind)}。');
                                 setState(() {
                                   _yoloText = yoloViewErrorStatus(errorKind);
+                                  if (errorKind ==
+                                      YoloViewErrorKind.modelLoadFailed) {
+                                    _yoloModelFailed = true;
+                                    _closeYoloLiveView();
+                                    _yoloAvailableAtStartup = false;
+                                    _yoloDetector = UnavailableYoloDetector();
+                                  }
                                 });
                                 if (!_yoloErrorAnnounced) {
                                   _yoloErrorAnnounced = true;

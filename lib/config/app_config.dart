@@ -5,7 +5,7 @@
 /// file committed to the repository. Run, for example:
 ///
 ///   flutter run --dart-define=MINGTU_ROUTE_PROXY_URL=https://your-server \
-///     --dart-define=MINGTU_YOLO_MODEL_PATH=yolo11n \
+///     --dart-define=MINGTU_YOLO_MODEL_PATH=assets/models/yolo11n.tflite \
 ///     --dart-define=MINGTU_LLM_MODEL_ID=... \
 ///     --dart-define=MINGTU_VISION_PROXY_URL=https://your-fc-endpoint \
 ///     --dart-define=MINGTU_VISION_TOKEN=<demo token, build time only>
@@ -31,9 +31,7 @@
 /// config/verified_locations.dart (human-verified, GCJ-02).
 /// Without a demo key or a proxy URL the app reports
 /// NOT_CONFIGURED and never invents a route. YOLO model path
-/// defaults to the official model id 'yolo11n' (the plugin
-/// downloads it on the phone); an asset path such as
-/// 'assets/models/custom.tflite' also works.
+/// uses only the bundled model asset.
 ///
 /// Bailian (DashScope) has NO client-side key channel at all
 /// (user decision, 2026-11-09): the former client dart-define
@@ -52,6 +50,16 @@
 Duration? mingtuPermissionTimeoutOverride;
 Duration? mingtuPermissionSpeechTimeoutOverride;
 Duration? mingtuPermissionRequestTimeoutOverride;
+
+const String packagedYoloModelPath = 'assets/models/yolo11n.tflite';
+const String localDetectionFaultText = '本地检测暂时不可用。将改用云端识图，或只用摄像头拍照识图。';
+
+String resolvePackagedYoloModelPath(String path, {void Function(String)? log}) {
+  if (path != packagedYoloModelPath) {
+    (log ?? print)('Non-packed model path ignored; using bundled asset.');
+  }
+  return packagedYoloModelPath;
+}
 
 class AppConfig {
   static const foregroundCameraStallThreshold = Duration(seconds: 10);
@@ -80,14 +88,10 @@ class AppConfig {
   /// demo. Empty = no demo mode (proxy or unconfigured).
   static const String amapDemoKey = String.fromEnvironment('MINGTU_AMAP_KEY');
 
-  /// Bundled model asset (assets/... paths are copied to a
-  /// real file by the ultralytics_yolo resolver). The previous
-  /// default 'yolo11n' was a bare model ID: the plugin tried
-  /// to download it on-device and failed ("Could not open
-  /// 'yolo11n'"), leaving YOLO dead on real hardware.
-  static const String yoloModelPath = String.fromEnvironment(
-    'MINGTU_YOLO_MODEL_PATH',
-    defaultValue: 'assets/models/yolo11n.tflite',
+  /// Only the packaged asset is permitted at runtime.
+  static final String yoloModelPath = resolvePackagedYoloModelPath(
+    const String.fromEnvironment('MINGTU_YOLO_MODEL_PATH',
+        defaultValue: packagedYoloModelPath),
   );
   static const String llmModelId =
       String.fromEnvironment('MINGTU_LLM_MODEL_ID');

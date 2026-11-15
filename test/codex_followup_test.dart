@@ -86,7 +86,7 @@ void main() {
       final YoloViewErrorKind kind = classifyYoloViewError(Exception(
           "Could not open 'yolo11n': Failed to load model from file"));
       expect(kind, YoloViewErrorKind.modelLoadFailed);
-      expect(yoloViewErrorSpeech(kind), contains('模型加载失败'));
+      expect(yoloViewErrorSpeech(kind), '本地检测暂时不可用。将改用云端识图，或只用摄像头拍照识图。');
     });
 
     test('unknown errors fall back to an honest generic sentence', () {

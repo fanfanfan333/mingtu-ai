@@ -28,6 +28,7 @@ import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 
+import '../config/app_config.dart';
 import '../core/navhaz_config.dart';
 import '../modules/visual_perception.dart';
 import 'yolo_detector.dart';
@@ -113,10 +114,10 @@ Future<void> applyYoloFrameRateTarget(int targetFps,
   }
   appliedYoloFrameRateFps = targetFps;
   _appliedAnalysisCap720p = capAnalysisAt720p;
-  await sharedYoloViewController.setStreamingConfig(
-      yoloStreamingConfigForFps(targetFps,
-          analysisResolution:
-              capAnalysisAt720p ? yoloAnalysisResolution720p : null));
+  await sharedYoloViewController.setStreamingConfig(yoloStreamingConfigForFps(
+      targetFps,
+      analysisResolution:
+          capAnalysisAt720p ? yoloAnalysisResolution720p : null));
 }
 
 Widget buildYoloLiveView({
@@ -196,41 +197,54 @@ class _YoloLiveViewHostState extends State<_YoloLiveViewHost> {
 
   @override
   Widget build(BuildContext context) {
-    return YOLOView(
-      modelPath: widget.modelPath,
-      controller: sharedYoloViewController,
-      task: YOLOTask.detect,
-      confidenceThreshold: 0.25,
-      streamingConfig: widget.streamingConfig,
-      onResult: (List<YOLOResult> results) {
-        // Frame timestamp (FIX4-FINAL S3): stamped HERE,
-        // the moment the plugin delivers this frame's
-        // results -- the plugin exposes no camera capture
-        // timestamp, so this delivery stamp is the frame's
-        // app-side timestamp and the start point of the
-        // frame-to-callback latency segment. Scope of that
-        // segment (NH-M1-10): it measures ONLY result-
-        // delivery -> detection callback; it does NOT
-        // include camera frame capture or model inference
-        // time (both happen before this stamp exists).
-        final DateTime frameCapturedAt = DateTime.now();
-        widget.onDetections(
-            results.map((YOLOResult r) => yoloResultToDetection(
-                  label: r.className,
-                  confidence: r.confidence,
-                  centerX: r.normalizedBox.left + r.normalizedBox.width / 2,
-                  centerY: r.normalizedBox.top + r.normalizedBox.height / 2,
-                  boxWidth: r.normalizedBox.width,
-                  boxHeight: r.normalizedBox.height,
-                )).toList(),
-            frameCapturedAt);
-      },
-      onPerformanceMetrics: (YOLOPerformanceMetrics metrics) {
-        widget.onLatencyMs?.call(metrics.processingTimeMs);
-      },
-      onModelError: (Object error, String path, YOLOTask? task) {
-        widget.onError?.call(error);
-      },
-    );
+    try {
+      return YOLOView(
+        modelPath: resolvePackagedYoloModelPath(widget.modelPath),
+        controller: sharedYoloViewController,
+        task: YOLOTask.detect,
+        confidenceThreshold: 0.25,
+        streamingConfig: widget.streamingConfig,
+        onResult: (List<YOLOResult> results) {
+          // Frame timestamp (FIX4-FINAL S3): stamped HERE,
+          // the moment the plugin delivers this frame's
+          // results -- the plugin exposes no camera capture
+          // timestamp, so this delivery stamp is the frame's
+          // app-side timestamp and the start point of the
+          // frame-to-callback latency segment. Scope of that
+          // segment (NH-M1-10): it measures ONLY result-
+          // delivery -> detection callback; it does NOT
+          // include camera frame capture or model inference
+          // time (both happen before this stamp exists).
+          final DateTime frameCapturedAt = DateTime.now();
+          widget.onDetections(
+              results
+                  .map((YOLOResult r) => yoloResultToDetection(
+                        label: r.className,
+                        confidence: r.confidence,
+                        centerX:
+                            r.normalizedBox.left + r.normalizedBox.width / 2,
+                        centerY:
+                            r.normalizedBox.top + r.normalizedBox.height / 2,
+                        boxWidth: r.normalizedBox.width,
+                        boxHeight: r.normalizedBox.height,
+                      ))
+                  .toList(),
+              frameCapturedAt);
+        },
+        onPerformanceMetrics: (YOLOPerformanceMetrics metrics) {
+          widget.onLatencyMs?.call(metrics.processingTimeMs);
+        },
+        onModelError: (Object error, String path, YOLOTask? task) {
+          widget.onError?.call(error);
+        },
+      );
+    } catch (_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          widget.onError?.call(StateError('model initialization failed'));
+        }
+      });
+      return const SizedBox.shrink();
+    }
   }
 }

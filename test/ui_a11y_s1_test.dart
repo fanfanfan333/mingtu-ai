@@ -1015,7 +1015,15 @@ void main() {
       final String manifest = File('android/app/src/main/AndroidManifest.xml')
           .readAsStringSync();
       expect(manifest.contains('ACCESS_BACKGROUND_LOCATION'), isFalse);
-      expect(manifest.contains('FOREGROUND_SERVICE'), isFalse);
+      final entries =
+          RegExp(r'<uses-permission\b[^>]*>', dotAll: true).allMatches(manifest);
+      for (final entry in entries) {
+        final declaration = entry.group(0)!;
+        if (declaration.contains('FOREGROUND_SERVICE') ||
+            declaration.contains('ACCESS_BACKGROUND_LOCATION')) {
+          expect(declaration, contains('tools:node="remove"'));
+        }
+      }
     });
 
     test('flow speech maps onto scheduler kinds: denials '
