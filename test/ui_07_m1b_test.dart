@@ -8,6 +8,7 @@ import 'package:mingtu_ai/adapters/amap_client.dart';
 import 'package:mingtu_ai/adapters/current_location.dart';
 import 'package:mingtu_ai/config/verified_locations.dart';
 import 'package:mingtu_ai/core/foreground_watchdog.dart';
+import 'package:mingtu_ai/core/location_signal_speech.dart';
 import 'package:mingtu_ai/core/real_navigation.dart';
 import 'package:mingtu_ai/core/speech_scheduler.dart';
 import 'package:mingtu_ai/modules/map_navigation.dart';
@@ -144,9 +145,10 @@ void main() {
       controller.addError(error);
       await Future<void>.delayed(Duration.zero);
       expect(results.single.failure, LocationFailure.failed);
-      const text = '定位信号中断，暂时无法更新你的位置。';
-      expect(File('lib/main.dart').readAsStringSync(), contains(text));
-      _speak(text, kind: SpeechKind.info);
+      const text = locationSignalLostText;
+      expect(File('lib/main.dart').readAsStringSync(),
+          contains('text: locationSignalLostText'));
+      _speak(text, kind: SpeechKind.alert);
       await subscription.cancel();
     });
   }

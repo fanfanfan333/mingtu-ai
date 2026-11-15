@@ -64,6 +64,7 @@ import 'core/permission_flow.dart';
 import 'core/recording_silence.dart';
 import 'core/wakelock_control.dart';
 import 'core/foreground_watchdog.dart';
+import 'core/location_signal_speech.dart';
 import 'core/ptt_feedback.dart';
 import 'adapters/permission_gateway.dart';
 import 'adapters/guide_store.dart';
@@ -2028,8 +2029,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _say(_request(
           id: 'gps-lost-$now',
           eventId: 'gps-lost',
-          text: '定位信号中断，暂时无法更新你的位置。',
-          kind: SpeechKind.info,
+          text: locationSignalLostText,
+          kind: SpeechKind.alert,
         ));
       }
       return;
@@ -3216,8 +3217,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // active prompt, promoteNext below finds the seat
       // taken and correctly does nothing.
       if ((finished.kind == SpeechKind.danger ||
+              finished.kind == SpeechKind.emergency ||
               finished.kind == SpeechKind.obstacleAvoidance) &&
           !_dangerPending) {
+        final SpeechRequest? locationReplay =
+            takeInterruptedLocationSignalReplay(_scheduler, _speechNow());
+        if (locationReplay != null) _say(locationReplay);
         final SpeechRequest? replay = _buildInterruptedReplay();
         if (replay != null) _say(replay);
       }
