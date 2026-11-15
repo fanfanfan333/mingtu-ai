@@ -59,6 +59,8 @@ import 'core/startup_guard.dart';
 import 'core/voice_log.dart';
 import 'adapters/startup_initializer.dart';
 import 'core/voice_commands.dart';
+import 'core/pocket_mode.dart';
+import 'adapters/pocket_mode_gateway.dart';
 import 'core/voice_startup.dart';
 import 'core/permission_flow.dart';
 import 'core/recording_silence.dart';
@@ -833,6 +835,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// initState (debug overrides first, factories after).
   late PermissionGateway _permissionGateway;
   late GuideStore _guideStore;
+  late final PocketMode _pocketMode;
+  final PocketModeStore _pocketStore = FilePocketModeStore();
+  bool _pocketSettingChanged = false;
   final PermissionFlow _permissionFlow = PermissionFlow();
   bool _permissionFlowRunning = false;
 
@@ -1441,6 +1446,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _permissionGateway =
         mingtuPermissionGatewayOverride ?? createPermissionGateway();
     _guideStore = mingtuGuideStoreOverride ?? createGuideStore();
+    _pocketMode = PocketMode(proximity: proximityEvents);
+    unawaited(_loadPocketMode());
     // UI-06-B3: start the first-launch marker read now.
     // The startup gate awaits this future with a bounded
     // timeout; a slow/failed/timed-out read is treated as
@@ -1449,6 +1456,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     WidgetsBinding.instance.addObserver(this);
     _foreground = WidgetsBinding.instance.lifecycleState == null ||
         WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+    _pocketMode.setForeground(_foreground);
     _updateForegroundPolicies();
     _foregroundTimer = Timer.periodic(
         const Duration(milliseconds: 250), (_) => _updateForegroundPolicies());
@@ -1466,6 +1474,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _foreground = state == AppLifecycleState.resumed;
+    _pocketMode.setForeground(_foreground);
     _updateForegroundPolicies();
     // UI-06: returning to the foreground while the
     // permission flow waits on the system settings page
@@ -2898,6 +2907,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    _pocketMode.dispose();
     _foreground = false;
     _foregroundTimer?.cancel();
     unawaited(_wakelock.update(
@@ -6873,9 +6883,31 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   /// Execute one recognised voice command. Illegal transitions are
   /// answered, never silently applied, and emergency never auto-resumes.
+  Future<void> _loadPocketMode() async {
+    bool enabled = false;
+    try { enabled = await _pocketStore.load(); } catch (_) {}
+    if (mounted && !_pocketSettingChanged) _pocketMode.setEnabled(enabled);
+  }
+
+  void _setPocketMode(bool enabled) {
+    _pocketSettingChanged = true;
+    _pocketMode.setEnabled(enabled);
+    unawaited(_pocketStore.save(enabled).catchError((Object _) {}));
+    final id = 'pocket-mode-${DateTime.now().microsecondsSinceEpoch}';
+    _say(_request(id: id, eventId: id,
+        text: enabled ? pocketEnabledSpeech : pocketDisabledSpeech,
+        kind: SpeechKind.info));
+  }
+
   void _handleVoiceCommand(String raw) {
     final VoiceCommand command = parseVoiceCommand(raw);
     switch (command) {
+      case VoiceCommand.enablePocketMode:
+        _setPocketMode(true);
+        break;
+      case VoiceCommand.disablePocketMode:
+        _setPocketMode(false);
+        break;
       case VoiceCommand.emergency:
         _endLiveNavigation();
         _triggerEmergency();
@@ -7272,13 +7304,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                   : talkBackToggleIdleLabel)
               : '按住说话按钮，按住后说话，松开结束',
           value: _bigStatusText(),
-          onTap: toggleMode ? _pttToggleTap : null,
-          onLongPress: toggleMode ? _pttToggleStart : _talkBackLongPress,
+          onTap: toggleMode ? () { if (!_pocketMode.ignoreTouches) _pttToggleTap(); } : null,
+          onLongPress: () { if (!_pocketMode.ignoreTouches) { if (toggleMode) { _pttToggleStart(); } else { _talkBackLongPress(); } } },
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             excludeFromSemantics: true,
-            onLongPressStart: (_) => _pushToTalkStart(),
-            onLongPressEnd: (_) => _pushToTalkEnd(),
+            onLongPressStart: (_) { if (!_pocketMode.ignoreTouches) _pushToTalkStart(); },
+            onLongPressEnd: (_) { if (!_pocketMode.ignoreTouches) _pushToTalkEnd(); },
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[

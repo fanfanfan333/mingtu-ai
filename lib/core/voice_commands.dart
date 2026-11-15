@@ -32,6 +32,8 @@ enum VoiceCommand {
   cloudVision,
   saveRecording,
   deleteRecording,
+  enablePocketMode,
+  disablePocketMode,
   unknown,
 }
 
@@ -103,11 +105,17 @@ VoiceCommand parseVoiceCommand(String raw) {
   if (text.contains('帮助') || text.contains('能做什么') || text.contains('怎么用')) {
     return VoiceCommand.help;
   }
+  if (text.contains('打开口袋') || text.contains('开启口袋模式')) {
+    return VoiceCommand.enablePocketMode;
+  }
+  if (text.contains('关闭口袋') || text.contains('关掉口袋模式')) {
+    return VoiceCommand.disablePocketMode;
+  }
   return VoiceCommand.unknown;
 }
 
 String voiceCommandHelpText() => '你可以说：带我去图书馆、停下、暂停、继续、取消、再说一遍、'
-    '现在到哪了、前面有什么、看看前面、确认、保存录像、删除录像、我需要帮助。';
+    '现在到哪了、前面有什么、看看前面、确认、保存录像、删除录像、我需要帮助、打开口袋模式、关闭口袋模式。';
 
 /// UI-A11Y S1 (UI-01): semantics labels of the big button
 /// in TalkBack TOGGLE mode (MediaQuery.accessibleNavigation
