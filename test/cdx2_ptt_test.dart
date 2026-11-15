@@ -289,8 +289,15 @@ void cdx2Group() {
               'Future<void>.delayed(const Duration(seconds: 10)'),
           isFalse,
           reason: 'no second, unbound 10 s auto-end may exist');
-      expect(mainDart.contains('onLongPress: _talkBackLongPress'),
-          isTrue);
+      // UI-A11Y UI-01 adjustment: in TalkBack toggle mode
+      // the Semantics long-press routes to _pttToggleStart;
+      // outside toggle mode it still routes to
+      // _talkBackLongPress (the shared-timer entry), which
+      // is what this guard pins.
+      expect(mainDart.contains('onLongPress:'), isTrue);
+      expect(mainDart.contains(': _talkBackLongPress'), isTrue,
+          reason: 'the hold-mode Semantics long-press must '
+              'keep routing through _talkBackLongPress');
       expect(mainDart.contains('_onPttCapTimerFired'), isTrue);
     });
   });

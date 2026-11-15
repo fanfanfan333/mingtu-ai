@@ -1502,7 +1502,13 @@ void main() {
       // opens no session.
       final String helpText = voiceCommandHelpText();
       await deliverFinalResult(tester, '帮助');
-      await tester.pump(const Duration(milliseconds: 200));
+      // UI-A11Y UI-06 adjustment: the help command now
+      // speaks the first-launch guide BEFORE the command
+      // list, so the list lands later than the old fixed
+      // 200 ms pump allowed for; wait for the list itself
+      // (this driver completes the guide on the way). The
+      // assertion below is unchanged.
+      await pumpUntilSpeak(tester, h, helpText);
       expect(h.count('tts.speak:$helpText'), 1,
           reason: 'the late final settled the FIRST press: '
               '${h.events}');
@@ -2013,7 +2019,20 @@ void main() {
         await deliverFinalResult(tester, '帮助');
         await tester.pump(const Duration(milliseconds: 100));
         await gesture.up();
-        await pumpUntilSpeak(tester, h, helpText);
+        // UI-A11Y UI-06 adjustment: the help command now
+        // speaks the first-launch guide before the command
+        // list, and the list's promotion through the
+        // scheduler takes more driver rounds than the old
+        // single pumpUntilSpeak budget; pump until this
+        // round's list announcement has actually been
+        // spoken. The assertion below is unchanged.
+        for (int i = 0;
+            i < 90 && h.count('tts.speak:$helpText') < round;
+            i++) {
+          h.completeAllSpeaks();
+          await h.deliverAllCloseStatuses();
+          await tester.pump(const Duration(milliseconds: 100));
+        }
         expect(h.count('tts.speak:$helpText'), round,
             reason: 'round $round executed: ${h.events}');
         expect(h.completeSpeak(helpText), isTrue);

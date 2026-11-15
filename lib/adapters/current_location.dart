@@ -108,10 +108,7 @@ class GeolocatorCurrentLocation implements CurrentLocationProvider {
           '设备定位服务未开启。',
         );
       }
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
+      final LocationPermission permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.deniedForever) {
         return LocationResult.error(
           LocationFailure.permissionDeniedForever,
@@ -149,10 +146,7 @@ class GeolocatorCurrentLocation implements CurrentLocationProvider {
   Future<bool> ensurePermission() async {
     try {
       if (!await Geolocator.isLocationServiceEnabled()) return false;
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
+      final LocationPermission permission = await Geolocator.checkPermission();
       return permission == LocationPermission.always ||
           permission == LocationPermission.whileInUse;
     } catch (_) {

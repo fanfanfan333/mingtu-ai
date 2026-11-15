@@ -95,6 +95,7 @@ Future<StartupInitResult> initializeStartup({
   YoloDetector Function()? yoloFactory,
   Future<bool> Function(String assetPath)? modelAssetProbe,
   StartupFailureLog? log,
+  bool deferAsrInitialization = false,
 }) async {
   final StartupFailureLog failures = log ?? startupFailures;
 
@@ -153,6 +154,7 @@ Future<StartupInitResult> initializeStartup({
     () async {
       final SystemVoiceInput adapter = (asrFactory ?? SystemVoiceInput.new)();
       asr = adapter;
+      if (deferAsrInitialization) return true;
       return adapter
           .initialize()
           .timeout(const Duration(seconds: 3), onTimeout: () => false);
