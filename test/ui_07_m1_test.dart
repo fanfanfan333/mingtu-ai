@@ -7,7 +7,34 @@ import 'package:mingtu_ai/adapters/yolo_detector_mobile.dart';
 import 'package:mingtu_ai/core/speech_scheduler.dart';
 import 'package:mingtu_ai/core/yolo_error_speech.dart';
 
+import 'support/posix_bash.dart';
+
+/// Whether a release merged manifest or release APK is available to check.
+///
+/// Only in that case does the manifest case have to execute
+/// `tool/check_release_manifest.sh`, which requires a real POSIX bash.
+bool _releaseArtifactsPresent() {
+  final merged = Directory('build/app/intermediates/merged_manifest/release');
+  final apk = File('build/app/outputs/flutter-apk/app-release.apk');
+  if (apk.existsSync()) {
+    return true;
+  }
+  return merged.existsSync() &&
+      merged
+          .listSync(recursive: true)
+          .whereType<File>()
+          .any((file) => file.path.endsWith('AndroidManifest.xml'));
+}
+
 void main() {
+  // The shell script is only executed when release artifacts exist; when it is
+  // needed but no POSIX bash can run, the case is skipped with an explicit
+  // reason instead of passing without ever running the script.
+  final needsBash = _releaseArtifactsPresent();
+  final posixBash = needsBash ? findUsableBash() : null;
+  final bashSkipReason = needsBash && posixBash == null
+      ? 'no usable POSIX bash on this host'
+      : null;
   test('only the packaged asset is accepted', () {
     expect(AppConfig.yoloModelPath, packagedYoloModelPath);
     for (final path in [
@@ -103,17 +130,13 @@ void main() {
     ]) {
       expect(manifest, contains('android:name="$name" tools:node="remove"'));
     }
-    final merged = Directory('build/app/intermediates/merged_manifest/release');
-    final apk = File('build/app/outputs/flutter-apk/app-release.apk');
-    if ((merged.existsSync() &&
-            merged
-                .listSync(recursive: true)
-                .whereType<File>()
-                .any((file) => file.path.endsWith('AndroidManifest.xml'))) ||
-        apk.existsSync()) {
-      final result =
-          Process.runSync('bash', ['tool/check_release_manifest.sh']);
+    if (needsBash) {
+      // `posixBash` is guaranteed non-null here: otherwise the case below is
+      // skipped with an explicit reason instead of asserting on a script that
+      // never ran.
+      final result = Process.runSync(
+          posixBash!, const ['tool/check_release_manifest.sh']);
       expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
     }
-  });
+  }, skip: bashSkipReason);
 }

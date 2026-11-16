@@ -13,6 +13,8 @@ import 'package:mingtu_ai/core/real_navigation.dart';
 import 'package:mingtu_ai/core/speech_scheduler.dart';
 import 'package:mingtu_ai/modules/map_navigation.dart';
 
+import 'support/posix_bash.dart';
+
 class _LocationPlatform extends GeolocatorPlatform {
   _LocationPlatform(this.error, this.stream);
   final Object error;
@@ -71,7 +73,13 @@ void main() {
     }
   });
 
+  // Resolved once; `null` means this host has no runnable POSIX bash (e.g. a
+  // Windows box whose only `bash` is the WSL stub). The case is then skipped
+  // explicitly instead of asserting on a script that never ran.
+  final posixBash = findUsableBash();
+
   test('manifest checker validates permissions and services', () {
+    final bash = posixBash!;
     final script = File('tool/check_release_manifest.sh').readAsStringSync();
     expect(script, contains('processReleaseMainManifest'));
     expect(script, contains('android.permission.FOREGROUND_SERVICE_LOCATION'));
@@ -84,7 +92,7 @@ void main() {
       file.writeAsStringSync(
           '<manifest xmlns:android="http://schemas.android.com/apk/res/android">$body</manifest>');
       return Process.runSync(
-          'bash', ['tool/check_release_manifest.sh', file.path]);
+          bash, ['tool/check_release_manifest.sh', file.path]);
     }
 
     const geo =
@@ -112,11 +120,10 @@ void main() {
                 .whereType<File>()
                 .any((f) => f.path.endsWith('AndroidManifest.xml'))) ||
         apk.existsSync()) {
-      final result =
-          Process.runSync('bash', ['tool/check_release_manifest.sh']);
+      final result = Process.runSync(bash, ['tool/check_release_manifest.sh']);
       expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
     }
-  });
+  }, skip: posixBash == null ? 'no usable POSIX bash on this host' : null);
 
   for (final error in [
     PlatformException(code: 'location'),

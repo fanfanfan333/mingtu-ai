@@ -6,6 +6,7 @@ import 'package:mingtu_ai/adapters/system_voice_io.dart';
 import 'package:mingtu_ai/adapters/amap_client.dart';
 import 'package:mingtu_ai/core/haptics.dart';
 import 'package:mingtu_ai/core/asr_errors.dart';
+import 'package:mingtu_ai/core/foreground_watchdog.dart';
 import 'package:mingtu_ai/core/permission_flow.dart';
 import 'package:mingtu_ai/core/navigation_tracker.dart';
 import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
@@ -33,6 +34,19 @@ class FakeOutput implements VoiceOutput {
   }
 }
 
+/// Records speech and finishes each utterance on a short fake timer.
+///
+/// The timer (rather than an immediate completion) keeps any runaway
+/// re-speak loop bounded by fake time: a regression that replays the same
+/// fault forever fails on a count assertion instead of hanging the run.
+class PacedFakeOutput extends FakeOutput {
+  @override
+  Future<void> speak(String text) async {
+    spoken.add(text);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+  }
+}
+
 void main() {
   testWidgets('permission timeout during TTS failure is spoken after recovery', (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
@@ -44,6 +58,70 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
     for (var i = 0; i < 10; i++) { await tester.pump(); }
     expect(output.spoken, contains(permissionRequestTimeoutText));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets(
+      'recovered foreground fault is announced once and never replayed again',
+      (tester) async {
+    var watchdogNow = DateTime(2026);
+    mingtuWatchdogNowOverride = () => watchdogNow;
+    addTearDown(() => mingtuWatchdogNowOverride = null);
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    const a = GeoPoint(latitude: 37.724409, longitude: 120.441723);
+    const b = GeoPoint(latitude: 37.726206, longitude: 120.441723);
+    const c = GeoPoint(latitude: 37.726206, longitude: 120.442859);
+    // A live tracker arms the foreground location watchdog (location: true).
+    handle.debugInstallLiveTracker(
+      steps: const <AmapStep>[
+        AmapStep(
+            action: '直行',
+            orientation: '北',
+            polyline: [a, b],
+            distanceM: 200,
+            durationS: 150),
+        AmapStep(
+            action: '右转',
+            orientation: '东',
+            polyline: [b, c],
+            distanceM: 100,
+            durationS: 75),
+      ],
+      stepTexts: const ['直行', '右转进入林荫道'],
+      destination: c,
+      destinationName: '图书馆',
+    );
+    final output = PacedFakeOutput();
+    handle.debugFailTts(() async => output);
+    // Let the 250 ms foreground ticker observe the live tracker.
+    await tester.pump(const Duration(milliseconds: 300));
+    // 31 s without a fix latches a location stall while TTS is down: the
+    // fault is registered for replay but must stay silent for now.
+    watchdogNow = watchdogNow.add(const Duration(seconds: 31));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(output.spoken, isNot(contains(foregroundLocationStallText)));
+    // TTS recovers -> the stalled fault is announced, and only then marked
+    // delivered (the mark is written when the utterance COMPLETES).
+    await tester.pump(const Duration(seconds: 1));
+    for (var i = 0; i < 10; i++) {
+      await tester.pump();
+    }
+    expect(output.spoken, contains(foregroundLocationStallText));
+    await tester.pump(const Duration(seconds: 1));
+    // Second replay window: another alert finishes while the stall is still
+    // active. The same fault text must NOT be spoken a second time.
+    handle.debugSayForTest(SpeechKind.alert, text: '测试提示');
+    await tester.pump(const Duration(seconds: 2));
+    expect(
+        output.spoken.where((text) => text == foregroundLocationStallText).length,
+        1,
+        reason: '同一个前景故障每次卡住只能补发一次，不能反复重播');
+    expect(output.spoken.every((text) => !containsBannedWord(text)), isTrue);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(seconds: 4));
   });
