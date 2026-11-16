@@ -64,6 +64,7 @@ import 'core/startup_guard.dart';
 import 'core/voice_log.dart';
 import 'adapters/startup_initializer.dart';
 import 'core/voice_commands.dart';
+import 'core/voice_replies.dart';
 import 'core/pocket_mode.dart';
 import 'adapters/pocket_mode_gateway.dart';
 import 'core/voice_startup.dart';
@@ -7814,10 +7815,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             confirmText: '任务已取消，直行提醒已停止。',
           ));
         } else {
+          // D5 (blind-first): the rejection used to say "请先重置演示",
+          // which is not actionable for a real user -- there is no demo
+          // to reset in their hand. `cancelRejectedSpeech` grades the
+          // reply by state (idle accepts the withdrawal, terminal states
+          // say there is nothing left, anything else says plainly that
+          // this state cannot cancel).
           _say(_request(
             id: 'voice-cancel-no-${DateTime.now().millisecondsSinceEpoch}',
             eventId: 'voice-cancel-no-${DateTime.now().millisecondsSinceEpoch}',
-            text: '当前状态不能取消，请先重置演示。',
+            text: cancelRejectedSpeech(_tasks.state),
             kind: SpeechKind.info,
           ));
         }
