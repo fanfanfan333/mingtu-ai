@@ -52,9 +52,18 @@ if bad:
 PY
 fi
 if [[ -n "$apk" ]]; then
-  sdk=/workspace/tools/android-sdk/build-tools
-  aapt=$(find "$sdk" -type f -name aapt | sort -V | tail -n 1)
-  [[ -n "$aapt" ]] || { echo 'aapt unavailable' >&2; exit 1; }
+  # SDK 定位：优先用 Flutter/Android 标准环境变量，未设置时回退到 CI 约定路径。
+  # 之前这里硬编码 /workspace/tools/android-sdk，导致本机（以及任何非该 CI 布局
+  # 的机器）一旦构建出 release 产物、该分支被激活，就报 "No such file or directory"。
+  sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/workspace/tools/android-sdk}}"
+  if command -v cygpath >/dev/null 2>&1; then
+    # Windows 下环境变量常是 D:\Android\Sdk 形式，转成 /d/Android/Sdk 供 find 使用。
+    sdk_root="$(cygpath -u "$sdk_root" 2>/dev/null || printf '%s' "$sdk_root")"
+  fi
+  sdk="$sdk_root/build-tools"
+  # 只用 aapt：aapt2 的 `dump xmltree` 参数顺序与 aapt 不同，混用会静默产出错误结果。
+  aapt=$(find "$sdk" -type f \( -name aapt -o -name aapt.exe \) 2>/dev/null | sort -V | tail -n 1)
+  [[ -n "$aapt" ]] || { echo "aapt unavailable (looked under $sdk)" >&2; exit 1; }
   permissions=$("$aapt" dump permissions "$apk")
   if printf '%s\n' "$permissions" | grep -E "uses-permission[^:]*:.*android.permission.(FOREGROUND_SERVICE(_LOCATION|_DATA_SYNC)?|ACCESS_BACKGROUND_LOCATION|RECEIVE_BOOT_COMPLETED)(['\" ]|$)"; then
     echo 'Forbidden APK permission found.' >&2; exit 1

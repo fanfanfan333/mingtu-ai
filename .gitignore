@@ -8,6 +8,9 @@ build/
 .env
 *.key
 *.pem
+# Build-time config for tool/build_release_apk.sh (real keys live here,
+# never in git). The tracked *.example file documents the five keys.
+tool/release_defines.local.env
 # OS / editor noise.
 .DS_Store
 .idea/
