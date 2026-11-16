@@ -395,8 +395,25 @@ void main() {
       await pumpFrames(tester);
       expect(timeline, contains('speak:停，前方来车。'));
       await completeSpeak(tester, 'speak:停，前方来车。');
+      await pumpFrames(tester, 5);
+      // 方向一（危险仍在）：车还在正前方、风险没有解除，
+      // 此时绝不能接一句「继续直走」——那等于让用户直接撞上去。
+      expect(
+        timeline.where((String e) => e.contains('继续直走')),
+        isEmpty,
+        reason: 'no straight replay while the hazard is still active. '
+            'timeline: $timeline',
+      );
+      // 方向二（危险解除后）：三帧连续无目标 → 风险解除，
+      // 被压住的直行重放必须补播出来，证明"压住"不等于"丢弃"。
+      for (int i = 0; i < 3; i++) {
+        h.simulateDetections(const <Detection>[]);
+      }
+      await pumpFrames(tester, 5);
+      await drainSpeaks(tester);
       expect(timeline, contains('speak:继续直走'),
-          reason: 'the shortened straight replay. timeline: $timeline');
+          reason: 'the held straight replay is delivered once the hazard '
+              'clears. timeline: $timeline');
       await drainSpeaks(tester);
     });
 

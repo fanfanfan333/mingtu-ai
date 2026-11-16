@@ -582,8 +582,23 @@ void main() {
       expect(timeline(), contains('speak:停，前方来车。'));
       expectVibrationLeadsDanger();
       await completeSpeak(tester, 'speak:停，前方来车。');
+      await pumpFrames(tester, 5);
+      // 方向一（危险仍在）：风险未解除时不得补播「继续直走」。
+      expect(
+        timeline().where((String e) => e.contains('继续直走')),
+        isEmpty,
+        reason: 'no straight replay while the hazard is still active. '
+            'timeline: ${timeline()}',
+      );
+      // 方向二（危险解除后）：风险解除后必须补播，不能丢。
+      for (int i = 0; i < 3; i++) {
+        h.simulateDetections(const <Detection>[]);
+      }
+      await pumpFrames(tester, 5);
+      await drainSpeaks(tester);
       expect(timeline(), contains('speak:继续直走'),
-          reason: 'the shortened straight replay. timeline: ${timeline()}');
+          reason: 'the held straight replay is delivered once the hazard '
+              'clears. timeline: ${timeline()}');
       await drainSpeaks(tester);
       expectTimelineClean();
     });

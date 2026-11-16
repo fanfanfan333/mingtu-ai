@@ -892,6 +892,16 @@ void main() {
         expect(output.spoken.every((text) => !text.contains('继续导航')), isTrue);
         expect(output.spoken.any((text) => text.contains('车') || text.contains('障碍')), isTrue);
         expect(output.spoken, contains('用盲杖确认。'));
+        // 顺序断言：危险仍在时必须先说「语音已恢复」，再说危险，最后说
+        // 「用盲杖确认。」——先报危险会让用户误以为语音已可用。
+        final recoveryIndex = output.spoken.indexWhere((text) => text.contains('语音已恢复'));
+        final hazardIndex = output.spoken.indexWhere(
+            (text) => text.contains('车') || text.contains('障碍'));
+        final confirmIndex = output.spoken.indexOf('用盲杖确认。');
+        expect(recoveryIndex, lessThan(hazardIndex));
+        expect(hazardIndex, lessThan(confirmIndex));
+        // 危险仍在时不得播「直走」：这是最危险的误导（会让人直接撞上去）。
+        expect(output.spoken.every((text) => !text.contains('直走')), isTrue);
       } else {
         expect(handle.taskState, TaskState.navigating);
         expect(output.spoken, contains('语音已恢复，继续导航。'));

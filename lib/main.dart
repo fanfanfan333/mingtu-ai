@@ -1358,6 +1358,14 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   Future<bool>? _pendingTtsStop;
   SystemVoiceOutput? _ttsStopUnconfirmed;
   bool _pendingForegroundFaultReplay = false;
+
+  /// True while an interrupted NAVIGATION prompt is being held
+  /// back because a hazard is still active (see
+  /// [_tryReplayInterruptedNav]). Holding, never dropping: the
+  /// item stays in the scheduler's interrupted queue (its 15 s
+  /// replay window and the user-pause drop rule are unchanged)
+  /// and is replayed as soon as the hazard is gone.
+  bool _pendingInterruptedNavReplay = false;
   final Set<String> _deliveredRecoveryFaults = <String>{};
   late final TtsRecoveryController _ttsRecovery = TtsRecoveryController(
     haptics: () => _haptics,
@@ -3618,6 +3626,45 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     return null;
   }
 
+  /// 重放（必要时先压住）被危险播报打断的导航提示。
+  ///
+  /// 返回 true 表示「还有没播出去的项，条件合适时还要再试一次」。
+  ///
+  /// 为什么危险仍在时必须压住直行重放（本轮修复的真实缺陷）：
+  /// [SpeechScheduler.submit] 对 straight 没有 risk 守卫——直发的重放
+  /// 一旦遇上空的 active 槽就会立刻变成 active 播出去，绕过
+  /// [SpeechScheduler.promoteNext] 的 `riskActive` 检查。于是
+  /// 「停，前方来车。」播完之后紧接着一句「继续直走」，对盲人是致命
+  /// 误导（等于在障碍还在正前方时让用户继续往前走）。
+  ///
+  /// 只压直行：turn（以及重算距离后的转向提示）是"前方路况信息"，
+  /// 不是"继续走"的动作指令，M1 2.6 的中断重放策略保持不变；把它一起
+  /// 压住等于改策略，不在本次修复范围内。
+  ///
+  /// 压住不等于丢弃：被中断项只在 [_buildInterruptedReplay] 里出队，
+  /// 危险解除后（下一次播报完成的尾声，见 _finishSpeech）立刻补放，
+  /// 15 秒重放窗口与用户暂停丢弃策略都不变。
+  bool _tryReplayInterruptedNav() {
+    if (_dangerPending) {
+      // 有危险/紧急播报在播或排队：重放让位，稍后再试。
+      return _scheduler.interruptedNavigationRequests().isNotEmpty;
+    }
+    final SpeechRequest? locationReplay =
+        takeInterruptedLocationSignalReplay(_scheduler, _speechNow());
+    if (locationReplay != null) _say(locationReplay);
+    final List<SpeechRequest> interrupted =
+        _scheduler.interruptedNavigationRequests();
+    if (interrupted.isNotEmpty &&
+        _riskActive &&
+        interrupted.first.kind == SpeechKind.straight) {
+      // 危险仍在：压住，绝不在危险播报后面接「继续直走」。
+      return true;
+    }
+    final SpeechRequest? replay = _buildInterruptedReplay();
+    if (replay != null) _say(replay);
+    return _scheduler.interruptedNavigationRequests().isNotEmpty;
+  }
+
   /// Regenerated text for an interrupted turn / distance
   /// prompt, recomputed from the latest GPS fix. Null when
   /// the moment has passed (see NavigationTracker).
@@ -3757,15 +3804,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // _buildInterruptedReplay). If the replay becomes the
       // active prompt, promoteNext below finds the seat
       // taken and correctly does nothing.
-      if ((finished.kind == SpeechKind.danger ||
-              finished.kind == SpeechKind.emergency ||
-              finished.kind == SpeechKind.obstacleAvoidance) &&
-          !_dangerPending) {
-        final SpeechRequest? locationReplay =
-            takeInterruptedLocationSignalReplay(_scheduler, _speechNow());
-        if (locationReplay != null) _say(locationReplay);
-        final SpeechRequest? replay = _buildInterruptedReplay();
-        if (replay != null) _say(replay);
+      //
+      // 本轮修复：`_tryReplayInterruptedNav` 会在危险仍在时把
+      // 「继续直走」这类直行重放压住（详见该方法注释），压住期间
+      // `_pendingInterruptedNavReplay` 为 true，于是每一次后续播报
+      // 完成的尾声都会再试一次——危险一解除就补播，不会喂给过期日志。
+      final bool urgentFinished = finished.kind == SpeechKind.danger ||
+          finished.kind == SpeechKind.emergency ||
+          finished.kind == SpeechKind.obstacleAvoidance;
+      if (_pendingInterruptedNavReplay || (urgentFinished && !_dangerPending)) {
+        _pendingInterruptedNavReplay = _tryReplayInterruptedNav();
       }
       final SpeechRequest? next = _scheduler.promoteNext(
         _speechNow(),
@@ -5841,6 +5889,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     required String confirmText,
   }) async {
     mingtuVoiceLog('用户打断（停下）：取消待播报并停止当前播报');
+    // 用户明确说停下：不再补播任何被压住的导航提示。
+    _pendingInterruptedNavReplay = false;
     final List<String> cancelled = _scheduler.cancelAll();
     if (cancelled.isNotEmpty) {
       _logMsg('已取消 ${cancelled.length} 条待播报提示。');
@@ -7958,6 +8008,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _resetDemo() {
     _userPausedDuringTtsFailure = false;
     _deferredPausedCatchUp = false;
+    _pendingInterruptedNavReplay = false;
     _pausedTurnStepIndex = null;
     _pausedTurnTracker = null;
     _ttsRecovery.stopDanger();
