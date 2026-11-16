@@ -57,6 +57,7 @@ class SystemVoiceOutput implements VoiceOutput {
   // exists (plain Dart test) and must be caught, not constructed here.
   FlutterTts? _tts;
   bool _available = false;
+  int _stopEpoch = 0;
   bool _chineseVerified = false;
   String _detail = '未初始化';
 
@@ -177,15 +178,18 @@ class SystemVoiceOutput implements VoiceOutput {
   Future<void> speak(String text) async {
     final FlutterTts? tts = _tts;
     if (!_available || tts == null) return;
+    final int epoch = _stopEpoch;
     try {
       final dynamic result = await tts.speak(text);
       if (!ttsResultSucceeded(result)) {
         throw StateError('系统语音合成返回失败（speak result=$result）');
       }
     } catch (e) {
-      _available = false;
-      _chineseVerified = false;
-      _detail = 'NOT_CONFIGURED（系统语音合成失败：平台调用异常）';
+      if (epoch == _stopEpoch) {
+        _available = false;
+        _chineseVerified = false;
+        _detail = 'NOT_CONFIGURED（系统语音合成失败：平台调用异常）';
+      }
       rethrow;
     }
   }
@@ -197,6 +201,7 @@ class SystemVoiceOutput implements VoiceOutput {
   Future<void> stop() async {
     final FlutterTts? tts = _tts;
     if (tts == null) return;
+    _stopEpoch++;
     final dynamic result = await tts.stop();
     if (!ttsResultSucceeded(result)) {
       throw StateError('停止语音播报未成功（stop result=$result）');

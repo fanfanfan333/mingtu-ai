@@ -5,6 +5,8 @@ import 'package:mingtu_ai/adapters/voice_io.dart';
 import 'package:mingtu_ai/adapters/system_voice_io.dart';
 import 'package:mingtu_ai/adapters/amap_client.dart';
 import 'package:mingtu_ai/core/haptics.dart';
+import 'package:mingtu_ai/core/asr_errors.dart';
+import 'package:mingtu_ai/core/permission_flow.dart';
 import 'package:mingtu_ai/core/navigation_tracker.dart';
 import 'package:mingtu_ai/core/hazard/hazard_phrases.dart';
 import 'package:mingtu_ai/core/tts_recovery.dart';
@@ -32,6 +34,61 @@ class FakeOutput implements VoiceOutput {
 }
 
 void main() {
+  testWidgets('permission timeout during TTS failure is spoken after recovery', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp()); await tester.pump();
+    final handle = mingtuHomeDebugHandle!; final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    expect(handle.debugSayForTest(SpeechKind.alert, text: permissionRequestTimeoutText), isFalse);
+    await tester.pump(const Duration(seconds: 1));
+    for (var i = 0; i < 10; i++) { await tester.pump(); }
+    expect(output.spoken, contains(permissionRequestTimeoutText));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('ASR fault recovery waits for foreground', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp()); await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    handle.debugHandleAsrError('error_permission|permanent=true');
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump(const Duration(seconds: 1));
+    for (var i = 0; i < 10; i++) { await tester.pump(); }
+    expect(output.spoken, isNot(contains(asrPermissionSpeechText)));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    for (var i = 0; i < 10; i++) { await tester.pump(); }
+    expect(output.spoken, contains(asrPermissionSpeechText));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('ASR permission error during TTS failure is spoken on recovery', (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    final output = FakeOutput();
+    handle.debugFailTts(() async => output);
+    handle.debugHandleAsrError('error_permission|permanent=true');
+    await tester.pump(const Duration(seconds: 1));
+    for (var i = 0; i < 10; i++) { await tester.pump(); }
+    expect(output.spoken, contains(asrPermissionSpeechText));
+    handle.debugFailTts(() async => output);
+    await tester.pump(const Duration(seconds: 1));
+    for (var i = 0; i < 10; i++) { await tester.pump(); }
+    expect(output.spoken.where((s) => s == asrPermissionSpeechText).length, 1);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
   testWidgets('navigation hazards vibrate after TTS failure pauses the task',
       (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
@@ -708,6 +765,12 @@ void main() {
   for (final scenario in <String>['hazard remains', 'hazard clears', 'demo hazard clears']) {
     testWidgets('recovery when $scenario during TTS failure', (tester) async {
       mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+      var frameTime = DateTime(2026);
+      mingtuYoloNowOverride = () {
+        frameTime = frameTime.add(const Duration(milliseconds: 200));
+        return frameTime;
+      };
+      addTearDown(() => mingtuYoloNowOverride = null);
       addTearDown(() => mingtuStartupTtsFactoryOverride = null);
       await tester.pumpWidget(const MingtuApp());
       await tester.pump();

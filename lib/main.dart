@@ -142,6 +142,7 @@ SystemVoiceOutput Function()? mingtuStartupTtsFactoryOverride;
 PermissionGateway? mingtuPermissionGatewayOverride;
 WakelockGateway? mingtuWakelockGatewayOverride;
 DateTime Function()? mingtuWatchdogNowOverride;
+DateTime Function()? mingtuYoloNowOverride;
 
 @visibleForTesting
 const emergencyConfirmTimeout = Duration(seconds: 10);
@@ -412,6 +413,8 @@ class MingtuHomeDebugHandle {
 
   /// NAVHAZ M1 seam: feed one live-navigation fix through
   /// the production fix handler.
+  void debugLiveLocationResult(LocationResult result) => _state._onLiveNavFix(result);
+
   void debugLiveFix(GeoPoint point, double? accuracyM) =>
       _state._onLiveNavFix(LocationResult.fix(point, accuracyM));
 
@@ -473,6 +476,8 @@ class MingtuHomeDebugHandle {
   /// Test seam: speak a hazard through the scheduler so
   /// permission-purpose delivery can be interrupted or
   /// queued behind it. Production never calls this.
+  void debugHandleAsrError(String error) => _state._handleAsrError(error);
+
   void debugSpeakHazard(String text) {
     _state._say(_state._request(
       id: 'test-hazard-${DateTime.now().microsecondsSinceEpoch}',
@@ -482,10 +487,10 @@ class MingtuHomeDebugHandle {
     ));
   }
 
-  bool debugSayForTest(SpeechKind kind) => _state._say(_state._request(
+  bool debugSayForTest(SpeechKind kind, {String text = '测试提示'}) => _state._say(_state._request(
         id: 'test-fallback-${kind.name}',
         eventId: 'test-fallback-${kind.name}',
-        text: '测试提示',
+        text: text,
         kind: kind,
       ));
 
@@ -794,6 +799,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// may announce the same code again). No code ever
   /// disables future presses.
   final Set<String> _asrErrorSpokenCodes = <String>{};
+  String? _pendingAsrFaultText;
+  bool _pendingPermissionTimeout = false;
 
   /// The ONE open streak of RECOVERABLE recognition
   /// errors (CDX2 replaces the per-code cumulative Map):
@@ -1307,6 +1314,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   String _liveNavDestName = '';
   double? _liveNavRemainingM;
   DateTime? _lastGpsErrorAt;
+  bool _gpsSignalFailed = false;
   // Step D entrance guidance: created when the tracker hands
   // over (fix within 60 m of the destination). While active,
   // GPS fixes feed the guidance instead of the tracker, and
@@ -1347,9 +1355,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             last.from == TaskState.findingEntrance);
   }
   Future<VoiceOutput?> Function()? _ttsRebuildOverride;
+  Future<bool>? _pendingTtsStop;
+  SystemVoiceOutput? _ttsStopUnconfirmed;
+  bool _pendingForegroundFaultReplay = false;
+  final Set<String> _deliveredRecoveryFaults = <String>{};
   late final TtsRecoveryController _ttsRecovery = TtsRecoveryController(
     haptics: () => _haptics,
     rebuild: () async {
+      if (_pendingTtsStop != null) return null;
+      if (_ttsStopUnconfirmed != null) {
+        final stopped = await _stopTtsPlayback().timeout(
+          const Duration(milliseconds: 800), onTimeout: () => false);
+        if (!stopped) return null;
+      }
       if (_ttsRebuildOverride != null) return _ttsRebuildOverride!();
       final output = SystemVoiceOutput();
       if (!await output.initialize() || !output.chineseVoiceVerified) {
@@ -1401,6 +1419,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       setState(() {
         _voiceText = '语音：TTS：${output.status}；ASR：${_voiceInput.status}。';
       });
+      _pendingForegroundFaultReplay = true;
+      _deliveredRecoveryFaults.clear();
+      if (!_replayHazardAfterRecovery && !recoveredEmergency) {
+        _replayForegroundFaults();
+      }
       if (recoveredEmergency) {
         final result = _emergency.trigger(
           triggerType: 'voice-小途，我需要帮助（演示）',
@@ -1608,11 +1631,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       WakelockControl(mingtuWakelockGatewayOverride ?? PluginWakelockGateway());
   late final ForegroundWatchdog _watchdog = ForegroundWatchdog(
     now: mingtuWatchdogNowOverride ?? DateTime.now,
-    onFault: (text) => _say(_request(
+    onFault: (text) {
+      _pendingForegroundFaultReplay = true;
+      _deliveredRecoveryFaults.remove(text);
+      _say(_request(
         id: 'foreground-fault-${DateTime.now().microsecondsSinceEpoch}',
         eventId: text,
         text: text,
-        kind: SpeechKind.alert)),
+        kind: SpeechKind.alert));
+    },
   );
   static const MethodChannel _headsetChannel = MethodChannel('mingtu/headset');
   int _emergencyTriggerCount = 0;
@@ -1761,6 +1788,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // result, then the flow continues. Nothing else runs
     // on resume (no background behaviour of any kind).
     if (state == AppLifecycleState.resumed) {
+      if (_pendingForegroundFaultReplay && !_replayHazardAfterRecovery && !_dangerPending) {
+        _replayForegroundFaults();
+      }
       unawaited(_onPermissionSettingsReturn());
       _retryDeferredPermissionFlow();
     }
@@ -1982,6 +2012,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   void _retryDeferredPermissionFlow() {
     final List<Object>? effects = _deferredPermissionEffects;
     if (effects == null) return;
+    _pendingPermissionTimeout = false;
     _deferredPermissionEffects = null;
     for (final effect in effects) {
       if (effect is PermissionRequestEffect) {
@@ -2043,6 +2074,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                 _permissionRequestGeneration[effect.permission] != generation) {
               return;
             }
+            _pendingPermissionTimeout = false;
             if (lateOutcome != PermissionOutcome.granted) return;
             _deferredPermissionEffects = null;
             if (lateOutcome == PermissionOutcome.granted) {
@@ -2359,6 +2391,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (!mounted || _liveNav == null) return;
     _watchdog.locationCallback();
     if (!r.ok) {
+      _gpsSignalFailed = true;
       final DateTime now = DateTime.now();
       if (_lastGpsErrorAt == null ||
           now.difference(_lastGpsErrorAt!) > const Duration(seconds: 60)) {
@@ -2372,6 +2405,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }
       return;
     }
+    _gpsSignalFailed = false;
     final DateTime fixAt = DateTime.now();
     _lastFixPoint = r.pointGcj02;
     _lastFixAccuracyM = r.accuracyM;
@@ -2685,6 +2719,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (naviSource != null) unawaited(naviSource.stop());
     _liveNav = null;
     _deferredPausedCatchUp = false;
+    _gpsSignalFailed = false;
     _pausedTurnStepIndex = null;
     _pausedTurnTracker = null;
     _updateForegroundPolicies();
@@ -3160,13 +3195,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       '语音识别运行中出错：$fixedText',
     );
     _logMsg('语音识别运行中出错（$fixedText）：下次按住仍会重新尝试。');
+    _pendingAsrFaultText = isPermission
+        ? asrPermissionSpeechText
+        : voiceNoticeText(VoiceNoticeKind.asrUnavailable);
+    _pendingForegroundFaultReplay = true;
+    _deliveredRecoveryFaults.remove(_pendingAsrFaultText);
     if (_voiceOutput.isAvailable && !_ttsFailed) {
       _say(_request(
         id: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
         eventId: 'asr-error-${DateTime.now().millisecondsSinceEpoch}',
-        text: isPermission
-            ? asrPermissionSpeechText
-            : voiceNoticeText(VoiceNoticeKind.asrUnavailable),
+        text: _pendingAsrFaultText!,
         kind: SpeechKind.alert,
       ));
     } else {
@@ -3453,6 +3491,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   bool _say(SpeechRequest request, {bool recordAsSpoken = true}) {
     if (!mounted) return false;
+    if (request.kind == SpeechKind.alert && request.text == permissionRequestTimeoutText) {
+      _pendingPermissionTimeout = true;
+      _pendingForegroundFaultReplay = true;
+      _deliveredRecoveryFaults.remove(permissionRequestTimeoutText);
+    }
     if (_ttsFailed) {
       if (request.kind == SpeechKind.danger) {
         _pauseStraightForRisk();
@@ -3488,6 +3531,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _pauseStraightForRisk();
     }
     final previousId = _scheduler.active?.id;
+    final previousEventId = _scheduler.active?.eventId;
     final bool accepted = _scheduler.submit(request, now);
     if (previousId != null && previousId != _scheduler.active?.id) {
       final previousCue = _cueWaits[previousId];
@@ -3511,8 +3555,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // v0.6: real TTS when the phone's engine is reachable; the
     // prompt completes only when the engine reports completion.
     // Otherwise the old simulated 1200 ms timing is used.
+    if (accepted && previousEventId == 'tts-recovered' &&
+        _replayHazardAfterRecovery && request.kind != SpeechKind.danger &&
+        request.kind != SpeechKind.emergency) {
+      _replayCurrentHazardAfterRecovery();
+    }
     if (accepted && _scheduler.active?.id == request.id) {
-      _speakActive(request);
+      _speakActive(request, preempt: previousId != null && previousId != request.id);
     }
     return accepted;
   }
@@ -3607,6 +3656,57 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     return null;
   }
 
+  void _replayCurrentHazardAfterRecovery() {
+    if (!_replayHazardAfterRecovery) return;
+    _replayHazardAfterRecovery = false;
+    if (_riskActive && _lastNavHazPhrase != null && _lastNavHazKind != null) {
+      final id = 'navhaz-recovery-${DateTime.now().microsecondsSinceEpoch}';
+      _say(_request(id: id, eventId: id, text: _lastNavHazPhrase!,
+          kind: _lastNavHazKind!));
+      if (_lastNavHazUrgent) {
+        _say(_request(id: '$id-cane', eventId: 'navhaz-cane',
+            text: '用盲杖确认。', kind: SpeechKind.alert));
+      }
+    } else {
+      _replayForegroundFaults();
+    }
+  }
+
+  void _replayForegroundFaults() {
+    if (!_pendingForegroundFaultReplay || _ttsFailed || !_foreground) return;
+    if (_scheduler.queue.any((request) =>
+        request.kind == SpeechKind.emergency ||
+        request.kind == SpeechKind.danger ||
+        request.kind == SpeechKind.obstacleAvoidance)) {
+      return;
+    }
+    final faults = <String>[
+      if (_watchdog.cameraFaultActive) foregroundCameraStallText,
+      if (_watchdog.locationFaultActive) foregroundLocationStallText,
+      if (_liveNav != null && _gpsSignalFailed) locationSignalLostText,
+      if (_pendingAsrFaultText != null) _pendingAsrFaultText!,
+      if (_pendingPermissionTimeout) permissionRequestTimeoutText,
+    ];
+    final outstanding = faults.where((text) => !_deliveredRecoveryFaults.contains(text));
+    if (outstanding.isEmpty) {
+      _pendingForegroundFaultReplay = false;
+      return;
+    }
+    for (final text in outstanding) {
+      if (_scheduler.active?.text == text ||
+          _scheduler.queue.any((request) => request.text == text)) {
+        continue;
+      }
+      final id = 'fault-recovery-${DateTime.now().microsecondsSinceEpoch}';
+      _say(_request(
+        id: id,
+        eventId: text == _pendingAsrFaultText ? 'asr-error-$id' : id,
+        text: text,
+        kind: SpeechKind.alert,
+      ));
+    }
+  }
+
   /// Shared completion step: mark the active prompt spoken, then
   /// promote the next queued prompt if it is still valid -- and speak
   /// it too, through the same real-or-simulated path.
@@ -3618,18 +3718,36 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (ttsCompleted && id.startsWith('permission-flow-')) {
         _completedPermissionSpeech.add(id);
       }
+      if (ttsCompleted && finished.text == permissionRequestTimeoutText) {
+        _pendingPermissionTimeout = false;
+      }
+      if (ttsCompleted && (finished.eventId.startsWith('fault-recovery-') ||
+          finished.id.startsWith('foreground-fault-'))) {
+        _deliveredRecoveryFaults.add(finished.text);
+      }
+      if (ttsCompleted && finished.text == _pendingAsrFaultText &&
+          finished.eventId.startsWith('asr-error-')) {
+        _pendingAsrFaultText = null;
+      }
       _scheduler.completeActive();
-      if (finished.eventId == 'tts-recovered' &&
-          _replayHazardAfterRecovery) {
-        _replayHazardAfterRecovery = false;
-        if (_riskActive && _lastNavHazPhrase != null && _lastNavHazKind != null) {
-          final id = 'navhaz-recovery-${DateTime.now().microsecondsSinceEpoch}';
-          _say(_request(id: id, eventId: id, text: _lastNavHazPhrase!,
-              kind: _lastNavHazKind!));
-          if (_lastNavHazUrgent) {
-            _say(_request(id: '$id-cane', eventId: 'navhaz-cane',
-                text: '用盲杖确认。', kind: SpeechKind.alert));
-          }
+      if (ttsCompleted && finished.kind == SpeechKind.alert &&
+          _pendingForegroundFaultReplay && !_replayHazardAfterRecovery) {
+        _replayForegroundFaults();
+      }
+      if (finished.eventId == 'tts-recovered' && _replayHazardAfterRecovery) {
+        _replayCurrentHazardAfterRecovery();
+      }
+      if ((finished.kind == SpeechKind.danger ||
+              finished.kind == SpeechKind.emergency ||
+              finished.kind == SpeechKind.obstacleAvoidance) && !_dangerPending) {
+        if (_replayHazardAfterRecovery &&
+            finished.kind == SpeechKind.danger && finished.text == _lastNavHazPhrase) {
+          _replayHazardAfterRecovery = false;
+        }
+        if (_replayHazardAfterRecovery) {
+          _replayCurrentHazardAfterRecovery();
+        } else {
+          _replayForegroundFaults();
         }
       }
       // NAVHAZ M1 arbitration: after a hazard prompt
@@ -3706,52 +3824,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// microphone -- and a danger/emergency prompt first awaits
   /// an unconditional physical stop of the current utterance. Cancellation that landed during the wait is
   /// honoured: a superseded request never starts speaking.
-  void _speakActive(SpeechRequest request) {
-    unawaited(_speakActiveSequenced(request));
+  void _speakActive(SpeechRequest request, {bool preempt = false}) {
+    unawaited(_speakActiveSequenced(request, preempt: preempt));
   }
 
-  Future<void> _speakActiveSequenced(SpeechRequest request) async {
-    if (request.kind == SpeechKind.danger ||
-        request.kind == SpeechKind.emergency) {
-      // Physical preemption, UNCONDITIONAL (Codex re-test of
-      // d01a081, as corrected): a high-priority prompt first
-      // stops the currently playing utterance, then speaks.
-      // No active-flag test decides this: the old design
-      // inspected scheduler state that the straight pause
-      // had already mutated, so on the YOLO path the stop
-      // silently never ran.
-      //
-      // FIX2 (2026-11-11): the wait for the stop to COMPLETE
-      // is capped at NavHazConfig.dangerStopWaitCap
-      // (150 ms), not the 800 ms bound this branch used
-      // before -- on a slow device the old bound could push
-      // the danger voice to 800 ms after the vibration,
-      // past the spec's 300 ms vibration -> speech limit.
-      // The stop is still issued (preemption preserved);
-      // on timeout the speak proceeds immediately and the
-      // engine's speak call interrupts the old utterance
-      // itself. The timeout is a NORMAL path here, not an
-      // error: it is swallowed by the onTimeout below and
-      // only logged. The late stop completion is harmless
-      // to the new utterance by construction: playback
-      // completion is routed per request id through
-      // _playActiveRequest's cancelled/active guards, and
-      // _finishSpeech only acts when the finishing id is
-      // still the scheduler's active id -- a stop that
-      // lands after the danger speak started cannot finish
-      // or cancel the danger request.
-      try {
-        await _stopTtsPlayback().timeout(
-          NavHazConfig.dangerStopWaitCap,
-          onTimeout: () {},
-        );
-      } on TimeoutException {
-        // Defensive: with onTimeout above the timeout does
-        // not throw; keep the historical catch so no
-        // timeout exception can ever leak into the speech
-        // chain from this branch.
-        _logMsg('停止当前播报未完成，继续播报高优先级提示；旧声音可能短暂残留。');
+  Future<void> _speakActiveSequenced(SpeechRequest request,
+      {bool preempt = false}) async {
+    final bool urgent = request.kind == SpeechKind.danger ||
+        request.kind == SpeechKind.emergency;
+    if (preempt && !urgent) {
+      final stopped = await _stopTtsPlayback().timeout(
+        const Duration(milliseconds: 800), onTimeout: () => false);
+      if (!mounted || _scheduler.active?.id != request.id) return;
+      if (!stopped) {
+        _handleTtsFailure(StateError('停止之前的语音播报失败'));
+        return;
       }
+    }
+    if (urgent) {
+      // shortcut: native cancellation can arrive late, use utterance IDs when the plugin supports them.
+      await _stopTtsPlayback().timeout(
+        NavHazConfig.dangerStopWaitCap, onTimeout: () => false);
       if (_scheduler.active?.id != request.id) return;
     }
     final VoiceInput input = _voiceInput;
@@ -3849,8 +3942,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       }).catchError((Object e) {
         // Same guard for the error path: a cancelled utterance
         // failing late is not a new TTS failure.
-        if (_scheduler.cancelledLog.contains(request.id)) {
-          _logMsg('已取消播报的迟到失败回调已忽略（${request.id}）：$e');
+        if (_scheduler.cancelledLog.contains(request.id) ||
+            _scheduler.active?.id != request.id) {
+          _logMsg('已取消或打断播报的迟到失败回调已忽略（${request.id}）：$e');
           return null;
         }
         if (mounted) _handleTtsFailure(e);
@@ -5445,6 +5539,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       // spoken again for a LATER session (dedup is per
       // stretch between successes, never permanent).
       _asrErrorSpokenCodes.clear();
+      _pendingAsrFaultText = null;
       // CDX3 / MT-1111-PTT-4B streak rule (supersedes
       // the CDX2 listen-start clearing AND the PTT-2
       // do-not-clear note): a listen that successfully
@@ -5679,21 +5774,36 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// swallows errors, so a failed stop is caught HERE and surfaced
   /// in the log/status -- the user is told the stop may not have
   /// taken effect instead of the failure disappearing silently.
-  Future<void> _stopTtsPlayback() async {
-    final VoiceOutput out = _voiceOutput;
+  Future<bool> _stopTtsPlayback() {
+    final pending = _pendingTtsStop;
+    if (pending != null) return pending;
+    final stop = _performTtsStop();
+    _pendingTtsStop = stop;
+    stop.then((_) {
+      if (identical(_pendingTtsStop, stop)) _pendingTtsStop = null;
+    });
+    return stop;
+  }
+
+  Future<bool> _performTtsStop() async {
+    final VoiceOutput out = _ttsStopUnconfirmed ?? _voiceOutput;
     if (out is SystemVoiceOutput) {
       _pttStoppedUtteranceAt = DateTime.now();
       try {
         await out.stop();
+        _ttsStopUnconfirmed = null;
       } catch (e) {
+        _ttsStopUnconfirmed = out;
         _logMsg('停止语音播报失败，播报可能仍在继续：$e');
         if (mounted) {
           setState(() {
             _voiceText = '停止语音播报失败：$e';
           });
         }
+        return false;
       }
     }
+    return true;
   }
 
   Future<void> _stopListening() async {
@@ -5735,12 +5845,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     if (cancelled.isNotEmpty) {
       _logMsg('已取消 ${cancelled.length} 条待播报提示。');
     }
-    try {
-      await _stopTtsPlayback().timeout(const Duration(milliseconds: 800));
-    } on TimeoutException {
-      _logMsg('停止播报 800 毫秒内未完成，先播报确认；旧声音可能短暂残留。');
-    }
+    final stopped = await _stopTtsPlayback().timeout(
+      const Duration(milliseconds: 800), onTimeout: () => false);
     if (!mounted) return;
+    if (!stopped) {
+      _handleTtsFailure(StateError('停止之前的语音播报失败'));
+      return;
+    }
     _say(_request(
       id: '$idPrefix-${DateTime.now().millisecondsSinceEpoch}',
       eventId: '$idPrefix-${DateTime.now().millisecondsSinceEpoch}',
@@ -5775,7 +5886,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // frame's own timestamp as stamped by the YOLO adapter
     // at delivery (null for simulated / scripted frames,
     // which then stamp no frame-to-callback segment).
-    final DateTime now = DateTime.now();
+    final DateTime now = mingtuYoloNowOverride?.call() ?? DateTime.now();
     _watchdog.cameraCallback();
     // M3: merge the pothole scanner's latest results
     // into THIS frame at the shared intake, BEFORE every
@@ -7359,9 +7470,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             unawaited(request.then((outcome) {
               if (mounted &&
                   _permissionRequestGeneration[GuidePermission.camera] ==
-                      generation &&
-                  outcome == PermissionOutcome.granted) {
-                _grantedPermissions.add(GuidePermission.camera);
+                      generation) {
+                _pendingPermissionTimeout = false;
+                if (outcome == PermissionOutcome.granted) {
+                  _grantedPermissions.add(GuidePermission.camera);
+                }
               }
             }, onError: (Object _, StackTrace __) {}));
             if (mounted && !token.isCancelled) {

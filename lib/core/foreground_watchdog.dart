@@ -13,6 +13,9 @@ class ForegroundWatchdog {
   DateTime? _cameraAt, _locationAt;
   bool _cameraLatched = false, _locationLatched = false;
 
+  bool get cameraFaultActive => _foreground && _camera && _cameraLatched;
+  bool get locationFaultActive => _foreground && _location && _locationLatched;
+
   void update(
       {required bool foreground,
       required bool camera,

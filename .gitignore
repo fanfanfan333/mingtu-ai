@@ -25,3 +25,6 @@ build/
 assets/models/**
 !assets/models/**/
 !assets/models/**/.gitkeep
+
+# Kotlin 2.x build cache created under android/ by AGP.
+android/.kotlin/

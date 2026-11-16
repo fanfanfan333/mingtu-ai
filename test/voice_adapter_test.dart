@@ -350,7 +350,8 @@ void main() {
       await out.stop();
       gate.complete(0);
       await expectLater(speaking, throwsStateError);
-      expect(out.isAvailable, isFalse);
+      // Android returns 0 for a deliberately stopped utterance.
+      expect(out.isAvailable, isTrue);
     });
   });
 

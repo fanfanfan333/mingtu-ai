@@ -409,7 +409,7 @@ void main() {
     test(
         'speech closes the mic first (awaited), via the single '
         'choke point', () {
-      expect(mainDart, contains('unawaited(_speakActiveSequenced(request))'));
+      expect(mainDart, contains('unawaited(_speakActiveSequenced(request, preempt: preempt))'));
       expect(mainDart, contains('await speakAfterClosingMic('));
       // Danger/emergency prompts physically stop the current
       // utterance first: the sequenced speak path awaits an

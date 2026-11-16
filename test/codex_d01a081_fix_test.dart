@@ -1,8 +1,10 @@
 import 'dart:async';
 
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mingtu_ai/main.dart';
+import 'package:mingtu_ai/core/speech_scheduler.dart';
 
 /// Production-orchestration proof for the Codex re-test of
 /// d01a081 (items 1 and 3), with a RECORDING fake TTS at the
@@ -120,6 +122,10 @@ void main() {
   group('recording fake TTS through the real app', () {
     final List<String> calls = <String>[];
     final List<Completer<dynamic>> pendingSpeaks = <Completer<dynamic>>[];
+    bool completeOnStop = false;
+    bool rejectWhileBusy = false;
+    int stopResult = 1;
+    Completer<dynamic>? stopGate;
 
     void installMocks() {
       final TestDefaultBinaryMessenger messenger =
@@ -134,12 +140,17 @@ void main() {
               return 1;
             case 'speak':
               calls.add('speak:${call.arguments}');
+              if (rejectWhileBusy && pendingSpeaks.any((c) => !c.isCompleted)) return 0;
               final Completer<dynamic> c = Completer<dynamic>();
               pendingSpeaks.add(c);
               return c.future;
             case 'stop':
               calls.add('stop');
-              return 1;
+              if (completeOnStop) {
+                for (final c in pendingSpeaks.where((c) => !c.isCompleted).toList()) { c.complete(0); }
+              }
+              if (stopGate != null) return stopGate!.future;
+              return stopResult;
             default:
               return 1;
           }
@@ -185,6 +196,167 @@ void main() {
         }
         await tester.pump(const Duration(milliseconds: 100));
       }
+    }
+
+    for (final slow in [false, true]) {
+      testWidgets('alert stop ${slow ? 'timeout' : 'failure'} never starts new speech', (tester) async {
+        calls.clear(); pendingSpeaks.clear();
+        completeOnStop = false; stopResult = slow ? 1 : 0;
+        stopGate = slow ? Completer<dynamic>() : null;
+        installMocks();
+        addTearDown(() { stopGate = null; stopResult = 1; clearMocks(); });
+        await tester.pumpWidget(const MingtuApp());
+        for (var i = 0; i < 15 && pendingSpeaks.isEmpty; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(pendingSpeaks, isNotEmpty);
+        expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.alert), isTrue);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 900));
+        await tester.pump();
+        expect(calls, isNot(contains('speak:测试提示')));
+        expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.emergency), isFalse);
+        if (stopGate != null && !stopGate!.isCompleted) stopGate!.complete(1);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(seconds: 4));
+      });
+    }
+
+    testWidgets('urgent stop timeout with busy engine fails closed', (tester) async {
+      calls.clear(); pendingSpeaks.clear(); completeOnStop = false;
+      rejectWhileBusy = true; stopGate = Completer<dynamic>();
+      installMocks();
+      addTearDown(() { rejectWhileBusy = false; stopGate = null; clearMocks(); });
+      await tester.pumpWidget(const MingtuApp());
+      for (var i = 0; i < 15 && pendingSpeaks.isEmpty; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(pendingSpeaks, isNotEmpty);
+      final handle = mingtuHomeDebugHandle!;
+      expect(handle.debugSayForTest(SpeechKind.danger), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+      await tester.pump(); await tester.pump();
+      expect(handle.debugSayForTest(SpeechKind.emergency), isFalse);
+      stopGate!.complete(1);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 4));
+    });
+
+    testWidgets('pause does not speak confirmation when native stop times out', (tester) async {
+      calls.clear(); pendingSpeaks.clear(); completeOnStop = false; stopResult = 1;
+      stopGate = Completer<dynamic>();
+      installMocks(); addTearDown(() { stopGate = null; clearMocks(); });
+      await tester.pumpWidget(const MingtuApp());
+      for (var i = 0; i < 15 && pendingSpeaks.isEmpty; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      final handle = mingtuHomeDebugHandle!;
+      handle.startVoiceDemo(); handle.planRoute(); handle.startNavigating();
+      handle.voiceCommand('暂停');
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 900));
+      await tester.pump();
+      expect(calls.any((s) => s.startsWith('speak:已暂停导航')), isFalse);
+      expect(handle.debugSayForTest(SpeechKind.emergency), isFalse);
+      stopGate!.complete(1);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 4));
+    });
+
+    testWidgets('failed native stop must succeed before TTS rebuild', (tester) async {
+      calls.clear(); pendingSpeaks.clear(); completeOnStop = false; stopResult = 0;
+      installMocks(); addTearDown(() { stopResult = 1; completeOnStop = false; clearMocks(); });
+      await tester.pumpWidget(const MingtuApp());
+      for (var i = 0; i < 15 && pendingSpeaks.isEmpty; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(pendingSpeaks, isNotEmpty);
+      final handle = mingtuHomeDebugHandle!;
+      expect(handle.debugSayForTest(SpeechKind.alert), isTrue);
+      await tester.pump(); await tester.pump();
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pump(); await tester.pump();
+      expect(handle.debugSayForTest(SpeechKind.emergency), isFalse);
+      stopResult = 1; completeOnStop = true;
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pump(); await tester.pump();
+      expect(handle.debugSayForTest(SpeechKind.emergency), isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 4));
+    });
+
+    testWidgets('a timed-out native stop must finish before TTS rebuild', (tester) async {
+      calls.clear(); pendingSpeaks.clear(); completeOnStop = false; stopResult = 1;
+      stopGate = Completer<dynamic>();
+      installMocks(); addTearDown(() { stopGate = null; clearMocks(); });
+      await tester.pumpWidget(const MingtuApp());
+      for (var i = 0; i < 15 && pendingSpeaks.isEmpty; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(pendingSpeaks, isNotEmpty);
+      expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.alert), isTrue);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 900));
+      await tester.pump();
+      expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.emergency), isFalse);
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pump(); await tester.pump();
+      expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.emergency), isFalse);
+      stopGate!.complete(1);
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pump(); await tester.pump();
+      expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.emergency), isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 4));
+    });
+
+    testWidgets('late stopped speech cannot fail a newer completed request', (tester) async {
+      calls.clear(); pendingSpeaks.clear(); completeOnStop = false;
+      installMocks(); addTearDown(clearMocks);
+      await tester.pumpWidget(const MingtuApp());
+      for (var i = 0; i < 15 && pendingSpeaks.isEmpty; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(pendingSpeaks, isNotEmpty);
+      final old = pendingSpeaks.first;
+      expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.alert), isTrue);
+      for (var i = 0; i < 8 && pendingSpeaks.length < 2; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(pendingSpeaks.length, greaterThanOrEqualTo(2));
+      pendingSpeaks[1].complete(1);
+      await tester.pump(); await tester.pump();
+      old.complete(0);
+      await tester.pump(); await tester.pump();
+      expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.emergency), isTrue);
+      await drainSpeech(tester);
+    });
+
+    for (final kind in [SpeechKind.alert, SpeechKind.danger]) {
+      testWidgets('$kind preemption stops the old voice without marking TTS failed',
+        (tester) async {
+      calls.clear();
+      pendingSpeaks.clear();
+      completeOnStop = true;
+      installMocks();
+      addTearDown(() { completeOnStop = false; clearMocks(); });
+      await tester.pumpWidget(const MingtuApp());
+      for (var i = 0; i < 15 && pendingSpeaks.isEmpty; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(pendingSpeaks, isNotEmpty);
+      final before = calls.lastIndexWhere((e) => e.startsWith('speak:'));
+      expect(mingtuHomeDebugHandle!.debugSayForTest(kind), isTrue);
+      for (var i = 0; i < 8; i++) { await tester.pump(const Duration(milliseconds: 50)); }
+      final stop = calls.indexWhere((e) => e == 'stop', before + 1);
+      final next = calls.indexWhere((e) => e == 'speak:测试提示', before + 1);
+      expect(stop, greaterThan(before), reason: '$calls');
+      expect(next, greaterThan(stop), reason: '$calls');
+      expect(mingtuHomeDebugHandle!.debugSayForTest(SpeechKind.emergency), isTrue);
+      await drainSpeech(tester);
+    });
     }
 
     testWidgets(

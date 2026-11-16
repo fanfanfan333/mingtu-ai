@@ -16,6 +16,7 @@ import 'package:mingtu_ai/main.dart';
 
 import 'push_to_talk_ui_test.dart' as ui;
 import 'ui_a11y_s1_test.dart' as s1;
+import 'tts_recovery_test.dart' as recovery;
 
 /// UI-06-B2 / B3 / B4 / B6 / B7 tests. Existing test files
 /// are not modified here.
@@ -1076,6 +1077,30 @@ void main() {
         () => h.events.contains('tts.speak:$permissionRequestTimeoutText'),
         'timeout alert');
     expect(frames.calls, 0);
+  });
+
+  testWidgets('late manual camera denial clears unspoken timeout', (tester) async {
+    store.seen = true;
+    final answer = Completer<PermissionOutcome>();
+    gateway.requestHangs[GuidePermission.camera] = answer;
+    final h = await _openApp(tester);
+    await _pumpSpeaks(tester, h);
+    mingtuHomeDebugHandle!.setCameraFrameSourceForTest(_CountingFrameSource());
+    mingtuHomeDebugHandle!.triggerManualVision();
+    await _driveUntil(tester, h,
+        () => gateway.requested.contains(GuidePermission.camera), 'camera request');
+    final output = recovery.FakeOutput();
+    var canRecover = false;
+    mingtuHomeDebugHandle!.debugFailTts(() async => canRecover ? output : null);
+    await tester.pump(const Duration(seconds: 120));
+    await tester.pump();
+    answer.complete(PermissionOutcome.denied);
+    await tester.pump();
+    canRecover = true;
+    await tester.pump(const Duration(seconds: 30));
+    for (var i = 0; i < 12; i++) { await tester.pump(); }
+    expect(output.spoken, isNot(contains(permissionRequestTimeoutText)));
+    expect(output.spoken.any((s) => s.contains('语音已恢复')), isTrue);
   });
 
   testWidgets('B12 permanent camera denial does not request', (tester) async {
