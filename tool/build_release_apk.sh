@@ -63,10 +63,18 @@ declare -A DEFINE_EXPLICIT=() # KEY -> 命令行已显式指定（不再重复�
 KEYS_ORDER=()
 TMP_FILES=()
 
+# 为什么这里的 rm 必须「失败不致命」：
+# mktemp 在 Git Bash 下会返回 Windows 风格路径（D:/Temp/tmp.XXX），而本机宿主
+# 对 rm 有 safe-delete 包装——它把这个绝对路径当成**相对当前目录**解析成
+# d:\明途AI\mingtu-ai\D:\Temp\tmp.XXX，trash 失败后 fail-closed，rm 返回非 0。
+# 在 set -euo pipefail 下，一个临时文件没删掉就会当场打死脚本：退出码变 1，
+# 更要命的是第 8 步「缺路线配置写 NOTICE」因此被跳过，告警机制恰好失效。
 cleanup() {
   local f
   for f in ${TMP_FILES[@]+"${TMP_FILES[@]}"}; do
-    [ -n "$f" ] && rm -f "$f"
+    if [ -n "$f" ]; then
+      rm -f "$f" 2>/dev/null || true
+    fi
   done
 }
 trap cleanup EXIT
@@ -457,7 +465,7 @@ set +e
 "$PYTHON_BIN_RESOLVED" "$VERIFY_SCRIPT_ARG" "$APK_ARG" < "$DEFINES_MANIFEST"
 VERIFY_RC=$?
 set -e
-rm -f "$DEFINES_MANIFEST" "$VERIFY_SCRIPT"
+rm -f "$DEFINES_MANIFEST" "$VERIFY_SCRIPT" 2>/dev/null || true
 if [ "$VERIFY_RC" -ne 0 ]; then
   echo "!! 进包校验失败，判定本次构建无效（exit=$VERIFY_RC）。"
   exit "$VERIFY_RC"
