@@ -344,6 +344,14 @@ class MingtuHomeDebugHandle {
   List<String> get debugExpired =>
       List<String>.unmodifiable(_state._scheduler.droppedExpiredLog);
 
+  /// NAVHAZ M1 seam: ids of requests STILL sitting in the
+  /// scheduler's interrupted list, i.e. prompts that a later
+  /// replay could still speak. Observable readout for the
+  /// "用户说停下后不得再补播" contract (a user stop must empty
+  /// this list). Production never calls this.
+  List<String> get debugInterrupted =>
+      List<String>.unmodifiable(_state._scheduler.interruptedLog);
+
   /// NAVHAZ M1 seam (CDX3): install a fake clock for the
   /// speech-arbitration timeline (see _speechNow in the
   /// state). Tests drive the 15 s replay-expiry boundary
@@ -5891,6 +5899,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     mingtuVoiceLog('用户打断（停下）：取消待播报并停止当前播报');
     // 用户明确说停下：不再补播任何被压住的导航提示。
     _pendingInterruptedNavReplay = false;
+    // 同时把仍留在中断队列里的导航提示（例如被危险打断的「继续直走」）
+    // 一并丢弃：cancelAll 只清 active/queue，不清 interruptedRequests，
+    // 否则用户喊停之后再来一次危险播报完成，仍会把「继续直走」补播出来。
+    final List<String> discardedInterrupted = _scheduler.discardAllInterrupted();
+    if (discardedInterrupted.isNotEmpty) {
+      _logMsg('用户要求停下：已丢弃 ${discardedInterrupted.length} 条被中断的导航提示，不会补播。');
+    }
     final List<String> cancelled = _scheduler.cancelAll();
     if (cancelled.isNotEmpty) {
       _logMsg('已取消 ${cancelled.length} 条待播报提示。');

@@ -417,6 +417,64 @@ void main() {
       await drainSpeaks(tester);
     });
 
+    testWidgets('(c3) a user stop discards the interrupted straight for good',
+        (tester) async {
+      await tester.pumpWidget(const MingtuApp());
+      await pumpFrames(tester);
+      final MingtuHomeDebugHandle h = mingtuHomeDebugHandle!;
+      h.debugSetHaptics(_FakeHaptics(timeline));
+      await drainSpeaks(tester);
+      h.startVoiceDemo();
+      await drainSpeaks(tester);
+      h.planRoute();
+      await drainSpeaks(tester);
+      h.startNavigating();
+      await pumpFrames(tester);
+      // 导航起步的「直走」正在播（completer 故意不完成），
+      // 接下来会被危险打断，成为一条"被中断的导航提示"。
+      expect(timeline, contains('speak:直走'));
+      feedApproachingCar(h);
+      await pumpFrames(tester);
+      expect(timeline, contains('speak:停，前方来车。'));
+
+      // 用户喊「停下」（VoiceCommand.pause → _stopSpeechThenConfirm）：
+      // 这条被中断的「直走」必须被彻底丢弃——cancelAll 只清 active/queue，
+      // 不清 interruptedRequests，所以必须显式 discardAllInterrupted。
+      h.voiceCommand('停下');
+      await pumpFrames(tester, 5);
+      await drainSpeaks(tester);
+      // 契约：用户说停下之后，中断队列必须是空的——只要还留着一条，
+      // 15 秒内任何危险/紧急播报完成都可能把它补播出来。
+      // 这条断言是"改前红、改后绿"的锚点：cancelAll 只清 active/queue，
+      // 不清 interruptedRequests。
+      expect(h.debugInterrupted, isEmpty,
+          reason: 'a user stop must discard every interrupted prompt that '
+              'could otherwise be replayed later');
+      // 以「停下」这一刻为界：之前那条「直走」是停下之前合法播出的，
+      // 之后不得再出现任何直行指令。
+      final int afterStop = timeline.length;
+
+      // 停下之后再触发一次紧急求助播报（紧急播报不受"暂停"限制），
+      // 它播完时 _finishSpeech 仍会走「紧急/危险播报完成」的重放分支。
+      h.voiceCommand('我需要帮助');
+      await pumpFrames(tester, 5);
+      await drainSpeaks(tester);
+      // 危险解除：这条路径在修复前会把 stale 的「继续直走」补播出来。
+      for (int i = 0; i < 3; i++) {
+        h.simulateDetections(const <Detection>[]);
+      }
+      await pumpFrames(tester, 5);
+      await drainSpeaks(tester);
+
+      // 用户说过停下：之后不得再出现「直走」/「继续直走」这类行走指令。
+      expect(
+        timeline.sublist(afterStop).where((String e) => e.contains('直走')),
+        isEmpty,
+        reason: 'the user said STOP: a stale straight prompt must never be '
+            'replayed afterwards. timeline: $timeline',
+      );
+    });
+
     testWidgets('(d) urgent replaces a playing warning immediately',
         (tester) async {
       final MingtuHomeDebugHandle h = await startApp(tester);

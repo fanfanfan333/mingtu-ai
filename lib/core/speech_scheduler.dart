@@ -378,6 +378,22 @@ class SpeechScheduler {
     return cancelled;
   }
 
+  /// 用户明确说「停下」：丢弃全部被中断的导航提示，此后不再补播。
+  ///
+  /// 与 [cancelAll] 分开：cancelAll 只清 active/queue，且还被紧急等其他
+  /// 场景复用——让它顺手清掉 [interruptedRequests] 会改变那些场景的中断
+  /// 重放状态机。这里只做「丢掉被中断项」这一件事，并把 id 记进
+  /// [cancelledLog]（同一条「被停掉的播报不得再播」账本，可观测性一致）。
+  List<String> discardAllInterrupted() {
+    final List<String> ids =
+        interruptedRequests.map((SpeechRequest r) => r.id).toList();
+    if (ids.isEmpty) return ids;
+    interruptedRequests.clear();
+    _interruptedAt.clear();
+    cancelledLog.addAll(ids);
+    return ids;
+  }
+
   /// Promote the highest-priority queued request that is still valid.
   /// Straight requests are only promoted when the segment is confirmed
   /// straight and no risk is active; expired requests are dropped.

@@ -72,6 +72,23 @@
 - **证据**：QA 独立复跑 单用例各 25 次 + 整文件 450+ 次用例执行，零失败；
   断言文本自 `41e5a8c` 起逐行未改（只多了帧时钟注入），不是改断言迁就实现。
 
+### 7. 用户说「停下」后中断队列未清空（防御性加固，非当前可达故障）
+
+- **不一致点**：`_stopSpeechThenConfirm` 只清了 `_pendingInterruptedNavReplay`，而
+  `SpeechScheduler.cancelAll()` 只清 `_active`/`_queue`，**不清 `interruptedRequests`**。
+  于是「用户说停下后不再补播任何被压住的导航提示」这句注释与实现不符。
+- **诚实说明**：QA 指出的端到端路径（停下 → 危险播报完成 → 解除 → 补播「继续直走」）
+  在当前代码里**不可达**——停下后 `_hazardWatchActive` 为 false，危险播报不再发出；
+  紧急求助又会把 `_yoloRiskActive` 置 false，因此不会出现「`_riskActive` 由 true 变 false
+  触发补播」的时刻。实测撤掉本项改动，纯端到端断言仍然绿。
+- **所以本项性质是**：让实现与既有注释承诺一致 + 消除未来重排代码时的风险，
+  **不是**修复一条当前可达的用户可见故障。红/绿锚点落在契约本身。
+- **改动**（`878dec5` 之后）：新增 `SpeechScheduler.discardAllInterrupted()`
+  （不改 `cancelAll` 本身，它被紧急等场景复用），清 `interruptedRequests` 与
+  `_interruptedAt`，id 记入 `cancelledLog`；新增用例
+  `(c3) a user stop discards the interrupted straight for good` 断言停下后
+  中断队列为空、且此后不再出现任何「直走」。
+
 ---
 
 ## 二、必须真机 / 云电脑验证（本机无法证伪，不得写成已验证）
@@ -103,8 +120,8 @@
 
 ## 四、当前交付状态
 
-- 分支 `fix/whole-test-4-frontend`，HEAD `0618c16`（已推送 origin）。
-- 全量串行回归：**1067 项全绿**（`--concurrency=1`，约 4 分钟）；`dart analyze lib test` 无告警。
+- 分支 `fix/whole-test-4-frontend`（HEAD 以 `git log -1` 为准，已推送 origin）。
+- 全量串行回归：**1068 项全绿**（`--concurrency=1`，约 4 分钟）；`dart analyze lib test` 无告警。
 - arm64 演示包：由 `tool/build_release_apk.sh` 产出，仅 `arm64-v8a`，含 `yolo11n.tflite`，
   **debug 签名**（沿用 `build.gradle.kts` 现有约定，仅供演示，上架需换正式 keystore）。
 - **当前包未注入路线配置**，导航/路线演示不可用，APK 旁会生成 `*.NOTICE.txt` 提示；
