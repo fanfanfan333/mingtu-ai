@@ -93,6 +93,16 @@ flutter build apk --release --target-platform android-arm64
 
 **体积与 ABI 完整性**：`android/app/build.gradle.kts` 使用 `useLegacyPackaging = true` 压缩 .so，默认排除 `lib/x86_64/**`、`lib/x86/**` 和 `lib/armeabi-v7a/**`。官方 arm64 包不适用于 32 位或 x86_64 设备。实际体积以下一次构建实测为准。
 
+**Windows 上项目路径含中文时打不出包（2026-11-16 实测）**：工作副本在 `D:\明途AI\mingtu-ai` 时 `flutter build apk` 会在两处失败——AGP 先拒绝非 ASCII 路径（1 秒即退），用 junction 映射到 `D:\mingtu` 也没用（Gradle 会把路径解析回真实路径）；即使加 `android.overridePathCheck=true` 盖过第一层，Gradle 调 `flutter.bat` 时项目路径仍会按 GBK 解读成 `D:\��;AI\...`，报 `Unable to read file: ...app.dill`。**结论：非 ASCII 路径在本机无法直接出包，必须在纯 ASCII 目录里构建。** 用下面的脚本（自动镜像到 ASCII 目录、构建、把包拷回原仓库）：
+
+```bash
+bash tool/build_release_apk.sh
+# 需要注入演示参数时照常追加
+bash tool/build_release_apk.sh --dart-define=MINGTU_AMAP_KEY=<演示key>
+```
+
+`android/gradle.properties` 里**不要**加 `android.overridePathCheck=true`：它只盖住第一层检查，会把上面这条有价值的报错换成更难查的 `.dill` 读不到。CI 与 Linux 构建路径本来就是 ASCII，不受影响。
+
 构建时按需追加演示参数（值用占位符，勿把真值写进任何文档/仓库）：
 
 
