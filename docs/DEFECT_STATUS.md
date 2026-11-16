@@ -91,6 +91,97 @@
 
 ---
 
+## 一之二、语音口令解析批次（2026-11-16 晚，D1–D8 + N1–N6）
+
+这一批全部集中在 `lib/core/voice_commands.dart`（纯 Dart，无 Flutter 依赖）+ `lib/main.dart` 一处播报。
+之所以单独成节：它不是「功能缺失」，而是**口令被解析成相反动作**——对盲人来说等于按错按钮。
+
+### 8. 四类「反向动作 / 漏识别」（P0 安全）
+
+| 编号 | 现象（修复前实测） | 应为 | 危害 |
+|---|---|---|---|
+| D1 | `停` / `停。` / `停！` / `站住` / `别动` / `停住` / `停一停` → `unknown` | pause | 遇险喊「停」，App 回「没听清」 |
+| D2 | `别继续了` / `不继续了` / `不要继续走了` → `resume` | pause | 要停，App 反而恢复导航并继续播报 |
+| D3 | `别删除录像` → `deleteRecording` | saveRecording | 想留证据，录像被真删 |
+| D4 | `我不去图书馆了` / `别去图书馆` → `startLibrary` | cancel | 说「不去」，App 开始带他走 |
+
+**共同根因**：`parseVoiceCommand` 是「正向关键字优先」的长 `if` 链——
+(a) 归一化只去掉了 `小途` 和两个逗号，ASR 常带的句号/感叹号原样保留，单字口令永远匹配不上；
+(b) 动作分支前面没有否定判断，`contains('继续')` 先于任何否定，
+(c) 否定词表只覆盖连续子串（`不去了`），被目的地/副词隔开就失效。
+
+**修复**：
+- 统一归一化 `_ignorableChars`（中英文标点、引号、括号、空白）→ 单字口令可精确匹配。
+- D1：`text == '停'` + `^停+$`（`停停停`）+ 复合词，**不使用裸 `contains('停')`**（否则「我要停车」会被误判）。
+- D2/N1：`_isNegatedContinue` 在 `resume` 之前；裸「不」只在紧邻「继续/恢复」时算，另收 `别/不要/不用/不想/不必/不需/没必要/甭/莫`。
+- D3/N3：`_isNegatedDelete` 提到急停分支之前；「别动我的录像」走相邻正则 `_negatedRecordingTouch`，避免把「别碰我，我在录像」当成数据请求。
+- D4：`_isNegatedDestination`（否定 + 目的地）→ cancel；`_isDestinationQuestion`（在哪/多远/什么地方…）→ unknown；**正向分支保持原样**，
+  单说「图书馆」与「图书馆怎么走」仍是 `startLibrary`（曾被工程师收窄成「必须带移动动词」，已打回）。
+- 问句/命令区分：`_looksLikeQuestion` 只认 `吗/什么/怎么/为什么/有没有/是不是/在哪`；复合急停词遇问句让路，
+  但**句首就是命令**时不让（`站住，有人吗` → pause）。
+
+**证据**（可复跑）：
+- 44 条断言探针（主理人自建，覆盖 D1–D8 全部正/反锚点）：**0 条不符合**。
+- 单测：`test/voice_commands_test.dart` 9 个用例、约 60 条断言，含每个缺陷的**反向锚点**
+  （`我要停车`→unknown、`停车场在哪`→不得 pause、`图书馆`→startLibrary、`继续`→resume…）。
+- 反向验证（改坏必红，逐字恢复后复绿）：D1 去掉急停分支、D2 去掉否定守卫、D3 去掉否定删除、
+  D4 去掉否定目的地、D6 去掉问句门、D7 挪回原位置、N1 删 `不需`、N2 加回裸 `么`、N3 换回裸词、
+  N4 去掉句首豁免、N6 注释 `停一停`——**每一项都确认了具体哪条断言变红**，不是"感觉修好了"。
+
+### 9. 本轮自己引入又被打回的 6 处（诚实记录，供后续复查）
+
+这一批不是一次写对的。第二轮 QA 判过 **NO-SHIP**，理由成立：
+
+| 编号 | 修复中引入的问题 | 触发说法 | 处理 |
+|---|---|---|---|
+| D6→N2 | 问句豁免把裸 `么` 当问句标记 | `这么多台阶，站住` → unknown | 删裸 `么`，改 `什么/怎么/为什么` |
+| D6→N4 | 命令 + 顺口一问被整条豁免 | `站住，有人吗` → unknown | 加句首命令豁免 |
+| D7→N3 | 「别动/别碰」裸词抢走急停 | `别碰我，我在录像` → saveRecording（谎报"已保存"） | 改相邻正则 |
+| D8→N1 | 收窄裸「不」后漏掉 `不必/不需要/没必要` | `不需要恢复导航` → resume | 补词；`不需` 覆盖"不需要" |
+| D5 | idle 态撤回播报是演示腔「请先重置演示」 | 盲人无法执行 | 按状态分档（见第 10 条） |
+| 收窄正向分支 | 为了让问路句落 unknown，把 `startLibrary` 改成「必须带移动动词」 | `图书馆` / `图书馆怎么走` → unknown | **打回**，改为独立的问句守卫 |
+
+教训：**过匹配（多停一次）和漏识别（该停没停）不对称**。修过匹配时若用「收紧关键字」的粗办法，
+很容易把 P0 的漏识别换回来；每次收紧都必须同时钉住"原来的锚点不许被打死"。
+
+### 10. idle 态撤回意图的播报（D5）
+
+- 现象：`TaskState.idle` 的合法出边只有 `listening`/`emergency`，`canTransitionTo(cancelled)` 为 false，
+  于是用户随口说「我不去图书馆了」会听到「当前状态不能取消，**请先重置演示**」——真实盲人手里没有"演示"可重置。
+- 修复：新增 `lib/core/voice_replies.dart` 的 `cancelRejectedSpeech(TaskState)`，三档：
+  idle →「好的，不去了。需要导航时随时说“去图书馆”。」；终态 →「任务已经结束，不用再取消。」；其余 →「当前状态不能取消。」
+- 证据：`test/voice_cancel_reply_test.dart`（纯 Dart，3 条）+ `test/voice_cancel_idle_reply_test.dart`
+  （widget，用录制型 fake TTS 抓真实播报时间线，断言出现「好的，不去了」且**不出现**「重置演示」）。
+
+### 11. 环境：`flutter test` 报 `Invalid WebSocket upgrade request`
+
+- 现象：任意 `flutter test` 在 loading 阶段失败，`Unable to connect to flutter_tester process`；
+  同一台机器 `dart test`（纯 VM）正常。
+- 根因：代理拦截了 localhost 的 WebSocket upgrade。**与代码无关**，但会把「环境故障」误读成「测试坏了」。
+- 处理：跑测试前清代理并放行本地回环：
+  `NO_PROXY=localhost,127.0.0.1 HTTP_PROXY= HTTPS_PROXY= … flutter test`。
+  另：本项目路径含中文，`flutter analyze` 会让 analysis_server 在 LSP 字节通道上崩
+  （`FormatException: Unexpected end of input`），**用 `dart analyze lib test` 才可靠**。
+
+### 12. 打包脚本自己把 NOTICE 告警吃掉了（构建期，B1）
+
+- 现象：`bash tool/build_release_apk.sh` 已经把包装出来了（22.4MB、SHA 都打印了），
+  但**退出码是 1**，而且第 8 步「缺路线配置时写 `*.NOTICE.txt`」根本没执行。
+- 根因：脚本 `set -euo pipefail` 下，第 460 行 `rm -f "$DEFINES_MANIFEST" "$VERIFY_SCRIPT"`
+  要删的是 `mktemp` 产生的 `D:/Temp/tmp.XXX`；本机宿主对 `rm` 有 safe-delete 包装，
+  它把这个 Windows 绝对路径当**相对路径**解析成 `d:\明途AI\mingtu-ai\D:\Temp\tmp.XXX`，
+  trash 失败 → fail-closed → `rm` 非 0 → `set -e` 当场结束脚本。
+- 危害：比"退出码不好看"严重得多——**NOTICE 的存在意义就是防止「没注入路线配置的包被误发」，
+  而它恰好被这一步跳过了**，告警机制在最需要的时候失效。
+- 修复：`cleanup()` 与第 460 行的 `rm` 都改成失败不致命（`2>/dev/null || true`），
+  并补注释说明宿主 safe-delete 的这个行为。
+- 证据：修前 `EXIT=1` 且无 NOTICE（已实测）；修后 `EXIT=0`、`==> 完成`、`app-release.apk.NOTICE.txt`
+  正常生成（内容首行「此 APK 缺少路线配置，不能作为导航/路线演示包。」），构建日志里不再有 safe-delete 报错。
+  补充说明：曾尝试用嵌套 `bash -c` 做最小反证，但宿主的 safe-delete 只包装顶层工具命令，
+  嵌套里复现不了，因此本条的证据是**完整构建的 before/after**，不是最小探针。
+
+---
+
 ## 二、必须真机 / 云电脑验证（本机无法证伪，不得写成已验证）
 
 1. **TalkBack 焦点顺序、整屏按住说话手势、振动波形**（起一下、止两下）、
@@ -116,13 +207,33 @@
 - **后台导航不支持**：需要保持屏幕亮、App 在前台。
 - **ultralytics_yolo 是 AGPL-3.0**：仅为比赛演示保留，赛后需迁移。
 
+### 语音口令的已知边界（本轮实测取值，刻意不改，如实记录）
+
+这些不是"还没发现"，是**测过、判过、暂时接受**的：
+
+| 说法 | 当前取值 | 为什么不改 |
+|---|---|---|
+| `能停住吗` / `可以停住吗` | unknown | 语义两可（请求 App 停 / 自问能不能停），判 pause 会因问句误停；判 unknown 至少不做错动作 |
+| `停不住` | unknown | 是求助（"我停不住"），目前没有对应动作；给不出可靠回应就不假装听懂 |
+| `继续吗` / `恢复吗` | resume | 征询被当命令，方向是"多继续"，可自愈（再说「停」即可） |
+| `不要碰我` | unknown | 与 `别碰我`→pause 不对称（`别碰` 有归属、`不要碰` 没有）；修它要动分支顺序，留待下轮 |
+| `不要录像` | deleteRecording | 语义上"不要录像=删"成立，与"别删除录像=保留"不矛盾 |
+| `别录像` | unknown | 没有"关闭录像"这条命令 |
+| `？` / `?` | 被归一化剥掉 | 问号承载的疑问语义丢失，`停住？` 与 `停住` 不可区分；急停宁可多停 |
+| 目的地 | 硬编码「图书馆」 | `_isNegatedDestination` / `_isDestinationQuestion` / 正向分支三处各自写死；新增目的地时必须三处同步，否则 D4 类反转会逐字复发 |
+
 ---
 
 ## 四、当前交付状态
 
 - 分支 `fix/whole-test-4-frontend`（HEAD 以 `git log -1` 为准，已推送 origin）。
-- 全量串行回归：**1068 项全绿**（`--concurrency=1`，约 4 分钟）；`dart analyze lib test` 无告警。
+- 全量串行回归：**1081 项全绿**（`--concurrency=1`，约 5 分钟）；`dart analyze lib test` 无告警。
+  （计数说明：本轮把 `停一停` 等断言加进了既有表驱动 `test()` 的循环里，`dart test` 数的是用例体，
+  所以总数仍是 1081；断言条数增加但用例体个数不变。）
 - arm64 演示包：由 `tool/build_release_apk.sh` 产出，仅 `arm64-v8a`，含 `yolo11n.tflite`，
   **debug 签名**（沿用 `build.gradle.kts` 现有约定，仅供演示，上架需换正式 keystore）。
 - **当前包未注入路线配置**，导航/路线演示不可用，APK 旁会生成 `*.NOTICE.txt` 提示；
   正式演示需先填 `tool/release_defines.local.env` 再用 `--require-routes` 构建。
+- 本轮重建产物：`D:\明途AI\deliverables\mingtu-arm64-s4-20261116.apk`
+  （22.4 MB，SHA256 `a074ab44…31289`，构建脚本退出码 0，NOTICE 同目录），
+  内含本次语音口令修复与 `cancelRejectedSpeech` 播报分档。
