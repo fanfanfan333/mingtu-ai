@@ -20,6 +20,18 @@ plus a clamped confidence, and a `parsed` flag) -- upstream
 prose never reaches the app, which generates its spoken Chinese
 from those enums with its own templates.
 
+It also serves the destination lookup behind 「带我去图书馆」:
+`GET /place/around?location=lon,lat&keywords=图书馆&radius=3000`.
+The proxy adds the key server-side, forwards to Amap's
+`/v3/place/around` (asked to sort by distance) and returns the
+candidates rebuilt from three whitelisted fields per place:
+`name`, `location` (strictly validated `lon,lat`) and `distance`
+(bounded integer). A place without a usable coordinate is
+dropped rather than given an invented one. An EMPTY `pois` list
+is a SUCCESSFUL answer, not an error: "nothing nearby" is a fact
+the app must be able to state, and it is announced as such
+instead of the app picking a farther place.
+
 ## Threat model
 
 Assets: the Amap and DashScope keys in this process's
@@ -33,7 +45,9 @@ coordinate-shaped or numeric values.
 
 Controls (structural, not textual): substring "cleaning" is
 explicitly NOT a control here -- it cannot survive the encoding
-tricks above. Instead, NO upstream free text crosses this proxy:
+tricks above. Instead, NO upstream free text crosses this proxy,
+with ONE bounded and deliberate exception (`/place/around`'s POI
+`name`, see the bullets below):
 
 - `/walking`: `status` is a fixed two-value enum, failure `info`
   is a fixed string, distances/durations are parsed and
@@ -45,6 +59,17 @@ tricks above. Instead, NO upstream free text crosses this proxy:
 - `/vision`: the model's answer is parsed as JSON and rebuilt
   from enum fields only; non-conforming content yields
   `parsed: false` and the app announces uncertainty.
+- `/place/around`: `status` is the same fixed two-value enum,
+  `distance` is a bounded integer, `pois` is capped at 10, and a
+  place whose `location` fails the strict `lon,lat` check is
+  dropped outright. The ONE free text that does cross is the POI
+  `name`, because the app must be able to tell the user WHICH
+  place it picked ("找到最近的图书馆：城市图书馆"). It is bounded
+  to 40 characters, NFKC-normalised, zero-width stripped, has the
+  secrets removed and control characters deleted. It is used ONLY
+  as a name: never parsed as an instruction, never appended to a
+  route step, never turned into a direction, and never allowed to
+  reach the ears as a sentence of its own.
 
 NFKC normalisation, zero-width removal and (case-insensitive)
 secret stripping are kept as belt-and-braces on the one input

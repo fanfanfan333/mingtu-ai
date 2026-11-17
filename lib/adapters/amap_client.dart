@@ -313,6 +313,49 @@ class AmapStepSpeaker {
   }
 }
 
+/// One candidate returned by a nearby (周边) search: a POI name, its
+/// GCJ-02 point and the straight-line distance the upstream reported.
+///
+/// [name] is the ONLY piece of upstream free text this feature lets
+/// through, and it is bounded twice (server whitelist, then here). It
+/// has exactly one use: telling the user WHICH place was picked. It is
+/// never parsed as an instruction, never concatenated into a route
+/// step, and never treated as a direction.
+class AmapPlace {
+  final String name;
+  final GeoPoint point;
+
+  /// Straight-line distance in metres, or null when the upstream did
+  /// not report one (absence is not the same as zero).
+  final double? distanceM;
+
+  const AmapPlace({
+    required this.name,
+    required this.point,
+    this.distanceM,
+  });
+}
+
+/// Result of one nearby search.
+///
+/// [status] is 'ok' | 'NOT_CONFIGURED' | 'ERROR'. An EMPTY but
+/// successful search is `ok` with no places: "nothing found nearby" is
+/// a real answer, and the caller must say so rather than invent a
+/// destination ([AmapWalkingResult] uses 'ok' for the same reason).
+class AmapPlaceResult {
+  final String status;
+  final List<AmapPlace> places;
+  final String? error;
+
+  const AmapPlaceResult({
+    required this.status,
+    this.places = const <AmapPlace>[],
+    this.error,
+  });
+
+  bool get ok => status == 'ok';
+}
+
 class AmapWalkingClient {
   /// Base URL of the route proxy (proxy mode; no trailing path --
   /// the client appends /walking).
@@ -471,5 +514,132 @@ class AmapWalkingClient {
       steps: steps,
       polyline: polyline,
     );
+  }
+
+  /// Search Amap's POI service around [center] and return the
+  /// candidates, NEAREST FIRST.
+  ///
+  /// PROXY MODE ONLY. The key must stay server-side, and directDemo
+  /// exists solely to fetch one demo route, so a nearby search there
+  /// reports NOT_CONFIGURED instead of quietly spending the disposable
+  /// demo key on a second endpoint.
+  ///
+  /// [keywords] is what the user asked for (e.g. '图书馆'). The proxy
+  /// bounds it as well; this client re-checks the shape first so a
+  /// caller bug cannot put junk on the wire.
+  ///
+  /// Returns `ok` with an EMPTY list when nothing is nearby -- that is
+  /// an answer, not an error, and the caller must announce it rather
+  /// than picking a far-away place.
+  ///
+  /// Error hygiene matches [walkingRoute]: every string here is a FIXED
+  /// generic sentence. No URL, no upstream `info`, no exception text.
+  Future<AmapPlaceResult> searchAround({
+    required GeoPoint center,
+    required String keywords,
+    double radiusM = 3000,
+  }) async {
+    if (mode != AmapRouteMode.proxy) {
+      return const AmapPlaceResult(
+        status: 'NOT_CONFIGURED',
+        error: '周边搜索需要已部署的路线代理，未配置。',
+      );
+    }
+    if (!center.hasCoordinates) {
+      return const AmapPlaceResult(
+        status: 'ERROR',
+        error: '缺少当前位置坐标，未发起周边搜索。',
+      );
+    }
+    final String trimmed = keywords.trim();
+    if (trimmed.isEmpty || trimmed.length > 32) {
+      return const AmapPlaceResult(
+        status: 'ERROR',
+        error: '搜索词不合法，未发起周边搜索。',
+      );
+    }
+    final int radius = radiusM.round().clamp(100, 50000);
+    final String base = proxyBaseUrl.endsWith('/')
+        ? proxyBaseUrl.substring(0, proxyBaseUrl.length - 1)
+        : proxyBaseUrl;
+    final Uri url = Uri.parse('$base/place/around')
+        .replace(queryParameters: <String, String>{
+      'location': '${center.longitude!.toStringAsFixed(6)},'
+          '${center.latitude!.toStringAsFixed(6)}',
+      'keywords': trimmed,
+      'radius': '$radius',
+      'output': 'json',
+    });
+    final String body;
+    try {
+      body = await sender(url).timeout(requestTimeout);
+    } on TimeoutException {
+      return const AmapPlaceResult(
+        status: 'ERROR',
+        error: '周边搜索超时，未获取地点。',
+      );
+    } catch (_) {
+      return const AmapPlaceResult(
+        status: 'ERROR',
+        error: '周边搜索失败（网络或服务错误），未获取地点。',
+      );
+    }
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(body);
+    } catch (_) {
+      return const AmapPlaceResult(
+        status: 'ERROR',
+        error: '周边搜索返回不是预期的 JSON。',
+      );
+    }
+    if (decoded is! Map<String, Object?>) {
+      return const AmapPlaceResult(
+        status: 'ERROR',
+        error: '周边搜索返回不是预期的 JSON 对象。',
+      );
+    }
+    if (decoded['status'] != '1') {
+      return const AmapPlaceResult(
+        status: 'ERROR',
+        error: '周边搜索返回失败状态，未获取地点。',
+      );
+    }
+    final Object? rawPois = decoded['pois'];
+    if (rawPois is! List) {
+      // A missing list is NOT "nothing found": a successful empty
+      // answer carries an empty list, so this shape means the response
+      // is not what we asked for.
+      return const AmapPlaceResult(
+        status: 'ERROR',
+        error: '周边搜索返回没有 pois。',
+      );
+    }
+    final List<AmapPlace> places = <AmapPlace>[];
+    for (final Object? raw in rawPois) {
+      if (raw is! Map<String, Object?>) continue;
+      final Object? rawLocation = raw['location'];
+      // A place without a usable point cannot be navigated to, so it is
+      // dropped rather than assigned an invented coordinate.
+      final GeoPoint? point =
+          rawLocation is String ? parseLonLat(rawLocation) : null;
+      if (point == null) continue;
+      final Object? rawName = raw['name'];
+      places.add(AmapPlace(
+        name: rawName is String ? rawName.trim() : '',
+        point: point,
+        distanceM:
+            raw['distance'] == null ? null : _boundedNum(raw['distance'], 50000),
+      ));
+    }
+    // Nearest first. The proxy asks Amap to sort by distance, but the
+    // pick must not depend on upstream honouring that: "最近的图书馆"
+    // is the user's requirement, not an upstream hint.
+    places.sort((AmapPlace a, AmapPlace b) {
+      final double da = a.distanceM ?? double.infinity;
+      final double db = b.distanceM ?? double.infinity;
+      return da.compareTo(db);
+    });
+    return AmapPlaceResult(status: 'ok', places: places);
   }
 }

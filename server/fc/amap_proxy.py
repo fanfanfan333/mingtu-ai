@@ -97,6 +97,18 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM_DEFAULT = "https://restapi.amap.com/v3/direction/walking"
+PLACE_UPSTREAM_DEFAULT = "https://restapi.amap.com/v3/place/around"
+
+# /place/around bounds. All of them are enforced SERVER-side: the
+# client cannot page, cannot widen the radius past 50 km and cannot
+# ask for more than 10 POIs.
+PLACE_MAX_POIS = 10
+PLACE_MAX_NAME_LEN = 40
+PLACE_KEYWORDS_MAX_LEN = 32
+PLACE_RADIUS_DEFAULT = 3_000
+PLACE_RADIUS_MIN = 100
+PLACE_RADIUS_MAX = 50_000
+PLACE_MAX_DISTANCE = 50_000  # metres, same cap as the radius
 
 VISION_MODEL = "qwen3.7-flash"  # exact lowercase id; uppercase 404s upstream
 VISION_MAX_TOKENS = 256
@@ -132,6 +144,33 @@ def build_upstream_url(base, origin, destination, key):
             "destination": destination,
             "key": key,
             "output": "json",
+        }
+    )
+    return base + "?" + query
+
+
+def build_place_upstream_url(base, location, keywords, radius, key):
+    """Compose the Amap place/around upstream URL. As with
+    build_upstream_url the key appears ONLY here, in a
+    server-side outbound request -- never in client responses or
+    logs.
+
+    The paging/ordering parameters are pinned here rather than
+    taken from the client: offset=10 (PLACE_MAX_POIS, the same cap
+    the whitelist enforces), page=1 and sortrule=distance
+    (nearest first -- the whole point of a "what is near me"
+    search). [radius] must already be a clamped int and [location]
+    an already-validated "lon,lat" string."""
+    query = urllib.parse.urlencode(
+        {
+            "location": location,
+            "keywords": keywords,
+            "radius": radius,
+            "key": key,
+            "output": "json",
+            "offset": PLACE_MAX_POIS,
+            "page": 1,
+            "sortrule": "distance",
         }
     )
     return base + "?" + query
@@ -360,6 +399,160 @@ def whitelist_walking_body(raw_body, secrets):
         },
     }
     return json.dumps(out).encode("utf-8")
+
+
+def _is_forbidden_char(ch):
+    """True for codepoints that must never reach a client from
+    upstream free text: every Unicode "C" category -- control
+    (Cc), format/invisible (Cf), surrogate (Cs), private-use (Co)
+    and unassigned (Cn)."""
+    return unicodedata.category(ch)[0] == "C"
+
+
+def _valid_keywords(value):
+    """True for a usable search keyword string: non-empty, at most
+    PLACE_KEYWORDS_MAX_LEN characters, and free of control /
+    format / private-use / unassigned codepoints.
+
+    Deliberately NOT a fixed enum: the user may ask for any
+    landmark ("图书馆", "药店", "地铁站", ...). The safety property
+    does not come from restricting the word -- it comes from the
+    RESPONSE being rebuilt field by field (whitelist_place_body),
+    so whatever the upstream returns for an arbitrary keyword still
+    cannot smuggle free text or a key echo to the client."""
+    if not isinstance(value, str):
+        return False
+    if any(_is_forbidden_char(ch) for ch in value):
+        return False
+    text = _normalize_text(value).strip()
+    return 0 < len(text) <= PLACE_KEYWORDS_MAX_LEN
+
+
+def _coerce_radius(value):
+    """Force the search radius to an int in [100, 50000] metres.
+
+    A value that does not parse as an integer ("abc", "", None,
+    "3000.5", "1e4") becomes PLACE_RADIUS_DEFAULT (3000); anything
+    numeric is clamped into the range. The raw client value is
+    never forwarded upstream."""
+    try:
+        radius = int(str(value).strip())
+    except (TypeError, ValueError):
+        return PLACE_RADIUS_DEFAULT
+    return min(max(radius, PLACE_RADIUS_MIN), PLACE_RADIUS_MAX)
+
+
+def _clean_poi_name(value, secrets):
+    """Force a POI name to a bounded, printable, single-line string.
+
+    A place name is the ONE piece of upstream free text this proxy
+    forwards -- it is the whole point of a place search, and there
+    is no enum the client could regenerate it from. It is therefore
+    REBUILT rather than copied:
+    1. NFKC + zero-width normalisation (full-width lookalikes fold,
+       invisible joiners vanish);
+    2. secret substrings stripped case-insensitively (belt and
+       braces -- the real control is that no other free text
+       crosses);
+    3. every Unicode "C" category character (control, format,
+       private-use, unassigned) removed, so a name cannot carry
+       terminal escapes, bidi overrides or line breaks;
+    4. whitespace collapsed to single spaces;
+    5. truncated to PLACE_MAX_NAME_LEN characters.
+
+    Returns None when the value is not a string at all -- the
+    caller drops that POI entry entirely."""
+    if not isinstance(value, str):
+        return None
+    text = _strip_secrets(_normalize_text(value), secrets)
+    text = "".join(ch for ch in text if not _is_forbidden_char(ch))
+    text = " ".join(text.split())
+    return text[:PLACE_MAX_NAME_LEN]
+
+
+def _coerce_lonlat(value, secrets):
+    """Force a POI location to a rebuilt "lon,lat" string.
+
+    Same reasoning as _coerce_polyline: when the key is synthetic
+    and coordinate-shaped, a mere parse would faithfully re-emit it
+    as a point. Defence, in order: strip secret substrings from the
+    RAW string first, validate the shape with _valid_lonlat, then
+    re-format at fixed 6-decimal precision so the upstream text
+    never crosses, and finally re-check the rebuilt string for a
+    secret. Returns None for anything that does not validate (the
+    caller drops that POI entry)."""
+    if not isinstance(value, str):
+        return None
+    cleaned = _strip_secrets(value, secrets).strip()
+    if not _valid_lonlat(cleaned):
+        return None
+    lon_text, lat_text = cleaned.split(",")
+    rebuilt = "%.6f,%.6f" % (float(lon_text), float(lat_text))
+    if _contains_secret(rebuilt, secrets):
+        return None
+    return rebuilt
+
+
+def whitelist_place_body(raw_body, secrets):
+    """Rebuild the /place/around response from whitelisted fields,
+    with every field FORCED to a fixed enum / type / bound:
+
+    - status: the fixed enum "1" or "0" (anything not exactly the
+      success marker becomes "0" -- a key echoed in status dies
+      here).
+    - info on failure: the FIXED string "UPSTREAM_ERROR". The
+      upstream info/infocode text never crosses at all.
+    - pois: at most PLACE_MAX_POIS (10) entries, each carrying
+      EXACTLY three keys:
+        name     -- _clean_poi_name (normalised, secret-stripped,
+                    control characters removed, <= 40 chars); a
+                    non-string name drops the whole entry.
+        location -- _coerce_lonlat (validated and re-formatted at
+                    6 decimals); anything that does not validate
+                    drops the whole entry.
+        distance -- _coerce_bounded_int(value, PLACE_MAX_DISTANCE).
+      Extra upstream fields (address, tel, id, typecode, ...) are
+      dropped, and the upstream "count" is ignored: the client
+      always sees the list it can actually use.
+
+    Returns bytes, or None for an unexpected top-level shape
+    (-> generic 502). An empty list is legal and returns
+    {"status": "1", "pois": []}."""
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status")) != "1":
+        return json.dumps(
+            {"status": "0", "info": "UPSTREAM_ERROR"}
+        ).encode("utf-8")
+    raw_pois = payload.get("pois")
+    if not isinstance(raw_pois, list):
+        return None
+    pois = []
+    for raw_poi in raw_pois:
+        if len(pois) >= PLACE_MAX_POIS:
+            break
+        if not isinstance(raw_poi, dict):
+            continue
+        name = _clean_poi_name(raw_poi.get("name"), secrets)
+        if name is None:
+            continue
+        location = _coerce_lonlat(raw_poi.get("location"), secrets)
+        if location is None:
+            continue
+        pois.append(
+            {
+                "name": name,
+                "location": location,
+                "distance": _coerce_bounded_int(
+                    raw_poi.get("distance"), PLACE_MAX_DISTANCE
+                ),
+            }
+        )
+    return json.dumps({"status": "1", "pois": pois}).encode("utf-8")
 
 
 # The vision model is instructed (client-side AND pinned again
@@ -1467,7 +1660,7 @@ def handler(event, context):
 
 class WalkingHandler(BaseHTTPRequestHandler):
     # Injected by make_server: api_key, upstream_base, fetcher,
-    # dashscope_key, vision_upstream, poster.
+    # dashscope_key, vision_upstream, poster, place_upstream.
     api_key = None
     upstream_base = UPSTREAM_DEFAULT
     fetcher = staticmethod(fetch_upstream)
@@ -1478,6 +1671,7 @@ class WalkingHandler(BaseHTTPRequestHandler):
     vision_limiter = None
     asr_limiter = None
     asr_upstream = ASR_UPSTREAM_DEFAULT
+    place_upstream = PLACE_UPSTREAM_DEFAULT
 
     def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
         # Deliberately path-only: BaseHTTPRequestHandler's default
@@ -1493,6 +1687,9 @@ class WalkingHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802 - stdlib name
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/place/around":
+            self._do_place_around_get(parsed)
+            return
         if parsed.path != "/walking":
             self._send_json(404, json.dumps({"error": "not found"}).encode())
             return
@@ -1526,6 +1723,48 @@ class WalkingHandler(BaseHTTPRequestHandler):
         cleaned = whitelist_walking_body(
             body, [self.api_key, self.dashscope_key]
         )
+        if cleaned is None:
+            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
+            return
+        self._send_json(200, cleaned)
+
+    def _do_place_around_get(self, parsed):
+        # Nearby-POI search. Guard order mirrors /walking exactly:
+        # validate locally, then PIN the upstream, then call, then
+        # rebuild the body from the whitelist.
+        params = urllib.parse.parse_qs(parsed.query)
+        location = (params.get("location") or [""])[0]
+        keywords = (params.get("keywords") or [""])[0]
+        if not _valid_lonlat(location):
+            self._send_json(
+                400,
+                json.dumps({"error": "location must be 'lon,lat'"}).encode(),
+            )
+            return
+        if not _valid_keywords(keywords):
+            self._send_json(
+                400, json.dumps({"error": "invalid keywords"}).encode()
+            )
+            return
+        if self.place_upstream != PLACE_UPSTREAM_DEFAULT:
+            # Same pin as /walking and /vision: the keyed URL may
+            # only ever go to the pinned Amap endpoint.
+            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
+            return
+        radius = _coerce_radius((params.get("radius") or [""])[0])
+        url = build_place_upstream_url(
+            self.place_upstream, location.strip(), keywords.strip(), radius,
+            self.api_key,
+        )
+        try:
+            _status, body = self.fetcher(url)
+        except Exception:  # upstream failure: no detail (may embed URL)
+            self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
+            return
+        # NEVER pass the upstream body through: rebuild name/
+        # location/distance per POI so an echoed key (or any extra
+        # field) cannot reach the client.
+        cleaned = whitelist_place_body(body, [self.api_key, self.dashscope_key])
         if cleaned is None:
             self._send_json(502, json.dumps({"error": "upstream failure"}).encode())
             return
@@ -1627,6 +1866,7 @@ def make_server(
     vision_token="",
     vision_limiter=None,
     asr_limiter=None,
+    place_upstream=PLACE_UPSTREAM_DEFAULT,
 ):
     handler = type(
         "BoundWalkingHandler",
@@ -1641,6 +1881,7 @@ def make_server(
             "vision_token": vision_token,
             "vision_limiter": vision_limiter,
             "asr_limiter": asr_limiter,
+            "place_upstream": place_upstream,
         },
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -1658,12 +1899,14 @@ def main():
     # the app degrades to local detection; /walking is unaffected.
     dashscope_key = os.environ.get("MINGTU_DASHSCOPE_API_KEY", "")
     vision_upstream = VISION_UPSTREAM_DEFAULT  # pinned, no env override
+    place_upstream = PLACE_UPSTREAM_DEFAULT  # pinned, no env override
     server = make_server(
         port,
         key,
         upstream,
         dashscope_key=dashscope_key,
         vision_upstream=vision_upstream,
+        place_upstream=place_upstream,
         vision_token=os.environ.get("MINGTU_VISION_TOKEN", ""),
         vision_limiter=VisionRateLimiter(
             _env_positive_int(

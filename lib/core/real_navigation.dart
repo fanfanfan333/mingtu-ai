@@ -1,14 +1,21 @@
 /// Real-navigation starter for Mingtu AI (navigation core).
 ///
-/// One attempt to start REAL voice navigation to a human-verified
-/// destination, as a pure orchestration over injected adapters so
-/// every branch is testable with fixtures -- no real API call and
-/// no real GPS in tests.
+/// ONE orchestration over injected adapters, with TWO entry points:
 ///
-/// Check order matters, and each failure is its own outcome with
-/// its own Chinese announcement; the caller speaks it and does NOT
-/// start navigation. Nothing falls back to a simulated route
-/// silently, and no coordinate is ever invented:
+/// - [RealNavigationStarter.start] navigates to a destination that must
+///   exist in the human-verified registry. The checks below describe it.
+/// - [RealNavigationStarter.startNearby] resolves the destination by
+///   SEARCHING near the user's own fix (「去图书馆」= the nearest library
+///   Amap knows about), so no registry entry and no demo-proximity gate
+///   applies. See that method for its own check order.
+///
+/// Everything is injectable so every branch is testable with fixtures --
+/// no real API call and no real GPS in tests.
+///
+/// For [RealNavigationStarter.start] the check order matters, and each
+/// failure is its own outcome with its own Chinese announcement; the
+/// caller speaks it and does NOT start navigation. Nothing falls back to
+/// a simulated route silently, and no coordinate is ever invented:
 ///
 /// 1. destination must exist in the verified registry (empty today
 ///    -> always destinationNotConfigured);
@@ -64,6 +71,14 @@ const double maxStartAccuracyM = 50.0;
 /// navigation to start (see check 4b in the file header).
 const double maxDemoStartDistanceM = 300.0;
 
+/// Default radius (metres) for the nearby search used by
+/// [RealNavigationStarter.startNearby]. 3 km is the user's decision
+/// (2026-11-17): "最近的图书馆" has to be findable from a normal campus
+/// or city block, while still being somewhere a person could actually
+/// walk to. Beyond this radius the attempt reports "not found nearby"
+/// rather than sending a blind user on an hour-long walk.
+const double nearbySearchRadiusM = 3000.0;
+
 /// The FIRST progress prompt spoken while the start attempt is
 /// still waiting for its first GPS fix (see
 /// `_startRealNavigation` in main.dart). A blind user cannot see
@@ -107,6 +122,16 @@ enum RealNavigationFailure {
   locationTooInaccurate,
   tooFarFromDemoStart,
   routeFetchFailed,
+
+  /// The nearby search ran and came back OK, but found nothing within
+  /// the radius. Distinct from [routeFetchFailed]: the service worked,
+  /// there is simply no such place near the user.
+  nearbyPlaceNotFound,
+
+  /// The nearby search itself failed (transport, bad payload, service
+  /// error). The user is told the lookup failed, not that nothing
+  /// exists -- those are different facts.
+  nearbyPlaceSearchFailed,
 }
 
 class RealNavigationOutcome {
@@ -121,6 +146,21 @@ class RealNavigationOutcome {
   /// point, when the demo-start check ran.
   final double? startDistanceM;
 
+  /// True when this attempt resolved its destination by SEARCHING near
+  /// the user's fix (see [RealNavigationStarter.startNearby]) instead of
+  /// looking it up in the verified registry. The caller uses it to say
+  /// which place was actually picked.
+  final bool viaNearbySearch;
+
+  /// Straight-line distance in metres from the user to the picked
+  /// place, when the nearby search reported one. Null means "not
+  /// reported", never "zero".
+  final double? placeDistanceM;
+
+  /// The words the user used for the nearby search (e.g. '图书馆'),
+  /// kept for the failure announcements ("附近没有找到图书馆").
+  final String? searchCategory;
+
   const RealNavigationOutcome._({
     this.failure,
     this.destination,
@@ -129,6 +169,9 @@ class RealNavigationOutcome {
     this.route,
     this.routeError,
     this.startDistanceM,
+    this.viaNearbySearch = false,
+    this.placeDistanceM,
+    this.searchCategory,
   });
 
   factory RealNavigationOutcome.failed(
@@ -137,6 +180,7 @@ class RealNavigationOutcome {
     double? accuracyM,
     String? routeError,
     double? startDistanceM,
+    String? searchCategory,
   }) =>
       RealNavigationOutcome._(
         failure: failure,
@@ -144,6 +188,7 @@ class RealNavigationOutcome {
         accuracyM: accuracyM,
         routeError: routeError,
         startDistanceM: startDistanceM,
+        searchCategory: searchCategory,
       );
 
   factory RealNavigationOutcome.ready({
@@ -152,6 +197,9 @@ class RealNavigationOutcome {
     required double? accuracyM,
     required AmapWalkingResult route,
     double? startDistanceM,
+    bool viaNearbySearch = false,
+    double? placeDistanceM,
+    String? searchCategory,
   }) =>
       RealNavigationOutcome._(
         destination: destination,
@@ -159,6 +207,9 @@ class RealNavigationOutcome {
         accuracyM: accuracyM,
         route: route,
         startDistanceM: startDistanceM,
+        viaNearbySearch: viaNearbySearch,
+        placeDistanceM: placeDistanceM,
+        searchCategory: searchCategory,
       );
 
   bool get ready => failure == null && route != null && route!.ok;
@@ -213,6 +264,23 @@ class RealNavigationOutcome {
             '请先到校门口附近再开始去图书馆的演示导航。';
       case RealNavigationFailure.routeFetchFailed:
         return '路线暂时取不到，可能是网络不稳，导航没有启动。'
+            '请稍后按住屏幕下方再说一次“带我去图书馆”。';
+      case RealNavigationFailure.nearbyPlaceNotFound:
+        // The lookup worked; there is simply nothing within the radius.
+        // Saying "没找到" is honest, and the only next actions are a UI
+        // action (speak again) or asking a person -- never "walk over
+        // there and look".
+        final String what =
+            (searchCategory == null || searchCategory!.isEmpty)
+                ? '你要去的地方'
+                : searchCategory!;
+        return '你附近没有找到$what，导航没有启动。'
+            '可以请身边的人帮忙确认一下，'
+            '或者过一会儿再按住屏幕下方说一次“带我去图书馆”。';
+      case RealNavigationFailure.nearbyPlaceSearchFailed:
+        // Distinct from "not found": we do not know whether a place
+        // exists, so the text must not claim we looked and found none.
+        return '查找附近的地点失败了，可能是网络不稳，导航没有启动。'
             '请稍后按住屏幕下方再说一次“带我去图书馆”。';
       case null:
         return '';
@@ -304,6 +372,114 @@ class RealNavigationStarter {
       startDistanceM: startDistanceM,
     );
   }
+
+  /// Start real navigation to the NEAREST place matching [category]
+  /// around the user's current fix.
+  ///
+  /// This is the behaviour the user specified for 「带我去图书馆」: take
+  /// MY current position, then go to the library Amap says is nearest --
+  /// not to a coordinate somebody typed into the repository.
+  ///
+  /// Order: proxy configured -> GPS fix -> accuracy -> nearby search ->
+  /// walking route. Two checks deliberately do NOT apply here:
+  ///
+  /// - there is no registry lookup, so no destination must be
+  ///   pre-verified for this path; and
+  /// - there is no [maxDemoStartDistanceM] gate. That gate exists only
+  ///   because the registry's demo coordinates describe ONE place; a
+  ///   destination derived from the user's own fix is meaningful
+  ///   wherever they stand, so gating it would refuse to navigate for no
+  ///   reason (and used to answer 「你不在演示路线附近」).
+  ///
+  /// A successful but EMPTY search is reported as
+  /// [RealNavigationFailure.nearbyPlaceNotFound]; a failed search is
+  /// [RealNavigationFailure.nearbyPlaceSearchFailed]. Neither ever
+  /// falls back to a farther place or to a guessed coordinate.
+  Future<RealNavigationOutcome> startNearby(
+    String category, {
+    double radiusM = nearbySearchRadiusM,
+  }) async {
+    if (!client.isConfigured) {
+      return RealNavigationOutcome.failed(
+        RealNavigationFailure.proxyNotConfigured,
+        searchCategory: category,
+      );
+    }
+    final LocationResult fix = await locationProvider.currentLocation();
+    if (!fix.ok) {
+      final RealNavigationFailure mapped = switch (fix.failure) {
+        LocationFailure.serviceDisabled =>
+          RealNavigationFailure.locationServiceDisabled,
+        LocationFailure.permissionDenied =>
+          RealNavigationFailure.locationPermissionDenied,
+        LocationFailure.permissionDeniedForever =>
+          RealNavigationFailure.locationPermissionDeniedForever,
+        _ => RealNavigationFailure.locationFailed,
+      };
+      return RealNavigationOutcome.failed(mapped, searchCategory: category);
+    }
+    final double? accuracy = fix.accuracyM;
+    if (accuracy == null || accuracy > maxStartAccuracyM) {
+      return RealNavigationOutcome.failed(
+        RealNavigationFailure.locationTooInaccurate,
+        accuracyM: accuracy,
+        searchCategory: category,
+      );
+    }
+    final AmapPlaceResult search = await client.searchAround(
+      center: fix.pointGcj02!,
+      keywords: category,
+      radiusM: radiusM,
+    );
+    if (!search.ok) {
+      return RealNavigationOutcome.failed(
+        search.status == 'NOT_CONFIGURED'
+            ? RealNavigationFailure.proxyNotConfigured
+            : RealNavigationFailure.nearbyPlaceSearchFailed,
+        accuracyM: accuracy,
+        searchCategory: category,
+      );
+    }
+    if (search.places.isEmpty) {
+      return RealNavigationOutcome.failed(
+        RealNavigationFailure.nearbyPlaceNotFound,
+        accuracyM: accuracy,
+        searchCategory: category,
+      );
+    }
+    // [AmapWalkingClient.searchAround] returns nearest-first and that
+    // ordering is pinned by its own test; taking `first` here is the
+    // "最近的" decision, made in exactly one place.
+    final AmapPlace nearest = search.places.first;
+    final VerifiedLocation destination = VerifiedLocation(
+      id: 'nearby-$category',
+      name: nearest.name.isEmpty ? category : nearest.name,
+      pointGcj02: nearest.point,
+    );
+    final AmapWalkingResult route = await client.walkingRoute(
+      from: fix.pointGcj02!,
+      to: destination.pointGcj02,
+    );
+    if (!route.ok) {
+      return RealNavigationOutcome.failed(
+        route.status == 'NOT_CONFIGURED'
+            ? RealNavigationFailure.proxyNotConfigured
+            : RealNavigationFailure.routeFetchFailed,
+        destination: destination,
+        routeError: route.error,
+        searchCategory: category,
+      );
+    }
+    return RealNavigationOutcome.ready(
+      destination: destination,
+      originGcj02: fix.pointGcj02!,
+      accuracyM: accuracy,
+      route: route,
+      viaNearbySearch: true,
+      placeDistanceM: nearest.distanceM,
+      searchCategory: category,
+    );
+  }
 }
 
 /// The ready announcement's fixed part (the caller appends the
@@ -312,6 +488,31 @@ class RealNavigationStarter {
 /// LIVE GPS guidance on top of this announcement (turn, off-
 /// route and arrival prompts), so the text must not claim the
 /// opposite.
+/// Spoken lead-in for a start that resolved its destination by nearby
+/// search. It names the place that was ACTUALLY picked and how far it
+/// is, because the user asked for "the nearest library" and deserves to
+/// hear which one it turned out to be.
+///
+/// Returns '' for a registry-based start, so the caller can prepend this
+/// unconditionally.
+///
+/// The distance clause is DROPPED when the upstream reported no
+/// distance: an absent number must never be read out as "约 未知 米"
+/// (same rule as [RealNavigationOutcome.failureAnnouncement]).
+String nearbyPlaceIntro({
+  required bool viaNearbySearch,
+  required String? category,
+  required String name,
+  required double? distanceM,
+}) {
+  if (!viaNearbySearch) return '';
+  final String rawCategory = category ?? '';
+  final String noun = rawCategory.isEmpty ? '地点' : rawCategory;
+  final String where = name.isEmpty ? '附近的$noun' : name;
+  if (distanceM == null) return '找到最近的$noun：$where。';
+  return '找到最近的$noun：$where，离你约 ${distanceM.round()} 米。';
+}
+
 String realRouteReadyAnnouncement({
   required String destinationName,
   required double distanceM,

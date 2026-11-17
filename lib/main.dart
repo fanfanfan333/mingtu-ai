@@ -2316,7 +2316,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       text: '好的，去${loc.name}。',
       kind: SpeechKind.info,
     ));
-    _startRealNavigation(loc.name);
+    // 「图书馆」 must take the nearby-search path even when it was
+    // answered here: the registry's library point is a demo coordinate,
+    // and the demo-proximity gate would refuse the request from anywhere
+    // else ("你不在演示路线附近"). The registry entry now only acts as the
+    // way this word is RECOGNISED, not as the destination.
+    _startRealNavigation(loc.name, nearby: loc.id == 'library');
   }
 
   /// Begin GPS-tracked live navigation for a ready route:
@@ -4358,7 +4363,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// cancelled the moment the attempt ends, and abandoned
   /// together on every early exit (停下 / 取消 / 紧急求助 / a fresh
   /// start / dispose).
-  Future<void> _startRealNavigation(String destinationName) async {
+  Future<void> _startRealNavigation(String destinationName,
+      {bool nearby = false}) async {
     if (_tasks.state != TaskState.idle) {
       _say(_request(
         id: 'real-nav-busy-${DateTime.now().millisecondsSinceEpoch}',
@@ -4401,7 +4407,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             prepToken, navLocationProgressStillWaitingSpeech, '2'),
       ),
     ]);
-    final RealNavigationOutcome outcome = await starter.start(destinationName);
+    final RealNavigationOutcome outcome = nearby
+        ? await starter.startNearby(destinationName)
+        : await starter.start(destinationName);
     // The attempt is over (success or failure): neither progress
     // prompt may speak afterwards. Only the attempt that still
     // owns the token may clear them (a newer round's timers must
@@ -4471,8 +4479,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _say(_request(
       id: 'real-nav-ready-${DateTime.now().millisecondsSinceEpoch}',
       eventId: 'real-nav-ready-${DateTime.now().millisecondsSinceEpoch}',
-      text: realRouteReadyAnnouncement(
-            destinationName: destinationName,
+      text: nearbyPlaceIntro(
+            viaNearbySearch: outcome.viaNearbySearch,
+            category: outcome.searchCategory,
+            name: outcome.destination?.name ?? destinationName,
+            distanceM: outcome.placeDistanceM,
+          ) +
+          realRouteReadyAnnouncement(
+            // A nearby search resolves the destination at runtime, so the
+            // announcement must name the place that was actually picked
+            // ("已获取到 XX图书馆的真实步行路线"), not the words the user said.
+            destinationName: outcome.destination?.name ?? destinationName,
             distanceM: candidate.distanceM,
             stepsCount: result.steps.length,
           ) +
@@ -4489,9 +4506,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   /// The on-screen "real route" button runs the same real
-  /// navigation attempt as the voice command (destination 图书馆，
-  /// which must exist in the verified registry).
-  Future<void> _fetchAmapRoute() => _startRealNavigation('图书馆');
+  /// navigation attempt as the voice command: 图书馆, resolved by
+  /// nearby search from the current fix (see
+  /// `RealNavigationStarter.startNearby`).
+  Future<void> _fetchAmapRoute() => _startRealNavigation('图书馆', nearby: true);
 
   /// v0.7: speak the next Amap walking step, in order. Saying
   /// "下一步" while navigating speaks the next step; when the steps
@@ -7833,11 +7851,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       case VoiceCommand.startLibrary:
         if (_tasks.state == TaskState.idle) {
           // Navigation: a real voice request goes to REAL
-          // navigation (verified destination + GPS + proxy route).
-          // The simulated flow stays available only through its
-          // explicitly labelled demo buttons, never as a silent
-          // fallback for a real request.
-          _startRealNavigation('图书馆');
+          // navigation. 「去图书馆」 means "take my current position and
+          // go to the library Amap says is nearest", NOT a coordinate
+          // typed into the repository -- so this uses the nearby-search
+          // path (see RealNavigationStarter.startNearby). The simulated
+          // flow stays available only through its explicitly labelled
+          // demo buttons, never as a silent fallback for a real request.
+          _startRealNavigation('图书馆', nearby: true);
         } else {
           _say(_request(
             id: 'voice-busy-${DateTime.now().millisecondsSinceEpoch}',
