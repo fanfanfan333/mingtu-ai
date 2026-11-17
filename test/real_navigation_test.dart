@@ -171,8 +171,8 @@ void main() {
       expect(outcome.ready, isFalse);
       expect(outcome.failure, RealNavigationFailure.destinationNotConfigured);
       expect(loc.called, isFalse);
-      expect(outcome.failureAnnouncement, contains('目的地未配置'));
-      expect(outcome.failureAnnouncement, contains('导航未启动'));
+      expect(outcome.failureAnnouncement, contains('还没有核对过'));
+      expect(outcome.failureAnnouncement, contains('导航没有启动'));
     });
 
     test('proxy not deployed: announced before any location fix', () async {
@@ -180,8 +180,13 @@ void main() {
       final outcome = await _starter(location: loc, proxy: '').start('图书馆');
       expect(outcome.failure, RealNavigationFailure.proxyNotConfigured);
       expect(loc.called, isFalse);
-      expect(outcome.failureAnnouncement, contains('路线服务未部署'));
-      expect(outcome.failureAnnouncement, contains('导航未启动'));
+      // Real-device fix round: this branch used to say "路线服务未部署",
+      // which is deployment vocabulary a blind user cannot act on. It now
+      // says the service is not ready yet, and gives the one action they
+      // can actually take (speak again).
+      expect(outcome.failureAnnouncement, contains('还没准备好'));
+      expect(outcome.failureAnnouncement, contains('导航没有启动'));
+      expect(outcome.failureAnnouncement, contains('请稍后再按住屏幕下方'));
     });
 
     test('each location failure maps to its own announcement', () async {
@@ -201,11 +206,22 @@ void main() {
           ),
         ).start('图书馆');
         expect(outcome.failure, entry.value, reason: '${entry.key}');
-        expect(outcome.failureAnnouncement, contains('导航未启动'));
+        final String text = outcome.failureAnnouncement;
+        // Every failure says navigation did not start. The copy is
+        // allowed to use either wording ("未启动" / "没有启动"),
+        // but it must be there.
+        expect(text, anyOf(contains('导航未启动'), contains('导航没有启动')),
+            reason: '${entry.key}');
         // No failure text may hand out a physical step instruction.
-        expect(outcome.failureAnnouncement, isNot(contains('向左')));
-        expect(outcome.failureAnnouncement, isNot(contains('向右')));
-        expect(outcome.failureAnnouncement, isNot(contains('过街')));
+        expect(text, isNot(contains('向左')));
+        expect(text, isNot(contains('向右')));
+        expect(text, isNot(contains('过街')));
+        // Nor may it speak build-time / engine vocabulary at a blind
+        // user who can only act on what is on this phone.
+        for (final String jargon in <String>['代理', '密钥', '坐标', '核验']) {
+          expect(text, isNot(contains(jargon)),
+              reason: '${entry.key} leaked "$jargon"');
+        }
       }
     });
 
@@ -245,7 +261,10 @@ void main() {
       ).start('图书馆');
       expect(outcome.ready, isFalse);
       expect(outcome.failure, RealNavigationFailure.routeFetchFailed);
-      expect(outcome.failureAnnouncement, contains('路线获取失败'));
+      // "路线获取失败" was the old, bare failure code read out loud; the
+      // copy now blames the likely cause (网络) and says what to do.
+      expect(outcome.failureAnnouncement, contains('路线暂时取不到'));
+      expect(outcome.failureAnnouncement, contains('导航没有启动'));
     });
   });
 

@@ -338,6 +338,16 @@ class MingtuHomeDebugHandle {
   /// never calls this).
   void debugSetHaptics(Haptics haptics) => _state._haptics = haptics;
 
+  /// Real-device fix round seam: substitute the Amap route
+  /// client. A widget test injects a CONFIGURED fake so the REAL
+  /// navigation start path gets past its "route proxy configured"
+  /// check and actually waits for the GPS -- without it the
+  /// shipped client (no proxy URL in a test build) refuses before
+  /// the location provider is ever asked. Production never calls
+  /// this.
+  void debugSetAmapClient(AmapWalkingClient client) =>
+      _state._amapClient = client;
+
   /// NAVHAZ M1 seam: ids of interrupted navigation prompts
   /// the arbitration dropped as EXPIRED (the scheduler's
   /// dropped-expired log) -- the observable readout for
@@ -761,6 +771,25 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _riskActive = false;
   String _navVersion = 'nav-v0';
   Timer? _straightTimer;
+
+  /// Real-device fix round: the "still working" prompts armed
+  /// while a REAL-navigation start waits for its first GPS fix (see
+  /// [_startRealNavigation]). The adapter's ladder may run 35 s and
+  /// a blind user cannot see a spinner, so the start is narrated in
+  /// TWO steps (8 s, 22 s) instead of one -- one prompt alone would
+  /// leave up to 27 s of dead air. Every timer here belongs to ONE
+  /// attempt and is cancelled wholesale by [_abandonNavProgress]:
+  /// none may outlive the attempt, and none may surface in a later
+  /// navigation.
+  final List<Timer> _navProgressTimers = <Timer>[];
+
+  /// Identifies the CURRENT real-navigation preparation attempt.
+  /// The pending `Future` of a superseded or abandoned attempt
+  /// compares its own token before touching [_navProgressTimers],
+  /// so a stale attempt cannot cancel (or speak into) a later
+  /// round, and no progress prompt can surface in the next
+  /// navigation.
+  int _navPrepToken = 0;
 
   String _routeText = '尚未规划路线。';
   String _obstacleText = '尚未模拟障碍。';
@@ -1494,18 +1523,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// no release window can leak an open microphone.
   ///
   /// UI-A11Y UI-01: the TalkBack toggle-mode semantics
-  /// label must flip between idle and listening, so writes
-  /// go through a setter that refreshes the widget tree --
-  /// but ONLY when the idle/non-idle boundary is crossed,
-  /// so the machine's internal transitions
-  /// (prompting -> starting -> listening -> stopping)
-  /// never trigger a rebuild. Hold mode ignores the extra
-  /// refresh (it rebuilds an identical tree).
+  /// label and visible instructions follow the press state.
   _PttState _pttStateValue = _PttState.idle;
 
   _PttState get _pttState => _pttStateValue;
 
   set _pttState(_PttState value) {
+    final previous = _pttStateValue;
     final bool wasIdle = _pttStateValue == _PttState.idle;
     final bool wasListening = _pttStateValue == _PttState.listening;
     _pttStateValue = value;
@@ -1516,7 +1540,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _updateForegroundPolicies();
     }
     final bool isIdle = value == _PttState.idle;
-    if (wasIdle != isIdle && _toggleModeNow && mounted) {
+    if (mounted && (wasIdle != isIdle || wasListening != (value == _PttState.listening) ||
+        previous == _PttState.stopping || value == _PttState.stopping)) {
       setState(() {});
     }
   }
@@ -1734,6 +1759,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   bool _foreground = true;
+  bool _reopenYoloOnResume = false;
   Timer? _foregroundTimer;
 
   void _updateForegroundPolicies() {
@@ -1805,6 +1831,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // result, then the flow continues. Nothing else runs
     // on resume (no background behaviour of any kind).
     if (state == AppLifecycleState.resumed) {
+      if (_reopenYoloOnResume) {
+        _reopenYoloOnResume = false;
+        unawaited(_openYoloLive());
+      }
       if (_pendingForegroundFaultReplay && !_replayHazardAfterRecovery && !_dangerPending) {
         _replayForegroundFaults();
       }
@@ -1816,6 +1846,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         state == AppLifecycleState.detached) {
       _ttsRecovery.stopDanger();
       if (_yoloLiveOpen && mounted) {
+        _reopenYoloOnResume = true;
         setState(() {
           _closeYoloLiveView();
         });
@@ -2719,11 +2750,54 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
+  /// Drop the in-flight REAL-navigation preparation's progress
+  /// prompts (BOTH of them): neither may be spoken any more, and
+  /// the attempt's pending `Future` must not cancel (or speak into)
+  /// a later round -- hence the token bump. Called from every early
+  /// exit (停下 / 取消 / 紧急求助 / a fresh start / the end of live
+  /// navigation / dispose).
+  void _abandonNavProgress() {
+    _cancelNavProgressTimers();
+    _navPrepToken++;
+  }
+
+  /// Cancel the armed progress prompts without touching the token
+  /// (used when the attempt simply finished).
+  void _cancelNavProgressTimers() {
+    for (final Timer timer in _navProgressTimers) {
+      timer.cancel();
+    }
+    _navProgressTimers.clear();
+  }
+
+  /// Speak one progress prompt for preparation attempt
+  /// [prepToken], but only if that attempt is still the current one
+  /// and is still preparing (nothing started, nothing cancelled).
+  ///
+  /// [tag] keeps the two prompts apart in the scheduler: the ids are
+  /// de-duplicated by eventId, and both prompts can be due in the
+  /// same millisecond (a zero-delay test, or a device where the
+  /// two timers land together), so a timestamp alone would make the
+  /// second one look like a repeat of the first and DROP it.
+  void _speakNavProgress(int prepToken, String text, String tag) {
+    if (!mounted) return;
+    if (prepToken != _navPrepToken) return;
+    if (_tasks.state != TaskState.idle) return;
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    _say(_request(
+      id: 'nav-location-progress-$tag-$now',
+      eventId: 'nav-location-progress-$tag-$now',
+      text: text,
+      kind: SpeechKind.info,
+    ));
+  }
+
   /// Stop GPS tracking and clear the live session. Called on
   /// arrival, on 停下, on task end and on emergency: the
   /// microphone/speech stop alone must not leave a phantom
   /// navigation running.
   void _endLiveNavigation() {
+    _abandonNavProgress();
     _ttsRecovery.stopDanger();
     _gpsSub?.cancel();
     _gpsSub = null;
@@ -2902,7 +2976,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _locationProvider = init.locationProvider;
     _yoloDetector = init.yolo;
     _yoloAvailableAtStartup =
-        mingtuYoloAvailableOverride ?? init.yolo.isAvailable;
+        mingtuYoloAvailableOverride ?? canOpenYoloLive(init.yolo);
     final SystemVoiceOutput? tts = init.tts;
     final bool ttsOk = init.ttsOk;
     final SystemVoiceInput? asr = init.asr;
@@ -3332,6 +3406,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
 
   @override
   void dispose() {
+    _abandonNavProgress();
     _emergencyHoldTimer?.cancel();
     _emergencyConfirmTimer?.cancel();
     _headsetPressTimer?.cancel();
@@ -4274,6 +4349,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// to the simulated route silently. On success the task machine
   /// walks its legal chain to navigating and the first step is
   /// spoken; further steps stay manual ("下一步").
+  ///
+  /// Real-device fix round: the GPS fix can take the adapter's
+  /// whole two-rung ladder (up to 35 s). A blind user hears
+  /// nothing at all during that window, so TWO timed progress
+  /// prompts are armed ([navLocationProgressSpeech] at 8 s,
+  /// [navLocationProgressStillWaitingSpeech] at 22 s); both are
+  /// cancelled the moment the attempt ends, and abandoned
+  /// together on every early exit (停下 / 取消 / 紧急求助 / a fresh
+  /// start / dispose).
   Future<void> _startRealNavigation(String destinationName) async {
     if (_tasks.state != TaskState.idle) {
       _say(_request(
@@ -4284,9 +4368,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       ));
       return;
     }
-    // Announce the current route mode first (演示直连 / 代理 /
-    // 未配置): a blind user must know which path a route would
-    // come from before any attempt is made.
+    // This attempt supersedes any previous one: the earlier
+    // timers can no longer speak, and its pending Future will not
+    // cancel ours (each round compares its own token).
+    _abandonNavProgress();
+    final int prepToken = ++_navPrepToken;
+    // Announce that navigation is being prepared before requesting location.
     _say(_request(
       id: 'route-mode-${DateTime.now().millisecondsSinceEpoch}',
       eventId: 'route-mode-${DateTime.now().millisecondsSinceEpoch}',
@@ -4300,8 +4387,38 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       locationProvider: _locationProvider,
       client: _amapClient,
     );
+    // Both progress prompts are armed BEFORE the await. Each fires
+    // only when the start is genuinely still running: mounted,
+    // still THIS attempt, and no navigation has begun yet.
+    _navProgressTimers.addAll(<Timer>[
+      Timer(
+        AppConfig.effectiveNavLocationProgressDelay,
+        () => _speakNavProgress(prepToken, navLocationProgressSpeech, '1'),
+      ),
+      Timer(
+        AppConfig.effectiveNavLocationProgressSecondDelay,
+        () => _speakNavProgress(
+            prepToken, navLocationProgressStillWaitingSpeech, '2'),
+      ),
+    ]);
     final RealNavigationOutcome outcome = await starter.start(destinationName);
+    // The attempt is over (success or failure): neither progress
+    // prompt may speak afterwards. Only the attempt that still
+    // owns the token may clear them (a newer round's timers must
+    // not be cancelled by this stale continuation).
+    if (prepToken == _navPrepToken) {
+      _cancelNavProgressTimers();
+    }
     if (!mounted) return;
+    // A 停下 / 取消 / 紧急求助 (or a fresh start) during the wait
+    // SUPERSEDES this attempt: its result must neither be spoken
+    // nor start navigation. Without this the app answered "好的，
+    // 不去了" and then, seconds later, either re-announced the
+    // location failure or ACTUALLY STARTED navigating -- for a
+    // blind user, a phone that navigates after being told to stop.
+    // Placed before the outcome branch so it covers failure AND
+    // success.
+    if (prepToken != _navPrepToken) return;
     if (!outcome.ready) {
       final String text = outcome.failureAnnouncement;
       final bool locationProblem = outcome.failure ==
@@ -6577,7 +6694,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// the camera is busy (or the wait times out) the view does NOT
   /// open and the user hears exactly that.
   Future<void> _openYoloLive() async {
-    if (_yoloModelFailed) return;
+    if (_yoloModelFailed || _yoloLiveOpen) return;
+    if (!_foreground) {
+      _reopenYoloOnResume = true;
+      return;
+    }
     if (_permissionGateway.isAvailable &&
         !_grantedPermissions.contains(GuidePermission.camera) &&
         (!_guideResolvedSeen ||
@@ -6600,8 +6721,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       ));
       return;
     }
+    if (!mounted || !_foreground) {
+      await _cameraOwnership.release(lease);
+      if (mounted && !_foreground) _reopenYoloOnResume = true;
+      return;
+    }
     _yoloLease = lease;
-    if (!mounted) return;
     setState(() {
       _yoloLiveOpen = true;
     });
@@ -7723,6 +7848,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.pause:
+        // "停下" withdraws an in-flight real-navigation start too:
+        // its pending progress prompt must be silent from here on.
+        _abandonNavProgress();
         if (_tasks.state == TaskState.paused &&
             _tasks.history.isNotEmpty &&
             _tasks.history.last.trigger == 'tts-failure') {
@@ -7800,6 +7928,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         }
         return;
       case VoiceCommand.cancel:
+        // "取消" withdraws an in-flight real-navigation start too.
+        _abandonNavProgress();
         _userPausedDuringTtsFailure = false;
         _deferredPausedCatchUp = false;
         _pausedTurnStepIndex = null;
@@ -7964,6 +8094,9 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   void _triggerEmergency() {
+    // An emergency overrides everything, including a pending
+    // real-navigation start: its progress prompt must stay silent.
+    _abandonNavProgress();
     _userPausedDuringTtsFailure = false;
     _deferredPausedCatchUp = false;
     _pausedTurnStepIndex = null;
@@ -8099,16 +8232,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   @override
   Widget build(BuildContext context) {
     // MT-1111-PTT-C minimal interface: the opened app shows
-    // ONLY two things -- the camera preview area (upper
-    // half) and the big hold-to-talk area (lower half). No
-    // visible text, no other controls: the demo panel, the
-    // status line and even the button's own caption are
-    // gone. All state (_voiceText, _currentPrompt, the big
-    // status value) stays in the logic layer and is spoken
-    // in Chinese through the existing speech path; nothing
-    // is rendered. The button keeps its TalkBack Semantics
-    // label and long-press action, and the physical
-    // press-and-hold gestures are unchanged.
+    // The camera preview and large talk target share one accessible action.
     //
     // UI-A11Y UI-01: with TalkBack on (accessible
     // navigation), the button additionally becomes a
@@ -8122,6 +8246,16 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _talkBackToggleOverride ?? MediaQuery.of(context).accessibleNavigation;
     _toggleModeNow = toggleMode;
     final bool pttActive = _pttState != _PttState.idle;
+    final String talkText = switch (_pttState) {
+      _PttState.idle => toggleMode
+          ? '双击开始说话\n再次双击结束'
+          : '按住说话\n听到提示后说，松开结束',
+      _PttState.prompting || _PttState.starting =>
+        toggleMode ? '准备中\n请稍候' : '准备中\n请继续按住',
+      _PttState.listening =>
+        toggleMode ? '正在听\n再次双击结束' : '正在听\n说完松开',
+      _PttState.stopping => '正在识别\n请稍候',
+    };
     return Scaffold(
       body: Listener(
         behavior: HitTestBehavior.translucent,
@@ -8207,7 +8341,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                     ),
                   ),
                   // The one very large push-to-talk area (lower
-                  // half): a plain colour block with no caption.
+                  // half), with visible instructions for sighted helpers.
                   // Hold: vibrate, stop any lower-priority speech, speak
                   // the cue and await it, then listen while held.
                   // Release: stop listening and submit the result.
@@ -8225,6 +8359,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
                         decoration: BoxDecoration(
                           color: Theme.of(context).colorScheme.primaryContainer,
                           borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Center(
+                          child: ExcludeSemantics(
+                            child: Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: FittedBox(
+                                fit: BoxFit.scaleDown,
+                                child: Text(
+                                  talkText,
+                                  style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                                        color: Theme.of(context).colorScheme.onPrimaryContainer,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
+                            ),
+                          ),
                         ),
                       ),
                     ),

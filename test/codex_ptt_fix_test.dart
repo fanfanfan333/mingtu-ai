@@ -762,6 +762,24 @@ class CodexFakeRecorder implements VoiceRecorder {
 final List<String> spokenCorpus = <String>[];
 
 void main() {
+  // YOLO startup side-effect isolation (2026-11 round).
+  //
+  // The app now opens the live camera view at startup BEFORE the
+  // first inference -- deliberate product behaviour, pinned by
+  // ui_06_b2_b7_test.dart 'packaged detector opens live camera
+  // before first inference'. In this harness the bundled model
+  // cannot load, so that view reports a failure and the app
+  // speaks localDetectionFaultText ('本地检测暂时不可用…').
+  //
+  // That prompt has nothing to do with push-to-talk, but it lands
+  // in the SAME recording-TTS event stream these tests assert on
+  // and shoves the real prompts aside. Turning the existing
+  // injection seam OFF for the whole file isolates it: product
+  // behaviour is untouched, and every expect() below keeps the
+  // expectation it was written with.
+  setUp(() => mingtuYoloAvailableOverride = false);
+  tearDown(() => mingtuYoloAvailableOverride = null);
+
   group('ASR start failure: vibration + fixed notice (behavioural)', () {
     testWidgets(
         'recogniser unavailable: startup arms the fallback '

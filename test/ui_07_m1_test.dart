@@ -33,7 +33,8 @@ void main() {
   final needsBash = _releaseArtifactsPresent();
   final posixBash = needsBash ? findUsableBash() : null;
   final bashSkipReason = needsBash && posixBash == null
-      ? 'no usable POSIX bash on this host'
+      ? 'no usable POSIX bash (needs dirname/find/sort/tail/grep + python3) '
+          'on this host'
       : null;
   test('only the packaged asset is accepted', () {
     expect(AppConfig.yoloModelPath, packagedYoloModelPath);

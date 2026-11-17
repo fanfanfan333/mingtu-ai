@@ -88,9 +88,7 @@ Future<String> amapHttpSender(Uri url) async {
 }
 
 /// How the walking route is fetched. Selected once from the
-/// build-time configuration; the current mode is announced to
-/// the user in Chinese ([amapRouteModeSpeech]) so a blind user
-/// always knows which path their route came from.
+/// build-time configuration.
 enum AmapRouteMode { directDemo, proxy, unconfigured }
 
 /// Mode selection: a demo key wins (direct), else a proxy URL
@@ -105,17 +103,14 @@ AmapRouteMode selectAmapRouteMode({
   return AmapRouteMode.unconfigured;
 }
 
-/// The exact Chinese announcement of the current route mode.
+/// A user-facing navigation status for the configured route mode.
 String amapRouteModeSpeech(AmapRouteMode mode) {
   switch (mode) {
     case AmapRouteMode.directDemo:
-      return '当前路线模式：演示直连。用构建时注入的演示密钥直连高德，'
-          '该密钥演示后作废。';
     case AmapRouteMode.proxy:
-      return '当前路线模式：经自建代理获取路线，密钥只在服务器上。';
+      return '正在准备导航，请稍候。';
     case AmapRouteMode.unconfigured:
-      return '路线服务未配置：没有演示密钥，也没有代理地址，'
-          '无法获取真实路线。';
+      return '导航服务尚未配置，无法获取路线。';
   }
 }
 

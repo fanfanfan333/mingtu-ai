@@ -40,6 +40,15 @@ Future<void> verifyCommands(
 }
 
 void main() {
+  // YOLO startup side-effect isolation (2026-11 round): the app
+  // opens the live camera view at startup (kept product
+  // behaviour), the bundled model cannot load in this harness,
+  // and the resulting '本地检测暂时不可用…' prompt overwrote the
+  // previous prompt this test asserts on. The seam is OFF for the
+  // whole file; no expect() below is relaxed.
+  setUp(() => mingtuYoloAvailableOverride = false);
+  tearDown(() => mingtuYoloAvailableOverride = null);
+
   testWidgets('hold cue preserves the previous prompt for repeat and status',
       (tester) async {
     final h = ui.RecordingVoiceChannels()..install();

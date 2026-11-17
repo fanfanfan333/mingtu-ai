@@ -417,6 +417,21 @@ void main() {
           () => gateway.timeline?.add('microphone.start');
     }
 
+    testWidgets('packaged detector opens live camera before first inference', (tester) async {
+      injectStartupFakes();
+      mingtuYoloAvailableOverride = null;
+      mingtuYoloViewBuilderOverride = (_) => const SizedBox.shrink();
+      addTearDown(() => mingtuYoloViewBuilderOverride = null);
+      store.seen = true;
+      for (final step in PermissionFlow.steps) {
+        gateway.statusResults[step] = PermissionOutcome.granted;
+      }
+      final h = await _openApp(tester);
+      await _driveUntil(tester, h,
+          () => mingtuHomeDebugHandle!.cameraStartCalls > 0, 'live camera startup');
+      expect(mingtuHomeDebugHandle!.yoloLiveOpen, isTrue);
+    });
+
     int starts(GuidePermission permission) {
       switch (permission) {
         case GuidePermission.microphone:

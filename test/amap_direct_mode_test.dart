@@ -62,11 +62,10 @@ void main() {
       );
     });
 
-    test('mode announcements are Chinese and name the mode', () {
-      expect(amapRouteModeSpeech(AmapRouteMode.directDemo), contains('演示直连'));
-      expect(amapRouteModeSpeech(AmapRouteMode.directDemo), contains('作废'));
-      expect(amapRouteModeSpeech(AmapRouteMode.proxy), contains('代理'));
-      expect(amapRouteModeSpeech(AmapRouteMode.unconfigured), contains('未配置'));
+    test('route announcements explain the user action without technical details', () {
+      expect(amapRouteModeSpeech(AmapRouteMode.directDemo), '正在准备导航，请稍候。');
+      expect(amapRouteModeSpeech(AmapRouteMode.proxy), '正在准备导航，请稍候。');
+      expect(amapRouteModeSpeech(AmapRouteMode.unconfigured), '导航服务尚未配置，无法获取路线。');
     });
   });
 

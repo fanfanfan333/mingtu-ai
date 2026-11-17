@@ -12,6 +12,21 @@
 /// converted WGS-84 -> GCJ-02 **exactly once**, here, before any
 /// other code sees it. Verified destinations are already GCJ-02
 /// and never pass through this adapter.
+///
+/// Acquisition ladder (real-device fix, 2026-11): a single
+/// high-accuracy request with a 15 s cap failed on every cold
+/// start and indoors (the GNSS chip has no lock yet), and the
+/// blind user heard nothing but silence followed by a dead end.
+/// [GeolocatorCurrentLocation.currentLocation] now walks the
+/// pinned [_fixRungs] ladder instead: a high-accuracy attempt
+/// first, then ONE coarser retry that the fused/network
+/// provider can usually answer. Both rungs are real platform
+/// fixes -- the retry trades accuracy, never honesty: no
+/// coordinate is invented, and a fix that is too coarse is
+/// refused by the caller (core/real_navigation.dart), which
+/// announces it aloud. Permission and service problems are
+/// re-checked before every rung and returned as-is: they are
+/// the user's to fix and are never swallowed by a retry.
 library;
 
 import 'dart:async';
@@ -99,47 +114,94 @@ abstract class CurrentLocationProvider {
 class GeolocatorCurrentLocation implements CurrentLocationProvider {
   const GeolocatorCurrentLocation();
 
+  /// One rung of the acquisition ladder: which platform accuracy
+  /// to ask for, and how long the platform may take to answer.
+  /// [label] is never spoken -- it only labels the rung inside
+  /// the diagnostic detail of a final failure, so a log reader
+  /// can tell that BOTH rungs were actually tried.
+  static const List<_FixRung> _fixRungs = <_FixRung>[
+    // Rung 1: the good fix. Pinned at 20 s (the pre-fix code used
+    // 15 s, which a cold GNSS start routinely exceeds).
+    _FixRung('高精度 20 秒', LocationAccuracy.high, Duration(seconds: 20)),
+    // Rung 2: the forgiving fix. A coarser source (fused /
+    // network assisted) answers far more often indoors; a real
+    // fix with a worse accuracy number is honest, a fabricated
+    // one is not.
+    _FixRung('一般精度 15 秒', LocationAccuracy.medium, Duration(seconds: 15)),
+  ];
+
   @override
   Future<LocationResult> currentLocation() async {
+    final List<String> attempts = <String>[];
     try {
-      if (!await Geolocator.isLocationServiceEnabled()) {
-        return LocationResult.error(
-          LocationFailure.serviceDisabled,
-          '设备定位服务未开启。',
-        );
+      for (final _FixRung rung in _fixRungs) {
+        // Access is re-verified before EVERY rung: a permission or
+        // service problem must surface as itself, not as a retried
+        // timeout.
+        final LocationResult? blocked = await _accessFailure();
+        if (blocked != null) return blocked;
+        try {
+          final Position position = await Geolocator.getCurrentPosition(
+            locationSettings: LocationSettings(
+              accuracy: rung.accuracy,
+              timeLimit: rung.timeLimit,
+            ),
+          );
+          // The platform fix is WGS-84; convert exactly once, here.
+          final GeoPoint gcj02 = wgs84ToGcj02(
+            GeoPoint(
+              latitude: position.latitude,
+              longitude: position.longitude,
+            ),
+          );
+          return LocationResult.fix(gcj02, position.accuracy,
+              speedMps: position.speed >= 0 ? position.speed : null);
+        } catch (e) {
+          // Timeout / platform error on THIS rung only: record it
+          // and let the ladder fall through to the next rung.
+          attempts.add('${rung.label}：$e');
+        }
       }
-      final LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.deniedForever) {
-        return LocationResult.error(
-          LocationFailure.permissionDeniedForever,
-          '定位权限已被永久拒绝，需要在系统设置里开启。',
-        );
-      }
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.unableToDetermine) {
-        return LocationResult.error(
-          LocationFailure.permissionDenied,
-          '定位权限被拒绝。',
-        );
-      }
-      final Position position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 15),
-        ),
+      return LocationResult.error(
+        LocationFailure.failed,
+        '定位失败：${_fixRungs.length} 次尝试都没有取得位置'
+        '（${attempts.join('；')}）。',
       );
-      // The platform fix is WGS-84; convert exactly once, here.
-      final GeoPoint gcj02 = wgs84ToGcj02(
-        GeoPoint(latitude: position.latitude, longitude: position.longitude),
-      );
-      return LocationResult.fix(gcj02, position.accuracy,
-          speedMps: position.speed >= 0 ? position.speed : null);
     } catch (e) {
+      // A throw from the access checks themselves (missing plugin,
+      // platform error): still one honest failure, never a guess.
       return LocationResult.error(
         LocationFailure.failed,
         '定位失败：$e',
       );
     }
+  }
+
+  /// The access gate shared by every rung of the ladder. Returns
+  /// the matching failure when a fix may NOT be attempted, or
+  /// null when it may.
+  Future<LocationResult?> _accessFailure() async {
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      return LocationResult.error(
+        LocationFailure.serviceDisabled,
+        '设备定位服务未开启。',
+      );
+    }
+    final LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.deniedForever) {
+      return LocationResult.error(
+        LocationFailure.permissionDeniedForever,
+        '定位权限已被永久拒绝，需要在系统设置里开启。',
+      );
+    }
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.unableToDetermine) {
+      return LocationResult.error(
+        LocationFailure.permissionDenied,
+        '定位权限被拒绝。',
+      );
+    }
+    return null;
   }
 
   @override
@@ -181,6 +243,21 @@ class GeolocatorCurrentLocation implements CurrentLocationProvider {
       );
     }
   }
+}
+
+/// One rung of the GPS acquisition ladder (see
+/// [GeolocatorCurrentLocation._fixRungs]).
+class _FixRung {
+  const _FixRung(this.label, this.accuracy, this.timeLimit);
+
+  /// Diagnostic label for the final failure detail. Never spoken.
+  final String label;
+
+  /// Platform accuracy this rung asks for.
+  final LocationAccuracy accuracy;
+
+  /// Cap on this rung; the platform throws a timeout past it.
+  final Duration timeLimit;
 }
 
 /// Always-unavailable provider (web without GPS, VM, tests that

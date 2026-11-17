@@ -51,6 +51,14 @@ Duration? mingtuPermissionTimeoutOverride;
 Duration? mingtuPermissionSpeechTimeoutOverride;
 Duration? mingtuPermissionRequestTimeoutOverride;
 
+/// Test-only override for the REAL-navigation progress prompt
+/// delay. Null in production.
+Duration? mingtuNavLocationProgressDelayOverride;
+
+/// Test-only override for the SECOND REAL-navigation progress
+/// prompt delay. Null in production.
+Duration? mingtuNavLocationProgressSecondDelayOverride;
+
 const String packagedYoloModelPath = 'assets/models/yolo11n.tflite';
 const String localDetectionFaultText = '本地检测暂时不可用。将改用云端识图，或只用摄像头拍照识图。';
 
@@ -73,6 +81,35 @@ class AppConfig {
       mingtuPermissionTimeoutOverride ?? permissionTimeout;
   static Duration get effectivePermissionSpeechTimeout =>
       mingtuPermissionSpeechTimeoutOverride ?? permissionSpeechTimeout;
+
+  /// How long the REAL-navigation start may stay SILENT before the
+  /// app speaks one progress prompt (see
+  /// `_startRealNavigation` in main.dart). The GPS adapter's own
+  /// ladder may legitimately take up to 35 s, and a blind user
+  /// cannot see a spinner: that much silence reads as a crash.
+  /// Pinned at 8 s -- long enough that a normal fix (and the
+  /// speech still playing "正在准备导航，请稍候。") fills the gap,
+  /// short enough to be heard as "still working".
+  static const Duration navLocationProgressDelay = Duration(seconds: 8);
+  static Duration get effectiveNavLocationProgressDelay =>
+      mingtuNavLocationProgressDelayOverride ?? navLocationProgressDelay;
+
+  /// When the SECOND progress prompt is due, measured from the same
+  /// START of the attempt (not from the first prompt): the pair is
+  /// "8 s, then 22 s". The adapter's ladder can run 35 s, and one
+  /// prompt alone would leave up to 27 s of silence -- for a blind
+  /// user that is indistinguishable from a crash.
+  ///
+  /// Deliberately its own absolute value plus its own override
+  /// rather than a multiple of [navLocationProgressDelay]: the two
+  /// are independent announcements with an explicit schedule, so a
+  /// test can pin either one without arithmetic that nobody can
+  /// read, and production stays readable as "8 秒, 22 秒".
+  static const Duration navLocationProgressSecondDelay =
+      Duration(seconds: 22);
+  static Duration get effectiveNavLocationProgressSecondDelay =>
+      mingtuNavLocationProgressSecondDelayOverride ??
+      navLocationProgressSecondDelay;
 
   /// Base URL of the self-hosted Amap route proxy (server side
   /// holds the Amap key). A URL is not a credential. Empty = the

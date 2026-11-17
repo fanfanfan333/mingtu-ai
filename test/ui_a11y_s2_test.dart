@@ -292,6 +292,7 @@ void main() {
     await s1.settleToggleApp(tester, h);
     await s1.toggleStartUntilListening(tester, h);
     expect(feedback.calls, ['start']);
+    expect(find.text('正在听\n再次双击结束'), findsOneWidget);
     await s1.deliverChannelError('error_speech_timeout');
     await tester.pump();
     expect(feedback.calls, ['start', 'end']);
@@ -314,7 +315,7 @@ void main() {
         greaterThanOrEqualTo(tester.view.physicalSize.height /
             tester.view.devicePixelRatio /
             2));
-    expect(find.byType(Text), findsNothing);
+    expect(find.text('双击开始说话\n再次双击结束'), findsOneWidget);
     semantics.dispose();
     await ui.shutdownVoice(tester, h);
   });

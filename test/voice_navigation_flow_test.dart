@@ -389,9 +389,19 @@ void main() {
       // status value survives as state ('明途' at idle), and
       // the two actions survive as the debug handle's
       // commands; the assertions now pin exactly that.
+      //
+      // Visible-instruction round (kept product behaviour, see
+      // push_to_talk_ui_test.dart 'PTT-C: ... with visible
+      // instructions'): the hold-to-talk area now carries ONE
+      // visible instruction line for a sighted helper. The
+      // "no visible text at all" assertion that stood here was
+      // written before that round; it is replaced by the exact
+      // positive copy plus the count, so any SECOND text
+      // widget still fails the test.
       expect(mingtuHomeDebugHandle!.bigStatusText, '明途');
       expect(find.byType(ElevatedButton), findsNothing);
-      expect(find.byType(Text), findsNothing);
+      expect(find.text('按住说话\n听到提示后说，松开结束'), findsOneWidget);
+      expect(find.byType(Text), findsOneWidget);
       expect(
         find.byKey(const ValueKey<String>('push-to-talk-area')),
         findsOneWidget,

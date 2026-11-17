@@ -6,3 +6,5 @@ import 'yolo_detector.dart';
 
 YoloDetector createYoloDetector(String modelPath) =>
     UnavailableYoloDetector();
+
+bool canOpenYoloLive(YoloDetector detector) => detector.isAvailable;

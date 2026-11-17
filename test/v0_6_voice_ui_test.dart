@@ -134,13 +134,21 @@ void main() {
     expect(mingtuHomeDebugHandle!.allStatusText, contains('系统语音识别不可用'));
 
     // No listen button exists anymore (press-and-hold
-    // only): the interface carries zero Text widgets.
-    expect(find.byType(Text), findsNothing);
+    // only). Visible-instruction round (kept product
+    // behaviour, see push_to_talk_ui_test.dart 'PTT-C: ...
+    // with visible instructions'): the hold-to-talk area
+    // carries exactly ONE text -- the instruction a sighted
+    // helper needs. The old "zero Text widgets" assertion
+    // predated that round; the count is still pinned, so a
+    // SECOND text widget fails this test.
+    expect(find.text('按住说话\n听到提示后说，松开结束'), findsOneWidget);
+    expect(find.byType(Text), findsOneWidget);
 
     await drivePanelAction(
         tester, '高德真实路线（真实导航：需已核验目的地与路线代理）');
     expect(mingtuHomeDebugHandle!.allStatusText, contains('真实导航未启动'));
-    expect(mingtuHomeDebugHandle!.allStatusText, contains('路线服务未部署'));
+    expect(mingtuHomeDebugHandle!.allStatusText,
+        contains('导航服务现在还没准备好'));
 
     // Drain the simulated speech-completion timer started by the
     // spoken failure announcement before teardown.

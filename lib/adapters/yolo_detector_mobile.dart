@@ -13,6 +13,9 @@ import 'yolo_detector.dart';
 YoloDetector createYoloDetector(String modelPath) =>
     MobileYoloDetector(modelPath: modelPath);
 
+bool canOpenYoloLive(YoloDetector detector) =>
+    detector is MobileYoloDetector ? !detector._failed : detector.isAvailable;
+
 class MobileYoloDetector implements YoloDetector {
   final String modelPath;
   YOLO? _yolo;

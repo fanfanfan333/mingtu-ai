@@ -53,7 +53,9 @@ Completer<void>? _yoloDisposeCompleter;
 /// freed until the physical view teardown finished. A fresh
 /// completer is created at every mount.
 Future<void> get yoloLiveViewDisposed =>
-    (_yoloDisposeCompleter ??= Completer<void>()).future;
+    yoloLiveViewMounted
+        ? (_yoloDisposeCompleter ??= Completer<void>()).future
+        : Future<void>.value();
 
 /// The 720p analysis-resolution ceiling the thermal
 /// policy imposes under heat (M2 section 3.2): the

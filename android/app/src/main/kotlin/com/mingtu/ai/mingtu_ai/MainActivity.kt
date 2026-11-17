@@ -149,15 +149,15 @@ class MainActivity : FlutterActivity() {
             if (thermalListener == null) {
                 val listener =
                     PowerManager.OnThermalStatusChangedListener { status ->
-                        try {
-                            deviceChannel?.invokeMethod(
-                                "onThermalStatus", thermalPayload(status)
-                            )
-                        } catch (e: Exception) {
-                            Log.w(
-                                "MingtuDevice",
-                                "onThermalStatus push failed", e
-                            )
+                        val payload = thermalPayload(status)
+                        runOnUiThread {
+                            try {
+                                if (thermalListener != null) {
+                                    deviceChannel?.invokeMethod("onThermalStatus", payload)
+                                }
+                            } catch (e: Exception) {
+                                Log.w("MingtuDevice", "onThermalStatus push failed", e)
+                            }
                         }
                     }
                 thermalListener = listener

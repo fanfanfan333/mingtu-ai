@@ -6,8 +6,10 @@ import 'package:mingtu_ai/adapters/voice_io.dart';
 import 'package:mingtu_ai/core/foreground_watchdog.dart';
 import 'package:mingtu_ai/core/asr_errors.dart';
 import 'package:mingtu_ai/core/location_signal_speech.dart';
+import 'package:mingtu_ai/core/real_navigation.dart';
 import 'package:mingtu_ai/adapters/current_location.dart';
 import 'package:mingtu_ai/core/speech_scheduler.dart';
+import 'package:mingtu_ai/core/task_manager.dart';
 import 'package:mingtu_ai/core/wakelock_control.dart';
 import 'package:mingtu_ai/core/yolo_error_speech.dart';
 import 'package:mingtu_ai/main.dart';
@@ -40,6 +42,63 @@ class PendingRecoveryOutput implements VoiceOutput {
   }
 }
 
+/// Real-device fix round: a GPS provider that NEVER answers. The
+/// REAL-navigation start therefore stays in its waiting window,
+/// which is exactly the window the progress prompt exists for.
+class HangingLocation implements CurrentLocationProvider {
+  final Completer<LocationResult> gate = Completer<LocationResult>();
+  int calls = 0;
+
+  @override
+  Future<LocationResult> currentLocation() {
+    calls++;
+    return gate.future;
+  }
+
+  @override
+  Future<bool> ensurePermission() async => true;
+
+  @override
+  Stream<LocationResult> positions() => const Stream<LocationResult>.empty();
+}
+
+/// A GPS provider that answers AT ONCE with a fix too coarse to
+/// start from (80 m). The start attempt finishes immediately, so
+/// the progress prompt must stay silent even though the delay is
+/// just as short as in the hanging case: that is the proof the
+/// prompt is conditional, not unconditional.
+class InstantCoarseLocation implements CurrentLocationProvider {
+  int calls = 0;
+
+  @override
+  Future<LocationResult> currentLocation() async {
+    calls++;
+    return LocationResult.fix(
+      const GeoPoint(latitude: 39.908692, longitude: 116.397477),
+      80,
+    );
+  }
+
+  @override
+  Future<bool> ensurePermission() async => true;
+
+  @override
+  Stream<LocationResult> positions() => const Stream<LocationResult>.empty();
+}
+
+/// Pump the fake clock (and complete whatever the TTS fake is
+/// holding) until [until] is true or the budget runs out.
+Future<void> _settleUntil(ui.RecordingVoiceChannels h, WidgetTester tester,
+    bool Function() until,
+    {int rounds = 20}) async {
+  for (int i = 0; i < rounds && !until(); i++) {
+    await tester.pump(const Duration(milliseconds: 20));
+    h.completeAllSpeaks();
+  }
+  h.completeAllSpeaks();
+  await tester.pump();
+}
+
 void main() {
   setUp(() {
     mingtuPermissionGatewayOverride = s1.FakePermissionGateway();
@@ -54,6 +113,9 @@ void main() {
     mingtuWakelockGatewayOverride = null;
     mingtuWatchdogNowOverride = null;
     mingtuYoloViewBuilderOverride = null;
+    mingtuLocationProviderOverride = null;
+    mingtuNavLocationProgressDelayOverride = null;
+    mingtuNavLocationProgressSecondDelayOverride = null;
   });
 
   for (final stillActive in [true, false]) {
@@ -293,6 +355,43 @@ void main() {
     await ui.shutdownVoice(tester, channels);
   });
 
+  testWidgets('camera request during inactive opens on resume', (tester) async {
+    mingtuYoloViewBuilderOverride = (_) => const SizedBox.shrink();
+    mingtuWakelockGatewayOverride = FakeWakelockGateway();
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    await ui.settleRecordedApp(tester, h);
+    final handle = mingtuHomeDebugHandle!;
+    handle.closeYoloLive();
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await handle.openYoloLive();
+    expect(handle.yoloLiveOpen, isFalse);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    for (var i = 0; i < 8; i++) { await tester.pump(const Duration(milliseconds: 100)); }
+    expect(handle.yoloLiveOpen, isTrue);
+    await ui.shutdownVoice(tester, h);
+  });
+
+  testWidgets('camera reopens after returning to foreground', (tester) async {
+    mingtuYoloViewBuilderOverride = (_) => const SizedBox.shrink();
+    mingtuWakelockGatewayOverride = FakeWakelockGateway();
+    final h = ui.RecordingVoiceChannels()..install();
+    addTearDown(h.uninstall);
+    await ui.settleRecordedApp(tester, h);
+    final handle = mingtuHomeDebugHandle!;
+    await handle.openYoloLive();
+    await tester.pump();
+    expect(handle.yoloLiveOpen, isTrue);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump();
+    expect(handle.yoloLiveOpen, isFalse);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    for (var i = 0; i < 8; i++) { await tester.pump(const Duration(milliseconds: 100)); }
+    expect(handle.yoloLiveOpen, isTrue);
+    await ui.shutdownVoice(tester, h);
+  });
+
   testWidgets('camera live view enables and closing disables wakelock',
       (tester) async {
     final gateway = FakeWakelockGateway();
@@ -382,5 +481,287 @@ void main() {
     await tester.pump(const Duration(milliseconds: 250));
     expect(gateway.calls.last, isTrue);
     await ui.shutdownVoice(tester, h);
+  });
+
+  group('real-navigation start progress prompt', () {
+    /// A CONFIGURED route client: without one the start refuses at
+    /// its "proxy configured" check and the GPS is never asked (a
+    /// test build has no proxy URL). Its sender must never run --
+    /// the location step is where every case here stops.
+    AmapWalkingClient configuredClient() => AmapWalkingClient(
+          proxyBaseUrl: 'https://proxy.example.test',
+          sender: (Uri url) async =>
+              throw StateError('no route request expected in this test'),
+        );
+
+    /// Occurrences of one spoken line in the TTS event stream.
+    int spokenCount(ui.RecordingVoiceChannels h, String text) => h.events
+        .where((String e) => e == 'tts.speak:$text')
+        .length;
+
+    // The two prompts share ONE schedule source of truth: both delays
+    // have their own override (AppConfig.effectiveNavLocationProgressDelay
+    // / ...SecondDelay), so a test can fire them at the same instant
+    // without touching the production 8 s / 22 s pair. Pinning both
+    // overrides together keeps the zero-delay cases deterministic --
+    // no test ever sleeps for 22 real seconds.
+    void armBothPromptsImmediately() {
+      mingtuNavLocationProgressDelayOverride = Duration.zero;
+      mingtuNavLocationProgressSecondDelayOverride = Duration.zero;
+    }
+
+    testWidgets('a start still waiting speaks BOTH progress prompts, once each',
+        (tester) async {
+      final HangingLocation location = HangingLocation();
+      mingtuLocationProviderOverride = location;
+      armBothPromptsImmediately();
+      final ui.RecordingVoiceChannels h = ui.RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await ui.settleRecordedApp(tester, h);
+
+      mingtuHomeDebugHandle!.debugSetAmapClient(configuredClient());
+      mingtuHomeDebugHandle!.fetchAmapRoute();
+      await _settleUntil(
+          h,
+          tester,
+          () =>
+              spokenCount(h, navLocationProgressStillWaitingSpeech) >= 1);
+
+      // The start really is waiting on the GPS...
+      expect(location.calls, 1, reason: 'the GPS was asked exactly once');
+      expect(location.gate.isCompleted, isFalse, reason: 'still waiting');
+      // ...and the user HEARS that, twice over ~35 s, instead of
+      // dead air that reads as a crash.
+      expect(h.events, contains('tts.speak:$navLocationProgressSpeech'),
+          reason: '${h.events}');
+      expect(h.events,
+          contains('tts.speak:$navLocationProgressStillWaitingSpeech'),
+          reason: '${h.events}');
+      // Exactly one of each: extra repeats would nag.
+      expect(spokenCount(h, navLocationProgressSpeech), 1,
+          reason: '${h.events}');
+      expect(spokenCount(h, navLocationProgressStillWaitingSpeech), 1,
+          reason: '${h.events}');
+      location.gate.complete(LocationResult.error(
+          LocationFailure.failed, 'test teardown'));
+      await tester.pump();
+      await ui.shutdownVoice(tester, h);
+    });
+
+    testWidgets('an immediate answer speaks NEITHER progress prompt',
+        (tester) async {
+      final InstantCoarseLocation location = InstantCoarseLocation();
+      mingtuLocationProviderOverride = location;
+      // SAME delays as the case above: the only difference is that
+      // the attempt finishes immediately.
+      armBothPromptsImmediately();
+      final ui.RecordingVoiceChannels h = ui.RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await ui.settleRecordedApp(tester, h);
+
+      mingtuHomeDebugHandle!.debugSetAmapClient(configuredClient());
+      mingtuHomeDebugHandle!.fetchAmapRoute();
+      await _settleUntil(
+          h, tester, () => h.events.any((String e) => e.contains('导航没有启动')));
+
+      expect(location.calls, 1);
+      // The attempt completed, so the user got the real verdict --
+      // not a "hang on" prompt for a wait that already ended.
+      expect(h.events.any((String e) => e.contains('定位精度不够')), isTrue,
+          reason: '${h.events}');
+      expect(h.events, isNot(contains('tts.speak:$navLocationProgressSpeech')),
+          reason: '${h.events}');
+      expect(
+          h.events,
+          isNot(contains(
+              'tts.speak:$navLocationProgressStillWaitingSpeech')),
+          reason: '${h.events}');
+      await ui.shutdownVoice(tester, h);
+    });
+
+    testWidgets('停下 cancels BOTH progress prompts', (tester) async {
+      final HangingLocation location = HangingLocation();
+      mingtuLocationProviderOverride = location;
+      // Realistic delays here: the start is stopped INSIDE the
+      // waiting window, before either prompt could ever be due.
+      mingtuNavLocationProgressDelayOverride = const Duration(seconds: 8);
+      mingtuNavLocationProgressSecondDelayOverride =
+          const Duration(seconds: 22);
+      final ui.RecordingVoiceChannels h = ui.RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await ui.settleRecordedApp(tester, h);
+
+      mingtuHomeDebugHandle!.debugSetAmapClient(configuredClient());
+      mingtuHomeDebugHandle!.fetchAmapRoute();
+      // The start reached the GPS (still waiting)...
+      await tester.pump();
+      expect(location.calls, 1);
+      // ...then the user says 停下.
+      mingtuHomeDebugHandle!.voiceCommand('停下');
+      // Past the point where the SECOND prompt would have been due
+      // (22 s) -- the one most likely to leak into a later
+      // navigation if only the first timer were cancelled.
+      await tester.pump(const Duration(seconds: 23));
+      h.completeAllSpeaks();
+      await tester.pump(const Duration(seconds: 1));
+      h.completeAllSpeaks();
+      await tester.pump();
+
+      expect(h.events, isNot(contains('tts.speak:$navLocationProgressSpeech')),
+          reason: '${h.events}');
+      expect(
+          h.events,
+          isNot(contains(
+              'tts.speak:$navLocationProgressStillWaitingSpeech')),
+          reason: '${h.events}');
+      location.gate.complete(LocationResult.error(
+          LocationFailure.failed, 'test teardown'));
+      await tester.pump();
+      await ui.shutdownVoice(tester, h);
+    });
+
+    /// A CONFIGURED client whose sender answers with ONE valid
+    /// walking path, so a start attempt can actually SUCCEED. Only
+    /// the "a withdrawn start must not navigate anyway" cases use
+    /// it -- every other case here stops at the GPS.
+    AmapWalkingClient succeedingClient() => AmapWalkingClient(
+          proxyBaseUrl: 'https://proxy.example.test',
+          sender: (Uri url) async => '{"status":"1","route":{"paths":[{'
+              '"distance":"500","duration":"400","steps":[{'
+              '"action":"直行","orientation":"北",'
+              '"polyline":"120.441723,37.724409;120.443212,37.723667",'
+              '"distance":"500","duration":"400"}]}]}}',
+        );
+
+    /// A fix AT the demo start point (校门口, GCJ-02, the same
+    /// coordinates as `verifiedLocations`), 10 m accuracy: the
+    /// accuracy gate and the 300 m proximity gate both pass, so
+    /// this fix WOULD start navigation if the attempt were not
+    /// withdrawn while it was still waiting.
+    LocationResult demoStartFix() => LocationResult.fix(
+          const GeoPoint(latitude: 37.724409, longitude: 120.441723),
+          10,
+        );
+
+    // The three cases below are the regression anchors for the
+    // supersede guard in `_startRealNavigation` (right after
+    // `await starter.start(...)`). Before it, a user who said
+    // 「取消」heard "好的，不去了" and then, seconds later, either
+    // the location failure again or -- worse -- a full route
+    // announcement plus live navigation starting on its own.
+
+    testWidgets('取消 during the wait silences the late location failure',
+        (tester) async {
+      final HangingLocation location = HangingLocation();
+      mingtuLocationProviderOverride = location;
+      // Realistic delays: the user withdraws INSIDE the waiting
+      // window, exactly as in the reported session.
+      mingtuNavLocationProgressDelayOverride = const Duration(seconds: 8);
+      mingtuNavLocationProgressSecondDelayOverride =
+          const Duration(seconds: 22);
+      final ui.RecordingVoiceChannels h = ui.RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await ui.settleRecordedApp(tester, h);
+
+      mingtuHomeDebugHandle!.debugSetAmapClient(configuredClient());
+      mingtuHomeDebugHandle!.fetchAmapRoute();
+      await tester.pump();
+      expect(location.calls, 1, reason: 'the GPS was asked');
+
+      mingtuHomeDebugHandle!.voiceCommand('取消');
+      await tester.pump();
+
+      // The platform finally answers -- AFTER the withdrawal.
+      location.gate.complete(LocationResult.error(
+          LocationFailure.failed, 'late platform failure'));
+      await tester.pump(const Duration(seconds: 1));
+      h.completeAllSpeaks();
+      await tester.pump(const Duration(seconds: 23));
+      h.completeAllSpeaks();
+      await tester.pump();
+
+      expect(h.events.any((String e) => e.contains('定位失败')), isFalse,
+          reason: 'a withdrawn start must not speak its late '
+              'failure: ${h.events}');
+      expect(h.events.any((String e) => e.contains('导航未启动')), isFalse,
+          reason: '${h.events}');
+      await ui.shutdownVoice(tester, h);
+    });
+
+    testWidgets('取消 during the wait: a late SUCCESS never navigates',
+        (tester) async {
+      final HangingLocation location = HangingLocation();
+      mingtuLocationProviderOverride = location;
+      mingtuNavLocationProgressDelayOverride = const Duration(seconds: 8);
+      mingtuNavLocationProgressSecondDelayOverride =
+          const Duration(seconds: 22);
+      final ui.RecordingVoiceChannels h = ui.RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await ui.settleRecordedApp(tester, h);
+
+      mingtuHomeDebugHandle!.debugSetAmapClient(succeedingClient());
+      mingtuHomeDebugHandle!.fetchAmapRoute();
+      await tester.pump();
+      expect(location.calls, 1);
+
+      mingtuHomeDebugHandle!.voiceCommand('取消');
+      await tester.pump();
+
+      // A GOOD fix arrives late. Without the guard this is the exact
+      // moment the app announced 「已获取到图书馆的真实步行路线…」
+      // and started live navigation on a user who said 不去了.
+      location.gate.complete(demoStartFix());
+      await tester.pump(const Duration(seconds: 1));
+      h.completeAllSpeaks();
+      await tester.pump(const Duration(seconds: 23));
+      h.completeAllSpeaks();
+      await tester.pump();
+
+      expect(h.events.any((String e) => e.contains('已获取到')), isFalse,
+          reason: 'a withdrawn start must not announce a route: '
+              '${h.events}');
+      expect(mingtuHomeDebugHandle!.taskState, isNot(TaskState.navigating),
+          reason: 'a withdrawn start must never reach navigating');
+      await ui.shutdownVoice(tester, h);
+    });
+
+    testWidgets('紧急求助 during the wait: a late SUCCESS never navigates',
+        (tester) async {
+      final HangingLocation location = HangingLocation();
+      mingtuLocationProviderOverride = location;
+      mingtuNavLocationProgressDelayOverride = const Duration(seconds: 8);
+      mingtuNavLocationProgressSecondDelayOverride =
+          const Duration(seconds: 22);
+      final ui.RecordingVoiceChannels h = ui.RecordingVoiceChannels()
+        ..install();
+      addTearDown(h.uninstall);
+      await ui.settleRecordedApp(tester, h);
+
+      mingtuHomeDebugHandle!.debugSetAmapClient(succeedingClient());
+      mingtuHomeDebugHandle!.fetchAmapRoute();
+      await tester.pump();
+      expect(location.calls, 1);
+
+      mingtuHomeDebugHandle!.voiceCommand('救命');
+      await tester.pump();
+
+      location.gate.complete(demoStartFix());
+      await tester.pump(const Duration(seconds: 1));
+      h.completeAllSpeaks();
+      await tester.pump(const Duration(seconds: 23));
+      h.completeAllSpeaks();
+      await tester.pump();
+
+      expect(h.events.any((String e) => e.contains('已获取到')), isFalse,
+          reason: 'an emergency must never start navigating: ${h.events}');
+      expect(mingtuHomeDebugHandle!.taskState, isNot(TaskState.navigating),
+          reason: 'an emergency must never reach navigating');
+      await ui.shutdownVoice(tester, h);
+    });
   });
 }

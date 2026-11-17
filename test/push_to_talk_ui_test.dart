@@ -676,17 +676,14 @@ void main() {
   group('step C push-to-talk layout', () {
     testWidgets(
         'PTT-C: the interface is only the camera area and '
-        'the hold-to-talk area -- zero Text widgets',
+        'the hold-to-talk area with visible instructions',
         (WidgetTester tester) async {
       final SemanticsHandle handle = tester.ensureSemantics();
       await tester.pumpWidget(const MingtuApp());
       await tester.pump();
       await settleStartup(tester);
 
-      // No visible text anywhere: no Text widget exists in
-      // the tree at all (Semantics labels are not Text).
-      expect(find.byType(Text), findsNothing);
-      expect(find.text('按住说话'), findsNothing);
+      expect(find.text('按住说话\n听到提示后说，松开结束'), findsOneWidget);
 
       // Structure: exactly the two areas, no scroll view,
       // no buttons.
