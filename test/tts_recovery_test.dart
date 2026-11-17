@@ -167,6 +167,28 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
   });
 
+  testWidgets('combined recording and stop command pauses navigation',
+      (tester) async {
+    mingtuStartupTtsFactoryOverride = FakeStartupTts.new;
+    addTearDown(() => mingtuStartupTtsFactoryOverride = null);
+    await tester.pumpWidget(const MingtuApp());
+    await tester.pump();
+    final handle = mingtuHomeDebugHandle!;
+    handle.startVoiceDemo();
+    handle.planRoute();
+    handle.startNavigating();
+    expect(handle.taskState, TaskState.navigating);
+    handle.voiceCommand('不要取消导航');
+    expect(handle.taskState, TaskState.navigating);
+    handle.voiceCommand('我不需要帮助');
+    expect(handle.taskState, TaskState.navigating);
+    handle.voiceCommand('别删除录像，停下');
+    await tester.pump();
+    expect(handle.taskState, TaskState.paused);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 4));
+  });
+
   testWidgets('navigation hazards vibrate after TTS failure pauses the task',
       (tester) async {
     mingtuStartupTtsFactoryOverride = FakeStartupTts.new;

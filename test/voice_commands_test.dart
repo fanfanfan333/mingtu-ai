@@ -2,6 +2,33 @@ import 'package:mingtu_ai/core/voice_commands.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('stop takes priority over keeping a recording', () {
+    for (final phrase in ['别删除录像，停下', '别删录像，前面危险，停下', '别动我的录像，站住', '别删录像，停']) {
+      expect(parseVoiceCommand(phrase), VoiceCommand.pause, reason: phrase);
+    }
+    expect(parseVoiceCommand('别动我的录像'), VoiceCommand.saveRecording);
+    expect(parseVoiceCommand('不要删除录像'), VoiceCommand.saveRecording);
+    expect(parseVoiceCommand('别删除录像，不要停下'), VoiceCommand.saveRecording);
+    expect(parseVoiceCommand('别删除录像，别停下'), VoiceCommand.saveRecording);
+  });
+
+  test('negated destination and cancel never start or cancel navigation', () {
+    for (final phrase in ['不需要去图书馆', '没必要去图书馆', '我不打算去图书馆', '我不准备去图书馆', '我不想再去图书馆', '不再去图书馆', '没有必要去图书馆', '无需去图书馆']) {
+      expect(parseVoiceCommand(phrase), VoiceCommand.cancel, reason: phrase);
+    }
+    for (final phrase in ['不要取消导航', '不取消导航', '别取消任务', '不需要取消导航']) {
+      expect(parseVoiceCommand(phrase), VoiceCommand.unknown, reason: phrase);
+    }
+    expect(parseVoiceCommand('取消导航'), VoiceCommand.cancel);
+    expect(parseVoiceCommand('带我去图书馆'), VoiceCommand.startLibrary);
+  });
+
+  test('a negated help request does not trigger emergency', () {
+    expect(parseVoiceCommand('我不需要帮助'), VoiceCommand.unknown);
+    expect(parseVoiceCommand('我需要帮助'), VoiceCommand.emergency);
+    expect(parseVoiceCommand('不需要帮助，救命'), VoiceCommand.emergency);
+  });
+
   test('emergency wins over generic help', () {
     expect(parseVoiceCommand('小途，我需要帮助'), VoiceCommand.emergency);
     expect(parseVoiceCommand('救命'), VoiceCommand.emergency);

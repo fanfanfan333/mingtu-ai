@@ -167,6 +167,15 @@ bool _isNegatedDestination(String text) {
     '别到',
     '别回',
     '不用去',
+    '不需要去',
+    '不必去',
+    '没必要去',
+    '不打算去',
+    '不准备去',
+    '不想再去',
+    '不再去',
+    '没有必要去',
+    '无需去',
     '甭去',
     '不会去',
   ];
@@ -208,7 +217,9 @@ VoiceCommand parseVoiceCommand(String raw) {
       .replaceAll(_ignorableChars, '')
       .trim();
   if (text.isEmpty) return VoiceCommand.unknown;
-  if (text.contains('需要帮助') || text.contains('救命') || text.contains('紧急')) {
+  final negatedHelp = RegExp(r'(不需要|不需|不用|不想|无需|没必要)帮助').hasMatch(text);
+  if (text.contains('救命') || text.contains('紧急') ||
+      (text.contains('需要帮助') && !negatedHelp)) {
     return VoiceCommand.emergency;
   }
   // Data safety (D7): a negated delete runs BEFORE the stop words,
@@ -216,6 +227,12 @@ VoiceCommand parseVoiceCommand(String raw) {
   // KEEP the recording. Wrong direction here is expensive: the other
   // order pauses the navigation and never answers the data request.
   if (_isNegatedDelete(text)) {
+    final remaining = text.replaceAll(_negatedRecordingTouch, '').replaceAll(
+        RegExp(r'(不要|不用|不必|别|不)(再)?(停下|暂停|停住|站住|停一下|停一停|快停)'), '');
+    if (RegExp(r'停下|暂停|停住|站住|快停|停一下|停一停|先别走|别走|别动|不要动|别碰|停+$')
+        .hasMatch(remaining)) {
+      return VoiceCommand.pause;
+    }
     return VoiceCommand.saveRecording;
   }
   // Safety (D1): an emergency stop is the shortest, most natural thing a
@@ -289,6 +306,10 @@ VoiceCommand parseVoiceCommand(String raw) {
   if (_isHowToQuestion(text)) {
     return VoiceCommand.unknown;
   }
+  if (RegExp(r'(不需要|没必要|不打算|不准备|不要|不用|不必|不想|无需|别|不)取消')
+      .hasMatch(text)) {
+    return VoiceCommand.unknown;
+  }
   if (text.contains('继续') || text.contains('恢复')) {
     return VoiceCommand.resume;
   }
@@ -357,7 +378,8 @@ VoiceCommand parseVoiceCommand(String raw) {
   if (text.contains('去图书馆') || text.contains('图书馆')) {
     return VoiceCommand.startLibrary;
   }
-  if (text.contains('帮助') || text.contains('能做什么') || text.contains('怎么用')) {
+  if ((text.contains('帮助') && !negatedHelp) ||
+      text.contains('能做什么') || text.contains('怎么用')) {
     return VoiceCommand.help;
   }
   if (text.contains('打开口袋') || text.contains('开启口袋模式')) {
