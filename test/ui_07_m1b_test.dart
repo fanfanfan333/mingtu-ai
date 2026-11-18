@@ -164,10 +164,15 @@ void main() {
       // "stay put", gives only a UI action (speak again) and, as a
       // last resort, asks a nearby PERSON for help -- never a
       // walking direction.
+      //
+      // Free-destination round: the retry sentence now NAMES the place
+      // the user asked for (here 图书馆, from the registry destination)
+      // instead of the hard-coded 「带我去图书馆」, which was wrong for
+      // anybody who said 药店 / 地铁站.
       expect(
           outcome.failureAnnouncement,
           '定位失败：还没拿到你的位置，导航未启动。'
-          '请留在原地不要走动，等十几秒后再按住屏幕下方说一次“带我去图书馆”。'
+          '请留在原地不要走动，等十几秒后按住屏幕下方再说一次“带我去图书馆”。'
           '如果连着几次都不行，可以请身边的人带你到室外再试。');
       _speak(outcome.failureAnnouncement);
       final results = <LocationResult>[];
@@ -226,10 +231,14 @@ void main() {
   // texts keep "stay put", give only a UI action (hold the lower
   // part of the screen to speak again) and, as a last resort,
   // ASK A NEARBY PERSON for help -- never a walking direction.
+  //
+  // Free-destination round: with NO place known (this outcome was built
+  // by hand, no destination), the retry sentence asks for the
+  // destination instead of naming the library.
   group('location failure texts are pinned, actionable and banned-clean',
       () {
     const String failedText = '定位失败：还没拿到你的位置，导航未启动。'
-        '请留在原地不要走动，等十几秒后再按住屏幕下方说一次“带我去图书馆”。'
+        '请留在原地不要走动，等十几秒后按住屏幕下方再说一次你的目的地。'
         '如果连着几次都不行，可以请身边的人带你到室外再试。';
 
     String tooInaccurateText(double? accuracyM) =>
@@ -252,7 +261,7 @@ void main() {
       expect(text, contains('约 87 米'));
       expect(text, contains('导航没有启动'));
       expect(text, contains('留在原地'));
-      expect(text, contains('带我去图书馆'));
+      expect(text, contains('再说一次你的目的地'));
       // Escalation is "ask a person", never "walk outside yourself".
       expect(text, contains('身边的人'));
       expect(text, contains('室外'));

@@ -14,6 +14,10 @@ library;
 
 enum VoiceCommand {
   startLibrary,
+  // 任意地点：「带我去药店」「去超市」「到地铁站」。以前只有 startLibrary
+  // 一个目的地，用户说别的词全落 unknown（「没听清」），而 App 的说法是
+  // 「只能在固定位置」——地名必须由用户自己说，见 parseDestinationPhrase。
+  startPlace,
   pause,
   resume,
   cancel,
@@ -146,14 +150,21 @@ bool _isNegatedDelete(String text) {
   return mentionsRecording && negatedDelete;
 }
 
-/// True when the utterance NEGATES a destination ("我不去图书馆了",
-/// "别去图书馆"): the app must withdraw the intent, never start a trip
+/// True when the utterance NEGATES going somewhere ("我不去药店了",
+/// "别去药店"): the app must withdraw the intent, never start a trip
 /// the user just refused. Narrow on purpose -- the negation word has to
 /// sit right next to 去/到/想/用 ("不去" / "不想去" / "别去" / "不用去"),
-/// so a sentence that merely contains 不 and 图书馆, such as
+/// so a sentence that merely contains 不 and a place, such as
 /// "我不知道图书馆在哪里", is not read as a withdrawal.
-bool _isNegatedDestination(String text) {
-  if (!text.contains('图书馆')) return false;
+///
+/// Destination-agnostic: it used to hard-require 图书馆, which was fine
+/// while the library was the only destination the app understood. Now
+/// that any landmark can be a destination (see
+/// [parseDestinationPhrase]), the negation has to be recognised for any
+/// place name -- otherwise 「我不去药店了」 would fall through to the
+/// free-destination branch and walk the user to the place they just
+/// refused. [parseDestinationPhrase] is the other caller.
+bool _isNegatedDeparture(String text) {
   // D8: "我要不要去图书馆" is the user thinking out loud, not refusing.
   // 要不要 embeds 不要, so it has to be excluded before the scan.
   if (text.contains('要不要')) return false;
@@ -185,6 +196,13 @@ bool _isNegatedDestination(String text) {
   return false;
 }
 
+/// The library-specific negation check kept for the existing
+/// `startLibrary`/`cancel` branches (its behaviour and its tests are
+/// unchanged: only a sentence that mentions 图书馆 can be a library
+/// withdrawal).
+bool _isNegatedDestination(String text) =>
+    text.contains('图书馆') && _isNegatedDeparture(text);
+
 /// True when the utterance is asking ABOUT the destination rather than
 /// asking to go there ("图书馆在哪里" / "图书馆多远" / "图书馆是什么地方").
 /// Such a sentence must not start a trip, but it must also stay a plain
@@ -209,6 +227,157 @@ bool _isDestinationQuestion(String text) {
   }
   return false;
 }
+
+/// Longest place name accepted from speech. A longer "name" is a whole
+/// sentence the recogniser handed over ("带我去今天天气怎么样"), and
+/// searching the map for it would answer 「附近没有找到…」 to a user who
+/// never asked to go anywhere. 20 characters covers real landmarks
+/// ("北京大学第三医院") with room to spare.
+const int maxSpokenDestinationLength = 20;
+
+/// Prefixes that turn a place name into a "take me there" request.
+/// MUST be tried longest first: a bare 去 would otherwise strip only
+/// 去 from 「带我去药店」 and leave 带我药店 as the "place".
+const List<String> _destinationPrefixes = <String>[
+  '带我去',
+  '我要去',
+  '我想去',
+  '想去',
+  '要去',
+  '去',
+  '到',
+];
+
+/// Trailing punctuation and fillers the recogniser adds: 「去超市吧。」
+/// must yield 超市, not 超市吧。
+const String _trailingPunctuation = '。！？!?，,、；;：:…·~';
+const String _trailingParticles = '了吧呢啊';
+
+/// Words that belong to OTHER commands. A destination containing one of
+/// them is not a place: 「去停下」 would otherwise send the user to a
+/// landmark called 停下.
+const List<String> _otherCommandWords = <String>[
+  '停下',
+  '暂停',
+  '继续',
+  '取消',
+  '紧急',
+  '求助',
+  '下一步',
+  '再说一遍',
+  '状态',
+];
+
+/// Control, format (zero-width / bidi) and unassigned-ish codepoints. A
+/// place name carrying them is never spoken data, only a broken or
+/// hostile transcript.
+final RegExp _controlCharacters = RegExp(
+  r'[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060\ufeff]',
+);
+
+/// Strip trailing punctuation and the fillers 了/吧/呢/啊, repeatedly.
+///
+/// A trailing filler is only removed when at least TWO characters
+/// remain afterwards, because 吧/了 are also word-final inside real
+/// names (「网吧」「酒吧」): asking for 网吧 must not search the map for 网.
+String _stripTrailingNoise(String value) {
+  String text = value.trim();
+  bool changed = true;
+  while (changed && text.isNotEmpty) {
+    changed = false;
+    final String last = text[text.length - 1];
+    if (_trailingPunctuation.contains(last) || last.trim().isEmpty) {
+      text = text.substring(0, text.length - 1).trim();
+      changed = true;
+      continue;
+    }
+    if (_trailingParticles.contains(last) && text.length >= 3) {
+      text = text.substring(0, text.length - 1).trim();
+      changed = true;
+    }
+  }
+  return text;
+}
+
+/// Strip leading punctuation and whitespace ("，带我去药店").
+String _stripLeadingNoise(String value) {
+  String text = value.trim();
+  while (text.isNotEmpty &&
+      (_trailingPunctuation.contains(text[0]) || text[0].trim().isEmpty)) {
+    text = text.substring(1).trim();
+  }
+  return text;
+}
+
+/// True when the sentence asks WHETHER to go somewhere ("我要不要去
+/// 药店") or is a question ("去药店吗" / "去药店？"). Such an utterance
+/// is not an order to start walking, so it must not become a
+/// destination. Deliberately NOT `_looksLikeQuestion`: 怎么走 / 怎么去
+/// are navigation requests, not questions about the destination.
+bool _asksWhetherToGo(String text) {
+  if (text.contains('要不要')) return true;
+  if (text.contains('吗')) return true;
+  final String trimmed = text.trim();
+  return trimmed.endsWith('?') || trimmed.endsWith('？');
+}
+
+/// Shared implementation of [parseDestinationPhrase] and
+/// [sanitizeSpokenDestination].
+///
+/// [requirePrefix] is the whole difference between the two: the voice
+/// COMMAND layer only accepts an explicit "take me there" shape
+/// (otherwise every sentence would be a destination and the command
+/// parser would collapse into "search the map for whatever I heard"),
+/// while the destination QUESTION accepts a bare answer ("药店").
+String? _destinationCore(String raw, {required bool requirePrefix}) {
+  String text = raw.trim().replaceAll('小途', '').trim();
+  if (text.isEmpty) return null;
+  // A withdrawal is never an intent to go: 「我不去药店了」 must not be
+  // read as a request for 药店 (same inversion as D4, generalised).
+  if (_isNegatedDeparture(text)) return null;
+  if (_asksWhetherToGo(text)) return null;
+  // Leading punctuation only ("，带我去药店"): the TRAILING run must be
+  // stripped AFTER the prefix, on the place name itself. Stripping it
+  // first would eat the 吧 of 「带我去网吧」 and leave the place 网 --
+  // the residual-length guard below can only work on the real name.
+  text = _stripLeadingNoise(text);
+  bool sawPrefix = false;
+  for (final String prefix in _destinationPrefixes) {
+    if (text.startsWith(prefix) && text.length > prefix.length) {
+      text = text.substring(prefix.length).trim();
+      sawPrefix = true;
+      break;
+    }
+  }
+  if (requirePrefix && !sawPrefix) return null;
+  text = _stripTrailingNoise(text);
+  if (text.isEmpty) return null;
+  if (text.length > maxSpokenDestinationLength) return null;
+  if (_controlCharacters.hasMatch(text)) return null;
+  for (final String word in _otherCommandWords) {
+    if (text.contains(word)) return null;
+  }
+  return text;
+}
+
+/// 从「带我去X」「去X」「到X」里取出 X；不是目的地意图时返回 null。
+///
+/// This is what makes 「带我去药店」(or any other landmark the user
+/// names) a navigation request instead of "没听清". Returns null -- i.e.
+/// "not a destination" -- for a negation, a question, a missing/empty
+/// place, a name longer than [maxSpokenDestinationLength], a control
+/// character, or a phrase that carries another command's words.
+String? parseDestinationPhrase(String text) =>
+    _destinationCore(text, requirePrefix: true);
+
+/// 清洗「用户说出的一个地名」：允许裸地名（"药店"），也会剥掉礼貌前缀
+/// （"我想去药店" → 药店）。否定、问句、空、超长、控制字符一律 null。
+///
+/// Used by the destination question, whose valid answer is just the
+/// place name. Kept in this file so the command layer and the dialogue
+/// layer cannot drift apart on what counts as a place.
+String? sanitizeSpokenDestination(String raw) =>
+    _destinationCore(raw, requirePrefix: false);
 
 VoiceCommand parseVoiceCommand(String raw) {
   final String text = raw
@@ -387,6 +556,16 @@ VoiceCommand parseVoiceCommand(String raw) {
   }
   if (text.contains('关闭口袋') || text.contains('关掉口袋模式')) {
     return VoiceCommand.disablePocketMode;
+  }
+  // 任意地点（「带我去药店」「去超市」「到地铁站」）。LAST on purpose:
+  // an explicit command word must win over a destination-shaped sentence,
+  // so this sits after every concrete command and before `unknown`.
+  // 图书馆 keeps its own branch above (startLibrary), which is pinned by
+  // its own tests. A clause-less place name ("药店" with no 去/到) is NOT
+  // a command here -- it answers the destination question instead, via
+  // resolveSpokenDestination.
+  if (parseDestinationPhrase(text) != null) {
+    return VoiceCommand.startPlace;
   }
   return VoiceCommand.unknown;
 }

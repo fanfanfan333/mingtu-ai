@@ -19,7 +19,6 @@ import 'adapters/pothole_detector.dart';
 import 'adapters/yolo_detector.dart';
 import 'adapters/yolo_live_view.dart';
 import 'config/app_config.dart';
-import 'config/verified_locations.dart';
 import 'core/camera_frame.dart';
 import 'core/event_bus.dart';
 import 'core/cloud_asr.dart';
@@ -2284,12 +2283,17 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     ));
   }
 
-  /// A spoken answer to the destination question. Matched:
-  /// start real navigation. Unmatched: re-ask (bounded), never
-  /// guess a place.
+  /// A spoken answer to the destination question. Usable: start real
+  /// navigation to the place the user named. Unusable: re-ask
+  /// (bounded), never guess a place.
+  ///
+  /// [resolveSpokenDestination] accepts ANY place name ("药店",
+  /// "地铁站", "图书馆"), not just the two coordinates the repository
+  /// happens to contain: the word only has to be searchable, the
+  /// coordinate comes from the nearby search around the current fix.
   void _answerDestination(String raw) {
-    final VerifiedLocation? loc = resolveDestinationAnswer(raw);
-    if (loc == null) {
+    final String? destination = resolveSpokenDestination(raw);
+    if (destination == null) {
       _destAttempts += 1;
       if (_destAttempts >= 3) {
         _awaitingDestination = false;
@@ -2313,15 +2317,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _say(_request(
       id: 'dest-ok',
       eventId: 'dest-ok',
-      text: '好的，去${loc.name}。',
+      text: '好的，去$destination。',
       kind: SpeechKind.info,
     ));
-    // 「图书馆」 must take the nearby-search path even when it was
-    // answered here: the registry's library point is a demo coordinate,
-    // and the demo-proximity gate would refuse the request from anywhere
-    // else ("你不在演示路线附近"). The registry entry now only acts as the
-    // way this word is RECOGNISED, not as the destination.
-    _startRealNavigation(loc.name, nearby: loc.id == 'library');
+    _startRealNavigation(destination);
   }
 
   /// Begin GPS-tracked live navigation for a ready route:
@@ -4355,6 +4354,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// walks its legal chain to navigating and the first step is
   /// spoken; further steps stay manual ("下一步").
   ///
+  /// Start real navigation to [destinationName] -- the place the user
+  /// said ("图书馆", "药店", "地铁站", …).
+  ///
+  /// ALWAYS the nearby path: [RealNavigationStarter.startNearby] takes
+  /// the current GPS fix, asks Amap for the nearest place matching those
+  /// words (3 km, the user's decision) and routes there. There is no
+  /// fixed destination and no demo-proximity gate any more: the old
+  /// registry-based [RealNavigationStarter.start] could only navigate to
+  /// coordinates somebody typed into the repository, which is what made
+  /// the app "only work at one fixed place". A place that is not within
+  /// 3 km is reported as not found -- honestly, without widening the
+  /// radius or falling back to a guessed coordinate.
+  ///
   /// Real-device fix round: the GPS fix can take the adapter's
   /// whole two-rung ladder (up to 35 s). A blind user hears
   /// nothing at all during that window, so TWO timed progress
@@ -4363,8 +4375,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// cancelled the moment the attempt ends, and abandoned
   /// together on every early exit (停下 / 取消 / 紧急求助 / a fresh
   /// start / dispose).
-  Future<void> _startRealNavigation(String destinationName,
-      {bool nearby = false}) async {
+  Future<void> _startRealNavigation(String destinationName) async {
     if (_tasks.state != TaskState.idle) {
       _say(_request(
         id: 'real-nav-busy-${DateTime.now().millisecondsSinceEpoch}',
@@ -4407,9 +4418,8 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             prepToken, navLocationProgressStillWaitingSpeech, '2'),
       ),
     ]);
-    final RealNavigationOutcome outcome = nearby
-        ? await starter.startNearby(destinationName)
-        : await starter.start(destinationName);
+    final RealNavigationOutcome outcome =
+        await starter.startNearby(destinationName);
     // The attempt is over (success or failure): neither progress
     // prompt may speak afterwards. Only the attempt that still
     // owns the token may clear them (a newer round's timers must
@@ -4506,10 +4516,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   }
 
   /// The on-screen "real route" button runs the same real
-  /// navigation attempt as the voice command: 图书馆, resolved by
-  /// nearby search from the current fix (see
+  /// navigation attempt as the voice command, 图书馆 as the word to
+  /// search for, resolved by nearby search from the current fix (see
   /// `RealNavigationStarter.startNearby`).
-  Future<void> _fetchAmapRoute() => _startRealNavigation('图书馆', nearby: true);
+  Future<void> _fetchAmapRoute() => _startRealNavigation('图书馆');
 
   /// v0.7: speak the next Amap walking step, in order. Saying
   /// "下一步" while navigating speaks the next step; when the steps
@@ -7857,7 +7867,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
           // path (see RealNavigationStarter.startNearby). The simulated
           // flow stays available only through its explicitly labelled
           // demo buttons, never as a silent fallback for a real request.
-          _startRealNavigation('图书馆', nearby: true);
+          _startRealNavigation('图书馆');
         } else {
           _say(_request(
             id: 'voice-busy-${DateTime.now().millisecondsSinceEpoch}',
@@ -7865,6 +7875,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             text: '已有任务在进行，请先取消或完成当前任务。',
             kind: SpeechKind.info,
           ));
+        }
+        return;
+      case VoiceCommand.startPlace:
+        // 任意地点：「带我去药店」「去超市」「到地铁站」。The place name
+        // comes from the user, the coordinate from the nearby search --
+        // so nothing here is fixed. An empty/unusable name never guesses
+        // and never searches: it says so and asks again.
+        final String? phrase = parseDestinationPhrase(raw);
+        if (phrase == null) {
+          _say(_request(
+            id: 'voice-place-unclear-${DateTime.now().millisecondsSinceEpoch}',
+            eventId:
+                'voice-place-unclear-${DateTime.now().millisecondsSinceEpoch}',
+            text: '没有听清你要去哪里，请再说一次。',
+            kind: SpeechKind.info,
+          ));
+        } else {
+          _startRealNavigation(phrase);
         }
         return;
       case VoiceCommand.pause:

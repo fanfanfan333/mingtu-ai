@@ -144,12 +144,38 @@ void main() {
       expect(resolveDestinationAnswer('随便走走'), isNull);
     });
 
+    test('any spoken place is a destination now', () {
+      // Free-destination round: the answer is no longer looked up in a
+      // two-entry table. Any place name is accepted; the nearby search
+      // turns it into a coordinate.
+      expect(resolveSpokenDestination('药店'), '药店');
+      expect(resolveSpokenDestination('我想去地铁站。'), '地铁站');
+      expect(resolveSpokenDestination('带我去公共厕所'), '公共厕所');
+      // A place the app already knows keeps its canonical name.
+      expect(resolveSpokenDestination('学校大门'), '校门口');
+      expect(resolveSpokenDestination('图书馆'), '图书馆');
+      // Unusable answers still resolve to null so the app asks again
+      // instead of guessing: empty, refusal, self-question, and an
+      // oversized "place" (a whole sentence).
+      expect(resolveSpokenDestination(''), isNull);
+      expect(resolveSpokenDestination('   '), isNull);
+      expect(resolveSpokenDestination('我不去药店了'), isNull);
+      expect(resolveSpokenDestination('我要不要去药店'), isNull);
+      expect(resolveSpokenDestination('图' * 21), isNull);
+    });
+
     test(
-        're-ask and give-up texts list real choices and '
+        're-ask and give-up texts name no fixed menu and '
         'contain no safety promise', () {
-      expect(destinationNotFoundText(), contains('图书馆'));
+      // Free-destination round: the re-ask no longer recites
+      // "目前可以导航到：校门口、图书馆" -- that menu WAS the
+      // "只能去固定地点" complaint. The example is a place the app
+      // does not ship, so the sentence teaches the new freedom.
+      expect(destinationNotFoundText(), contains('带我去药店'));
+      expect(destinationNotFoundText(), isNot(contains('目前可以导航到')));
       expect(destinationNotFoundText(), isNot(contains('安全')));
       expect(destinationGiveUpText(), contains('停止询问'));
+      expect(destinationGiveUpText(), contains('带我去药店'));
     });
   });
 

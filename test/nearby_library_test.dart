@@ -138,6 +138,28 @@ RealNavigationStarter _starter({
 
 void main() {
   group('startNearby picks the NEAREST library', () {
+    test('a result outside 3 km is not used for navigation', () async {
+      final sender = RecordingSender(poiBody: _poiBody([
+        _poi('远处图书馆', '116.450000,39.950000', '3001'),
+      ]));
+      final outcome = await _starter(
+          location: FakeLocation(_goodFix()), sender: sender.call)
+          .startNearby('图书馆');
+      expect(outcome.failure, RealNavigationFailure.nearbyPlaceNotFound);
+      expect(sender.countOf('/walking'), 0);
+    });
+
+    test('an unusable nearby coordinate cannot be silently skipped', () async {
+      final sender = RecordingSender(poiBody: _poiBody([
+        _poi('无坐标图书馆', '', '30'),
+        _poi('另一图书馆', '116.401000,39.900800', '120'),
+      ]));
+      final outcome = await _starter(
+          location: FakeLocation(_goodFix()), sender: sender.call)
+          .startNearby('图书馆');
+      expect(outcome.failure, RealNavigationFailure.nearbyPlaceSearchFailed);
+      expect(sender.countOf('/walking'), 0);
+    });
     test('out-of-order payload: the closest place wins, by distance', () async {
       // The upstream list is deliberately NOT sorted: a client that
       // trusted payload order would pick 「远处图书馆」.
@@ -181,8 +203,10 @@ void main() {
               .startNearby('图书馆');
 
       expect(outcome.failure, isNull);
-      expect(outcome.failure, isNot(RealNavigationFailure.tooFarFromDemoStart));
-      expect(outcome.startDistanceM, isNull, reason: 'the gate never ran');
+      // `startDistanceM` and `RealNavigationFailure.tooFarFromDemoStart`
+      // no longer exist: the gate was deleted outright (docs + enum +
+      // field), so there is nothing left to assert "did not run". The
+      // positive pin below is the same thing said without the dead API.
       expect(outcome.route!.ok, isTrue);
     });
 
@@ -334,6 +358,33 @@ void main() {
       expect(sender.countOf('/place/around'), 0);
     });
 
+    test('unknown place distance fails without requesting a route', () async {
+      final sender = RecordingSender(poiBody: _poiBody(<Map<String, Object?>>[
+        _poi('距离未知', '116.402000,39.901000', null),
+        _poi('另一处', '116.401000,39.900800', '120'),
+      ]));
+      final outcome = await _starter(
+        location: FakeLocation(_goodFix()), sender: sender.call,
+      ).startNearby('图书馆');
+      expect(outcome.failure, RealNavigationFailure.nearbyPlaceSearchFailed);
+      expect(sender.countOf('/walking'), 0);
+    });
+
+    test('non-finite or negative location accuracy never starts a search', () async {
+      for (final accuracy in <double>[double.nan, double.infinity, -1]) {
+        final sender = RecordingSender(poiBody: _poiBody(<Map<String, Object?>>[]));
+        final outcome = await _starter(
+          location: FakeLocation(LocationResult.fix(_beijingFix, accuracy)),
+          sender: sender.call,
+        ).startNearby('图书馆');
+        expect(outcome.failure, RealNavigationFailure.locationTooInaccurate);
+        expect(sender.paths, isEmpty);
+        expect(outcome.failureAnnouncement, isNot(contains('NaN')));
+        expect(outcome.failureAnnouncement, isNot(contains('Infinity')));
+        expect(outcome.failureAnnouncement, isNot(contains('-1')));
+      }
+    });
+
     test('an unknown accuracy is refused, same as the registry path',
         () async {
       final RecordingSender sender =
@@ -371,27 +422,33 @@ void main() {
       ]));
       expect(result.ok, isTrue);
       expect(result.places.map((AmapPlace p) => p.name).toList(),
-          <String>['近', '中', '远']);
+          <String>['近', '中']);
     });
 
-    test('a place without a usable coordinate is dropped, never invented',
+    test('a place without a usable coordinate fails closed',
         () async {
       final AmapPlaceResult result = await search(_poiBody(<Map<String, Object?>>[
         _poi('没有坐标', '', '10'),
         _poi('坐标越界', '999,999', '20'),
         _poi('正常', '116.401000,39.900800', '30'),
       ]));
-      expect(result.places, hasLength(1));
-      expect(result.places.single.name, '正常');
+      expect(result.ok, isFalse);
+      expect(result.places, isEmpty);
     });
 
-    test('a missing distance stays null, and sorts last', () async {
+    test('missing or invalid distance cannot be treated as the nearest', () async {
       final AmapPlaceResult result = await search(_poiBody(<Map<String, Object?>>[
         _poi('没距离', '116.402000,39.901000', null),
         _poi('有距离', '116.401000,39.900800', '120'),
       ]));
-      expect(result.places.first.name, '有距离');
-      expect(result.places.last.distanceM, isNull);
+      expect(result.ok, isFalse);
+      expect(result.places, isEmpty);
+      final invalid = await search(_poiBody(<Map<String, Object?>>[
+        _poi('错误距离', '116.402000,39.901000', 'abc'),
+        _poi('有距离', '116.401000,39.900800', '120'),
+      ]));
+      expect(invalid.ok, isFalse);
+      expect(invalid.places, isEmpty);
     });
 
     test('an empty success is ok with no places (not an error)', () async {

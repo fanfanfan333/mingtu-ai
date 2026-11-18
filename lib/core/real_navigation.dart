@@ -5,9 +5,12 @@
 /// - [RealNavigationStarter.start] navigates to a destination that must
 ///   exist in the human-verified registry. The checks below describe it.
 /// - [RealNavigationStarter.startNearby] resolves the destination by
-///   SEARCHING near the user's own fix (「去图书馆」= the nearest library
-///   Amap knows about), so no registry entry and no demo-proximity gate
-///   applies. See that method for its own check order.
+///   SEARCHING near the user's own fix (「带我去药店」= the nearest
+///   pharmacy Amap knows about), so no registry entry applies. See that
+///   method for its own check order. **This is the path the app uses for
+///   every voice request** (`_startRealNavigation` in main.dart), which is
+///   what removed the old "the app only works at one fixed place"
+///   behaviour: there is no demo-proximity gate any more.
 ///
 /// Everything is injectable so every branch is testable with fixtures --
 /// no real API call and no real GPS in tests.
@@ -36,16 +39,16 @@
 /// 4. the fix must be accurate enough to start from
 ///    ([maxStartAccuracyM]); a worse fix is announced and refused,
 ///    never silently used;
-/// 4b. for the demo route (a registry start point with id
-///    [demoStartLocationId] exists), the fix must be within
-///    [maxDemoStartDistanceM] of that start point -- the demo
-///    coordinates describe one specific place, and starting a
-///    demo navigation from somewhere else is announced as
-///    "你不在演示路线附近" and refused;
 /// 5. the walking route must come back ok from the proxy. A failed
 ///    fetch is announced as "the route cannot be fetched right
 ///    now, maybe the network is unstable" plus "try again later",
 ///    not as an internal route-service error.
+///
+/// (Step 4b, a 300 m "you are not near the demo route" gate, was
+/// REMOVED: the user must be able to start from wherever they are. The
+/// destination is now resolved around the current fix, so a fix far from
+/// the repository's demo coordinates is not a problem -- it is the normal
+/// case.)
 ///
 /// Step advancement after a successful start stays MANUAL (the
 /// existing "下一步" voice command drives AmapStepSpeaker): this
@@ -66,10 +69,6 @@ import '../modules/map_navigation.dart';
 /// replans on deviation when accuracy <= 30 m; 50 m is the looser
 /// bound for merely starting, and anything worse is refused aloud.
 const double maxStartAccuracyM = 50.0;
-
-/// Farthest the user may be from the demo start point for a demo
-/// navigation to start (see check 4b in the file header).
-const double maxDemoStartDistanceM = 300.0;
 
 /// Default radius (metres) for the nearby search used by
 /// [RealNavigationStarter.startNearby]. 3 km is the user's decision
@@ -112,6 +111,21 @@ double haversineMeters(GeoPoint a, GeoPoint b) {
   return 2 * earthRadiusM * math.asin(root > 1 ? 1 : root);
 }
 
+/// The retry sentence every failure announcement ends with.
+///
+/// It names the place the user actually asked for, because the app no
+/// longer has one fixed destination: telling somebody who said
+/// 「带我去药店」 to "say 带我去图书馆 again" is simply wrong, and worse,
+/// it teaches that only the library is supported. With no place known
+/// (a failure before the destination was resolved) it asks for the
+/// destination instead of inventing one.
+///
+/// Only a UI action is offered -- hold the lower part of the screen and
+/// speak -- never a walking instruction.
+String _retryHint(String? place) => (place == null || place.isEmpty)
+    ? '按住屏幕下方再说一次你的目的地'
+    : '按住屏幕下方再说一次“带我去$place”';
+
 enum RealNavigationFailure {
   destinationNotConfigured,
   proxyNotConfigured,
@@ -120,7 +134,6 @@ enum RealNavigationFailure {
   locationPermissionDeniedForever,
   locationFailed,
   locationTooInaccurate,
-  tooFarFromDemoStart,
   routeFetchFailed,
 
   /// The nearby search ran and came back OK, but found nothing within
@@ -141,10 +154,6 @@ class RealNavigationOutcome {
   final double? accuracyM;
   final AmapWalkingResult? route;
   final String? routeError;
-
-  /// Distance in metres from the GPS fix to the demo start
-  /// point, when the demo-start check ran.
-  final double? startDistanceM;
 
   /// True when this attempt resolved its destination by SEARCHING near
   /// the user's fix (see [RealNavigationStarter.startNearby]) instead of
@@ -168,7 +177,6 @@ class RealNavigationOutcome {
     this.accuracyM,
     this.route,
     this.routeError,
-    this.startDistanceM,
     this.viaNearbySearch = false,
     this.placeDistanceM,
     this.searchCategory,
@@ -179,7 +187,6 @@ class RealNavigationOutcome {
     VerifiedLocation? destination,
     double? accuracyM,
     String? routeError,
-    double? startDistanceM,
     String? searchCategory,
   }) =>
       RealNavigationOutcome._(
@@ -187,7 +194,6 @@ class RealNavigationOutcome {
         destination: destination,
         accuracyM: accuracyM,
         routeError: routeError,
-        startDistanceM: startDistanceM,
         searchCategory: searchCategory,
       );
 
@@ -196,7 +202,6 @@ class RealNavigationOutcome {
     required GeoPoint originGcj02,
     required double? accuracyM,
     required AmapWalkingResult route,
-    double? startDistanceM,
     bool viaNearbySearch = false,
     double? placeDistanceM,
     String? searchCategory,
@@ -206,7 +211,6 @@ class RealNavigationOutcome {
         originGcj02: originGcj02,
         accuracyM: accuracyM,
         route: route,
-        startDistanceM: startDistanceM,
         viaNearbySearch: viaNearbySearch,
         placeDistanceM: placeDistanceM,
         searchCategory: searchCategory,
@@ -225,46 +229,49 @@ class RealNavigationOutcome {
   /// anywhere on their own. (The ready announcement is composed by
   /// the caller, who owns the step speaker.)
   String get failureAnnouncement {
+    // The place the user actually asked for, so a retry hint can name it.
+    // `startNearby` failures carry it as [searchCategory] (the words the
+    // user said), `start` failures as the registry destination. Never the
+    // hard-coded 图书馆: a user who asked for a pharmacy must not be told
+    // to say 「带我去图书馆」.
+    final String? place = searchCategory ?? destination?.name;
     switch (failure) {
       case RealNavigationFailure.destinationNotConfigured:
         return '这个地点我还没有核对过，不能凭猜测带你走，导航没有启动。';
       case RealNavigationFailure.proxyNotConfigured:
         return '导航服务现在还没准备好，取不到真实路线，导航没有启动。'
-            '请稍后再按住屏幕下方说一次“带我去图书馆”。';
+            '请稍后${_retryHint(place)}。';
       case RealNavigationFailure.locationServiceDisabled:
         return '定位没有打开，我找不到你在哪，导航没有启动。'
             '请打开手机定位，或者请身边的人帮忙打开，'
-            '然后按住屏幕下方再说一次“带我去图书馆”。';
+            '然后${_retryHint(place)}。';
       case RealNavigationFailure.locationPermissionDenied:
         return '明途还没拿到定位权限，我找不到你在哪，导航没有启动。'
-            '请允许明途使用定位，然后按住屏幕下方再说一次“带我去图书馆”。';
+            '请允许明途使用定位，然后${_retryHint(place)}。';
       case RealNavigationFailure.locationPermissionDeniedForever:
         return '明途的定位权限被关掉了，我找不到你在哪，导航没有启动。'
             '可以请身边的人在系统设置里打开明途的定位权限，'
-            '然后按住屏幕下方再说一次“带我去图书馆”。';
+            '然后${_retryHint(place)}。';
       case RealNavigationFailure.locationFailed:
         return '定位失败：还没拿到你的位置，导航未启动。'
-            '请留在原地不要走动，等十几秒后再按住屏幕下方说一次“带我去图书馆”。'
+            '请留在原地不要走动，等十几秒后${_retryHint(place)}。'
             '如果连着几次都不行，可以请身边的人带你到室外再试。';
       case RealNavigationFailure.locationTooInaccurate:
         // The accuracy figure is only spoken when it is known: a
         // blind user has no use for the literal word "未知" wedged
         // into a number slot ("约 未知 米"), so the whole
         // parenthetical is dropped instead.
-        final String accuracyPhrase =
-            accuracyM == null ? '' : '（约 ${accuracyM!.toStringAsFixed(0)} 米）';
+        final String accuracyPhrase = accuracyM == null ||
+                !accuracyM!.isFinite || accuracyM! < 0
+            ? ''
+            : '（约 ${accuracyM!.toStringAsFixed(0)} 米）';
         return '当前定位精度不够$accuracyPhrase，'
             '用这个位置出发可能走错路，导航没有启动。'
-            '请留在原地，等十几秒后再按住屏幕下方说一次“带我去图书馆”。'
+            '请留在原地，等十几秒后${_retryHint(place)}。'
             '如果连着几次都不行，可以请身边的人带你到室外再试。';
-      case RealNavigationFailure.tooFarFromDemoStart:
-        return '你不在演示路线附近：当前位置离演示起点（校门口）约 '
-            '${startDistanceM == null ? '未知' : startDistanceM!.toStringAsFixed(0)} 米，'
-            '超过了三百米的演示范围，导航未启动。'
-            '请先到校门口附近再开始去图书馆的演示导航。';
       case RealNavigationFailure.routeFetchFailed:
         return '路线暂时取不到，可能是网络不稳，导航没有启动。'
-            '请稍后按住屏幕下方再说一次“带我去图书馆”。';
+            '请稍后${_retryHint(place)}。';
       case RealNavigationFailure.nearbyPlaceNotFound:
         // The lookup worked; there is simply nothing within the radius.
         // Saying "没找到" is honest, and the only next actions are a UI
@@ -276,12 +283,12 @@ class RealNavigationOutcome {
                 : searchCategory!;
         return '你附近没有找到$what，导航没有启动。'
             '可以请身边的人帮忙确认一下，'
-            '或者过一会儿再按住屏幕下方说一次“带我去图书馆”。';
+            '或者过一会儿${_retryHint(place)}。';
       case RealNavigationFailure.nearbyPlaceSearchFailed:
         // Distinct from "not found": we do not know whether a place
         // exists, so the text must not claim we looked and found none.
         return '查找附近的地点失败了，可能是网络不稳，导航没有启动。'
-            '请稍后按住屏幕下方再说一次“带我去图书馆”。';
+            '请稍后${_retryHint(place)}。';
       case null:
         return '';
     }
@@ -327,29 +334,12 @@ class RealNavigationStarter {
       return RealNavigationOutcome.failed(mapped, destination: destination);
     }
     final double? accuracy = fix.accuracyM;
-    if (accuracy == null || accuracy > maxStartAccuracyM) {
+    if (accuracy == null || !accuracy.isFinite || accuracy < 0 || accuracy > maxStartAccuracyM) {
       return RealNavigationOutcome.failed(
         RealNavigationFailure.locationTooInaccurate,
         destination: destination,
         accuracyM: accuracy,
       );
-    }
-    // Check 4b: the demo-start proximity gate. The verified
-    // points are GCJ-02 and are used as-is here -- this distance
-    // compares the (already converted, exactly once) GPS fix
-    // against the registry's GCJ-02 start point.
-    double? startDistanceM;
-    for (final VerifiedLocation loc in registry) {
-      if (loc.id != demoStartLocationId) continue;
-      startDistanceM = haversineMeters(fix.pointGcj02!, loc.pointGcj02);
-      if (startDistanceM > maxDemoStartDistanceM) {
-        return RealNavigationOutcome.failed(
-          RealNavigationFailure.tooFarFromDemoStart,
-          destination: destination,
-          accuracyM: accuracy,
-          startDistanceM: startDistanceM,
-        );
-      }
     }
     final AmapWalkingResult route = await client.walkingRoute(
       from: fix.pointGcj02!,
@@ -369,27 +359,28 @@ class RealNavigationStarter {
       originGcj02: fix.pointGcj02!,
       accuracyM: accuracy,
       route: route,
-      startDistanceM: startDistanceM,
     );
   }
 
   /// Start real navigation to the NEAREST place matching [category]
   /// around the user's current fix.
   ///
-  /// This is the behaviour the user specified for 「带我去图书馆」: take
-  /// MY current position, then go to the library Amap says is nearest --
-  /// not to a coordinate somebody typed into the repository.
+  /// This is the behaviour the user specified for 「带我去图书馆」 and,
+  /// generalised, for any place they name: take MY current position,
+  /// then go to the place Amap says is nearest -- not to a coordinate
+  /// somebody typed into the repository.
   ///
   /// Order: proxy configured -> GPS fix -> accuracy -> nearby search ->
   /// walking route. Two checks deliberately do NOT apply here:
   ///
   /// - there is no registry lookup, so no destination must be
   ///   pre-verified for this path; and
-  /// - there is no [maxDemoStartDistanceM] gate. That gate exists only
+  /// - there is no demo-proximity gate. Such a gate could only exist
   ///   because the registry's demo coordinates describe ONE place; a
   ///   destination derived from the user's own fix is meaningful
   ///   wherever they stand, so gating it would refuse to navigate for no
-  ///   reason (and used to answer 「你不在演示路线附近」).
+  ///   reason (it used to answer 「你不在演示路线附近」, which is exactly
+  ///   the "the app only works at a fixed place" complaint).
   ///
   /// A successful but EMPTY search is reported as
   /// [RealNavigationFailure.nearbyPlaceNotFound]; a failed search is
@@ -419,7 +410,7 @@ class RealNavigationStarter {
       return RealNavigationOutcome.failed(mapped, searchCategory: category);
     }
     final double? accuracy = fix.accuracyM;
-    if (accuracy == null || accuracy > maxStartAccuracyM) {
+    if (accuracy == null || !accuracy.isFinite || accuracy < 0 || accuracy > maxStartAccuracyM) {
       return RealNavigationOutcome.failed(
         RealNavigationFailure.locationTooInaccurate,
         accuracyM: accuracy,

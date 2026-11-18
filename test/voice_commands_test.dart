@@ -325,4 +325,39 @@ void main() {
       );
     }
   });
+
+  // 自由目的地（用户要求：「目的地为用户的地点」）。以前只有「图书馆」
+  // 一个目的地，用户说「带我去药店」会落 unknown，App 回一句「没听清」，
+  // 用起来就像「只能在固定位置」。
+  test('任意地点口令判 startPlace，图书馆仍走 startLibrary', () {
+    const List<String> freeDestinations = <String>[
+      '带我去药店',
+      '去超市',
+      '到地铁站',
+      '我要去银行',
+      '我想去公共厕所',
+      '带我去北京大学第三医院',
+    ];
+    for (final String phrase in freeDestinations) {
+      expect(parseVoiceCommand(phrase), VoiceCommand.startPlace,
+          reason: '「$phrase」是去任意地点的口令，必须判 startPlace');
+      expect(parseDestinationPhrase(phrase), isNotNull, reason: phrase);
+    }
+    // 不回归：图书馆有自己一条分支（并且有自己的测试钉着），不许改成
+    // startPlace。
+    for (final String phrase in <String>['带我去图书馆', '图书馆', '去图书馆']) {
+      expect(parseVoiceCommand(phrase), VoiceCommand.startLibrary,
+          reason: phrase);
+    }
+    // 反向锚点：裸地名不是口令 —— 它是「你要去哪里」的回答，由
+    // resolveSpokenDestination 接。否则任何名词都会变成一次出发。
+    expect(parseVoiceCommand('药店'), VoiceCommand.unknown);
+    expect(parseDestinationPhrase('药店'), isNull);
+    // 别的指令不许被新的目的地分支吃掉。
+    expect(parseVoiceCommand('停下'), VoiceCommand.pause);
+    expect(parseVoiceCommand('取消'), VoiceCommand.cancel);
+    expect(parseVoiceCommand('紧急求助'), VoiceCommand.emergency);
+    expect(parseVoiceCommand('我要停车'), VoiceCommand.unknown);
+    expect(parseVoiceCommand('今天天气怎么样'), VoiceCommand.unknown);
+  });
 }

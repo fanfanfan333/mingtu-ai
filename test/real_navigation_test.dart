@@ -186,7 +186,13 @@ void main() {
       // can actually take (speak again).
       expect(outcome.failureAnnouncement, contains('还没准备好'));
       expect(outcome.failureAnnouncement, contains('导航没有启动'));
-      expect(outcome.failureAnnouncement, contains('请稍后再按住屏幕下方'));
+      // Free-destination round: the retry hint now names the place the
+      // user asked for instead of hard-coding 「带我去图书馆」, and the
+      // sentence reads 请稍后 + 按住屏幕下方再说一次“带我去X” (the old text
+      // wedged 再 into 请稍后再按住…).
+      expect(
+          outcome.failureAnnouncement, contains('请稍后按住屏幕下方再说一次'));
+      expect(outcome.failureAnnouncement, contains('带我去图书馆'));
     });
 
     test('each location failure maps to its own announcement', () async {
@@ -357,7 +363,6 @@ void main() {
         },
       ).start('图书馆');
       expect(outcome.ready, isTrue);
-      expect(outcome.startDistanceM, closeTo(0, 1));
       // The registry point reaches the request EXACTLY as the
       // user provided it -- a conversion would change these.
       expect(seen!.queryParameters['destination'], '120.443212,37.723667');
@@ -380,7 +385,7 @@ void main() {
               'nearest 50 m (was: 186 米, the raw figure)');
     });
 
-    test('about 150 m from the gate: still inside the demo range', () async {
+    test('a fix ~150 m from the registry point still starts', () async {
       final outcome = await demoStarter(
         location: FakeLocation(LocationResult.fix(
           // ~150 m east of the gate.
@@ -389,12 +394,16 @@ void main() {
         )),
       ).start('图书馆');
       expect(outcome.ready, isTrue);
-      expect(outcome.startDistanceM, lessThan(300));
     });
 
-    test(
-        'more than 300 m from the gate: announced '
-        '你不在演示路线附近, no route fetched, not started', () async {
+    test('a fix ~500 m from the registry point still starts (no gate)',
+        () async {
+      // This REPLACES the old "more than 300 m from the gate: announced
+      // 你不在演示路线附近, no route fetched, not started" test. That gate
+      // was deleted together with the fixed-destination design (the user
+      // asked to navigate from wherever they are), so the same fix must
+      // now simply start. Pinned positively, so the gate cannot come back
+      // unnoticed.
       bool senderCalled = false;
       final outcome = await demoStarter(
         location: FakeLocation(LocationResult.fix(
@@ -407,12 +416,8 @@ void main() {
           return _amapOkBody;
         },
       ).start('图书馆');
-      expect(outcome.ready, isFalse);
-      expect(outcome.failure, RealNavigationFailure.tooFarFromDemoStart);
-      expect(outcome.failureAnnouncement, contains('你不在演示路线附近'));
-      expect(outcome.failureAnnouncement, contains('导航未启动'));
-      expect(outcome.startDistanceM, greaterThan(300));
-      expect(senderCalled, isFalse);
+      expect(outcome.ready, isTrue, reason: '${outcome.failure}');
+      expect(senderCalled, isTrue);
     });
   });
 }
