@@ -29,12 +29,19 @@ import 'dart:math' as math;
 import '../modules/map_navigation.dart';
 import 'real_navigation.dart' show haversineMeters;
 
-/// Spoken when the user reaches the arrival radius. Contains
-/// the task-completion line the user asked for, and keeps the
+/// Spoken when the user reaches the arrival radius WITH a fix
+/// accurate enough to support it. Contains the
+/// task-completion line the user asked for, and keeps the
 /// honest boundary: being at the coordinates is NOT a
 /// confirmed entrance.
 const String entranceArrivedSpeech =
     '已到达目的地附近。小途已完成任务。入口的具体位置请通过盲杖探测或向身边的人确认。';
+
+/// Spoken when the user reaches the arrival radius but the fix
+/// is too coarse to call it arrival. Same task ending, weaker
+/// claim: GPS proximity is not evidence about a doorway.
+const String entranceVicinityUncertainSpeech =
+    '可能已在目的地附近，但定位误差较大，不能确认到达；入口请用盲杖探测或询问身边的人。';
 
 /// Initial great-circle bearing in degrees (0 = north,
 /// clockwise, normalised to [0, 360)) from [from] to [to].
@@ -85,6 +92,21 @@ class EntranceGuidance {
   /// Distance (m) at or below which the user counts as
   /// arrived and the completion line is spoken.
   static const double arriveRadiusM = 15;
+
+  /// Evidence threshold for the WORDING of an arrival, not for
+  /// the geometry of one. Numerically the same 15 m as
+  /// [arriveRadiusM] (the trip still ends there), but the two
+  /// answer different questions: the radius is "how close", this
+  /// is "how well do we know". A fix coarser than this may put
+  /// the user inside the radius by ERROR alone, so the phase
+  /// must not claim the destination was reached -- it says the
+  /// destination may be nearby and that the entrance still has
+  /// to be found by cane or by asking.
+  static const double confidentArrivalAccuracyM = 15;
+
+  /// Whether [accuracyM] is good enough to state an arrival.
+  static bool isConfidentArrival(double? accuracyM) =>
+      accuracyM != null && accuracyM <= confidentArrivalAccuracyM;
 
   /// Minimum distance change (m) since the last announcement
   /// before another one may be spoken.
@@ -168,7 +190,7 @@ class EntranceGuidance {
   }
 
   String _guidanceText(double distanceM,
-      {required bool first, double? headingDeg}) {
+      {required bool first, double? headingDeg, double? accuracyM}) {
     final int n = roundedDistanceM(distanceM);
     // The direction clause exists only with a heading: the
     // caller passes one only when the heading sample is
@@ -178,6 +200,17 @@ class EntranceGuidance {
         ? ''
         : '，入口大致在${relativeDirectionWord(bearingDegrees(_lastPoint!, destination) - headingDeg)}';
     if (first) {
+      // Evidence-graded opening: a coarse fix cannot support
+      // "you have reached it", only "it may be nearby". The
+      // phase still continues (the entrance has to be found by
+      // cane or by asking either way), so the direction
+      // guidance clause stays -- only the CLAIM about arrival
+      // is downgraded.
+      if (!isConfidentArrival(accuracyM)) {
+        return '可能已在$destinationName附近，但定位误差较大，不能确认到达。'
+            '继续为你指引入口方向，还剩约$n米$dirClause。'
+            '请以盲杖探测和现场声音为准。';
+      }
       return '已到达$destinationName附近，继续为你指引入口方向。'
           '还剩约$n米$dirClause。请以盲杖探测和现场声音为准。';
     }
@@ -203,13 +236,18 @@ class EntranceGuidance {
     _lastDistanceM = d;
     if (d <= arriveRadiusM) {
       _completed = true;
-      return entranceArrivedSpeech;
+      // The trip ends either way; only the CLAIM is graded by
+      // the fix's accuracy (see confidentArrivalAccuracyM).
+      return isConfidentArrival(accuracyM)
+          ? entranceArrivedSpeech
+          : entranceVicinityUncertainSpeech;
     }
     if (!_started) {
       _started = true;
       _lastAnnouncedDistanceM = d;
       _lastAnnouncedAt = now;
-      return _guidanceText(d, first: true, headingDeg: headingDeg);
+      return _guidanceText(d,
+          first: true, headingDeg: headingDeg, accuracyM: accuracyM);
     }
     final double changed = (d - _lastAnnouncedDistanceM!).abs();
     final bool waited = _lastAnnouncedAt == null ||
@@ -217,7 +255,8 @@ class EntranceGuidance {
     if (changed >= announceEveryM && waited) {
       _lastAnnouncedDistanceM = d;
       _lastAnnouncedAt = now;
-      return _guidanceText(d, first: false, headingDeg: headingDeg);
+      return _guidanceText(d,
+          first: false, headingDeg: headingDeg, accuracyM: accuracyM);
     }
     return null;
   }

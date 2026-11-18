@@ -171,6 +171,45 @@ class NavigationTracker {
     return haversineMeters(p, _points[_stepStartPointIndex[stepIndex]]);
   }
 
+  /// How many steps carry usable geometry (a step whose
+  /// polyline is empty is skipped by the constructor, so it
+  /// gets no start point and cannot be guided along).
+  int get routableStepCount => _stepStartPointIndex.length;
+
+  /// The START point of step [stepIndex] -- the point a turn
+  /// into that step is taken at -- or null when the index
+  /// names no step with geometry.
+  ///
+  /// Read-only accessor added for
+  /// core/guidance/route_instruction.dart: the guidance layer
+  /// must compare the leg's own bearing with the phone's
+  /// heading before it names a direction, which needs the
+  /// POINT and not only [distanceToStepStartM]'s scalar.
+  GeoPoint? stepStartPointAt(int stepIndex) {
+    if (stepIndex < 0 || stepIndex >= _stepStartPointIndex.length) {
+      return null;
+    }
+    return _points[_stepStartPointIndex[stepIndex]];
+  }
+
+  /// Index (into the flattened polyline) of the point step
+  /// [stepIndex] starts at, or null when the index names no
+  /// step with geometry.
+  int? stepStartPointIndexAt(int stepIndex) {
+    if (stepIndex < 0 || stepIndex >= _stepStartPointIndex.length) {
+      return null;
+    }
+    return _stepStartPointIndex[stepIndex];
+  }
+
+  /// Index of the route point nearest to [p] -- the SAME
+  /// nearest-point search [onFix] and [regenerateTurnPrompt]
+  /// already use, exposed so the guidance layer can tell
+  /// "ahead" from "already behind" without a second,
+  /// divergent geometry. A step whose start point index is
+  /// below this one is behind the user.
+  int nearestRoutePointIndex(GeoPoint p) => _nearest(p).$1;
+
   /// NAVHAZ M1 arbitration (spec section 2.6): regenerate an
   /// interrupted turn-ahead prompt for [stepIndex] from the
   /// LATEST fix -- the distance is recomputed against the

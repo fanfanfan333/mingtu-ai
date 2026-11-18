@@ -54,6 +54,9 @@ import 'core/hazard/ttc_estimator.dart';
 import 'core/hazard/hazard_policy.dart';
 import 'core/destination_dialogue.dart';
 import 'core/entrance_guidance.dart';
+import 'core/guidance/guidance_diag.dart';
+import 'core/guidance/hazard_repeat_gate.dart';
+import 'core/guidance/route_instruction.dart';
 import 'core/navigation_tracker.dart';
 import 'core/nav_event_speech.dart';
 import 'core/straight_pacing.dart';
@@ -361,6 +364,35 @@ class MingtuHomeDebugHandle {
   /// this list). Production never calls this.
   List<String> get debugInterrupted =>
       List<String>.unmodifiable(_state._scheduler.interruptedLog);
+
+  /// Guidance round seams. The diagnostic dump is ALREADY
+  /// redacted by GuidanceDiag (no positions, URLs, keys or
+  /// place names ever reach it).
+  String get debugGuidanceDiag => GuidanceDiag.dumpLines();
+
+  /// The diagnostic event names in order, oldest first.
+  List<String> get debugGuidanceDiagEvents => GuidanceDiag.snapshot()
+      .map((GuidanceDiagEntry e) => e.event)
+      .toList();
+
+  /// Tracks the hazard repeat gate kept quiet.
+  List<String> get debugHazardSuppressed =>
+      List<String>.unmodifiable(_state._hazardRepeatGate.suppressedLog);
+
+  /// Tracks the hazard repeat gate let through.
+  List<String> get debugHazardSpoken =>
+      List<String>.unmodifiable(_state._hazardRepeatGate.spokenLog);
+
+  /// Turn prompts the scheduler dropped as conflicting with an
+  /// avoidance step.
+  List<String> get debugDroppedConflicts =>
+      List<String>.unmodifiable(_state._scheduler.droppedConflictLog);
+
+  /// Every request id the scheduler has played, in order.
+  List<String> get debugPlayedLog =>
+      List<String>.unmodifiable(_state._scheduler.playedLog);
+
+  bool get debugRiskActive => _state._riskActive;
 
   /// NAVHAZ M1 seam (CDX3): install a fake clock for the
   /// speech-arbitration timeline (see _speechNow in the
@@ -1386,6 +1418,27 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   String? _lastNavHazPhrase;
   SpeechKind? _lastNavHazKind;
   bool _lastNavHazUrgent = false;
+
+  /// Repeat gate for stationary obstacle warnings: it decides
+  /// whether the SAME unchanged warning is worth saying again
+  /// (see core/guidance/hazard_repeat_gate.dart). It never
+  /// changes the risk state -- a suppressed line is still a
+  /// detected hazard, only the speech is thinned out so it
+  /// cannot keep crowding out the turn instruction.
+  final HazardRepeatGate _hazardRepeatGate = HazardRepeatGate();
+
+  /// When the CURRENT obstacle-risk episode began, or null
+  /// while no risk is active. Used to say ONE "navigation is
+  /// paused" line when a hazard persists, instead of nagging.
+  DateTime? _riskSinceAt;
+
+  /// Whether that persistent-hazard line has already been
+  /// spoken during this episode.
+  bool _riskPersistentAnnounced = false;
+
+  /// When route guidance was last resumed after a hazard, for
+  /// the 5 s debounce in [_resumeRouteGuidanceAfterHazard].
+  DateTime? _lastGuidanceResumeAt;
   bool _replayHazardAfterRecovery = false;
   bool _userPausedDuringTtsFailure = false;
   int? _pausedTurnStepIndex;
@@ -2419,6 +2472,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _startStraightTimer();
     }
     _logMsg('实时导航已开始：GPS 跟踪中（转向/偏航/到达自动播报）。');
+    // Diagnostics: one line per adopted route, so a real-device
+    // log shows WHICH route the guidance decisions were taken
+    // against (step count only -- never a coordinate).
+    GuidanceDiag.record('route_adopted', detail: 'steps=${result.steps.length}');
   }
 
   /// M3 TBT spike: start the Amap navi source for the
@@ -2575,6 +2632,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       return;
     }
     final bool done = g.completed;
+    if (done) {
+      // Diagnostics: the trip reached the arrival radius. The
+      // accuracy band is logged as a CLASS, never as a number
+      // (see guidance_diag's redaction contract).
+      GuidanceDiag.record('arrived_vicinity',
+          detail: 'confident=${EntranceGuidance.isConfidentArrival(r.accuracyM)}');
+    }
     _say(_request(
       id: 'entrance-${done ? 'arrived' : 'guide'}-$now',
       eventId: done ? 'entrance-arrived' : 'entrance-guide-$now',
@@ -2866,6 +2930,20 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _pacing.stop();
     _rerouting = false;
     _stopStraightTimer();
+    _resetGuidanceState();
+  }
+
+  /// Forget every per-trip guidance decision (hazard repeat
+  /// memory, the persistent-hazard latch, the resume debounce).
+  /// Called when live navigation ends and when the page is
+  /// disposed: a new trip must not inherit the previous trip's
+  /// quiet obstacle tracks, or its first warning would be
+  /// swallowed.
+  void _resetGuidanceState() {
+    _hazardRepeatGate.reset();
+    _riskSinceAt = null;
+    _riskPersistentAnnounced = false;
+    _lastGuidanceResumeAt = null;
   }
 
   /// The single announcement site for startup failures: every
@@ -3502,6 +3580,7 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _visionRuns.cancelActive();
     _cameraOwnership.cancelAllAndRelease();
     _straightTimer?.cancel();
+    _resetGuidanceState();
     _orientation.dispose();
     _pitchMonitor.dispose();
     _thermalSub?.cancel();
@@ -3670,7 +3749,15 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     final previousId = _scheduler.active?.id;
     final previousEventId = _scheduler.active?.eventId;
+    final int interruptedBefore = _scheduler.interruptedRequests.length;
     final bool accepted = _scheduler.submit(request, now);
+    if (_scheduler.interruptedRequests.length > interruptedBefore) {
+      // Diagnostics: WHAT interrupted WHAT, by delivery class
+      // only. This is the exact moment the field report could
+      // not see ("the warning kept cutting the guidance off").
+      GuidanceDiag.record('speech_interrupted',
+          detail: 'by_kind=${request.kind.name}');
+    }
     if (previousId != null && previousId != _scheduler.active?.id) {
       final previousCue = _cueWaits[previousId];
       if (previousCue != null && !previousCue.isCompleted) {
@@ -3945,11 +4032,34 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       if (_pendingInterruptedNavReplay || (urgentFinished && !_dangerPending)) {
         _pendingInterruptedNavReplay = _tryReplayInterruptedNav();
       }
+      // A hazard prompt has finished and nothing urgent is
+      // pending: re-attach route guidance by itself, recomputed
+      // from the latest fix. This is the "the user never has to
+      // ask what next" guarantee; the 5 s debounce lives inside
+      // the method so a burst of long hazard sentences cannot
+      // turn it into a stream of instructions.
+      //
+      // ONLY when the seat is still empty: if the arbitration
+      // above just submitted a regenerated turn, guidance is
+      // already back and a second sentence would talk over it.
+      if (urgentFinished &&
+          !_dangerPending &&
+          !_pendingInterruptedNavReplay &&
+          _scheduler.active == null &&
+          _liveNav != null &&
+          !_entranceActive) {
+        _resumeRouteGuidanceAfterHazard(reason: 'urgent-finished');
+      }
+      final int expiredBefore = _scheduler.droppedExpiredLog.length;
       final SpeechRequest? next = _scheduler.promoteNext(
         _speechNow(),
         straightSegmentConfirmed: _straightSegmentConfirmedNow,
         riskActive: _riskActive,
       );
+      if (_scheduler.droppedExpiredLog.length > expiredBefore) {
+        GuidanceDiag.record('speech_expired',
+            detail: 'dropped=${_scheduler.droppedExpiredLog.length - expiredBefore}');
+      }
       // Resume re-check, anchored to the DANGER completion
       // callback (Codex re-test of d01a081): straight timing
       // restarts only after a danger/emergency prompt has
@@ -4105,6 +4215,11 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// Play the active prompt: real TTS when available,
   /// simulated timing otherwise.
   void _playActiveRequest(SpeechRequest request) {
+    // Diagnostics: the moment a prompt actually starts playing.
+    // Kind + id PREFIX only (ids carry timestamps, not content).
+    GuidanceDiag.record('tts_started',
+        detail: 'kind=${request.kind.name} '
+            'id=${request.id.split('-').first}');
     if (_voiceOutput.isAvailable) {
       _trackedSpeak(request).then((_) {
         // Stop-race guard (Codex re-test): a request the user has
@@ -4508,8 +4623,6 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     }
     final AmapWalkingResult result = outcome.route!;
     final RouteCandidate candidate = result.candidate!;
-    _amapSpeaker = AmapStepSpeaker(result.steps);
-    final String? firstStep = _amapSpeaker!.nextStepText();
     _tasks.startTask(
       id: 'real-nav-${DateTime.now().millisecondsSinceEpoch}',
       goalText: '带我去$destinationName（真实路线）',
@@ -4528,9 +4641,38 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     });
     _logMsg('真实导航已启动：${candidate.distanceM.toStringAsFixed(0)} 米，'
         '${result.steps.length} 个路段（手动逐步播报）。');
+    // Step 2: from here the navigation is LIVE -- GPS fixes
+    // drive turn / off-route / arrival announcements until
+    // arrival, 停下, cancel or emergency ends the session.
+    // A fresh trip gets a fresh re-plan budget; re-plans
+    // within the trip share it (never reset by a rebuild).
+    _tripRerouteBudget = RerouteBudget();
+    _beginLiveNavigation(outcome, destinationName);
+    // The first actionable instruction comes FIRST and on its
+    // own delivery class (see _announceFirstInstruction). It is
+    // submitted before the route summary on purpose: the
+    // summary is [SpeechKind.info] (lowest priority), so if it
+    // were submitted first the instruction would pre-empt it
+    // and the user would never hear WHICH place was picked.
+    // This order gives: instruction (heard at once, cannot be
+    // lost to a hazard), then the summary queued behind it.
+    await _announceFirstInstruction(
+      fallbackFix: outcome.originGcj02,
+      fallbackAccuracyM: outcome.accuracyM,
+    );
+    if (!mounted) return;
     _say(_request(
       id: 'real-nav-ready-${DateTime.now().millisecondsSinceEpoch}',
       eventId: 'real-nav-ready-${DateTime.now().millisecondsSinceEpoch}',
+      // ROUTE ADOPTION ONLY. The first actionable instruction is
+      // deliberately NOT part of this sentence any more: as
+      // [SpeechKind.info] the whole bundle sat at the LOWEST
+      // delivery priority, and an obstacle warning arriving in
+      // the next two seconds interrupted it -- an interrupted
+      // info prompt is never replayed, so on the phone the user
+      // heard the warning and NEVER heard where to walk. No
+      // "第一段：…" tail either: that duplicated the tracker's
+      // own step speaker and left 「下一步」 repeating step 0.
       text: nearbyPlaceIntro(
             viaNearbySearch: outcome.viaNearbySearch,
             category: outcome.searchCategory,
@@ -4544,17 +4686,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
             destinationName: outcome.destination?.name ?? destinationName,
             distanceM: candidate.distanceM,
             stepsCount: result.steps.length,
-          ) +
-          (firstStep == null ? '' : '第一段：$firstStep'),
+          ),
       kind: SpeechKind.info,
+      // Queued behind the first instruction: still current
+      // information about the route just adopted, so it may
+      // outlive the default five seconds.
+      expiresSeconds: 20,
     ));
-    // Step 2: from here the navigation is LIVE -- GPS fixes
-    // drive turn / off-route / arrival announcements until
-    // arrival, 停下, cancel or emergency ends the session.
-    // A fresh trip gets a fresh re-plan budget; re-plans
-    // within the trip share it (never reset by a rebuild).
-    _tripRerouteBudget = RerouteBudget();
-    _beginLiveNavigation(outcome, destinationName);
   }
 
   /// The on-screen "real route" button runs the same real
@@ -4562,6 +4700,161 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// search for, resolved by nearby search from the current fix (see
   /// `RealNavigationStarter.startNearby`).
   Future<void> _fetchAmapRoute() => _startRealNavigation('图书馆');
+
+  /// Announce the FIRST actionable instruction of a freshly
+  /// adopted route.
+  ///
+  /// Why this is its own request and not part of the route
+  /// notification: the notification is [SpeechKind.info] (the
+  /// lowest delivery priority) and is never replayed. A hazard
+  /// warning that interrupts it therefore used to destroy the
+  /// only copy of "where do I walk first". This request is
+  /// [SpeechKind.turn] / [SpeechKind.straight], it is short,
+  /// and although its own replay policy is [NavReplay.drop]
+  /// (a stale direction must never be spoken late) the resume
+  /// path rebuilds a fresh one from the latest fix, so a
+  /// dropped copy is replaced rather than lost.
+  ///
+  /// [fallbackFix] / [fallbackAccuracyM] carry the start fix the
+  /// route was planned from: no GPS fix has necessarily been
+  /// delivered through the live stream at this instant, and a
+  /// route without its origin would produce a "position
+  /// unknown" pause line as the very first thing the user
+  /// hears.
+  Future<void> _announceFirstInstruction({
+    GeoPoint? fallbackFix,
+    double? fallbackAccuracyM,
+  }) async {
+    final NavigationTracker? nav = _liveNav;
+    if (nav == null) {
+      GuidanceDiag.record('first_instruction_enqueued',
+          detail: 'skipped=no_tracker');
+      return;
+    }
+    final GeoPoint? fix = _lastFixPoint ?? fallbackFix;
+    final double? accuracyM =
+        _lastFixPoint == null ? fallbackAccuracyM : _lastFixAccuracyM;
+    final RouteInstruction? instruction = nextRouteInstruction(
+      nav: nav,
+      fix: fix,
+      accuracyM: accuracyM,
+      headingDeg: _currentHeadingDeg(),
+      firstInstruction: true,
+    );
+    if (instruction == null) {
+      GuidanceDiag.record('first_instruction_enqueued',
+          detail: 'skipped=no_instruction');
+      return;
+    }
+    if (!mounted || !identical(_liveNav, nav)) return;
+    final String id =
+        'nav-first-instruction-${DateTime.now().millisecondsSinceEpoch}';
+    // Deliberately NO navStepIndex: that field routes the
+    // scheduler's replay through NavigationTracker's
+    // regeneration, which would re-derive "前方0米…" wording
+    // from the step geometry. The resume path recomputes
+    // instead.
+    _say(_request(
+      id: id,
+      eventId: id,
+      text: instruction.text,
+      kind: instruction.kind,
+      expiresSeconds: 10,
+      replay: NavReplay.drop,
+    ));
+    GuidanceDiag.record('first_instruction_enqueued',
+        detail: 'kind=${instruction.kind.name} '
+            'match=${instruction.match.name}');
+  }
+
+  /// Re-attach route guidance the moment a hazard episode ends.
+  ///
+  /// This replaces the old "前方已无检测到的障碍。请说继续…" line,
+  /// which forced the user to ask for the next step -- the exact
+  /// complaint this round is about. The instruction is rebuilt
+  /// from the LATEST fix and heading (core/guidance/
+  /// route_instruction.dart), so it is never a replay of text
+  /// whose distance has gone stale.
+  ///
+  /// Returns true when an instruction was actually submitted
+  /// (the caller then skips its own recovery line so the user
+  /// hears one sentence, not two).
+  ///
+  /// Guards: no live route / entrance phase / pending urgent
+  /// prompt / hazard still latched -> silent, and at most one
+  /// resume per 5 s.
+  ///
+  /// The risk latch matters: a danger prompt *finishing* is not
+  /// the same event as the hazard being gone. In the NAVHAZ
+  /// pipeline the danger sentence ends while the obstacle track
+  /// is still live (`_riskActive` stays true until three
+  /// consecutive clear frames). Resuming there would talk over
+  /// an unresolved hazard; the exit path
+  /// ([_exitYoloRiskState]) clears the latch first and only then
+  /// asks for a resume.
+  bool _resumeRouteGuidanceAfterHazard({
+    String reason = 'hazard-cleared',
+    String? leadIn,
+  }) {
+    final NavigationTracker? nav = _liveNav;
+    if (nav == null || _entranceActive || _dangerPending) return false;
+    if (_riskActive || _yoloRiskActive) return false;
+    final DateTime now = DateTime.now();
+    final DateTime? last = _lastGuidanceResumeAt;
+    if (last != null &&
+        now.difference(last) < const Duration(seconds: 5)) {
+      return false;
+    }
+    final RouteInstruction? instruction = nextRouteInstruction(
+      nav: nav,
+      fix: _lastFixPoint,
+      accuracyM: _lastFixAccuracyM,
+      headingDeg: _currentHeadingDeg(),
+    );
+    if (instruction == null) return false;
+    _lastGuidanceResumeAt = now;
+    final String id = 'nav-resume-${now.millisecondsSinceEpoch}';
+    final String text =
+        leadIn == null ? instruction.text : '$leadIn${instruction.text}';
+    _say(_request(
+      id: id,
+      eventId: id,
+      text: text,
+      kind: instruction.kind,
+      expiresSeconds: 8,
+      replay: NavReplay.drop,
+    ));
+    GuidanceDiag.record('guidance_resumed',
+        detail: '$reason kind=${instruction.kind.name} '
+            'match=${instruction.match.name}');
+    if (_pacing.isPaused) {
+      // Reuse the ONE resume path (no second timing machine).
+      _recheckStraightResume();
+    }
+    return true;
+  }
+
+  /// Say ONE "navigation is paused" line when a hazard episode
+  /// has been going on for 15 s without clearing.
+  ///
+  /// Without it a user standing in front of a stationary
+  /// obstacle gets a repeated warning and nothing else, with no
+  /// hint that guidance is suspended rather than broken. The
+  /// line deliberately does NOT ask them to move on: the hazard
+  /// is still there.
+  void _maybeAnnouncePersistentHazard(DateTime now) {
+    final DateTime? since = _riskSinceAt;
+    if (since == null || _riskPersistentAnnounced) return;
+    if (now.difference(since) < const Duration(seconds: 15)) return;
+    _riskPersistentAnnounced = true;
+    _say(_request(
+      id: 'nav-paused-by-hazard-${now.millisecondsSinceEpoch}',
+      eventId: 'nav-paused-by-hazard-${now.millisecondsSinceEpoch}',
+      text: '前方情况持续，导航暂时暂停，请先停下；情况解除后我接着为你指引。',
+      kind: SpeechKind.info,
+    ));
+    GuidanceDiag.record('nav_paused_no_fix', detail: 'hazard-persistent');
+  }
 
   /// v0.7: speak the next Amap walking step, in order. Saying
   /// "下一步" while navigating speaks the next step; when the steps
@@ -6275,6 +6568,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// move the task to obstacle-avoidance.
   void _enterYoloRiskState() {
     _yoloRiskActive = true;
+    // A fresh episode: the persistent-hazard line has not been
+    // spoken yet, and the episode start drives its 15 s delay.
+    _riskSinceAt = DateTime.now();
+    _riskPersistentAnnounced = false;
     if (_tasks.state == TaskState.navigating) {
       _tasks.transitionTo(TaskState.avoidingObstacle, trigger: 'yolo-obstacle');
       _stopStraightTimer();
@@ -6291,9 +6588,19 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   /// re-check NOW, not at some later speech completion, and
   /// restarts the straight timer so the re-armed 3 s cadence
   /// can actually fire.
+  ///
+  /// The closing line no longer tells the user to say 继续: route
+  /// guidance re-attaches by itself, recomputed from the latest
+  /// fix (see [_resumeRouteGuidanceAfterHazard]). When a fresh
+  /// instruction is available it CARRIES the recovery news
+  /// ("危险已解除，…") instead of being spoken after a separate
+  /// sentence -- a blind user gets one clear sentence, not two
+  /// competing ones.
   void _exitYoloRiskState(DateTime now) {
     _ttsRecovery.stopDanger();
     _yoloRiskActive = false;
+    _riskSinceAt = null;
+    _riskPersistentAnnounced = false;
     if (_tasks.state == TaskState.avoidingObstacle) {
       _tasks.transitionTo(TaskState.navigating, trigger: 'yolo-cleared');
     }
@@ -6302,12 +6609,22 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       _straightConfirmed = false;
     });
     _recheckStraightResume();
-    _say(_request(
-      id: 'yolo-cleared-${now.millisecondsSinceEpoch}',
-      eventId: 'yolo-cleared-${now.millisecondsSinceEpoch}',
-      text: '前方已无检测到的障碍。请说继续，重新确认直行路段后再走。',
-      kind: SpeechKind.info,
-    ));
+    final bool resumed = _resumeRouteGuidanceAfterHazard(
+      reason: 'yolo-cleared',
+      leadIn: '危险已解除，',
+    );
+    if (!resumed) {
+      _say(_request(
+        id: 'yolo-cleared-${now.millisecondsSinceEpoch}',
+        eventId: 'yolo-cleared-${now.millisecondsSinceEpoch}',
+        // No "请说继续" any more: the user must not have to ask
+        // for the next step. The detection statement itself is
+        // unchanged (it is an honest report about the DETECTOR,
+        // not a promise about the pavement).
+        text: '前方已无检测到的障碍。导航继续为你指引。',
+        kind: SpeechKind.info,
+      ));
+    }
   }
 
   /// Ego-motion estimate for one hazard frame (M1 fix
@@ -6569,6 +6886,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
         _exitYoloRiskState(now);
       }
     }
+    // A hazard that will not clear: say ONCE that guidance is
+    // suspended, instead of repeating the warning and leaving
+    // the user wondering whether the app is stuck.
+    if (_riskActive || _yoloRiskActive) {
+      _maybeAnnouncePersistentHazard(now);
+    }
     final HazardAlert? alert = result.alert;
     if (alert == null) return;
     if (_ttsFailed && alert.urgent && _yoloRiskActive) {
@@ -6606,6 +6929,29 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     // when the request starts playing and the engine's
     // speak-start callback closes the segment.
     _hazardSpeakSegmentStarts[requestId] = pipelineReturnedAt;
+    // Repeat gate for the SAME unchanged warning (see
+    // core/guidance/hazard_repeat_gate.dart). A user standing
+    // still in front of a pole used to hear the identical line
+    // every few seconds; because obstacleAvoidance also wins the
+    // scheduler's conflict rule against turn, that repetition
+    // kept drowning out the direction the user actually needed.
+    // Suppressing the SPEECH here changes nothing about the risk
+    // state: _riskActive / _yoloRiskActive were already set
+    // above and stay set, and the pending line is left intact so
+    // a later genuine change is measured against it.
+    final bool gateOpen = _hazardRepeatGate.shouldSpeak(
+      trackId: '${alert.trackId}',
+      urgent: alert.urgent,
+      rangeM: alert.rangeM,
+      egoMoving: HazardRepeatGate.isMovingSpeed(_egoMotionNow(now).vEgoMps),
+      now: now,
+    );
+    if (!gateOpen) {
+      GuidanceDiag.record('hazard_suppressed',
+          detail: 'track_len=${alert.trackId.toString().length}');
+      _logMsg('同一处情况未变化，本次不重复播报（track ${alert.trackId}）。');
+      return;
+    }
     _lastNavHazPhrase = '$text。';
     _lastNavHazKind = alert.speechKind;
     _lastNavHazUrgent = alert.urgent;
