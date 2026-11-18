@@ -401,6 +401,14 @@ class MingtuHomeDebugHandle {
       destinationName: destinationName,
     );
     _state._liveNavDestName = destinationName;
+    // This seam installs a tracker WITHOUT a resolved point: it has a
+    // coordinate for the tracker but has never run a nearby search, and
+    // inventing one here would be a guessed destination. So
+    // `_liveNavDestPoint` stays null and an off-route re-plan from this
+    // injected tracker fails honestly through the null branch in
+    // `_rerouteLiveNavigation` (no registry fallback, no invented
+    // coordinate).
+    _state._liveNavDestPoint = null;
     _state._liveNavRemainingM = null;
   }
 
@@ -1349,6 +1357,13 @@ class _MingtuHomePageState extends State<MingtuHomePage>
   bool _rerouteFailureAnnounced = false;
   StreamSubscription<LocationResult>? _gpsSub;
   String _liveNavDestName = '';
+  // The destination POINT of the current trip, as resolved when the trip
+  // started (a nearby-search POI, never a registry entry). An off-route
+  // re-plan navigates to THIS point instead of resolving the name again
+  // -- see `_rerouteLiveNavigation`. Null means "no trip has resolved a
+  // point yet", which the re-plan path treats as a plain failure rather
+  // than guessing a coordinate.
+  GeoPoint? _liveNavDestPoint;
   double? _liveNavRemainingM;
   DateTime? _lastGpsErrorAt;
   bool _gpsSignalFailed = false;
@@ -2357,6 +2372,10 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     );
     _updateForegroundPolicies();
     _liveNavDestName = destinationName;
+    // Remember the resolved POINT too: an off-route re-plan routes to it
+    // directly (see `_rerouteLiveNavigation`), so a name that is not in
+    // `verified_locations.dart` can still be re-planned.
+    _liveNavDestPoint = outcome.destination!.pointGcj02;
     _liveNavRemainingM = _liveNav!.remainingM;
     // A newly installed route supersedes any entrance phase
     // left over from the previous tracker (only reachable if
@@ -2719,7 +2738,24 @@ class _MingtuHomePageState extends State<MingtuHomePage>
       locationProvider: _locationProvider,
       client: _amapClient,
     );
-    final RealNavigationOutcome outcome = await starter.start(_liveNavDestName);
+    // Re-plan to the destination point the trip ALREADY resolved --
+    // never by name. Re-resolving the name here was the bug: it went
+    // through the registry lookup, so a place the nearby search had
+    // just found for the user (药店, 同仁堂药店, ...) was not found on
+    // re-plan and every off-route attempt failed, while 图书馆 was
+    // re-planned to the coordinate typed into `verified_locations.dart`
+    // instead of the POI the user had picked.
+    //
+    // With no resolved point there is nothing honest to route to: the
+    // attempt fails through the existing failure branch below (retry
+    // streak re-armed, the usual 「路线重新规划失败」 notice). It must
+    // NOT fall back to `starter.start(name)`, which would reintroduce
+    // exactly the registry lookup being removed here.
+    final GeoPoint? dest = _liveNavDestPoint;
+    final RealNavigationOutcome outcome = dest == null
+        ? RealNavigationOutcome.failed(RealNavigationFailure.routeFetchFailed,
+            searchCategory: _liveNavDestName)
+        : await starter.startToPoint(to: dest, name: _liveNavDestName);
     if (!mounted || _liveNav == null) return;
     if (!outcome.ready) {
       // Re-arm the RETRY only: the user is still off route,
@@ -2813,6 +2849,12 @@ class _MingtuHomePageState extends State<MingtuHomePage>
     _amapNaviActive = false;
     if (naviSource != null) unawaited(naviSource.stop());
     _liveNav = null;
+    // The trip is over, so its resolved destination point is no longer
+    // valid: a later re-plan must never route to a finished trip's
+    // place. `_liveNavDestName` is deliberately left alone -- the status
+    // lines still name the last destination -- and the point is always
+    // re-set by `_beginLiveNavigation` before any re-plan can read it.
+    _liveNavDestPoint = null;
     _deferredPausedCatchUp = false;
     _gpsSignalFailed = false;
     _pausedTurnStepIndex = null;

@@ -471,6 +471,102 @@ class RealNavigationStarter {
       searchCategory: category,
     );
   }
+
+  /// Re-plan to an ALREADY RESOLVED destination point.
+  ///
+  /// This is the OFF-ROUTE re-plan path (see `_rerouteLiveNavigation`
+  /// in main.dart). The destination coordinate was decided when the
+  /// trip STARTED -- by the nearby search that picked the place the
+  /// user actually named -- and the caller hands it back here
+  /// verbatim ([to]); this method only asks "from where I am NOW, what
+  /// is the walking route to THAT point".
+  ///
+  /// Order: proxy configured -> GPS fix -> accuracy -> walking route,
+  /// i.e. exactly [startNearby] minus the search. Two things are
+  /// deliberately ABSENT and must never be added back:
+  ///
+  /// - NO place resolution. No registry lookup, no nearby search, no
+  ///   geocoding. Resolving the name again is precisely the bug this
+  ///   method replaces: [start] looks names up in
+  ///   `verified_locations.dart`, so 「带我去药店」 could start but
+  ///   NEVER re-plan (药店 is not in that table -> every re-plan
+  ///   answered 「路线重新规划失败」), and 「图书馆」 was re-planned to
+  ///   the coordinate typed into that table instead of the POI the
+  ///   user had actually selected.
+  /// - NO distance gate. A re-plan starts from wherever the user now
+  ///   is, which is by definition away from the original route;
+  ///   measuring distance here could only refuse to help.
+  ///
+  /// Nothing is invented either: without a fix, a usable accuracy or a
+  /// returned route, the outcome is a failure with the usual
+  /// announcement and no navigation.
+  Future<RealNavigationOutcome> startToPoint({
+    required GeoPoint to,
+    String? name,
+  }) async {
+    if (!client.isConfigured) {
+      return RealNavigationOutcome.failed(
+        RealNavigationFailure.proxyNotConfigured,
+        searchCategory: name,
+      );
+    }
+    final LocationResult fix = await locationProvider.currentLocation();
+    if (!fix.ok) {
+      final RealNavigationFailure mapped = switch (fix.failure) {
+        LocationFailure.serviceDisabled =>
+          RealNavigationFailure.locationServiceDisabled,
+        LocationFailure.permissionDenied =>
+          RealNavigationFailure.locationPermissionDenied,
+        LocationFailure.permissionDeniedForever =>
+          RealNavigationFailure.locationPermissionDeniedForever,
+        _ => RealNavigationFailure.locationFailed,
+      };
+      return RealNavigationOutcome.failed(mapped, searchCategory: name);
+    }
+    final double? accuracy = fix.accuracyM;
+    if (accuracy == null ||
+        !accuracy.isFinite ||
+        accuracy < 0 ||
+        accuracy > maxStartAccuracyM) {
+      return RealNavigationOutcome.failed(
+        RealNavigationFailure.locationTooInaccurate,
+        accuracyM: accuracy,
+        searchCategory: name,
+      );
+    }
+    // The destination is the point the caller already resolved. Its id
+    // is a constant marker so nothing downstream can mistake it for a
+    // registry entry, and an empty name falls back to the neutral word
+    // 目的地 rather than to an empty announcement.
+    final VerifiedLocation destination = VerifiedLocation(
+      id: 'reroute-known',
+      name: (name == null || name.trim().isEmpty) ? '目的地' : name,
+      pointGcj02: to,
+    );
+    final AmapWalkingResult route = await client.walkingRoute(
+      from: fix.pointGcj02!,
+      to: destination.pointGcj02,
+    );
+    if (!route.ok) {
+      return RealNavigationOutcome.failed(
+        route.status == 'NOT_CONFIGURED'
+            ? RealNavigationFailure.proxyNotConfigured
+            : RealNavigationFailure.routeFetchFailed,
+        destination: destination,
+        routeError: route.error,
+        searchCategory: name,
+      );
+    }
+    // No `viaNearbySearch` / `placeDistanceM`: this is not a new place
+    // choice, it is the SAME place reached from a new position, so the
+    // "found the nearest X" lead-in must not be spoken again.
+    return RealNavigationOutcome.ready(
+      destination: destination,
+      originGcj02: fix.pointGcj02!,
+      accuracyM: accuracy,
+      route: route,
+    );
+  }
 }
 
 /// The ready announcement's fixed part (the caller appends the
